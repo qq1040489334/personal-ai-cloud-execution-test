@@ -1,0 +1,107 @@
+name: cloud-agent-dispatch
+
+on:
+  repository_dispatch:
+    types: [gpt_task]
+
+permissions:
+  contents: write
+
+jobs:
+  agent:
+    name: cloud-agent-dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout (no persisted credentials)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install opencode + pytest
+        run: |
+          npm install -g opencode-ai
+          python -m pip install --quiet pytest
+
+      - name: Record base revision
+        id: base
+        run: echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Write task contract from client_payload
+        env:
+          TASK_JSON: ${{ toJSON(github.event.client_payload.task) }}
+        run: printf '%s' "$TASK_JSON" > "$RUNNER_TEMP/task.json"
+
+      # ---- Gate 1: structured task contract ------------------------------
+      - name: Gate 1 - validate task contract (fail-closed)
+        run: git show "${{ steps.base.outputs.base }}:scripts/task_contract.py" | python - "$RUNNER_TEMP/task.json"
+
+      # ---- Execution ------------------------------------------------------
+      - name: Run OpenCode agent (execute task contract)
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.MODEL_API_KEY }}
+        run: |
+          CONTRACT="$(cat "$RUNNER_TEMP/task.json")"
+          opencode run --auto -m deepseek/deepseek-flash "You are working in a git repository in the current directory. Execute this structured task contract (JSON): ${CONTRACT}. Hard rules: only modify hello.py and test_hello.py; never touch .github/, scripts/, planner/, secrets; never delete files. Steps: 1) read the files; 2) implement the instructions; 3) add or update pytest tests; 4) run: python -m pytest -q and fix failures; 5) run: git add -A && git commit -m 'cloud agent: gpt task'. At the very end print a line beginning with AGENT_DONE followed by the pytest summary line and the commit hash."
+
+      # ---- Gate 2: scope --------------------------------------------------
+      - name: Gate 2 - scope guard (fail-closed)
+        run: git show "${{ steps.base.outputs.base }}:scripts/scope_guard.py" | python - "${{ steps.base.outputs.base }}"
+
+      - name: Verify tests (independent)
+        id: tests
+        run: |
+          python -m pytest -q
+          echo "summary=$(python -m pytest -q 2>&1 | tail -n 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure a commit exists
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no uncommitted changes"
+          else
+            git commit -m "cloud agent: gpt task"
+          fi
+
+      # ---- Gate 3: secret leak -------------------------------------------
+      - name: Gate 3 - secret leak check (fail-closed)
+        env:
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+        run: git show "${{ steps.base.outputs.base }}:scripts/secret_guard.py" | python - "${{ steps.base.outputs.base }}"
+
+      # ---- Evidence -------------------------------------------------------
+      - name: Build execution_result.json
+        run: |
+          git show "${{ steps.base.outputs.base }}:scripts/build_execution_result.py" | python - "$RUNNER_TEMP/task.json" "${{ steps.base.outputs.base }}" "${{ steps.tests.outputs.summary }}" "$RUNNER_TEMP/execution_result.json"
+
+      - name: Upload execution_result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: execution_result
+          path: ${{ runner.temp }}/execution_result.json
+
+      - name: Step summary
+        run: |
+          echo "## cloud-agent-dispatch" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/execution_result.json" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- Publish --------------------------------------------------------
+      - name: Push (credentials added only here)
+        run: |
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push origin HEAD:main
