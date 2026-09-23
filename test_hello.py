@@ -7,6 +7,7 @@ from hello import (
     cloud_agent_test_2,
     cloud_asset_status,
     cloudflare_mcp_test,
+    get_task_result,
     goodbye,
     gpt_bridge_test,
     hello,
@@ -104,3 +105,48 @@ def test_cloud_asset_status_timestamp_and_overall() -> None:
         c["component"] for c in report["checks"] if c["status"] != "PASS"
     ]
     assert len(report["next_steps"]) == len(expected_next_steps)
+
+
+def test_get_task_result_shape() -> None:
+    result = get_task_result("cf-5ce9f24c8aa1")
+    assert set(result) == {
+        "execution_summary",
+        "commit",
+        "tests",
+        "artifacts",
+        "execution_result_json",
+        "evidence",
+    }
+    summary = result["execution_summary"]
+    assert set(summary) == {"task_id", "status", "round", "summary"}
+    assert summary["task_id"] == "cf-5ce9f24c8aa1"
+    assert summary["status"] in VALID_STATUSES
+    assert isinstance(summary["round"], int)
+    assert summary["summary"]
+    assert isinstance(result["tests"], str) and result["tests"]
+    assert isinstance(result["artifacts"], list)
+    for artifact in result["artifacts"]:
+        assert set(artifact) >= {"name", "path", "sha256", "bytes"}
+        assert artifact["sha256"]
+        assert artifact["bytes"] > 0
+    assert isinstance(result["execution_result_json"], dict)
+    assert set(result["evidence"]) >= {"acceptance", "logs", "validation", "decision"}
+    assert result["evidence"]["decision"]["status"] == summary["status"]
+
+
+def test_get_task_result_self_contained() -> None:
+    result = get_task_result("cf-5ce9f24c8aa1")
+    status = result["execution_summary"]["status"]
+    assert status in VALID_STATUSES
+    assert result["evidence"]["decision"]["status"] == status
+    assert result["evidence"]["validation"]["pytest"]
+    assert "execution_result_present" in result["evidence"]["validation"]
+    assert result["evidence"]["validation"]["artifacts_present"]
+
+
+def test_get_task_result_artifacts_hashed() -> None:
+    paths = {a["path"] for a in get_task_result("cf-5ce9f24c8aa1")["artifacts"]}
+    assert "hello.py" in paths
+    assert "test_hello.py" in paths
+    for artifact in get_task_result("cf-5ce9f24c8aa1")["artifacts"]:
+        assert len(artifact["sha256"]) == 64

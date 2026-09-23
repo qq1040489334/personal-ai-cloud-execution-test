@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -197,4 +199,119 @@ def cloud_asset_status() -> dict:
             for c in checks
             if c["status"] != PASS
         ],
+    }
+
+
+ARTIFACT_CANDIDATES = ("hello.py", "test_hello.py", "execution_result.json")
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _collect_artifacts() -> list[dict]:
+    artifacts: list[dict] = []
+    for rel in ARTIFACT_CANDIDATES:
+        path = REPO_ROOT / rel
+        if path.is_file():
+            artifacts.append(
+                {
+                    "name": path.name,
+                    "path": rel,
+                    "sha256": _sha256(path),
+                    "bytes": path.stat().st_size,
+                }
+            )
+    return artifacts
+
+
+def _read_execution_result() -> dict | None:
+    path = REPO_ROOT / "execution_result.json"
+    if not path.is_file():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(loaded, str):
+        try:
+            loaded = json.loads(loaded)
+        except json.JSONDecodeError:
+            return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _derive_status(execution_result: dict | None) -> str:
+    if execution_result is None:
+        return BLOCKED
+    raw_status = str(execution_result.get("status", "")).strip().lower()
+    tests = str(execution_result.get("tests", "")).strip().lower()
+    if "fail" in tests or raw_status in {"fail", "failed", "error"}:
+        return FAIL
+    if raw_status in {"success", "succeed", "pass", "passed", "ok"} or "passed" in tests:
+        return PASS
+    return BLOCKED
+
+
+def get_task_result(task_id: str) -> dict:
+    """Return a fully self-contained task result for phone-side verification.
+
+    The payload carries every field needed to decide PASS / FAIL / BLOCKED
+    without re-opening the execution environment.
+    """
+    execution_result = _read_execution_result()
+    status = _derive_status(execution_result)
+    commit = _git("rev-parse", "HEAD")
+    artifacts = _collect_artifacts()
+
+    tests_summary = (
+        str(execution_result.get("tests", "")).strip()
+        if execution_result and execution_result.get("tests")
+        else "not available: no test summary recorded in execution_result.json"
+    )
+    summary = (
+        str(execution_result.get("summary", "")).strip()
+        if execution_result and execution_result.get("summary")
+        else "task result derived from repository evidence"
+    )
+    try:
+        round_number = int(execution_result.get("round", 1)) if execution_result else 1
+    except (TypeError, ValueError):
+        round_number = 1
+
+    evidence = {
+        "acceptance": [
+            "PASS / FAIL / BLOCKED is decidable from this payload alone",
+            f"execution_result.json present: {execution_result is not None}",
+            f"artifacts hashed: {[a['path'] for a in artifacts]}",
+            f"git commit recorded: {bool(commit)}",
+        ],
+        "logs": _git("log", "--oneline", "-5").splitlines(),
+        "validation": {
+            "pytest": tests_summary,
+            "execution_result_present": execution_result is not None,
+            "artifacts_present": [a["path"] for a in artifacts],
+        },
+        "decision": {
+            "status": status,
+            "reason": (
+                "execution_result.json missing; cannot verify remotely"
+                if execution_result is None
+                else f"execution_result.json status={execution_result.get('status')!r} tests={tests_summary!r}"
+            ),
+        },
+    }
+
+    return {
+        "execution_summary": {
+            "task_id": task_id,
+            "status": status,
+            "round": round_number,
+            "summary": summary,
+        },
+        "commit": commit,
+        "tests": tests_summary,
+        "artifacts": artifacts,
+        "execution_result_json": execution_result if execution_result is not None else {},
+        "evidence": evidence,
     }
