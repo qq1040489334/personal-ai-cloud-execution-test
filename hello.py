@@ -98,6 +98,11 @@ def result_consumer_test() -> str:
     return "result consumer ok"
 
 
+def result_consumer_test2() -> str:
+    """Return the second result consumer test marker."""
+    return "result consumer two ok"
+
+
 def _git(*args: str) -> str:
     try:
         result = subprocess.run(

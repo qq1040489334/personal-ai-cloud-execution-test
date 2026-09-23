@@ -26,6 +26,7 @@ from hello import (
     mcp_runtime_deploy_verify,
     oauth_mcp_test,
     result_consumer_test,
+    result_consumer_test2,
     runtime_provenance_report,
     security_test,
     trigger_bridge_test,
@@ -76,6 +77,10 @@ def test_oauth_mcp_test() -> None:
 
 def test_result_consumer_test() -> None:
     assert result_consumer_test() == "result consumer ok"
+
+
+def test_result_consumer_test2() -> None:
+    assert result_consumer_test2() == "result consumer two ok"
 
 
 def test_cloud_asset_status_report_shape() -> None:
