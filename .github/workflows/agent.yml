@@ -1,0 +1,83 @@
+name: cloud-agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Task for the cloud agent (e.g. Add goodbye2 function to hello.py)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  agent:
+    name: cloud-agent
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install opencode + pytest
+        run: |
+          npm install -g opencode-ai
+          python -m pip install --quiet pytest
+
+      - name: Runner / agent environment evidence
+        run: |
+          echo "runner_os=$RUNNER_OS runner_arch=$RUNNER_ARCH runner_name=$RUNNER_NAME"
+          node --version
+          python --version
+          opencode --version
+
+      - name: Configure git identity and authenticated remote
+        run: |
+          git config user.name "cloud-agent"
+          git config user.email "cloud-agent@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+      - name: Run OpenCode agent
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          TASK: ${{ inputs.task }}
+        run: |
+          opencode run --auto -m deepseek/deepseek-flash "You are working in a git repository in the current directory. Task: ${TASK}. Steps you must perform: 1) read the relevant files; 2) implement the task; 3) add or update pytest tests covering the change; 4) run: python -m pytest -q ; fix failures until it passes; 5) run: git add -A && git commit -m 'cloud agent: update' . At the very end print a line beginning with AGENT_DONE followed by the pytest summary line and the commit hash."
+
+      - name: Verify tests (independent)
+        run: python -m pytest -q
+
+      - name: Ensure a commit exists (fallback if agent did not commit)
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no uncommitted changes (agent already committed or no change)"
+          else
+            git commit -m "cloud agent: update"
+          fi
+
+      - name: Push
+        run: git push origin HEAD:main
+
+      - name: Cloud evidence
+        run: |
+          echo "--- runner ---"
+          uname -a
+          echo "--- git log ---"
+          git log -3 --oneline
+          echo "--- changed in HEAD ---"
+          git show --stat --oneline HEAD | head -n 15
