@@ -29,3 +29,8 @@ def trigger_bridge_test() -> str:
 def security_test() -> str:
     """Return the security gate marker."""
     return "security gate ok"
+
+
+def gpt_bridge_test() -> str:
+    """Return the gpt bridge test marker."""
+    return "gpt bridge ok"

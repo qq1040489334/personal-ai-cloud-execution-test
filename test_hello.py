@@ -4,6 +4,7 @@ from hello import (
     cloud_agent_test,
     cloud_agent_test_2,
     goodbye,
+    gpt_bridge_test,
     hello,
     security_test,
     trigger_bridge_test,
@@ -32,3 +33,7 @@ def test_trigger_bridge_test() -> None:
 
 def test_security_test() -> None:
     assert security_test() == "security gate ok"
+
+
+def test_gpt_bridge_test() -> None:
+    assert gpt_bridge_test() == "gpt bridge ok"
