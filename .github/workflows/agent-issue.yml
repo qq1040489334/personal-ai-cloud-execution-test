@@ -1,0 +1,88 @@
+name: cloud-agent-issue
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  agent:
+    name: cloud-agent-issue
+    # Only the repository owner may trigger the agent. Public issues are ignored.
+    if: ${{ github.event.issue.user.login == github.repository_owner }}
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install opencode + pytest
+        run: |
+          npm install -g opencode-ai
+          python -m pip install --quiet pytest
+
+      - name: Runner evidence
+        run: |
+          echo "runner_os=$RUNNER_OS runner_arch=$RUNNER_ARCH runner_name=$RUNNER_NAME"
+          echo "issue_number=${{ github.event.issue.number }}"
+          opencode --version
+
+      - name: Configure git identity and authenticated remote
+        run: |
+          git config user.name "cloud-agent"
+          git config user.email "cloud-agent@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+      - name: Run OpenCode agent
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          TASK_TITLE: ${{ github.event.issue.title }}
+          TASK_BODY: ${{ github.event.issue.body }}
+        run: |
+          opencode run --auto -m deepseek/deepseek-flash "You are working in a git repository in the current directory. Task title: ${TASK_TITLE}. Task details: ${TASK_BODY}. Steps you must perform: 1) read the relevant files; 2) implement the task; 3) add or update pytest tests covering the change; 4) run: python -m pytest -q ; fix failures until it passes; 5) run: git add -A && git commit -m 'cloud agent: issue'. At the very end print a line beginning with AGENT_DONE followed by the pytest summary line and the commit hash."
+
+      - name: Verify tests (independent)
+        run: python -m pytest -q
+
+      - name: Ensure a commit exists
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no uncommitted changes"
+          else
+            git commit -m "cloud agent: issue"
+          fi
+
+      - name: Push and capture evidence
+        id: evidence
+        run: |
+          git push origin HEAD:main
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tests=$(python -m pytest -q 2>&1 | tail -n 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Comment evidence on issue
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment ${{ github.event.issue.number }} --body "cloud-agent finished.
+          - run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          - commit: ${{ steps.evidence.outputs.commit }}
+          - tests: ${{ steps.evidence.outputs.tests }}
+          - runner: $RUNNER_NAME"
