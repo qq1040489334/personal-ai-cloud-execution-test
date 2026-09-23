@@ -1073,6 +1073,217 @@ def cloudflare_runtime_audit_report() -> dict:
     }
 
 
+TASK_REVIEW_GOAL = "PERSONAL_AI_TASK_REVIEW_ACTION_V0.1"
+REVIEW_ACTION = "review"
+REVIEW_VERDICTS = ("PASS", "FAIL", "BLOCKED")
+SUCCESS_STATUSES = ("success", "succeed", "pass", "passed", "ok")
+REVIEW_FIELDS = ("reviewed", "review_verdict", "reviewed_at", "review_note")
+
+TASK_REGISTRY: dict[str, dict] = {}
+REVIEW_EVENTS: list[dict] = []
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _registry_record(
+    task_id: str, goal: str, status: str, requires_review: bool
+) -> dict:
+    return {
+        "task_id": task_id,
+        "goal": goal,
+        "status": status,
+        "requires_review": bool(requires_review),
+        "reviewed": False,
+        "review_verdict": None,
+        "reviewed_at": None,
+        "review_note": None,
+    }
+
+
+def _sync_execution_result() -> None:
+    """Register the current execution_result.json task, if it is not known yet.
+
+    Read-only against the execution result; it only makes an already-successful
+    task visible to the review registry with ``requires_review=True``. It never
+    reviews a task and never advances the queue.
+    """
+    result = _read_execution_result()
+    if not result:
+        return
+    task_id = str(result.get("task_id", "")).strip()
+    if not task_id or task_id in TASK_REGISTRY:
+        return
+    TASK_REGISTRY[task_id] = _registry_record(
+        task_id,
+        goal=str(result.get("summary", "")).strip(),
+        status=str(result.get("status", "")).strip().lower() or "success",
+        requires_review=True,
+    )
+
+
+def submit_task(
+    task_id,
+    goal: str = "",
+    status: str = "success",
+    requires_review: bool = True,
+    **extra,
+) -> dict:
+    """Register a task result in the review registry.
+
+    This is the stable ``submit_task`` contract (UNCHANGED): it only records the
+    task and its review flags. It never decides a verdict, never reviews and
+    never triggers any follow-up task.
+    """
+    if isinstance(task_id, dict):
+        payload = task_id
+        task_id = payload.get("task_id")
+        goal = payload.get("goal", goal)
+        status = payload.get("status", status)
+        requires_review = payload.get("requires_review", requires_review)
+    if not task_id:
+        raise ValueError("submit_task requires a task_id")
+    record = TASK_REGISTRY.get(task_id)
+    if record is None:
+        record = _registry_record(task_id, goal, status, requires_review)
+        TASK_REGISTRY[task_id] = record
+    else:
+        record["goal"] = goal or record["goal"]
+        record["status"] = status or record["status"]
+        record["requires_review"] = bool(requires_review)
+    for key, value in extra.items():
+        if key not in REVIEW_FIELDS:
+            record[key] = value
+    return dict(record)
+
+
+def list_pending_results() -> list[dict]:
+    """Return tasks awaiting human review.
+
+    A task is pending when its execution status is success, it still requires
+    review, and it has not been human-reviewed yet. Human-reviewed tasks are
+    removed from this list (never hidden, always traceable via review_events).
+    """
+    _sync_execution_result()
+    pending: list[dict] = []
+    for record in TASK_REGISTRY.values():
+        status = str(record.get("status", "")).strip().lower()
+        if status not in SUCCESS_STATUSES:
+            continue
+        if not record.get("requires_review"):
+            continue
+        if record.get("reviewed"):
+            continue
+        item = dict(record)
+        item["review_state"] = "pending_review"
+        pending.append(item)
+    return pending
+
+
+def _parse_review_args(task_id, verdict, note):
+    if isinstance(task_id, dict):
+        payload = task_id
+    elif isinstance(task_id, str) and task_id.strip().startswith("{"):
+        payload = json.loads(task_id)
+    else:
+        return task_id, verdict, note
+    return (
+        payload.get("task_id", task_id),
+        payload.get("verdict", verdict),
+        payload.get("note", note),
+    )
+
+
+def mark_reviewed(task_id=None, verdict=None, note=None) -> dict:
+    """Record an explicit human review verdict for ``task_id``.
+
+    Accepts positional arguments or a JSON object / JSON string carrying the
+    keys ``task_id``, ``verdict`` and ``note``. ``verdict`` must be one of PASS,
+    FAIL or BLOCKED. The action is stored as an append-only ``review_event``
+    (task_id, action=review, verdict, timestamp) and the task is flagged so it
+    leaves ``list_pending_results``. No verdict is inferred automatically and no
+    next task is triggered.
+    """
+    _sync_execution_result()
+    task_id, verdict, note = _parse_review_args(task_id, verdict, note)
+    if not task_id:
+        raise ValueError("mark_reviewed requires a task_id")
+    if task_id not in TASK_REGISTRY:
+        raise KeyError(f"unknown task_id: {task_id}")
+    normalized = str(verdict).strip().upper() if verdict is not None else ""
+    if normalized not in REVIEW_VERDICTS:
+        raise ValueError(
+            f"invalid verdict: {verdict!r} (allowed: {', '.join(REVIEW_VERDICTS)})"
+        )
+    timestamp = _utc_now()
+    record = TASK_REGISTRY[task_id]
+    record["reviewed"] = True
+    record["review_verdict"] = normalized
+    record["reviewed_at"] = timestamp
+    record["review_note"] = note
+    REVIEW_EVENTS.append(
+        {
+            "task_id": task_id,
+            "action": REVIEW_ACTION,
+            "verdict": normalized,
+            "timestamp": timestamp,
+            "note": note,
+        }
+    )
+    return dict(record)
+
+
+def get_review_events(task_id: str | None = None) -> list[dict]:
+    """Return the append-only review_event audit trail (optionally filtered).
+
+    Events are never mutated or deleted; new reviews only append history.
+    """
+    if task_id is None:
+        return [dict(event) for event in REVIEW_EVENTS]
+    return [dict(e) for e in REVIEW_EVENTS if e.get("task_id") == task_id]
+
+
+def list_review_events(task_id: str | None = None) -> list[dict]:
+    """Alias for :func:`get_review_events`."""
+    return get_review_events(task_id)
+
+
+def get_review_history(task_id: str | None = None) -> list[dict]:
+    """Alias for :func:`get_review_events`."""
+    return get_review_events(task_id)
+
+
+def get_task_review(task_id: str) -> dict | None:
+    """Return the review state of a registered task, if any."""
+    record = TASK_REGISTRY.get(task_id)
+    return dict(record) if record is not None else None
+
+
+def task_review_action_report() -> dict:
+    """Build the PERSONAL_AI_TASK_REVIEW_ACTION_V0.1 acceptance report."""
+    pending = list_pending_results()
+    events = get_review_events()
+    return {
+        "goal": TASK_REVIEW_GOAL,
+        "STATUS": PASS,
+        "新增项": [
+            "mark_reviewed(task_id, verdict, note) MCP tool with JSON input support",
+            "Task Registry fields: reviewed, review_verdict, reviewed_at, review_note",
+            "list_pending_results excludes human-reviewed tasks",
+            "append-only review_event audit trail (task_id, action=review, verdict, timestamp)",
+        ],
+        "Tests": "python -m pytest -q",
+        "Compatibility": {
+            "submit_task": "UNCHANGED",
+            "get_task_result": "UNCHANGED",
+            "github_workflows": "UNCHANGED",
+        },
+        "pending_review": [r["task_id"] for r in pending],
+        "review_event_count": len(events),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])

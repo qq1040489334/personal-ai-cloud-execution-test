@@ -1,6 +1,9 @@
 """Automated test for hello.py."""
 
+import json
 from datetime import datetime
+
+import pytest
 
 from hello import (
     CLOUDFLARE_AUDIT_GOAL,
@@ -10,18 +13,25 @@ from hello import (
     DEPLOY_VERIFY_COMMIT,
     DEPLOY_VERIFY_TASK_ID,
     REQUIRED_RESULT_FIELDS,
+    REVIEW_VERDICTS,
     RUNTIME_CANDIDATE_COMMITS,
     RUNTIME_PROVENANCE_GOAL,
     RUNTIME_PROVENANCE_TASK_ID,
+    TASK_REVIEW_GOAL,
     cloud_agent_test,
     cloud_agent_test_2,
     cloud_asset_status,
     cloudflare_mcp_test,
     cloudflare_runtime_audit_report,
+    get_review_events,
     get_task_result,
+    get_task_review,
     goodbye,
     gpt_bridge_test,
     hello,
+    list_pending_results,
+    list_review_events,
+    mark_reviewed,
     mcp_bridge_test,
     mcp_runtime_deploy_verify,
     oauth_mcp_test,
@@ -29,6 +39,8 @@ from hello import (
     result_consumer_test2,
     runtime_provenance_report,
     security_test,
+    submit_task,
+    task_review_action_report,
     trigger_bridge_test,
 )
 
@@ -369,3 +381,116 @@ def test_cloudflare_runtime_audit_no_fabricated_live_pass() -> None:
     assert report["NEEDS_DEPLOY"] == "YES"
     assert isinstance(report["WORKER_VERSION_ID"], str) and report["WORKER_VERSION_ID"]
     assert isinstance(report["LATEST_DEPLOYMENT_ID"], str) and report["LATEST_DEPLOYMENT_ID"]
+
+
+def _pending_ids() -> set[str]:
+    return {task["task_id"] for task in list_pending_results()}
+
+
+def test_submit_task_appears_in_pending_review() -> None:
+    task_id = "review-flow-001"
+    submit_task(task_id, goal="review flow", status="success", requires_review=True)
+    pending = {task["task_id"]: task for task in list_pending_results()}
+    assert task_id in pending
+    assert pending[task_id]["requires_review"] is True
+    assert pending[task_id]["review_state"] == "pending_review"
+
+
+def test_mark_reviewed_removes_task_from_pending_review() -> None:
+    task_id = "review-flow-002"
+    submit_task(task_id, status="success", requires_review=True)
+    assert task_id in _pending_ids()
+    result = mark_reviewed(task_id, "PASS", "looks good")
+    assert result["reviewed"] is True
+    assert result["review_verdict"] == "PASS"
+    assert result["reviewed_at"]
+    assert result["review_note"] == "looks good"
+    assert task_id not in _pending_ids()
+
+
+def test_mark_reviewed_accepts_json_input() -> None:
+    task_id = "review-flow-003"
+    submit_task(task_id, status="success", requires_review=True)
+    payload = json.dumps({"task_id": task_id, "verdict": "FAIL", "note": "regression"})
+    result = mark_reviewed(payload)
+    assert result["review_verdict"] == "FAIL"
+    assert result["review_note"] == "regression"
+    assert task_id not in _pending_ids()
+
+
+def test_mark_reviewed_accepts_dict_input() -> None:
+    task_id = "review-flow-004"
+    submit_task(task_id, status="success", requires_review=True)
+    result = mark_reviewed({"task_id": task_id, "verdict": "BLOCKED", "note": "wait"})
+    assert result["review_verdict"] == "BLOCKED"
+    assert task_id not in _pending_ids()
+
+
+def test_mark_reviewed_rejects_invalid_verdict() -> None:
+    task_id = "review-flow-005"
+    submit_task(task_id, status="success", requires_review=True)
+    with pytest.raises(ValueError):
+        mark_reviewed(task_id, "MAYBE")
+    assert task_id in _pending_ids()
+
+
+def test_mark_reviewed_rejects_unknown_task() -> None:
+    with pytest.raises(KeyError):
+        mark_reviewed("review-flow-unknown", "PASS")
+
+
+def test_review_events_are_append_only_and_queryable() -> None:
+    task_id = "review-flow-006"
+    submit_task(task_id, status="success", requires_review=True)
+    mark_reviewed(task_id, "PASS", "first")
+    mark_reviewed(task_id, "FAIL", "second")
+    events = get_review_events(task_id)
+    assert [event["verdict"] for event in events] == ["PASS", "FAIL"]
+    for event in events:
+        assert event["action"] == "review"
+        assert event["task_id"] == task_id
+        assert event["timestamp"]
+    assert get_review_events(task_id) == list_review_events(task_id)
+
+
+def test_review_registry_fields_present() -> None:
+    task_id = "review-flow-007"
+    submit_task(task_id, status="success", requires_review=True)
+    record = get_task_review(task_id)
+    assert record is not None
+    for field in ("reviewed", "review_verdict", "reviewed_at", "review_note"):
+        assert field in record
+    assert record["reviewed"] is False
+    assert task_id in _pending_ids()
+
+
+def test_only_success_tasks_are_pending() -> None:
+    task_id = "review-flow-008"
+    submit_task(task_id, status="fail", requires_review=True)
+    assert task_id not in _pending_ids()
+
+
+def test_no_auto_review_or_auto_pass() -> None:
+    task_id = "review-flow-009"
+    submit_task(task_id, status="success", requires_review=True)
+    record = get_task_review(task_id)
+    assert record["reviewed"] is False
+    assert record["review_verdict"] is None
+    assert record["reviewed_at"] is None
+
+
+def test_mark_reviewed_verdict_allowlist() -> None:
+    assert set(REVIEW_VERDICTS) == {"PASS", "FAIL", "BLOCKED"}
+
+
+def test_task_review_action_report_contract() -> None:
+    report = task_review_action_report()
+    assert report["goal"] == TASK_REVIEW_GOAL
+    assert report["STATUS"] == "PASS"
+    assert report["新增项"]
+    assert "Tests" in report
+    assert report["Compatibility"] == {
+        "submit_task": "UNCHANGED",
+        "get_task_result": "UNCHANGED",
+        "github_workflows": "UNCHANGED",
+    }
