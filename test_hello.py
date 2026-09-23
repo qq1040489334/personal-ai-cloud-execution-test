@@ -8,6 +8,7 @@ from hello import (
     gpt_bridge_test,
     hello,
     mcp_bridge_test,
+    oauth_mcp_test,
     security_test,
     trigger_bridge_test,
 )
@@ -47,3 +48,7 @@ def test_mcp_bridge_test() -> None:
 
 def test_cloudflare_mcp_test() -> None:
     assert cloudflare_mcp_test() == "cloudflare mcp ok"
+
+
+def test_oauth_mcp_test() -> None:
+    assert oauth_mcp_test() == "oauth mcp ok"
