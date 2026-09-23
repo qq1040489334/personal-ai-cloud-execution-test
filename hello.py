@@ -9,3 +9,8 @@ def hello() -> str:
 def goodbye() -> str:
     """Return a farewell."""
     return "goodbye from cloud execution golden test"
+
+
+def cloud_agent_test() -> str:
+    """Return the cloud agent execution marker."""
+    return "executed inside github actions"
