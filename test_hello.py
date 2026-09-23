@@ -3,6 +3,7 @@
 from hello import (
     cloud_agent_test,
     cloud_agent_test_2,
+    cloudflare_mcp_test,
     goodbye,
     gpt_bridge_test,
     hello,
@@ -42,3 +43,7 @@ def test_gpt_bridge_test() -> None:
 
 def test_mcp_bridge_test() -> None:
     assert mcp_bridge_test() == "mcp bridge ok"
+
+
+def test_cloudflare_mcp_test() -> None:
+    assert cloudflare_mcp_test() == "cloudflare mcp ok"

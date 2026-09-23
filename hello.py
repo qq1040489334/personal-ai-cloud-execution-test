@@ -39,3 +39,8 @@ def gpt_bridge_test() -> str:
 def mcp_bridge_test() -> str:
     """Return the mcp bridge test marker."""
     return "mcp bridge ok"
+
+
+def cloudflare_mcp_test() -> str:
+    """Return the cloudflare mcp test marker."""
+    return "cloudflare mcp ok"
