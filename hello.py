@@ -4,3 +4,8 @@
 def hello() -> str:
     """Return a greeting."""
     return "hello from cloud execution golden test"
+
+
+def goodbye() -> str:
+    """Return a farewell."""
+    return "goodbye from cloud execution golden test"
