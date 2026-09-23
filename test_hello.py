@@ -1,6 +1,6 @@
 """Automated test for hello.py."""
 
-from hello import cloud_agent_test, goodbye, hello
+from hello import cloud_agent_test, cloud_agent_test_2, goodbye, hello
 
 
 def test_hello() -> None:
@@ -13,3 +13,7 @@ def test_goodbye() -> None:
 
 def test_cloud_agent_test() -> None:
     assert cloud_agent_test() == "executed inside github actions"
+
+
+def test_cloud_agent_test_2() -> None:
+    assert cloud_agent_test_2() == "second cloud run"

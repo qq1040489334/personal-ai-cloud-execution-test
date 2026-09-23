@@ -14,3 +14,8 @@ def goodbye() -> str:
 def cloud_agent_test() -> str:
     """Return the cloud agent execution marker."""
     return "executed inside github actions"
+
+
+def cloud_agent_test_2() -> str:
+    """Return the second cloud agent execution marker."""
+    return "second cloud run"
