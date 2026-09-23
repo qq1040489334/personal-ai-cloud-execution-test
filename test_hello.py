@@ -3,6 +3,9 @@
 from datetime import datetime
 
 from hello import (
+    DEPLOY_VERIFY_COMMIT,
+    DEPLOY_VERIFY_TASK_ID,
+    REQUIRED_RESULT_FIELDS,
     cloud_agent_test,
     cloud_agent_test_2,
     cloud_asset_status,
@@ -12,6 +15,7 @@ from hello import (
     gpt_bridge_test,
     hello,
     mcp_bridge_test,
+    mcp_runtime_deploy_verify,
     oauth_mcp_test,
     security_test,
     trigger_bridge_test,
@@ -150,3 +154,65 @@ def test_get_task_result_artifacts_hashed() -> None:
     assert "test_hello.py" in paths
     for artifact in get_task_result("cf-5ce9f24c8aa1")["artifacts"]:
         assert len(artifact["sha256"]) == 64
+
+
+def test_mcp_runtime_deploy_verify_shape() -> None:
+    report = mcp_runtime_deploy_verify()
+    assert set(report) >= {
+        "task_id",
+        "goal",
+        "target_commit",
+        "head_commit",
+        "result_fields",
+        "result_fields_complete",
+        "target_commit_on_history",
+        "worker_asset",
+        "deploy_workflows",
+        "online_mcp_version",
+        "checks",
+        "final_status",
+        "final_return_markdown",
+    }
+    assert report["task_id"] == DEPLOY_VERIFY_TASK_ID
+    assert report["goal"] == "PERSONAL_AI_EXECUTION_MCP_RUNTIME_DEPLOY_VERIFY_01"
+    assert report["final_status"] in {"PASS", "PARTIAL", "FAIL"}
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+
+
+def test_mcp_runtime_deploy_verify_return_fields() -> None:
+    report = mcp_runtime_deploy_verify()
+    assert report["result_fields"] == {
+        name: True for name in REQUIRED_RESULT_FIELDS
+    }
+    assert report["result_fields_complete"] is True
+
+
+def test_mcp_runtime_deploy_verify_target_commit() -> None:
+    report = mcp_runtime_deploy_verify()
+    assert report["target_commit"] == DEPLOY_VERIFY_COMMIT
+    assert report["head_commit"]
+    assert report["target_commit_on_history"] is True
+
+
+def test_mcp_runtime_deploy_verify_no_fabricated_pass() -> None:
+    report = mcp_runtime_deploy_verify()
+    if not report["worker_asset"]:
+        assert report["final_status"] != "PASS"
+    if not report["deploy_workflows"]:
+        assert report["final_status"] != "PASS"
+    assert report["online_mcp_version"] != "PASS"
+
+
+def test_mcp_runtime_deploy_verify_final_return_markdown() -> None:
+    report = mcp_runtime_deploy_verify()
+    markdown = report["final_return_markdown"]
+    assert markdown.startswith(
+        "# FINAL_RETURN_PERSONAL_AI_EXECUTION_MCP_RUNTIME_DEPLOY_VERIFY_01"
+    )
+    for name in REQUIRED_RESULT_FIELDS:
+        assert f"- {name}: returned" in markdown
+    assert f"## Final status: {report['final_status']}" in markdown

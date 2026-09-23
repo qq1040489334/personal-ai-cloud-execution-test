@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 PASS = "PASS"
 FAIL = "FAIL"
 BLOCKED = "BLOCKED"
+PARTIAL = "PARTIAL"
 
 WORKER_EVIDENCE = (
     "wrangler.toml",
@@ -27,6 +28,18 @@ WORKER_EVIDENCE = (
 )
 D1_EVIDENCE = ("migrations", "schema.sql", "d1", "db/schema.sql")
 AUDIT_EVIDENCE = ("execution_result.json", "gpt_verification.json")
+
+DEPLOY_VERIFY_TASK_ID = "cf-5ce9f24c8aa1"
+DEPLOY_VERIFY_COMMIT = "b3474609bb325ef31854d65c934d8eb431b67eba"
+REQUIRED_RESULT_FIELDS = (
+    "execution_summary",
+    "commit",
+    "tests",
+    "artifacts",
+    "execution_result_json",
+    "evidence",
+)
+DEPLOY_WORKFLOW_HINTS = ("deploy", "wrangler", "cloudflare", "mcp")
 
 
 def hello() -> str:
@@ -315,3 +328,187 @@ def get_task_result(task_id: str) -> dict:
         "execution_result_json": execution_result if execution_result is not None else {},
         "evidence": evidence,
     }
+
+
+def _git_ok(*args: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def _workflow_names() -> list[str]:
+    directory = REPO_ROOT / ".github" / "workflows"
+    if not directory.is_dir():
+        return []
+    names: list[str] = []
+    for pattern in ("*.yml", "*.yaml"):
+        names.extend(p.name for p in directory.glob(pattern))
+    return sorted(names)
+
+
+def _deploy_pipeline_workflows() -> list[str]:
+    matches: list[str] = []
+    for name in _workflow_names():
+        try:
+            text = (REPO_ROOT / ".github" / "workflows" / name).read_text(
+                encoding="utf-8", errors="ignore"
+            )
+        except OSError:
+            continue
+        lowered = text.lower()
+        if any(hint in lowered for hint in DEPLOY_WORKFLOW_HINTS):
+            matches.append(name)
+    return matches
+
+
+def mcp_runtime_deploy_verify() -> dict:
+    """Verify the MCP runtime deployment for the target commit.
+
+    Read-only. Confirms the six required fields of ``get_task_result`` are
+    returned, whether the target commit is present on the current history,
+    whether any deployable Worker asset exists, and whether a deploy pipeline
+    workflow is configured. Never fabricates a PASS.
+    """
+    result = get_task_result(DEPLOY_VERIFY_TASK_ID)
+    result_fields = {name: name in result for name in REQUIRED_RESULT_FIELDS}
+    fields_complete = all(result_fields.values())
+
+    head = _git("rev-parse", "HEAD")
+    target_committed = _git_ok("cat-file", "-e", DEPLOY_VERIFY_COMMIT + "^{commit}")
+    target_on_history = target_committed and _git_ok(
+        "merge-base", "--is-ancestor", DEPLOY_VERIFY_COMMIT, "HEAD"
+    )
+
+    worker = _first_present(WORKER_EVIDENCE)
+    deploy_workflows = _deploy_pipeline_workflows()
+
+    checks = [
+        {
+            "check": "get_task_result required fields",
+            "status": PASS if fields_complete else FAIL,
+            "detail": (
+                "all required fields returned: " + ", ".join(REQUIRED_RESULT_FIELDS)
+                if fields_complete
+                else "missing fields: "
+                + ", ".join(n for n, ok in result_fields.items() if not ok)
+            ),
+        },
+        {
+            "check": "target commit present",
+            "status": PASS if target_on_history else FAIL,
+            "detail": (
+                f"commit {DEPLOY_VERIFY_COMMIT[:12]} is on current history (HEAD={head[:12]})"
+                if target_on_history
+                else f"commit {DEPLOY_VERIFY_COMMIT[:12]} not found on current history"
+            ),
+        },
+        {
+            "check": "MCP runtime Worker asset",
+            "status": PASS if worker else BLOCKED,
+            "detail": (
+                f"worker configuration present: {worker}"
+                if worker
+                else "no Cloudflare Worker configuration or entrypoint found; nothing deployable"
+            ),
+        },
+        {
+            "check": "deploy pipeline workflow",
+            "status": PASS if deploy_workflows else BLOCKED,
+            "detail": (
+                "deploy workflow(s): " + ", ".join(deploy_workflows)
+                if deploy_workflows
+                else "no deploy workflow (deploy|wrangler|cloudflare|mcp) configured"
+            ),
+        },
+        {
+            "check": "online /mcp version",
+            "status": BLOCKED,
+            "detail": "offline verification environment: live /mcp endpoint not reachable from here",
+        },
+    ]
+
+    if any(c["status"] == FAIL for c in checks):
+        final_status = FAIL
+    elif any(c["status"] == BLOCKED for c in checks):
+        final_status = PARTIAL
+    else:
+        final_status = PASS
+
+    markdown = _final_return_markdown(
+        result=result,
+        result_fields=result_fields,
+        head=head,
+        target_on_history=target_on_history,
+        worker=worker,
+        deploy_workflows=deploy_workflows,
+        checks=checks,
+        final_status=final_status,
+    )
+
+    return {
+        "task_id": DEPLOY_VERIFY_TASK_ID,
+        "goal": "PERSONAL_AI_EXECUTION_MCP_RUNTIME_DEPLOY_VERIFY_01",
+        "target_commit": DEPLOY_VERIFY_COMMIT,
+        "head_commit": head,
+        "result_fields": result_fields,
+        "result_fields_complete": fields_complete,
+        "target_commit_on_history": target_on_history,
+        "worker_asset": worker,
+        "deploy_workflows": deploy_workflows,
+        "online_mcp_version": "unavailable (offline verification environment)",
+        "checks": checks,
+        "final_status": final_status,
+        "final_return_markdown": markdown,
+    }
+
+
+def _final_return_markdown(
+    *,
+    result: dict,
+    result_fields: dict,
+    head: str,
+    target_on_history: bool,
+    worker: str | None,
+    deploy_workflows: list[str],
+    checks: list[dict],
+    final_status: str,
+) -> str:
+    summary = result.get("execution_summary", {})
+    evidence = result.get("evidence", {})
+    lines = [
+        "# FINAL_RETURN_PERSONAL_AI_EXECUTION_MCP_RUNTIME_DEPLOY_VERIFY_01",
+        "",
+        f"- task_id: {DEPLOY_VERIFY_TASK_ID}",
+        f"- target_commit: {DEPLOY_VERIFY_COMMIT}",
+        f"- head_commit: {head}",
+        f"- target_commit_on_history: {target_on_history}",
+        f"- worker_asset: {worker or 'absent'}",
+        f"- deploy_workflows: {', '.join(deploy_workflows) or 'absent'}",
+        f"- online_mcp_version: unavailable (offline verification environment)",
+        f"- get_task_result status: {summary.get('status')}",
+        f"- get_task_result commit: {result.get('commit')}",
+        "",
+        "## Required return fields",
+    ]
+    for name, present in result_fields.items():
+        lines.append(f"- {name}: {'returned' if present else 'MISSING'}")
+    lines += [
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += [
+        "",
+        f"## Final status: {final_status}",
+        "",
+        f"evidence.decision.status: {evidence.get('decision', {}).get('status')}",
+    ]
+    return "\n".join(lines)
