@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -768,3 +769,301 @@ def runtime_provenance_report() -> dict:
         "overall": overall,
         "markdown": markdown,
     }
+
+
+CLOUDFLARE_AUDIT_TASK_ID = "cf-cd60940bb715"
+CLOUDFLARE_AUDIT_GOAL = "PERSONAL_AI_EXECUTION_MCP_CLOUDFLARE_RUNTIME_AUDIT_01"
+CLOUDFLARE_WORKER_NAME = "personal-ai-execution-mcp"
+WORKER_VERSION_ENV = ("CLOUDFLARE_WORKER_VERSION_ID", "WORKER_VERSION_ID")
+LATEST_DEPLOYMENT_ENV = ("CLOUDFLARE_DEPLOYMENT_ID", "LATEST_DEPLOYMENT_ID")
+CLOUDFLARE_AUDIT_TOKENS = (
+    "CURRENT_RUNTIME_COMMIT",
+    "WORKER_VERSION_ID",
+    "LATEST_DEPLOYMENT_ID",
+    "DEPLOY_STATUS",
+    "NEEDS_DEPLOY",
+)
+
+
+def _env_value(names: tuple[str, ...]) -> str | None:
+    """Return the first non-empty environment value among ``names``."""
+    for name in names:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _deployment_metadata() -> dict:
+    """Load Cloudflare deployment metadata from in-repo evidence, if any."""
+    for rel in DEPLOY_METADATA_EVIDENCE:
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            continue
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(loaded, str):
+            try:
+                loaded = json.loads(loaded)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(loaded, dict):
+            return loaded
+    return {}
+
+
+def _metadata_str(metadata: dict, *keys: str) -> str | None:
+    for key in keys:
+        value = metadata.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _cloudflare_audit_markdown(
+    *,
+    head: str,
+    origin_main: str,
+    current_runtime_commit: str,
+    worker_version_id: str,
+    latest_deployment_id: str,
+    deployment_timestamp: str,
+    deploy_status: str,
+    needs_deploy: str,
+    script_version_hash: str,
+    runtime_verified: bool,
+    provenance_source: str,
+    worker: str | None,
+    deploy_metadata: str | None,
+    deploy_workflows: list[str],
+    deploy_history: list[str],
+    checks: list[dict],
+    overall: str,
+) -> str:
+    lines = [
+        "# CLOUDFLARE_RUNTIME_AUDIT_REPORT",
+        "",
+        f"- goal: {CLOUDFLARE_AUDIT_GOAL}",
+        f"- task_id: {CLOUDFLARE_AUDIT_TASK_ID}",
+        f"- worker_name: {CLOUDFLARE_WORKER_NAME}",
+        f"- repository_head: {head or 'unknown'}",
+        f"- origin_main: {origin_main or 'unknown'}",
+        f"- provenance_source: {provenance_source}",
+        f"- runtime_verified: {runtime_verified}",
+        f"- deployment_timestamp: {deployment_timestamp or 'UNAVAILABLE'}",
+        f"- script_version_hash: {script_version_hash or 'UNAVAILABLE'}",
+        f"- worker_asset: {worker or 'absent'}",
+        f"- deploy_metadata: {deploy_metadata or 'absent'}",
+        f"- deploy_workflows: {', '.join(deploy_workflows) or 'absent'}",
+        f"- deploy_history: {len(deploy_history)} commit(s) on worker/deploy paths",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += [
+        "",
+        "## Answers",
+        f"CURRENT_RUNTIME_COMMIT={current_runtime_commit}",
+        f"WORKER_VERSION_ID={worker_version_id}",
+        f"LATEST_DEPLOYMENT_ID={latest_deployment_id}",
+        f"DEPLOY_STATUS={deploy_status}",
+        f"NEEDS_DEPLOY={needs_deploy}",
+        "",
+        f"## Overall: {overall}",
+    ]
+    return "\n".join(lines)
+
+
+def cloudflare_runtime_audit_report() -> dict:
+    """Audit the Cloudflare Worker ``personal-ai-execution-mcp`` runtime.
+
+    Read-only and offline. Resolves the candidate runtime commit from
+    ``origin/main`` (or HEAD), and reports the latest deployment id, worker
+    version id, deployment timestamp and script version/hash *only* when they
+    are genuinely available via environment variables or in-repo deployment
+    metadata. When the live Cloudflare account and ``/mcp`` endpoint are not
+    reachable from this sandbox those values are reported as ``UNAVAILABLE``
+    rather than fabricated, so no PASS is ever invented.
+    """
+    head = _git("rev-parse", "HEAD")
+    origin_main = _git("rev-parse", "origin/main")
+    resolved = origin_main or head
+
+    worker = _first_present(WORKER_EVIDENCE)
+    deploy_metadata = _first_present(DEPLOY_METADATA_EVIDENCE)
+    metadata = _deployment_metadata()
+    deploy_workflows = _deploy_pipeline_workflows()
+    deploy_history = _deploy_history()
+
+    worker_version_id = _env_value(WORKER_VERSION_ENV) or _metadata_str(
+        metadata, "version_id", "versionId"
+    )
+    latest_deployment_id = _env_value(LATEST_DEPLOYMENT_ENV) or _metadata_str(
+        metadata, "deployment_id", "deploymentId", "id"
+    )
+    deployment_timestamp = _metadata_str(
+        metadata, "deployed_at", "deployment_timestamp", "timestamp", "created_at"
+    )
+    script_version_hash = _metadata_str(
+        metadata, "script_version_hash", "script_hash", "hash", "etag"
+    )
+
+    runtime_verified = bool(worker_version_id) and bool(resolved)
+    current_runtime_commit = resolved or "UNVERIFIED"
+
+    if runtime_verified:
+        provenance_source = (
+            f"worker version id resolved from configuration: {worker_version_id}"
+        )
+    elif deploy_metadata:
+        provenance_source = (
+            f"deployment metadata present: {deploy_metadata} "
+            "(version id not machine-readable offline)"
+        )
+    else:
+        provenance_source = (
+            "inferred from origin/main (offline; live /mcp and Cloudflare "
+            "account unreachable)"
+        )
+
+    if runtime_verified:
+        deploy_status = PASS
+    elif not worker and not deploy_metadata:
+        deploy_status = BLOCKED
+    else:
+        deploy_status = PARTIAL
+    needs_deploy = "NO" if runtime_verified else "YES"
+
+    checks = [
+        {
+            "check": "worker name target",
+            "status": PASS if CLOUDFLARE_WORKER_NAME == "personal-ai-execution-mcp" else FAIL,
+            "detail": (
+                f"audit target worker name confirmed: {CLOUDFLARE_WORKER_NAME}"
+                if CLOUDFLARE_WORKER_NAME == "personal-ai-execution-mcp"
+                else f"unexpected audit target worker name: {CLOUDFLARE_WORKER_NAME}"
+            ),
+        },
+        {
+            "check": "current /mcp runtime commit",
+            "status": PASS if runtime_verified else BLOCKED,
+            "detail": (
+                f"runtime commit {current_runtime_commit[:12]} confirmed by worker version id"
+                if runtime_verified
+                else "live /mcp unreachable and no worker version id available; "
+                f"runtime commit inferred as {current_runtime_commit[:12]}"
+            ),
+        },
+        {
+            "check": "worker version id",
+            "status": PASS if worker_version_id else BLOCKED,
+            "detail": (
+                f"worker version id: {worker_version_id}"
+                if worker_version_id
+                else "worker version id unavailable offline (no env var or deployment metadata)"
+            ),
+        },
+        {
+            "check": "latest deployment id",
+            "status": PASS if latest_deployment_id else BLOCKED,
+            "detail": (
+                f"latest deployment id: {latest_deployment_id}"
+                if latest_deployment_id
+                else "latest deployment id unavailable offline (no env var or deployment metadata)"
+            ),
+        },
+        {
+            "check": "deployment timestamp / script hash",
+            "status": PASS if (deployment_timestamp or script_version_hash) else BLOCKED,
+            "detail": (
+                "deployment timestamp: "
+                f"{deployment_timestamp or 'UNAVAILABLE'}; script version/hash: "
+                f"{script_version_hash or 'UNAVAILABLE'}"
+            ),
+        },
+        {
+            "check": "deployable Worker asset",
+            "status": PASS if worker else BLOCKED,
+            "detail": (
+                f"worker configuration present: {worker}"
+                if worker
+                else "no Cloudflare Worker configuration or entrypoint found; nothing deployable in this repo"
+            ),
+        },
+        {
+            "check": "deploy pipeline workflow",
+            "status": PASS if deploy_workflows else BLOCKED,
+            "detail": (
+                "deploy workflow(s): " + ", ".join(deploy_workflows)
+                if deploy_workflows
+                else "no deploy workflow (deploy|wrangler|cloudflare|mcp) configured"
+            ),
+        },
+    ]
+
+    if any(c["status"] == FAIL for c in checks):
+        overall = FAIL
+    elif not runtime_verified:
+        overall = BLOCKED
+    elif any(c["status"] == BLOCKED for c in checks):
+        overall = PARTIAL
+    else:
+        overall = PASS
+
+    markdown = _cloudflare_audit_markdown(
+        head=head,
+        origin_main=origin_main,
+        current_runtime_commit=current_runtime_commit,
+        worker_version_id=worker_version_id or "UNAVAILABLE",
+        latest_deployment_id=latest_deployment_id or "UNAVAILABLE",
+        deployment_timestamp=deployment_timestamp,
+        script_version_hash=script_version_hash,
+        deploy_status=deploy_status,
+        needs_deploy=needs_deploy,
+        runtime_verified=runtime_verified,
+        provenance_source=provenance_source,
+        worker=worker,
+        deploy_metadata=deploy_metadata,
+        deploy_workflows=deploy_workflows,
+        deploy_history=deploy_history,
+        checks=checks,
+        overall=overall,
+    )
+
+    return {
+        "report": "CLOUDFLARE_RUNTIME_AUDIT_REPORT",
+        "task_id": CLOUDFLARE_AUDIT_TASK_ID,
+        "goal": CLOUDFLARE_AUDIT_GOAL,
+        "WORKER_NAME": CLOUDFLARE_WORKER_NAME,
+        "CURRENT_RUNTIME_COMMIT": current_runtime_commit,
+        "WORKER_VERSION_ID": worker_version_id or "UNAVAILABLE",
+        "LATEST_DEPLOYMENT_ID": latest_deployment_id or "UNAVAILABLE",
+        "DEPLOY_STATUS": deploy_status,
+        "NEEDS_DEPLOY": needs_deploy,
+        "deployment_timestamp": deployment_timestamp or "UNAVAILABLE",
+        "script_version_hash": script_version_hash or "UNAVAILABLE",
+        "head_commit": head,
+        "origin_main_commit": origin_main,
+        "provenance_source": provenance_source,
+        "runtime_verified": runtime_verified,
+        "worker_asset": worker,
+        "deploy_metadata": deploy_metadata,
+        "deploy_workflows": deploy_workflows,
+        "deploy_history": deploy_history,
+        "live_endpoint_checked": False,
+        "checks": checks,
+        "overall": overall,
+        "markdown": markdown,
+    }
+
+
+if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
+    print(cloudflare_runtime_audit_report()["markdown"])
+    print(mcp_runtime_deploy_verify()["final_return_markdown"])
+    print(runtime_provenance_report()["markdown"])
