@@ -93,6 +93,11 @@ def oauth_mcp_test() -> str:
     return "oauth mcp ok"
 
 
+def result_consumer_test() -> str:
+    """Return the result consumer test marker."""
+    return "result consumer ok"
+
+
 def _git(*args: str) -> str:
     try:
         result = subprocess.run(
