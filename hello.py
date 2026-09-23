@@ -24,3 +24,8 @@ def cloud_agent_test_2() -> str:
 def trigger_bridge_test() -> str:
     """Return the bridge test marker."""
     return "triggered from github issue"
+
+
+def security_test() -> str:
+    """Return the security gate marker."""
+    return "security gate ok"

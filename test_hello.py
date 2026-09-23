@@ -5,6 +5,7 @@ from hello import (
     cloud_agent_test_2,
     goodbye,
     hello,
+    security_test,
     trigger_bridge_test,
 )
 
@@ -27,3 +28,7 @@ def test_cloud_agent_test_2() -> None:
 
 def test_trigger_bridge_test() -> None:
     assert trigger_bridge_test() == "triggered from github issue"
+
+
+def test_security_test() -> None:
+    assert security_test() == "security gate ok"
