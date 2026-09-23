@@ -1,0 +1,24 @@
+{
+  "event_type": "gpt_task",
+  "client_payload": {
+    "task": {
+      "task_id": "gpt-bridge-001",
+      "goal": "Add function gpt_bridge_test() to hello.py and add pytest.",
+      "instructions": [
+        "In hello.py add a function gpt_bridge_test that returns the string 'gpt bridge ok'.",
+        "Add a pytest test for it in test_hello.py.",
+        "Run python -m pytest -q and commit."
+      ],
+      "risk_level": "LOW",
+      "expected_files": [
+        "hello.py",
+        "test_hello.py"
+      ],
+      "acceptance": [
+        "gpt_bridge_test exists in hello.py and returns 'gpt bridge ok'",
+        "test_hello.py contains a test for gpt_bridge_test",
+        "python -m pytest -q passes"
+      ]
+    }
+  }
+}

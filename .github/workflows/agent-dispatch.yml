@@ -87,10 +87,16 @@ jobs:
         run: |
           git show "${{ steps.base.outputs.base }}:scripts/build_execution_result.py" | python - "$RUNNER_TEMP/task.json" "${{ steps.base.outputs.base }}" "${{ steps.tests.outputs.summary }}" "$RUNNER_TEMP/execution_result.json"
 
+      - name: Extract task_id
+        id: taskid
+        run: |
+          TID=$(python -c "import json,sys;d=json.load(open(sys.argv[1]));d=json.loads(d) if isinstance(d,str) else d;print(d.get('task_id',''))" "$RUNNER_TEMP/task.json")
+          echo "task_id=$TID" >> "$GITHUB_OUTPUT"
+
       - name: Upload execution_result artifact
         uses: actions/upload-artifact@v4
         with:
-          name: execution_result
+          name: execution_result-${{ steps.taskid.outputs.task_id }}
           path: ${{ runner.temp }}/execution_result.json
 
       - name: Step summary
