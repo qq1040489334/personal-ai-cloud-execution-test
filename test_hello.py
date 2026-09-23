@@ -6,6 +6,7 @@ from hello import (
     goodbye,
     gpt_bridge_test,
     hello,
+    mcp_bridge_test,
     security_test,
     trigger_bridge_test,
 )
@@ -37,3 +38,7 @@ def test_security_test() -> None:
 
 def test_gpt_bridge_test() -> None:
     assert gpt_bridge_test() == "gpt bridge ok"
+
+
+def test_mcp_bridge_test() -> None:
+    assert mcp_bridge_test() == "mcp bridge ok"

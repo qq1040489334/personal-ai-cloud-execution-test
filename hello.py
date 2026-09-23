@@ -34,3 +34,8 @@ def security_test() -> str:
 def gpt_bridge_test() -> str:
     """Return the gpt bridge test marker."""
     return "gpt bridge ok"
+
+
+def mcp_bridge_test() -> str:
+    """Return the mcp bridge test marker."""
+    return "mcp bridge ok"
