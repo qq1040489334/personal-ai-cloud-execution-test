@@ -14,13 +14,15 @@ jobs:
     # Only the repository owner may trigger the agent. Public issues are ignored.
     if: ${{ github.event.issue.user.login == github.repository_owner }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       CI: "true"
     steps:
-      - name: Checkout
+      - name: Checkout (no persisted credentials)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup node
         uses: actions/setup-node@v4
@@ -37,28 +39,53 @@ jobs:
           npm install -g opencode-ai
           python -m pip install --quiet pytest
 
-      - name: Runner evidence
-        run: |
-          echo "runner_os=$RUNNER_OS runner_arch=$RUNNER_ARCH runner_name=$RUNNER_NAME"
-          echo "issue_number=${{ github.event.issue.number }}"
-          opencode --version
+      - name: Record base revision
+        id: base
+        run: echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Configure git identity and authenticated remote
-        run: |
-          git config user.name "cloud-agent"
-          git config user.email "cloud-agent@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-
-      - name: Run OpenCode agent
+      # ---- Gate 1a: planning (no file changes intended) -------------------
+      - name: Gate 1a - agent produces EXECUTION_PLAN
         env:
           DEEPSEEK_API_KEY: ${{ secrets.MODEL_API_KEY }}
           TASK_TITLE: ${{ github.event.issue.title }}
           TASK_BODY: ${{ github.event.issue.body }}
         run: |
-          opencode run --auto -m deepseek/deepseek-flash "You are working in a git repository in the current directory. Task title: ${TASK_TITLE}. Task details: ${TASK_BODY}. Steps you must perform: 1) read the relevant files; 2) implement the task; 3) add or update pytest tests covering the change; 4) run: python -m pytest -q ; fix failures until it passes; 5) run: git add -A && git commit -m 'cloud agent: issue'. At the very end print a line beginning with AGENT_DONE followed by the pytest summary line and the commit hash."
+          opencode run --auto -m deepseek/deepseek-flash "Do NOT modify, create, or delete any files. Analyze this task and output ONLY an EXECUTION_PLAN block in exactly this shape, one item per line:
+          EXECUTION_PLAN
+          Task: <short summary>
+          Files to modify: <comma-separated file paths>
+          Expected changes: <short description>
+          Risk level: LOW
+          Task title: ${TASK_TITLE}. Task details: ${TASK_BODY}." | tee "$RUNNER_TEMP/plan.txt"
+
+      - name: Discard any side effects from the planning step
+        run: |
+          git reset --hard "${{ steps.base.outputs.base }}"
+          git clean -fdx
+
+      # ---- Gate 1b: plan rule check --------------------------------------
+      - name: Gate 1b - validate plan (fail-closed)
+        run: git show "${{ steps.base.outputs.base }}:scripts/plan_gate.py" | python - "$RUNNER_TEMP/plan.txt"
+
+      # ---- Execution ------------------------------------------------------
+      - name: Run OpenCode agent (execute approved plan)
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          TASK_TITLE: ${{ github.event.issue.title }}
+          TASK_BODY: ${{ github.event.issue.body }}
+        run: |
+          PLAN="$(cat "$RUNNER_TEMP/plan.txt")"
+          opencode run --auto -m deepseek/deepseek-flash "You are working in a git repository in the current directory. Implement this task. Task title: ${TASK_TITLE}. Task details: ${TASK_BODY}. Approved plan: ${PLAN}. Hard rules: only modify hello.py and test_hello.py; never touch .github/, scripts/, secrets, or delete files. Steps: 1) read the files; 2) implement; 3) add or update pytest tests; 4) run: python -m pytest -q and fix failures; 5) run: git add -A && git commit -m 'cloud agent: issue'. At the very end print a line beginning with AGENT_DONE followed by the pytest summary line and the commit hash."
+
+      # ---- Gate 2: scope --------------------------------------------------
+      - name: Gate 2 - scope guard (fail-closed)
+        run: git show "${{ steps.base.outputs.base }}:scripts/scope_guard.py" | python - "${{ steps.base.outputs.base }}"
 
       - name: Verify tests (independent)
-        run: python -m pytest -q
+        id: tests
+        run: |
+          python -m pytest -q
+          echo "summary=$(python -m pytest -q 2>&1 | tail -n 1)" >> "$GITHUB_OUTPUT"
 
       - name: Ensure a commit exists
         run: |
@@ -69,20 +96,28 @@ jobs:
             git commit -m "cloud agent: issue"
           fi
 
-      - name: Push and capture evidence
-        id: evidence
+      # ---- Gate 3: secret leak -------------------------------------------
+      - name: Gate 3 - secret leak check (fail-closed)
+        env:
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+        run: git show "${{ steps.base.outputs.base }}:scripts/secret_guard.py" | python - "${{ steps.base.outputs.base }}"
+
+      # ---- Publish --------------------------------------------------------
+      - name: Push (credentials added only here)
+        id: push
         run: |
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git push origin HEAD:main
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "tests=$(python -m pytest -q 2>&1 | tail -n 1)" >> "$GITHUB_OUTPUT"
 
       - name: Comment evidence on issue
         if: ${{ always() }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh issue comment ${{ github.event.issue.number }} --body "cloud-agent finished.
+          gh issue comment ${{ github.event.issue.number }} --body "cloud-agent status: ${{ job.status }}
           - run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          - commit: ${{ steps.evidence.outputs.commit }}
-          - tests: ${{ steps.evidence.outputs.tests }}
-          - runner: $RUNNER_NAME"
+          - commit: ${{ steps.push.outputs.commit }}
+          - tests: ${{ steps.tests.outputs.summary }}
+          - runner: $RUNNER_NAME
+          - guards: plan=Gate1 scope=Gate2 secret=Gate3 (fail-closed)"
