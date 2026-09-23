@@ -6,6 +6,9 @@ from hello import (
     DEPLOY_VERIFY_COMMIT,
     DEPLOY_VERIFY_TASK_ID,
     REQUIRED_RESULT_FIELDS,
+    RUNTIME_CANDIDATE_COMMITS,
+    RUNTIME_PROVENANCE_GOAL,
+    RUNTIME_PROVENANCE_TASK_ID,
     cloud_agent_test,
     cloud_agent_test_2,
     cloud_asset_status,
@@ -17,6 +20,7 @@ from hello import (
     mcp_bridge_test,
     mcp_runtime_deploy_verify,
     oauth_mcp_test,
+    runtime_provenance_report,
     security_test,
     trigger_bridge_test,
 )
@@ -216,3 +220,70 @@ def test_mcp_runtime_deploy_verify_final_return_markdown() -> None:
     for name in REQUIRED_RESULT_FIELDS:
         assert f"- {name}: returned" in markdown
     assert f"## Final status: {report['final_status']}" in markdown
+
+
+def test_runtime_provenance_report_shape() -> None:
+    report = runtime_provenance_report()
+    assert report["report"] == "RUNTIME_PROVENANCE_REPORT"
+    assert report["task_id"] == RUNTIME_PROVENANCE_TASK_ID
+    assert report["goal"] == RUNTIME_PROVENANCE_GOAL
+    assert set(report) >= {
+        "report",
+        "CURRENT_RUNTIME_COMMIT",
+        "DEPLOY_STATUS",
+        "NEEDS_DEPLOY",
+        "head_commit",
+        "origin_main_commit",
+        "provenance_source",
+        "runtime_verified",
+        "candidate_commits",
+        "worker_asset",
+        "deploy_metadata",
+        "deploy_workflows",
+        "deploy_history",
+        "live_endpoint_checked",
+        "assessment",
+        "checks",
+        "overall",
+        "markdown",
+    }
+
+
+def test_runtime_provenance_candidate_commits() -> None:
+    report = runtime_provenance_report()
+    assert set(report["candidate_commits"]) == set(RUNTIME_CANDIDATE_COMMITS)
+    assert report["candidates_present"] is True
+    for commit, info in report["candidate_commits"].items():
+        assert info["present_locally"] is True
+        assert info["on_current_history"] is True
+        assert commit in RUNTIME_CANDIDATE_COMMITS
+
+
+def test_runtime_provenance_markdown_tokens() -> None:
+    report = runtime_provenance_report()
+    markdown = report["markdown"]
+    assert markdown.startswith("# RUNTIME_PROVENANCE_REPORT")
+    assert f"CURRENT_RUNTIME_COMMIT={report['CURRENT_RUNTIME_COMMIT']}" in markdown
+    assert f"DEPLOY_STATUS={report['DEPLOY_STATUS']}" in markdown
+    assert f"NEEDS_DEPLOY={report['NEEDS_DEPLOY']}" in markdown
+
+
+def test_runtime_provenance_no_fabricated_live_pass() -> None:
+    report = runtime_provenance_report()
+    assert report["live_endpoint_checked"] is False
+    assert report["runtime_verified"] is False
+    assert report["overall"] != "PASS"
+    if not report["deploy_metadata"]:
+        assert report["DEPLOY_STATUS"] != "PASS"
+    assert report["NEEDS_DEPLOY"] in {"YES", "NO"}
+
+
+def test_runtime_provenance_checks_and_status() -> None:
+    report = runtime_provenance_report()
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+    assert report["DEPLOY_STATUS"] in {"PASS", "FAIL", "BLOCKED", "PARTIAL"}
+    assert report["overall"] in {"PASS", "FAIL", "BLOCKED", "PARTIAL"}

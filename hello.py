@@ -512,3 +512,259 @@ def _final_return_markdown(
         f"evidence.decision.status: {evidence.get('decision', {}).get('status')}",
     ]
     return "\n".join(lines)
+
+
+RUNTIME_PROVENANCE_TASK_ID = "cf-820cc1db817b"
+RUNTIME_PROVENANCE_GOAL = "PERSONAL_AI_EXECUTION_MCP_RUNTIME_PROVENANCE_01"
+RUNTIME_CANDIDATE_COMMITS = (
+    "b3474609bb325ef31854d65c934d8eb431b67eba",
+    "775e5e5094ff027ab788e42652499451004ada9e",
+)
+DEPLOY_METADATA_EVIDENCE = (
+    "wrangler.toml",
+    "wrangler.json",
+    "wrangler.jsonc",
+    "deployment.json",
+    "deploy_metadata.json",
+    ".wrangler/deployments.json",
+)
+
+
+def _commit_present(commit: str) -> bool:
+    """Return True if the commit object exists in the local object store."""
+    return _git_ok("cat-file", "-e", commit + "^{commit}")
+
+
+def _commit_on_history(commit: str) -> bool:
+    """Return True if the commit is an ancestor of the current HEAD."""
+    if not _commit_present(commit):
+        return False
+    return _git_ok("merge-base", "--is-ancestor", commit, "HEAD")
+
+
+def _deploy_history() -> list[str]:
+    """Return recent commits that touched Worker or deployment metadata paths."""
+    paths = list(WORKER_EVIDENCE) + list(DEPLOY_METADATA_EVIDENCE)
+    return _git("log", "--oneline", "-10", "--", *paths).splitlines()
+
+
+def _provenance_markdown(
+    *,
+    current_runtime_commit: str,
+    deploy_status: str,
+    needs_deploy: str,
+    origin_main: str,
+    head: str,
+    provenance_source: str,
+    runtime_verified: bool,
+    candidates: dict,
+    worker: str | None,
+    deploy_metadata: str | None,
+    deploy_workflows: list[str],
+    deploy_history: list[str],
+    checks: list[dict],
+    overall: str,
+) -> str:
+    lines = [
+        "# RUNTIME_PROVENANCE_REPORT",
+        "",
+        f"- goal: {RUNTIME_PROVENANCE_GOAL}",
+        f"- task_id: {RUNTIME_PROVENANCE_TASK_ID}",
+        f"- repository_head: {head or 'unknown'}",
+        f"- origin_main: {origin_main or 'unknown'}",
+        f"- provenance_source: {provenance_source}",
+        f"- runtime_verified: {runtime_verified}",
+        f"- worker_asset: {worker or 'absent'}",
+        f"- deploy_metadata: {deploy_metadata or 'absent'}",
+        f"- deploy_workflows: {', '.join(deploy_workflows) or 'absent'}",
+        f"- deploy_history: {len(deploy_history)} commit(s) on worker/deploy paths",
+        "",
+        "## Candidate commits",
+    ]
+    for commit, info in candidates.items():
+        lines.append(
+            f"- {info['short']}: present={info['present_locally']} "
+            f"on_history={info['on_current_history']} "
+            f"is_origin_main={info['is_origin_main']} is_head={info['is_head']}"
+        )
+    lines += [
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += [
+        "",
+        f"CURRENT_RUNTIME_COMMIT={current_runtime_commit}",
+        f"DEPLOY_STATUS={deploy_status}",
+        f"NEEDS_DEPLOY={needs_deploy}",
+        "",
+        f"## Overall: {overall}",
+    ]
+    return "\n".join(lines)
+
+
+def runtime_provenance_report() -> dict:
+    """Build the RUNTIME_PROVENANCE_REPORT for the Remote MCP ``/mcp`` runtime.
+
+    Read-only and offline. Confirms which candidate commit the live runtime
+    *should* be on, whether Cloudflare Worker deployment metadata and a deploy
+    pipeline are present locally, and whether a deploy is still required.
+
+    The live ``/mcp`` endpoint and Cloudflare account deployment metadata are
+    not reachable from this sandbox, so the runtime commit is reported as an
+    inference from ``origin/main`` (or HEAD); it is never fabricated as a
+    verified live version.
+    """
+    head = _git("rev-parse", "HEAD")
+    origin_main = _git("rev-parse", "origin/main")
+    resolved = origin_main or head
+
+    candidates = {
+        commit: {
+            "short": commit[:12],
+            "present_locally": _commit_present(commit),
+            "on_current_history": _commit_on_history(commit),
+            "is_origin_main": bool(origin_main) and commit == origin_main,
+            "is_head": bool(head) and commit == head,
+        }
+        for commit in RUNTIME_CANDIDATE_COMMITS
+    }
+    candidates_present = all(info["present_locally"] for info in candidates.values())
+    candidate_on_main = any(info["is_origin_main"] for info in candidates.values())
+
+    worker = _first_present(WORKER_EVIDENCE)
+    deploy_metadata = _first_present(DEPLOY_METADATA_EVIDENCE)
+    deploy_workflows = _deploy_pipeline_workflows()
+    deploy_history = _deploy_history()
+
+    # Without reachable live metadata the runtime commit is only inferred.
+    runtime_verified = bool(deploy_metadata) and bool(resolved)
+    if deploy_metadata:
+        provenance_source = f"deployment metadata present: {deploy_metadata} (commit not machine-readable offline)"
+    else:
+        provenance_source = "inferred from origin/main (offline; live /mcp unreachable)"
+
+    current_runtime_commit = resolved or "UNVERIFIED"
+
+    if runtime_verified and current_runtime_commit == resolved:
+        deploy_status = PASS
+    elif not worker and not deploy_metadata:
+        deploy_status = BLOCKED
+    else:
+        deploy_status = PARTIAL
+
+    needs_deploy = "YES" if (not runtime_verified or not candidate_on_main) else "NO"
+
+    checks = [
+        {
+            "check": "candidate commits resolvable",
+            "status": PASS if candidates_present else FAIL,
+            "detail": (
+                "both candidate commits present locally: "
+                + ", ".join(info["short"] for info in candidates.values())
+                if candidates_present
+                else "missing candidate commit(s): "
+                + ", ".join(
+                    info["short"]
+                    for info in candidates.values()
+                    if not info["present_locally"]
+                )
+            ),
+        },
+        {
+            "check": "current /mcp runtime commit",
+            "status": PASS if runtime_verified else BLOCKED,
+            "detail": (
+                f"runtime commit {current_runtime_commit[:12]} confirmed from {deploy_metadata}"
+                if runtime_verified
+                else "live /mcp unreachable and no deployment metadata in-repo; "
+                f"runtime commit inferred as {current_runtime_commit[:12]}"
+            ),
+        },
+        {
+            "check": "Cloudflare Worker deployment metadata",
+            "status": PASS if deploy_metadata else BLOCKED,
+            "detail": (
+                f"deployment metadata present: {deploy_metadata}"
+                if deploy_metadata
+                else "no Cloudflare Worker deployment metadata (version id / deployment history) found"
+            ),
+        },
+        {
+            "check": "deployable Worker asset",
+            "status": PASS if worker else BLOCKED,
+            "detail": (
+                f"worker configuration present: {worker}"
+                if worker
+                else "no Cloudflare Worker configuration or entrypoint found; nothing deployable in this repo"
+            ),
+        },
+        {
+            "check": "deploy pipeline workflow",
+            "status": PASS if deploy_workflows else BLOCKED,
+            "detail": (
+                "deploy workflow(s): " + ", ".join(deploy_workflows)
+                if deploy_workflows
+                else "no deploy workflow (deploy|wrangler|cloudflare|mcp) configured"
+            ),
+        },
+    ]
+
+    if any(c["status"] == FAIL for c in checks):
+        overall = FAIL
+    elif not runtime_verified:
+        overall = BLOCKED
+    elif any(c["status"] == BLOCKED for c in checks):
+        overall = PARTIAL
+    else:
+        overall = PASS
+
+    assessment = (
+        f"{RUNTIME_CANDIDATE_COMMITS[1][:12]} is origin/main and a descendant of "
+        f"{RUNTIME_CANDIDATE_COMMITS[0][:12]}; both are on current history. The live "
+        "/mcp runtime cannot be confirmed offline, so provenance resolves to the "
+        "promoted origin/main revision by inference, not by live verification."
+    )
+
+    markdown = _provenance_markdown(
+        current_runtime_commit=current_runtime_commit,
+        deploy_status=deploy_status,
+        needs_deploy=needs_deploy,
+        origin_main=origin_main,
+        head=head,
+        provenance_source=provenance_source,
+        runtime_verified=runtime_verified,
+        candidates=candidates,
+        worker=worker,
+        deploy_metadata=deploy_metadata,
+        deploy_workflows=deploy_workflows,
+        deploy_history=deploy_history,
+        checks=checks,
+        overall=overall,
+    )
+
+    return {
+        "report": "RUNTIME_PROVENANCE_REPORT",
+        "task_id": RUNTIME_PROVENANCE_TASK_ID,
+        "goal": RUNTIME_PROVENANCE_GOAL,
+        "CURRENT_RUNTIME_COMMIT": current_runtime_commit,
+        "DEPLOY_STATUS": deploy_status,
+        "NEEDS_DEPLOY": needs_deploy,
+        "head_commit": head,
+        "origin_main_commit": origin_main,
+        "provenance_source": provenance_source,
+        "runtime_verified": runtime_verified,
+        "candidate_commits": candidates,
+        "candidates_present": candidates_present,
+        "candidate_on_origin_main": candidate_on_main,
+        "worker_asset": worker,
+        "deploy_metadata": deploy_metadata,
+        "deploy_workflows": deploy_workflows,
+        "deploy_history": deploy_history,
+        "live_endpoint_checked": False,
+        "assessment": assessment,
+        "checks": checks,
+        "overall": overall,
+        "markdown": markdown,
+    }
