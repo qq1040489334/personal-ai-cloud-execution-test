@@ -19,3 +19,8 @@ def cloud_agent_test() -> str:
 def cloud_agent_test_2() -> str:
     """Return the second cloud agent execution marker."""
     return "second cloud run"
+
+
+def trigger_bridge_test() -> str:
+    """Return the bridge test marker."""
+    return "triggered from github issue"

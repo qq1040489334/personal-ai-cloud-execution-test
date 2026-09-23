@@ -1,6 +1,12 @@
 """Automated test for hello.py."""
 
-from hello import cloud_agent_test, cloud_agent_test_2, goodbye, hello
+from hello import (
+    cloud_agent_test,
+    cloud_agent_test_2,
+    goodbye,
+    hello,
+    trigger_bridge_test,
+)
 
 
 def test_hello() -> None:
@@ -17,3 +23,7 @@ def test_cloud_agent_test() -> None:
 
 def test_cloud_agent_test_2() -> None:
     assert cloud_agent_test_2() == "second cloud run"
+
+
+def test_trigger_bridge_test() -> None:
+    assert trigger_bridge_test() == "triggered from github issue"
