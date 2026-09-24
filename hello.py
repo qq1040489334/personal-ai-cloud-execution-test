@@ -5301,6 +5301,262 @@ def task_result_auto_consumer_freeze_decision_report(
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_RESULT_EXPOSURE_AUDIT_DETAIL_EXPORT_V0.1
+#
+# Read-only export of an already-produced exposure regression audit into a
+# *single self-contained* ``summary`` string, so that the existing six-field
+# get_task_result surface can still carry the root cause and next step even
+# though it only exposes ``execution_summary.summary``.
+#
+# This section does NOT touch get_task_result, submit_task, the Worker, any
+# workflow, any script or any secret. It reads only local evidence. When the
+# previous task's audit artifact cannot be read it reports BLOCKED with the
+# reason instead of fabricating a verdict (per the task contract).
+# ---------------------------------------------------------------------------
+
+EXPOSURE_AUDIT_DETAIL_EXPORT_GOAL = (
+    "PERSONAL_AI_EXECUTION_RESULT_EXPOSURE_AUDIT_DETAIL_EXPORT_V0.1"
+)
+EXPOSURE_AUDIT_DETAIL_EXPORT_TASK_ID = "cf-5f36864952d6"
+EXPOSURE_REGRESSION_AUDIT_TASK_ID = "cf-331c3ad2d35c"
+EXPOSURE_REGRESSION_AUDIT_GOAL = (
+    "PERSONAL_AI_EXECUTION_RESULT_EXPOSURE_REGRESSION_AUDIT_V0.1"
+)
+EXPOSURE_AUDIT_FIELD_CLIPPING_LAYERS = (
+    "WORKER",
+    "MCP_TRANSPORT",
+    "CONNECTOR_SCHEMA",
+    "CHATGPT_ENTRY",
+    "UNKNOWN",
+)
+EXPOSURE_AUDIT_ARTIFACT_CANDIDATES = (
+    "execution_result.json",
+    "gpt_verification.json",
+    "results/" + EXPOSURE_REGRESSION_AUDIT_TASK_ID + ".json",
+    "artifacts/execution_result-" + EXPOSURE_REGRESSION_AUDIT_TASK_ID + ".json",
+)
+EXPOSURE_AUDIT_BLOCKED_REASON = (
+    "previous regression audit artifact for "
+    f"{EXPOSURE_REGRESSION_AUDIT_TASK_ID} is not readable from this "
+    "environment: no audit result at any local candidate path and no committed "
+    "REGRESSION_AUDIT evidence in git history; the uploaded GitHub Actions "
+    "artifact body requires authentication and is therefore unavailable here"
+)
+EXPOSURE_AUDIT_TRUTHY = {"true", "1", "yes", "y"}
+
+
+def _read_previous_exposure_audit_artifact() -> dict:
+    """Best-effort, read-only lookup of the previous exposure audit result.
+
+    Returns ``{"available": bool, "source": str|None, "data": dict|None,
+    "reason": str}``. It never fabricates: an unavailable artifact stays
+    unavailable with an explicit reason instead of an invented verdict.
+    """
+    for rel in EXPOSURE_AUDIT_ARTIFACT_CANDIDATES:
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+            loaded = json.loads(text)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(loaded, str):
+            try:
+                loaded = json.loads(loaded)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(loaded, dict) or not loaded:
+            continue
+        if (
+            loaded.get("task_id") == EXPOSURE_REGRESSION_AUDIT_TASK_ID
+            or EXPOSURE_REGRESSION_AUDIT_TASK_ID in text
+        ):
+            return {
+                "available": True,
+                "source": rel,
+                "data": loaded,
+                "reason": f"previous audit artifact loaded from {rel}",
+            }
+    history = _git(
+        "log", "--all", "--oneline", "-S", EXPOSURE_REGRESSION_AUDIT_TASK_ID
+    )
+    history_regression = _git(
+        "log", "--all", "--oneline", "-S", "REGRESSION_AUDIT"
+    )
+    if history or history_regression:
+        return {
+            "available": False,
+            "source": "git-history",
+            "data": None,
+            "reason": (
+                "the audit task is referenced in git history but no readable "
+                "structured artifact (verdict / root_cause) is committed"
+            ),
+        }
+    return {
+        "available": False,
+        "source": None,
+        "data": None,
+        "reason": EXPOSURE_AUDIT_BLOCKED_REASON,
+    }
+
+
+def _extract_exposure_audit_findings(data: dict) -> dict:
+    """Normalize a previous audit artifact into the required fields."""
+
+    def pick(*keys: str) -> str | None:
+        for key in keys:
+            value = data.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return None
+
+    layer = pick("field_clipping_layer", "FIELD_CLIPPING_LAYER", "layer")
+    if layer not in EXPOSURE_AUDIT_FIELD_CLIPPING_LAYERS:
+        layer = "UNKNOWN"
+    raw_local = pick("LOCAL_ACTION_REQUIRED", "local_action_required")
+    if raw_local is None:
+        local_action_required = True
+    else:
+        local_action_required = raw_local.strip().lower() in EXPOSURE_AUDIT_TRUTHY
+    return {
+        "regression_audit_verdict": pick(
+            "REGRESSION_AUDIT", "regression_audit", "verdict"
+        )
+        or "UNKNOWN",
+        "field_clipping_layer": layer,
+        "current_worker_version": pick(
+            "CURRENT_WORKER_VERSION", "current_worker_version", "worker_version"
+        )
+        or "UNKNOWN",
+        "root_cause": pick("ROOT_CAUSE", "root_cause") or "UNKNOWN",
+        "minimal_fix": pick("MINIMAL_FIX", "minimal_fix") or "UNKNOWN",
+        "local_action_required": local_action_required,
+    }
+
+
+def _build_exposure_audit_summary(
+    findings: dict, *, blocked: bool, reason: str
+) -> str:
+    """Compress the audit findings into one self-contained summary string."""
+    layer_enum = "/".join(EXPOSURE_AUDIT_FIELD_CLIPPING_LAYERS)
+    local_action = "true" if findings["local_action_required"] else "false"
+    return (
+        f"goal={EXPOSURE_AUDIT_DETAIL_EXPORT_GOAL}; "
+        f"task_id={EXPOSURE_AUDIT_DETAIL_EXPORT_TASK_ID}; "
+        f"REGRESSION_AUDIT={findings['regression_audit_verdict']}; "
+        f"field_clipping_layer={findings['field_clipping_layer']} "
+        f"(candidates {layer_enum}); "
+        f"CURRENT_WORKER_VERSION={findings['current_worker_version']}; "
+        f"ROOT_CAUSE={findings['root_cause']}; "
+        f"MINIMAL_FIX={findings['minimal_fix']}; "
+        f"LOCAL_ACTION_REQUIRED={local_action}; "
+        f"status={'BLOCKED' if blocked else 'EXPORTED'}; "
+        f"artifact_available={'false' if blocked else 'true'}; reason={reason}"
+    )
+
+
+def personal_ai_execution_result_exposure_audit_detail_export(
+    artifact: dict | None = None,
+) -> dict:
+    """Export the previous exposure regression audit into one summary field.
+
+    The exporter is read-only. Without an explicitly supplied ``artifact`` it
+    looks for the previous task's audit result in local evidence. If that result
+    cannot be read it returns a self-contained BLOCKED summary with the reason
+    and ``LOCAL_ACTION_REQUIRED=true`` instead of inventing a root cause.
+
+    ``get_task_result`` and ``submit_task`` are never modified; the returned
+    ``summary`` (and the ``execution_summary.summary`` mirror) is exactly what
+    the existing six-field surface would carry.
+    """
+    if artifact is not None:
+        probe = {
+            "available": bool(artifact),
+            "source": "supplied",
+            "data": artifact if artifact else None,
+            "reason": (
+                "previous audit artifact supplied to the exporter"
+                if artifact
+                else "empty audit artifact supplied to the exporter"
+            ),
+        }
+    else:
+        probe = _read_previous_exposure_audit_artifact()
+
+    if probe["available"] and probe["data"]:
+        findings = _extract_exposure_audit_findings(probe["data"])
+        blocked = False
+    else:
+        findings = {
+            "regression_audit_verdict": BLOCKED,
+            "field_clipping_layer": "UNKNOWN",
+            "current_worker_version": "UNKNOWN",
+            "root_cause": (
+                f"{probe['reason']}; additionally get_task_result exposes only "
+                "its six-field schema and sources summary from an uncommitted "
+                "repo-root execution_result.json, so the prior audit conclusion "
+                "cannot reach ChatGPT"
+            ),
+            "minimal_fix": (
+                "commit the regression audit result to a readable in-repo "
+                "artifact (or re-run the audit as a committed task) so its "
+                "conclusion can be read and exported through the existing "
+                "summary field; do not modify get_task_result/submit_task"
+            ),
+            "local_action_required": True,
+        }
+        blocked = True
+
+    summary = _build_exposure_audit_summary(
+        findings, blocked=blocked, reason=probe["reason"]
+    )
+    status = BLOCKED if blocked else PASS
+
+    return {
+        "report": "EXECUTION_RESULT_EXPOSURE_AUDIT_DETAIL_EXPORT",
+        "goal": EXPOSURE_AUDIT_DETAIL_EXPORT_GOAL,
+        "task_id": EXPOSURE_AUDIT_DETAIL_EXPORT_TASK_ID,
+        "previous_task_id": EXPOSURE_REGRESSION_AUDIT_TASK_ID,
+        "previous_goal": EXPOSURE_REGRESSION_AUDIT_GOAL,
+        "summary": summary,
+        "execution_summary": {
+            "task_id": EXPOSURE_AUDIT_DETAIL_EXPORT_TASK_ID,
+            "status": status,
+            "round": 1,
+            "summary": summary,
+        },
+        "regression_audit_verdict": findings["regression_audit_verdict"],
+        "field_clipping_layer": findings["field_clipping_layer"],
+        "field_clipping_layer_candidates": list(
+            EXPOSURE_AUDIT_FIELD_CLIPPING_LAYERS
+        ),
+        "current_worker_version": findings["current_worker_version"],
+        "root_cause": findings["root_cause"],
+        "minimal_fix": findings["minimal_fix"],
+        "local_action_required": findings["local_action_required"],
+        "artifact_available": probe["available"],
+        "artifact_source": probe["source"],
+        "blocked": blocked,
+        "reason": probe["reason"],
+        "submit_task_contract": (
+            "UNCHANGED"
+            if list(inspect.signature(submit_task).parameters)
+            == SUBMIT_TASK_PARAMS
+            else "CHANGED"
+        ),
+        "get_task_result_contract": (
+            "UNCHANGED"
+            if list(inspect.signature(get_task_result).parameters)
+            == GET_TASK_RESULT_PARAMS
+            else "CHANGED"
+        ),
+        "workflow_modified": False,
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])

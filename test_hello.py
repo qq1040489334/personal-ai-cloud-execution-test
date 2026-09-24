@@ -22,6 +22,10 @@ from hello import (
     CONSUMER_EVIDENCE_ENV,
     DEPLOY_VERIFY_COMMIT,
     DEPLOY_VERIFY_TASK_ID,
+    EXPOSURE_AUDIT_DETAIL_EXPORT_GOAL,
+    EXPOSURE_AUDIT_DETAIL_EXPORT_TASK_ID,
+    EXPOSURE_AUDIT_FIELD_CLIPPING_LAYERS,
+    EXPOSURE_REGRESSION_AUDIT_TASK_ID,
     FINAL_EVIDENCE_AUDIT_GOAL,
     FINAL_EVIDENCE_AUDIT_REPORT,
     FINAL_EVIDENCE_AUDIT_TASK_ID,
@@ -84,6 +88,7 @@ from hello import (
     mcp_runtime_deploy_verify,
     oauth_mcp_test,
     pending_acceptance_notice,
+    personal_ai_execution_result_exposure_audit_detail_export,
     personal_ai_task_runtime_audit,
     record_consumer_evidence,
     result_consumer_test,
@@ -2026,3 +2031,151 @@ def test_freeze_decision_checks_and_markdown() -> None:
         "## Compatibility",
     ):
         assert token in markdown
+
+
+def test_exposure_audit_detail_export_shape() -> None:
+    report = personal_ai_execution_result_exposure_audit_detail_export()
+    assert report["report"] == "EXECUTION_RESULT_EXPOSURE_AUDIT_DETAIL_EXPORT"
+    assert report["goal"] == EXPOSURE_AUDIT_DETAIL_EXPORT_GOAL
+    assert report["task_id"] == EXPOSURE_AUDIT_DETAIL_EXPORT_TASK_ID == "cf-5f36864952d6"
+    assert report["previous_task_id"] == EXPOSURE_REGRESSION_AUDIT_TASK_ID
+    assert report["previous_task_id"] == "cf-331c3ad2d35c"
+    assert set(report) >= {
+        "report",
+        "goal",
+        "task_id",
+        "previous_task_id",
+        "summary",
+        "execution_summary",
+        "regression_audit_verdict",
+        "field_clipping_layer",
+        "current_worker_version",
+        "root_cause",
+        "minimal_fix",
+        "local_action_required",
+        "artifact_available",
+        "blocked",
+        "reason",
+    }
+    assert isinstance(report["summary"], str) and report["summary"]
+    assert isinstance(report["execution_summary"], dict)
+    assert report["execution_summary"]["summary"] == report["summary"]
+    assert report["execution_summary"]["task_id"] == report["task_id"]
+
+
+def test_exposure_audit_detail_export_summary_self_contained() -> None:
+    report = personal_ai_execution_result_exposure_audit_detail_export()
+    summary = report["summary"]
+    assert summary != EXPOSURE_AUDIT_DETAIL_EXPORT_GOAL
+    assert report["goal"] in summary
+    for token in (
+        "REGRESSION_AUDIT",
+        "WORKER",
+        "MCP_TRANSPORT",
+        "CONNECTOR_SCHEMA",
+        "CHATGPT_ENTRY",
+        "UNKNOWN",
+        "CURRENT_WORKER_VERSION",
+        "ROOT_CAUSE",
+        "MINIMAL_FIX",
+        "LOCAL_ACTION_REQUIRED",
+    ):
+        assert token in summary
+    assert f"LOCAL_ACTION_REQUIRED={'true' if report['local_action_required'] else 'false'}" in summary
+    assert report["regression_audit_verdict"] in {
+        "BLOCKED",
+        "PASS",
+        "FAIL",
+        "UNKNOWN",
+    }
+    assert report["regression_audit_verdict"] in summary
+
+
+def test_exposure_audit_detail_export_blocked_when_artifact_unreadable() -> None:
+    report = personal_ai_execution_result_exposure_audit_detail_export()
+    assert report["artifact_available"] is False
+    assert report["blocked"] is True
+    assert report["regression_audit_verdict"] == "BLOCKED"
+    assert report["field_clipping_layer"] == "UNKNOWN"
+    assert report["current_worker_version"] == "UNKNOWN"
+    assert report["local_action_required"] is True
+    assert report["reason"]
+    assert "BLOCKED" in report["summary"]
+    assert "reason=" in report["summary"]
+    assert report["root_cause"] and report["minimal_fix"]
+
+
+def test_exposure_audit_detail_export_requires_no_fabrication() -> None:
+    report = personal_ai_execution_result_exposure_audit_detail_export()
+    for key in (
+        "regression_audit_verdict",
+        "field_clipping_layer",
+        "current_worker_version",
+        "root_cause",
+        "minimal_fix",
+    ):
+        assert isinstance(report[key], str) and report[key]
+    assert report["field_clipping_layer"] in EXPOSURE_AUDIT_FIELD_CLIPPING_LAYERS
+    assert set(report["field_clipping_layer_candidates"]) == set(
+        EXPOSURE_AUDIT_FIELD_CLIPPING_LAYERS
+    )
+    assert report["workflow_modified"] is False
+
+
+def test_exposure_audit_detail_export_reads_supplied_artifact() -> None:
+    artifact = {
+        "task_id": EXPOSURE_REGRESSION_AUDIT_TASK_ID,
+        "REGRESSION_AUDIT": "PASS",
+        "field_clipping_layer": "MCP_TRANSPORT",
+        "CURRENT_WORKER_VERSION": "v42",
+        "ROOT_CAUSE": "connector schema clipped detail fields",
+        "MINIMAL_FIX": "surface the audit summary through the existing field",
+        "LOCAL_ACTION_REQUIRED": "false",
+    }
+    report = personal_ai_execution_result_exposure_audit_detail_export(artifact)
+    assert report["artifact_available"] is True
+    assert report["blocked"] is False
+    assert report["regression_audit_verdict"] == "PASS"
+    assert report["field_clipping_layer"] == "MCP_TRANSPORT"
+    assert report["current_worker_version"] == "v42"
+    assert report["root_cause"] == "connector schema clipped detail fields"
+    assert report["minimal_fix"] == "surface the audit summary through the existing field"
+    assert report["local_action_required"] is False
+    assert "MCP_TRANSPORT" in report["summary"]
+    assert "LOCAL_ACTION_REQUIRED=false" in report["summary"]
+    assert "status=EXPORTED" in report["summary"]
+
+
+def test_exposure_audit_detail_export_unknown_layer_falls_back() -> None:
+    artifact = {
+        "task_id": EXPOSURE_REGRESSION_AUDIT_TASK_ID,
+        "verdict": "FAIL",
+        "layer": "SOME_UNKNOWN_LAYER",
+    }
+    report = personal_ai_execution_result_exposure_audit_detail_export(artifact)
+    assert report["blocked"] is False
+    assert report["field_clipping_layer"] == "UNKNOWN"
+    assert report["current_worker_version"] == "UNKNOWN"
+    assert report["local_action_required"] is True
+
+
+def test_exposure_audit_detail_export_contracts_unchanged() -> None:
+    report = personal_ai_execution_result_exposure_audit_detail_export()
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert list(inspect.signature(submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(get_task_result).parameters) == ["task_id"]
+    assert set(get_task_result(EXPOSURE_AUDIT_DETAIL_EXPORT_TASK_ID)) == {
+        "execution_summary",
+        "commit",
+        "tests",
+        "artifacts",
+        "execution_result_json",
+        "evidence",
+    }
