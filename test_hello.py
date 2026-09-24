@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import hello as hello_module
 from hello import (
     AUTO_CONSUMER_GOAL,
     AUTO_CONSUMER_GOLDEN_E2E_GOAL,
@@ -33,6 +34,9 @@ from hello import (
     POST_E2E_AUDIT_LAYERS,
     POST_E2E_AUDIT_REPORT,
     POST_E2E_AUDIT_TASK_ID,
+    PRODUCTION_READINESS_GOAL,
+    PRODUCTION_READINESS_REPORT,
+    PRODUCTION_READINESS_TASK_ID,
     REQUIRED_RESULT_FIELDS,
     REVIEW_VERDICTS,
     RUNTIME_AUDIT_GOAL,
@@ -84,6 +88,7 @@ from hello import (
     task_result_auto_consumer_golden_e2e_verify,
     task_result_auto_consumer_live_acceptance_report,
     task_result_auto_consumer_post_e2e_audit,
+    task_result_auto_consumer_production_readiness_report,
     task_result_auto_consumer_report,
     task_review_action_report,
     trigger_bridge_test,
@@ -1547,3 +1552,164 @@ def test_live_acceptance_no_auto_pass_or_trigger() -> None:
     record = get_task_review(probe["task_id"])
     assert record["reviewed"] is True
     assert record["review_verdict"] == "PASS"
+
+
+def test_production_readiness_report_shape() -> None:
+    report = task_result_auto_consumer_production_readiness_report()
+    assert report["report"] == PRODUCTION_READINESS_REPORT
+    assert report["goal"] == PRODUCTION_READINESS_GOAL
+    assert report["task_id"] == PRODUCTION_READINESS_TASK_ID == "cf-c6f00c4926eb"
+    assert report["PRODUCTION_READINESS"] == report["STATUS"]
+    assert report["PRODUCTION_READINESS"] in VALID_STATUSES
+    assert report["Tests"] == "python -m pytest -q"
+    assert report["Evidence"]
+    assert report["Known Limitations"]
+    assert report["Remaining Gaps"]
+    assert set(report["Compatibility"]) == {
+        "submit_task",
+        "get_task_result",
+        "mark_reviewed",
+        "list_pending_results",
+        "review_event",
+        "github_workflows",
+    }
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {PRODUCTION_READINESS_REPORT}")
+    assert f"- task_id: {PRODUCTION_READINESS_TASK_ID}" in markdown
+    for token in (
+        "## Production readiness steps",
+        "## Evidence",
+        "## Tests",
+        "## Known Limitations",
+        "## Compatibility",
+        "## Remaining Gaps",
+    ):
+        assert token in markdown
+
+
+def test_production_readiness_steps_and_status() -> None:
+    report = task_result_auto_consumer_production_readiness_report()
+    assert report["steps"]
+    for step in report["steps"]:
+        assert set(step) >= {"step", "status", "detail"}
+        assert step["status"] in VALID_STATUSES
+        assert step["detail"]
+    assert report["PRODUCTION_READINESS"] == "PASS"
+
+
+def test_production_readiness_batch_no_missed_or_duplicate_consumption() -> None:
+    report = task_result_auto_consumer_production_readiness_report()
+    assert report["batch_size"] == 3
+    assert report["missed_consumption"] == []
+    assert report["duplicate_consumption"] == []
+    assert set(report["batch_task_ids"]) <= set(report["first_scan_newly_consumed"])
+    for task_id in report["batch_task_ids"]:
+        events = get_consumption_evidence(task_id)
+        assert sum(1 for e in events if e["event_type"] == "discovered") == 1
+        assert sum(1 for e in events if e["event_type"] == "consumed") == 1
+
+
+def test_production_readiness_repeated_and_restart_scan_idempotent() -> None:
+    report = task_result_auto_consumer_production_readiness_report()
+    assert report["repeated_scan_idempotent"] is True
+    assert report["restart_scan_idempotent"] is True
+    assert report["restart_scan_reconsumed"] == []
+    assert not (
+        set(report["repeated_scan_newly_consumed"])
+        & set(report["batch_task_ids"])
+    )
+    assert report["batch_task_ids"][0] in report["durable_consumed_task_ids"]
+
+
+def test_production_readiness_review_gate_and_event_traceable() -> None:
+    report = task_result_auto_consumer_production_readiness_report()
+    assert report["human_review_gate"] is True
+    assert report["review_event_traceable"] is True
+    assert report["review_gate_not_reopened"] is True
+    reviewed_id = report["reviewed_task_id"]
+    events = get_review_events(reviewed_id)
+    assert events
+    assert events[-1]["action"] == "review"
+    assert events[-1]["verdict"] == "PASS"
+    assert events[-1]["timestamp"]
+    record = get_task_review(reviewed_id)
+    assert record["reviewed"] is True
+    assert reviewed_id not in {
+        item["task_id"] for item in list_pending_results()
+    }
+
+
+def test_production_readiness_permanent_pending_disposition() -> None:
+    report = task_result_auto_consumer_production_readiness_report()
+    assert report["permanent_pending_disposition"] is True
+    assert report["stale_task_terminal"] is True
+    assert report["stale_task_state"] == "timed_out"
+    record = get_task_review(report["stale_task_id"])
+    assert record["timed_out"] is True
+    assert record["terminal_state"] == "timed_out"
+    assert any(
+        event["event_type"] == "timed_out"
+        for event in get_consumption_evidence(report["stale_task_id"])
+    )
+
+
+def test_production_readiness_target_task_terminal() -> None:
+    report = task_result_auto_consumer_production_readiness_report()
+    assert report["target_task_id"] == RUNTIME_AUDIT_TASK_ID == "cf-62e0f30e0d02"
+    assert report["target_task_terminal"] is True
+    assert report["target_task_state"] in {"stuck", "timed_out", "failed"}
+    assert report["target_task_pending"] is False
+    assert report["target_task_state_reason"]
+    assert report["target_task_terminal_evidence"]
+    assert "cf-62e0f30e0d02" in report["markdown"]
+
+
+def test_production_readiness_contracts_unchanged() -> None:
+    report = task_result_auto_consumer_production_readiness_report()
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert list(inspect.signature(submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(get_task_result).parameters) == ["task_id"]
+
+
+def test_production_readiness_outputs_tests_evidence_limitations_gaps() -> None:
+    report = task_result_auto_consumer_production_readiness_report()
+    assert report["Tests"] == "python -m pytest -q"
+    assert isinstance(report["Evidence"], list) and report["Evidence"]
+    assert isinstance(report["Known Limitations"], list) and report["Known Limitations"]
+    assert isinstance(report["Remaining Gaps"], list) and report["Remaining Gaps"]
+    assert report["known_limitations"] == report["Known Limitations"]
+    assert report["remaining_gaps"] == report["Remaining Gaps"]
+
+
+def test_production_readiness_no_auto_pass_or_trigger() -> None:
+    report = task_result_auto_consumer_production_readiness_report()
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    assert report["human_review_gate"] is True
+
+
+def test_consumer_evidence_ledger_survives_restart(tmp_path, monkeypatch) -> None:
+    ledger = tmp_path / "consumer_evidence.json"
+    monkeypatch.setenv(CONSUMER_EVIDENCE_ENV, str(ledger))
+    saved = list(hello_module.CONSUMPTION_EVIDENCE)
+    hello_module.CONSUMPTION_EVIDENCE.clear()
+    try:
+        record_consumer_evidence("discovered", "restart-probe-a", detail="first")
+        record_consumer_evidence("consumed", "restart-probe-a", detail="first")
+        hello_module.CONSUMPTION_EVIDENCE.clear()
+        record_consumer_evidence("discovered", "restart-probe-b", detail="second")
+        persisted = {
+            event["task_id"]
+            for event in json.loads(ledger.read_text(encoding="utf-8"))["events"]
+        }
+        assert {"restart-probe-a", "restart-probe-b"} <= persisted
+    finally:
+        hello_module.CONSUMPTION_EVIDENCE.clear()
+        hello_module.CONSUMPTION_EVIDENCE.extend(saved)

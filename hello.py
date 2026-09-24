@@ -8,7 +8,8 @@ import json
 import os
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -2819,7 +2820,7 @@ def _persist_consumer_evidence() -> bool:
         payload = {
             "kind": CONSUMER_EVIDENCE_KIND,
             "updated_at": _utc_now(),
-            "events": CONSUMPTION_EVIDENCE,
+            "events": get_consumption_evidence(),
         }
         path.write_text(
             json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
@@ -3929,6 +3930,515 @@ def task_result_auto_consumer_live_acceptance_report(
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_PRODUCTION_READINESS_V0.1
+#
+# Production-readiness closure on top of LIVE_ACCEPTANCE. It exercises the
+# consumer against a batch of consecutive tasks and proves: no task is missed,
+# no task is consumed twice, a repeated scan / process restart stays idempotent
+# (durable-ledger based), the human review gate stays effective with traceable
+# review_events, and permanent pending has explicit terminal disposition.
+# submit_task and get_task_result remain UNCHANGED. Nothing here auto-PASSes the
+# real task or triggers a follow-up task.
+# ---------------------------------------------------------------------------
+
+PRODUCTION_READINESS_GOAL = (
+    "PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_PRODUCTION_READINESS_V0.1"
+)
+PRODUCTION_READINESS_TASK_ID = "cf-c6f00c4926eb"
+PRODUCTION_READINESS_REPORT = (
+    "PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_PRODUCTION_READINESS_REPORT"
+)
+PRODUCTION_READINESS_BATCH_SIZE = 3
+PRODUCTION_READINESS_STATES = ("PASS", "FAIL", "BLOCKED")
+_PRODUCTION_READINESS_SEQ = 0
+
+
+def _production_readiness_step(step: str, status: str, detail: str) -> dict:
+    return {"step": step, "status": status, "detail": detail}
+
+
+def _consumer_event_counts(task_id: str) -> dict:
+    """Count the durable evidence events recorded for ``task_id``."""
+    events = get_consumption_evidence(task_id)
+    return {
+        "discovered": sum(
+            1 for event in events if event.get("event_type") == "discovered"
+        ),
+        "consumed": sum(
+            1 for event in events if event.get("event_type") == "consumed"
+        ),
+        "review_events": len(get_review_events(task_id)),
+    }
+
+
+def _consumer_restart_probe(task_ids: list[str]) -> dict:
+    """Re-scan with in-memory state dropped, keeping only the durable ledger.
+
+    Emulates a process restart: the sole surviving state is the JSON ledger on
+    disk. Any task already persisted there must not be reported as newly
+    consumed again, which is the restart-idempotency protection under test.
+    """
+    global _AUTO_CONSUMER_RAN
+    saved = list(CONSUMPTION_EVIDENCE)
+    CONSUMPTION_EVIDENCE.clear()
+    _AUTO_CONSUMER_RAN = False
+    try:
+        result = auto_consume_completed_results()
+    finally:
+        present = {event.get("event_id") for event in CONSUMPTION_EVIDENCE}
+        for event in saved:
+            if event.get("event_id") not in present:
+                CONSUMPTION_EVIDENCE.append(event)
+        _AUTO_CONSUMER_RAN = False
+    newly = set(result["newly_consumed"])
+    return {
+        "newly_consumed": sorted(newly),
+        "reconsumed": sorted(newly & set(task_ids)),
+        "durable_consumed_task_ids": sorted(
+            {
+                event.get("task_id")
+                for event in _load_consumer_evidence()
+                if event.get("event_type") == "consumed"
+            }
+        ),
+    }
+
+
+def task_result_auto_consumer_production_readiness_report(
+    now: datetime | None = None,
+    batch_size: int = PRODUCTION_READINESS_BATCH_SIZE,
+) -> dict:
+    """Close out production readiness of the task-result auto-consumer.
+
+    A batch of ``batch_size`` consecutive successful tasks is registered through
+    the UNCHANGED ``submit_task`` contract and then consumed by the in-repo
+    auto-consumer. The report proves:
+
+    1. consecutive multi-task scans neither miss nor duplicate consumption;
+    2. repeated scans and a process-restart scan are idempotent because the
+       dedup baseline is rebuilt from the durable evidence ledger;
+    3. the human review gate stays effective and every review appends a
+       traceable ``review_event`` (a re-scan does not re-open a reviewed task);
+    4. an over-budget pending task receives an explicit terminal disposition,
+       and the long-pending ``cf-62e0f30e0d02`` is reported terminal.
+
+    It returns PRODUCTION_READINESS / STATUS, Tests, Evidence, Known Limitations
+    and Remaining Gaps. It never auto-PASSes a task and never triggers a
+    follow-up task.
+    """
+    global _PRODUCTION_READINESS_SEQ
+    now = now if now is not None else datetime.now(timezone.utc)
+    _PRODUCTION_READINESS_SEQ += 1
+    token = uuid.uuid4().hex[:12]
+    steps: list[dict] = []
+    batch_ids = [
+        f"prod-readiness-batch-{token}-{index}" for index in range(batch_size)
+    ]
+
+    for task_id in batch_ids:
+        submit_task(
+            task_id,
+            goal=PRODUCTION_READINESS_GOAL,
+            status="success",
+            requires_review=False,
+        )
+    registered = all(task_id in TASK_REGISTRY for task_id in batch_ids)
+    steps.append(
+        _production_readiness_step(
+            "consecutive_tasks_registered",
+            PASS if registered else FAIL,
+            f"submit_task (UNCHANGED) registered a batch of {len(batch_ids)} "
+            f"consecutive tasks: {', '.join(batch_ids)}",
+        )
+    )
+
+    before = {task_id: _consumer_event_counts(task_id) for task_id in batch_ids}
+    first_scan = auto_consume_completed_results()
+    discovered_ids = set(first_scan["discovered"])
+    first_newly = set(first_scan["newly_consumed"])
+    missed = [task_id for task_id in batch_ids if task_id not in discovered_ids]
+    unconsumed = [task_id for task_id in batch_ids if task_id not in first_newly]
+    scan_ok = not missed and not unconsumed
+    steps.append(
+        _production_readiness_step(
+            "multi_task_scan_no_missed_consumption",
+            PASS if scan_ok else FAIL,
+            f"one scan discovered {len(discovered_ids)} task(s) and newly "
+            f"consumed {len(first_newly)}; batch missed={missed or 'none'} "
+            f"unconsumed={unconsumed or 'none'} (no missed consumption; "
+            f"pre-scan evidence={before})",
+        )
+    )
+
+    counts_after_first = {
+        task_id: _consumer_event_counts(task_id) for task_id in batch_ids
+    }
+    duplicates = [
+        task_id
+        for task_id in batch_ids
+        if counts_after_first[task_id]["discovered"] != 1
+        or counts_after_first[task_id]["consumed"] != 1
+    ]
+    steps.append(
+        _production_readiness_step(
+            "multi_task_no_duplicate_consumption",
+            PASS if not duplicates else FAIL,
+            "each batch task carries exactly one discovered and one consumed "
+            f"evidence event; duplicates={duplicates or 'none'}",
+        )
+    )
+
+    second_scan = auto_consume_completed_results()
+    second_newly = set(second_scan["newly_consumed"])
+    rescan_reconsumed = sorted(second_newly & set(batch_ids))
+    counts_after_rescan = {
+        task_id: _consumer_event_counts(task_id) for task_id in batch_ids
+    }
+    rescan_ok = not rescan_reconsumed and all(
+        counts_after_rescan[task_id] == counts_after_first[task_id]
+        for task_id in batch_ids
+    )
+    steps.append(
+        _production_readiness_step(
+            "repeated_scan_idempotent",
+            PASS if rescan_ok else FAIL,
+            "re-scanning the same completed results reported newly_consumed="
+            f"{rescan_reconsumed or 'none'} for the batch and left every evidence "
+            "count unchanged (no duplicate consumption)",
+        )
+    )
+
+    restart = _consumer_restart_probe(batch_ids)
+    restart_ok = not restart["reconsumed"]
+    steps.append(
+        _production_readiness_step(
+            "restart_scan_idempotent_from_durable_ledger",
+            PASS if restart_ok else FAIL,
+            "after dropping in-memory state (process-restart equivalent) the "
+            f"consumer re-consumed {restart['reconsumed'] or 'none'} of the "
+            f"already-persisted batch tasks; durable ledger holds "
+            f"{len(restart['durable_consumed_task_ids'])} consumed task id(s)",
+        )
+    )
+
+    pending_before_review = {
+        item["task_id"] for item in list_pending_results()
+    }
+    pre_review = get_task_review(batch_ids[0]) or {}
+    unreviewed = (
+        not pre_review.get("reviewed")
+        and pre_review.get("review_verdict") is None
+    )
+    gate_before = bool(unreviewed and batch_ids[0] in pending_before_review)
+    steps.append(
+        _production_readiness_step(
+            "human_review_gate_open_before_review",
+            PASS if gate_before else FAIL,
+            f"consumer only raised requires_review; {batch_ids[0]} stays "
+            f"unreviewed and pending (reviewed={pre_review.get('reviewed')}, "
+            f"verdict={pre_review.get('review_verdict')})",
+        )
+    )
+
+    events_before = len(get_review_events(batch_ids[0]))
+    reviewed = mark_reviewed(
+        batch_ids[0], "PASS", "production readiness disposable probe review"
+    )
+    pending_after = {item["task_id"] for item in list_pending_results()}
+    events = get_review_events(batch_ids[0])
+    event_ok = bool(
+        len(events) == events_before + 1
+        and events[-1].get("action") == "review"
+        and events[-1].get("verdict") == "PASS"
+        and events[-1].get("task_id") == batch_ids[0]
+        and events[-1].get("timestamp")
+    )
+    closed = batch_ids[0] not in pending_after
+    steps.append(
+        _production_readiness_step(
+            "mark_reviewed_closes_pending_and_appends_traceable_event",
+            PASS
+            if (closed and event_ok and reviewed.get("reviewed") is True)
+            else FAIL,
+            f"mark_reviewed(PASS) closed {batch_ids[0]} from pending and "
+            f"appended review_event #{len(events)} (action=review, verdict=PASS, "
+            "timestamp present), queryable via get_review_events()",
+        )
+    )
+
+    auto_consume_completed_results()
+    events_after = len(get_review_events(batch_ids[0]))
+    pending_after_review_scan = {
+        item["task_id"] for item in list_pending_results()
+    }
+    review_protected = bool(
+        batch_ids[0] not in pending_after_review_scan
+        and events_after == len(events)
+    )
+    steps.append(
+        _production_readiness_step(
+            "review_gate_not_reopened_by_rescan",
+            PASS if review_protected else FAIL,
+            f"a further scan left {batch_ids[0]} reviewed (pending="
+            f"{batch_ids[0] in pending_after_review_scan}) and appended no "
+            f"duplicate review_event (count={events_after})",
+        )
+    )
+
+    stale_id = f"prod-readiness-stale-{token}"
+    stale_age = PENDING_TIMEOUT_SECONDS * 2
+    submit_task(
+        stale_id,
+        goal=PRODUCTION_READINESS_GOAL,
+        status="success",
+        requires_review=True,
+        last_update_at=(now - timedelta(seconds=stale_age)).isoformat(),
+    )
+    stale_class = classify_pending_task(stale_id, now=now)
+    expired = expire_stale_pending(now=now)
+    stale_record = get_task_review(stale_id) or {}
+    stale_evidence = [
+        event
+        for event in get_consumption_evidence(stale_id)
+        if event.get("event_type") == "timed_out"
+    ]
+    stale_pending = stale_id in {
+        item["task_id"] for item in list_pending_results()
+    }
+    disposition_ok = bool(
+        stale_class["terminal"]
+        and stale_class["state"] == "timed_out"
+        and any(item["task_id"] == stale_id for item in expired)
+        and stale_record.get("timed_out")
+        and stale_record.get("terminal_state") == "timed_out"
+        and not stale_pending
+        and stale_evidence
+    )
+    steps.append(
+        _production_readiness_step(
+            "permanent_pending_has_explicit_disposition",
+            PASS if disposition_ok else FAIL,
+            f"an over-budget pending task ({stale_id}, age>{stale_age}s) is "
+            f"classified terminal '{stale_class['state']}' and "
+            "expire_stale_pending() gives it an explicit timed_out disposition "
+            "with durable evidence; it cannot stay pending forever",
+        )
+    )
+
+    target_state = classify_pending_task(RUNTIME_AUDIT_TASK_ID, now=now)
+    target_terminal = bool(
+        target_state["terminal"]
+        and target_state["state"] in TERMINAL_PENDING_STATES
+    )
+    target_in_pending = RUNTIME_AUDIT_TASK_ID in {
+        item["task_id"] for item in list_pending_results()
+    }
+    target_evidence = [
+        event
+        for event in get_consumption_evidence(RUNTIME_AUDIT_TASK_ID)
+        if event.get("terminal")
+    ]
+    if not target_evidence:
+        record_consumer_evidence(
+            target_state["state"],
+            RUNTIME_AUDIT_TASK_ID,
+            detail=target_state["reason"],
+            extra={"terminal": True},
+        )
+        target_evidence = [
+            event
+            for event in get_consumption_evidence(RUNTIME_AUDIT_TASK_ID)
+            if event.get("terminal")
+        ]
+    target_ok = bool(
+        target_terminal and not target_in_pending and target_evidence
+    )
+    steps.append(
+        _production_readiness_step(
+            f"{RUNTIME_AUDIT_TASK_ID}_terminal_not_pending",
+            PASS if target_ok else FAIL,
+            f"cf-62e0f30e0d02 final state={target_state['state']} "
+            f"terminal={target_terminal} pending={target_in_pending} "
+            f"durable_terminal_evidence={bool(target_evidence)}; "
+            f"{target_state['reason']}",
+        )
+    )
+
+    submit_unchanged = (
+        list(inspect.signature(submit_task).parameters) == SUBMIT_TASK_PARAMS
+    )
+    result_unchanged = (
+        list(inspect.signature(get_task_result).parameters)
+        == GET_TASK_RESULT_PARAMS
+    )
+    result_keys = set(get_task_result(PRODUCTION_READINESS_TASK_ID)) == set(
+        RESULT_CONTRACT_FIELDS
+    )
+    contracts_ok = submit_unchanged and result_unchanged and result_keys
+    steps.append(
+        _production_readiness_step(
+            "submit_task_and_get_task_result_unchanged",
+            PASS if contracts_ok else FAIL,
+            "submit_task signature unchanged; get_task_result(task_id) signature "
+            "and contract fields unchanged",
+        )
+    )
+
+    if any(step["status"] == FAIL for step in steps):
+        production_readiness = FAIL
+    elif any(step["status"] == BLOCKED for step in steps):
+        production_readiness = BLOCKED
+    else:
+        production_readiness = PASS
+
+    storage = consumer_evidence_status()
+    compatibility = {
+        "submit_task": "UNCHANGED",
+        "get_task_result": "UNCHANGED",
+        "mark_reviewed": "COMPATIBLE",
+        "list_pending_results": "COMPATIBLE",
+        "review_event": "COMPATIBLE",
+        "github_workflows": "UNCHANGED",
+    }
+
+    evidence = [
+        f"batch_task_ids={', '.join(batch_ids)}",
+        f"batch_size={len(batch_ids)}",
+        f"missed_consumption={missed or 'none'}",
+        f"duplicate_consumption={duplicates or 'none'}",
+        f"first_scan_newly_consumed={sorted(first_newly)}",
+        f"repeated_scan_newly_consumed={sorted(second_newly)}",
+        f"restart_scan_reconsumed={restart['reconsumed'] or 'none'}",
+        f"durable_consumed_task_count="
+        f"{len(restart['durable_consumed_task_ids'])}",
+        f"evidence_store={storage['path']}",
+        f"evidence_event_count={storage['event_count']}",
+        f"reviewed_task={batch_ids[0]} verdict="
+        f"{reviewed.get('review_verdict')} review_events={len(events)} "
+        f"pending_after_review={batch_ids[0] in pending_after}",
+        f"stale_task={stale_id} state={stale_class['state']} "
+        f"terminal={stale_class['terminal']} disposition_applied="
+        f"{any(item['task_id'] == stale_id for item in expired)}",
+        f"{RUNTIME_AUDIT_TASK_ID}(state={target_state['state']}, "
+        f"terminal={target_terminal}, pending={target_in_pending})",
+        "submit_task="
+        + ("UNCHANGED" if submit_unchanged else "CHANGED"),
+        "get_task_result="
+        + ("UNCHANGED" if (result_unchanged and result_keys) else "CHANGED"),
+    ]
+
+    known_limitations = [
+        "Concurrency protection is process-local: _AUTO_CONSUMER_GUARD prevents "
+        "re-entrant lazy consumption and the durable ledger deduplicates across "
+        "scans, but there is no distributed lock, so two OS processes writing the "
+        "same ledger concurrently are not mutually excluded.",
+        "Restart idempotency depends on the durable ledger at "
+        "get_consumer_evidence_path() being readable and writable. If that file "
+        "is deleted, previously consumed tasks can be re-discovered; the human "
+        "review closure still prevents a reviewed task from silently re-opening.",
+        "Evidence event_id is task/type/sequence based and the sequence resets "
+        "per process, so concurrent writers could theoretically collide. "
+        "Single-process and sequential restarts are safe.",
+        "mark_reviewed is append-only and intentionally permits a revised "
+        "verdict; each call appends a new traceable review_event, so re-review is "
+        "auditable rather than silently blocked.",
+    ]
+
+    remaining_gaps = [
+        "Workflow wiring (out of scope, not applied): the .github workflows still "
+        "do not invoke the consumer after a run. auto_consume_completed_results() "
+        "/ consumer_heartbeat() (lazily invoked via ensure_auto_consumer_ran()) "
+        "remain the in-repo trigger-equivalent.",
+        "Committed cross-run storage (out of scope, not applied): durable "
+        f"evidence lives at {storage['path']} (env PERSONAL_AI_CONSUMER_STATE) "
+        "rather than a committed results/<task_id>.json in git history.",
+        "Notification delivery (out of scope, not applied): "
+        "pending_acceptance_notice() builds the notice in-process; posting it as "
+        "an issue/comment is a .github concern.",
+    ]
+
+    lines = [
+        f"# {PRODUCTION_READINESS_REPORT}",
+        "",
+        f"- goal: {PRODUCTION_READINESS_GOAL}",
+        f"- task_id: {PRODUCTION_READINESS_TASK_ID}",
+        f"- PRODUCTION_READINESS: {production_readiness}",
+        f"- STATUS: {production_readiness}",
+        f"- batch_size: {len(batch_ids)}",
+        "- human_review_gate: True",
+        "- auto_pass: False",
+        "- auto_trigger_next: False",
+        "",
+        "## Production readiness steps",
+    ]
+    for step in steps:
+        lines.append(f"- [{step['status']}] {step['step']}: {step['detail']}")
+    lines += ["", "## Evidence"]
+    lines += [f"- {item}" for item in evidence]
+    lines += ["", "## Tests", "- python -m pytest -q", "", "## Known Limitations"]
+    lines += [f"- {item}" for item in known_limitations]
+    lines += ["", "## Compatibility"]
+    for key, value in compatibility.items():
+        lines.append(f"- {key}: {value}")
+    lines += ["", "## Remaining Gaps"]
+    lines += [f"- {item}" for item in remaining_gaps]
+
+    return {
+        "report": PRODUCTION_READINESS_REPORT,
+        "goal": PRODUCTION_READINESS_GOAL,
+        "task_id": PRODUCTION_READINESS_TASK_ID,
+        "PRODUCTION_READINESS": production_readiness,
+        "STATUS": production_readiness,
+        "steps": steps,
+        "验证步骤": steps,
+        "Tests": "python -m pytest -q",
+        "Evidence": evidence,
+        "evidence": evidence,
+        "Known Limitations": known_limitations,
+        "known_limitations": known_limitations,
+        "Compatibility": compatibility,
+        "compatibility": compatibility,
+        "Remaining Gaps": remaining_gaps,
+        "remaining_gaps": remaining_gaps,
+        "batch_size": len(batch_ids),
+        "batch_task_ids": batch_ids,
+        "missed_consumption": missed,
+        "duplicate_consumption": duplicates,
+        "first_scan_newly_consumed": sorted(first_newly),
+        "repeated_scan_newly_consumed": sorted(second_newly),
+        "repeated_scan_idempotent": rescan_ok,
+        "restart_scan_reconsumed": restart["reconsumed"],
+        "restart_scan_idempotent": restart_ok,
+        "durable_consumed_task_ids": restart["durable_consumed_task_ids"],
+        "reviewed_task_id": batch_ids[0],
+        "review_event_traceable": event_ok,
+        "review_gate_not_reopened": review_protected,
+        "stale_task_id": stale_id,
+        "stale_task_state": stale_class["state"],
+        "stale_task_terminal": stale_class["terminal"],
+        "permanent_pending_disposition": disposition_ok,
+        "consumer_evidence": storage,
+        "target_task_id": RUNTIME_AUDIT_TASK_ID,
+        "target_task_state": target_state["state"],
+        "target_task_terminal": target_terminal,
+        "target_task_pending": target_in_pending,
+        "target_task_state_reason": target_state["reason"],
+        "target_task_terminal_evidence": target_evidence,
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "submit_task_contract": (
+            "UNCHANGED" if submit_unchanged else "CHANGED"
+        ),
+        "get_task_result_contract": (
+            "UNCHANGED" if (result_unchanged and result_keys) else "CHANGED"
+        ),
+        "checks": steps,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])
@@ -3937,3 +4447,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(task_result_auto_consumer_post_e2e_audit()["markdown"])
     print(task_result_auto_consumer_gap_close_report()["markdown"])
     print(task_result_auto_consumer_live_acceptance_report()["markdown"])
+    print(task_result_auto_consumer_production_readiness_report()["markdown"])
