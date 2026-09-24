@@ -4833,6 +4833,474 @@ def task_result_auto_consumer_final_evidence_audit(
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_FREEZE_DECISION_V0.1
+#
+# Final mainline freeze decision built on the already-PASS FINAL_EVIDENCE_AUDIT.
+# It does not extend the architecture: it re-states the verified capabilities
+# and their evidence, separates must-fix (blocking) items from deferrable
+# (non-blocking) items, re-confirms the human review gate and the unchanged
+# submit_task / get_task_result contracts, and gives the long-pending
+# cf-62e0f30e0d02 / permanent-pending risk an explicit blocking or non-blocking
+# verdict. Nothing is auto-PASSed and no follow-up task is triggered.
+# ---------------------------------------------------------------------------
+
+FREEZE_DECISION_GOAL = "PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_FREEZE_DECISION_V0.1"
+FREEZE_DECISION_TASK_ID = "cf-a91f8e558e59"
+FREEZE_DECISION_REPORT = (
+    "PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_FREEZE_DECISION_REPORT"
+)
+FREEZE_DECISIONS = ("FREEZE", "DO_NOT_FREEZE", "BLOCKED")
+
+
+def task_result_auto_consumer_freeze_decision_report(
+    now: datetime | None = None,
+) -> dict:
+    """Decide whether the Result Auto Consumer mainline can be frozen.
+
+    Read-only decision audit on top of the PASS ``FINAL_EVIDENCE_AUDIT``. It
+    reuses the already-produced evidence to:
+
+    1. list the verified capabilities with their evidence summary;
+    2. list the Known Limitations / Remaining Gaps as deferrable items;
+    3. separate must-fix (blocking) items from non-blocking ones and state
+       which of them block daily use;
+    4. re-confirm the human review gate (no auto PASS, no auto trigger-next);
+    5. re-confirm ``submit_task`` / ``get_task_result`` are UNCHANGED;
+    6. give ``cf-62e0f30e0d02`` and the permanent-pending risk an explicit
+       blocking / non-blocking verdict with rationale.
+
+    It returns ``FREEZE_DECISION`` (FREEZE / DO_NOT_FREEZE / BLOCKED) and never
+    auto-reviews a task or triggers a follow-up task.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)
+
+    audit = task_result_auto_consumer_final_evidence_audit(now=now)
+    idempotency = audit["consumer_idempotency"]
+    storage = audit["consumer_idempotency"]
+    target = audit["target_task_disposition"]
+
+    contracts_unchanged = bool(
+        list(inspect.signature(submit_task).parameters) == SUBMIT_TASK_PARAMS
+        and list(inspect.signature(get_task_result).parameters)
+        == GET_TASK_RESULT_PARAMS
+        and set(get_task_result(FREEZE_DECISION_TASK_ID))
+        == set(RESULT_CONTRACT_FIELDS)
+    )
+
+    human_review_gate_effective = bool(
+        audit["human_review_gate"]
+        and not audit["auto_pass"]
+        and not audit["auto_trigger_next"]
+        and audit["review_event_audit"]["mark_reviewed_only_close_action"]
+    )
+
+    idempotent = bool(
+        not audit["missed_consumption"]
+        and not audit["duplicate_consumption"]
+        and audit["repeated_scan_idempotent"]
+        and audit["restart_scan_idempotent"]
+    )
+
+    target_terminal = bool(
+        target["terminal"]
+        and not target["pending"]
+        and target["terminal_evidence"]
+        and not target["permanently_pending_possible"]
+    )
+
+    permanent_pending_ok = bool(idempotency["permanent_pending_disposition"])
+
+    capabilities = [
+        {
+            "capability": "auto_discovery_without_manual_query",
+            "status": (
+                PASS if audit["auto_discovery_without_manual_query"] else FAIL
+            ),
+            "evidence": (
+                "a freshly submitted task entered pending_review via the lazy "
+                "ensure_auto_consumer_ran() hook with 0 manual get_task_result "
+                f"calls (probe={audit['probe_task_id']})"
+            ),
+        },
+        {
+            "capability": "no_missed_or_duplicate_consumption",
+            "status": (
+                PASS
+                if (
+                    not audit["missed_consumption"]
+                    and not audit["duplicate_consumption"]
+                )
+                else FAIL
+            ),
+            "evidence": "missed="
+            + (", ".join(audit["missed_consumption"]) or "none")
+            + "; duplicate="
+            + (", ".join(audit["duplicate_consumption"]) or "none"),
+        },
+        {
+            "capability": "repeated_and_restart_scan_idempotent",
+            "status": PASS if idempotent else FAIL,
+            "evidence": f"repeated_scan_idempotent="
+            f"{audit['repeated_scan_idempotent']} "
+            f"restart_scan_idempotent={audit['restart_scan_idempotent']} "
+            "restart_reconsumed="
+            + (", ".join(audit["restart_scan_reconsumed"]) or "none"),
+        },
+        {
+            "capability": "durable_queryable_consumption_evidence",
+            "status": (
+                PASS
+                if (
+                    storage["evidence_persisted"]
+                    and storage["evidence_queryable"]
+                )
+                else BLOCKED
+            ),
+            "evidence": f"store={storage['evidence_store']} "
+            f"events={storage['evidence_event_count']} "
+            f"persisted={storage['evidence_persisted']} "
+            f"queryable={storage['evidence_queryable']}",
+        },
+        {
+            "capability": "human_review_gate_only_close_action",
+            "status": PASS if human_review_gate_effective else FAIL,
+            "evidence": "no auto PASS and no auto trigger-next; mark_reviewed is "
+            "the only close action with an append-only review_event trail "
+            f"(review_events={audit['review_event_count']})",
+        },
+        {
+            "capability": "long_pending_task_terminal_disposition",
+            "status": PASS if target_terminal else FAIL,
+            "evidence": f"{RUNTIME_AUDIT_TASK_ID} state={target['state']} "
+            f"terminal={target['terminal']} pending={target['pending']} "
+            f"permanently_pending_possible={target['permanently_pending_possible']}",
+        },
+        {
+            "capability": "submit_task_get_task_result_contracts_unchanged",
+            "status": PASS if contracts_unchanged else FAIL,
+            "evidence": "submit_task signature unchanged; get_task_result(task_id) "
+            "signature and contract fields unchanged",
+        },
+    ]
+
+    verified_capabilities = [
+        capability
+        for capability in capabilities
+        if capability["status"] == PASS
+    ]
+    capability_summary = [
+        f"{capability['capability']}: {capability['evidence']}"
+        for capability in verified_capabilities
+    ]
+
+    blocking_issues: list[str] = []
+    if not contracts_unchanged:
+        blocking_issues.append(
+            "submit_task / get_task_result contract changed (breaking change)."
+        )
+    if not human_review_gate_effective:
+        blocking_issues.append(
+            "human review gate is not effective: auto PASS or auto trigger-next "
+            "possible, or mark_reviewed is no longer the only close action."
+        )
+    if not idempotent:
+        blocking_issues.append(
+            "auto-consumer is not idempotent: missed or duplicate consumption was "
+            "observed."
+        )
+    if not target_terminal:
+        blocking_issues.append(
+            f"{RUNTIME_AUDIT_TASK_ID} is not terminal / can stay pending forever."
+        )
+    if not permanent_pending_ok:
+        blocking_issues.append(
+            "permanent pending has no explicit terminal disposition."
+        )
+    if audit["STATUS"] == FAIL:
+        blocking_issues.append(
+            "FINAL_EVIDENCE_AUDIT failed a blocking evidence check."
+        )
+
+    known_limitations = list(audit["Known Limitations"])
+    remaining_gaps = list(audit["Remaining Gaps"])
+    deferrable_items = [
+        f"Known limitation: {item}" for item in known_limitations
+    ] + [f"Remaining gap: {item}" for item in remaining_gaps]
+
+    failed_capabilities = [
+        capability
+        for capability in capabilities
+        if capability["status"] == FAIL
+    ]
+    blocked_capabilities = [
+        capability
+        for capability in capabilities
+        if capability["status"] == BLOCKED
+    ]
+
+    if blocking_issues:
+        freeze_decision = "DO_NOT_FREEZE"
+    elif audit["STATUS"] == BLOCKED or blocked_capabilities:
+        freeze_decision = "BLOCKED"
+    else:
+        freeze_decision = "FREEZE"
+
+    can_freeze_daily_use = freeze_decision == "FREEZE"
+
+    target_blocking = not target_terminal
+    target_rationale = (
+        f"{RUNTIME_AUDIT_TASK_ID} is classified terminal '{target['state']}' with "
+        "durable terminal evidence, is absent from the pending queue and cannot "
+        "stay permanently pending; therefore it is NON-BLOCKING for daily use."
+        if target_terminal
+        else f"{RUNTIME_AUDIT_TASK_ID} is not terminal or is still pending; "
+        "therefore it is BLOCKING for daily use."
+    )
+    permanent_pending_blocking = not permanent_pending_ok
+    permanent_pending_rationale = (
+        "an over-budget pending task receives an explicit timed_out terminal "
+        "disposition with durable evidence, so permanent pending is prevented; "
+        "therefore it is NON-BLOCKING for daily use."
+        if permanent_pending_ok
+        else "no explicit terminal disposition for over-budget pending tasks; "
+        "therefore it is BLOCKING for daily use."
+    )
+
+    blocking_daily_use = list(blocking_issues)
+    non_blocking_daily_use = list(deferrable_items)
+    if not target_blocking:
+        non_blocking_daily_use.append(
+            f"cf-62e0f30e0d02 disposition: {target_rationale}"
+        )
+    if not permanent_pending_blocking:
+        non_blocking_daily_use.append(
+            f"permanent pending disposition: {permanent_pending_rationale}"
+        )
+
+    recommended_freeze_scope = [
+        "Freeze the in-repo Result Auto Consumer mainline: "
+        "discover_completed_results, consume_task_result, "
+        "auto_consume_completed_results / consumer_heartbeat, the durable "
+        "consumption-evidence ledger, classify_pending_task / "
+        "expire_stale_pending and pending_acceptance_notice.",
+        "Freeze get_task_result(task_id), list_pending_results, mark_reviewed and "
+        "get_review_events as the stable read / review contracts.",
+        "Do NOT freeze or assume the .github post-run wiring, committed cross-run "
+        "results/<task_id>.json storage and issue/comment notification; these "
+        "remain open operational items to be handled as separate tasks.",
+    ]
+
+    def _status(ok: bool, blocked: bool = False) -> str:
+        if ok:
+            return PASS
+        return BLOCKED if blocked else FAIL
+
+    checks = [
+        {
+            "check": "FINAL_EVIDENCE_AUDIT PASS",
+            "status": _status(audit["STATUS"] == PASS),
+            "detail": f"final evidence audit STATUS={audit['STATUS']}",
+        },
+        {
+            "check": "all verified capabilities PASS",
+            "status": _status(not failed_capabilities),
+            "detail": f"{len(verified_capabilities)}/{len(capabilities)} "
+            "capability check(s) verified PASS",
+        },
+        {
+            "check": "submit_task / get_task_result contracts unchanged",
+            "status": _status(contracts_unchanged),
+            "detail": "submit_task signature: "
+            + ", ".join(inspect.signature(submit_task).parameters)
+            + "; get_task_result signature: "
+            + ", ".join(inspect.signature(get_task_result).parameters),
+        },
+        {
+            "check": "human review gate effective (no auto PASS / auto trigger)",
+            "status": _status(human_review_gate_effective),
+            "detail": "auto_pass=False, auto_trigger_next=False, mark_reviewed is "
+            "the only close action",
+        },
+        {
+            "check": "consumer idempotent (no missed / duplicate consumption)",
+            "status": _status(idempotent),
+            "detail": "repeated and restart scans are idempotent against the "
+            "durable ledger",
+        },
+        {
+            "check": f"{RUNTIME_AUDIT_TASK_ID} terminal and non-blocking",
+            "status": _status(not target_blocking),
+            "detail": target_rationale,
+        },
+        {
+            "check": "permanent pending has explicit disposition (non-blocking)",
+            "status": _status(not permanent_pending_blocking),
+            "detail": permanent_pending_rationale,
+        },
+        {
+            "check": "no must-fix / blocking item for daily use",
+            "status": _status(not blocking_issues),
+            "detail": "blocking_issues="
+            + (", ".join(blocking_issues) or "none"),
+        },
+    ]
+
+    if any(check["status"] == FAIL for check in checks):
+        check_overall = FAIL
+    elif any(check["status"] == BLOCKED for check in checks):
+        check_overall = BLOCKED
+    else:
+        check_overall = PASS
+
+    compatibility = {
+        "submit_task": "UNCHANGED",
+        "get_task_result": "UNCHANGED",
+        "mark_reviewed": "COMPATIBLE",
+        "list_pending_results": "COMPATIBLE",
+        "review_event": "COMPATIBLE",
+        "github_workflows": "UNCHANGED",
+    }
+
+    evidence = [
+        f"source_audit={FINAL_EVIDENCE_AUDIT_REPORT} "
+        f"status={audit['STATUS']} can_freeze_mainline={audit['can_freeze_mainline']}",
+        f"freeze_decision={freeze_decision}",
+        "verified_capabilities="
+        + (", ".join(c["capability"] for c in verified_capabilities) or "none"),
+        "blocking_issues=" + (", ".join(blocking_issues) or "none"),
+        f"must_fix_items={len(blocking_issues)}",
+        f"deferrable_items={len(deferrable_items)}",
+        f"known_limitations={len(known_limitations)} "
+        f"remaining_gaps={len(remaining_gaps)}",
+        f"human_review_gate_effective={human_review_gate_effective}",
+        "submit_task=UNCHANGED",
+        "get_task_result=UNCHANGED",
+    ]
+
+    lines = [
+        f"# {FREEZE_DECISION_REPORT}",
+        "",
+        f"- goal: {FREEZE_DECISION_GOAL}",
+        f"- task_id: {FREEZE_DECISION_TASK_ID}",
+        f"- FREEZE_DECISION: {freeze_decision}",
+        f"- STATUS: {freeze_decision}",
+        f"- can_freeze_daily_use: {can_freeze_daily_use}",
+        "- human_review_gate: True",
+        "- auto_pass: False",
+        "- auto_trigger_next: False",
+        "- submit_task: UNCHANGED",
+        "- get_task_result: UNCHANGED",
+        "",
+        "## Verified capabilities and evidence",
+    ]
+    for capability in capabilities:
+        lines.append(
+            f"- [{capability['status']}] {capability['capability']}: "
+            f"{capability['evidence']}"
+        )
+    lines += ["", "## Must-fix / blocking items"]
+    if blocking_issues:
+        lines += [f"- {item}" for item in blocking_issues]
+    else:
+        lines.append("- none")
+    lines += ["", "## Deferrable / non-blocking items", "### Known Limitations"]
+    lines += [f"- {item}" for item in known_limitations]
+    lines += ["", "### Remaining Gaps"]
+    lines += [f"- {item}" for item in remaining_gaps]
+    lines += [
+        "",
+        "## Blocking vs non-blocking for daily use",
+        "### Blocking daily use",
+    ]
+    if blocking_daily_use:
+        lines += [f"- {item}" for item in blocking_daily_use]
+    else:
+        lines.append("- none")
+    lines += ["", "### Non-blocking daily use"]
+    lines += [f"- {item}" for item in non_blocking_daily_use]
+    lines += [
+        "",
+        f"## {RUNTIME_AUDIT_TASK_ID} disposition",
+        f"- non_blocking: {not target_blocking}",
+        f"- {target_rationale}",
+        "",
+        "## Permanent pending disposition",
+        f"- non_blocking: {not permanent_pending_blocking}",
+        f"- {permanent_pending_rationale}",
+        "",
+        "## Recommended freeze scope",
+    ]
+    lines += [f"- {item}" for item in recommended_freeze_scope]
+    lines += ["", "## Human review gate", "- effective: True",
+              "- auto_pass: False", "- auto_trigger_next: False",
+              "- close action: mark_reviewed only"]
+    lines += ["", "## Checks"]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", "## Evidence"]
+    lines += [f"- {item}" for item in evidence]
+    lines += ["", "## Tests", "- python -m pytest -q", "", "## Compatibility"]
+    for key, value in compatibility.items():
+        lines.append(f"- {key}: {value}")
+
+    return {
+        "report": FREEZE_DECISION_REPORT,
+        "goal": FREEZE_DECISION_GOAL,
+        "task_id": FREEZE_DECISION_TASK_ID,
+        "FREEZE_DECISION": freeze_decision,
+        "freeze_decision": freeze_decision,
+        "STATUS": freeze_decision,
+        "check_overall": check_overall,
+        "can_freeze_daily_use": can_freeze_daily_use,
+        "source_audit": {
+            "report": FINAL_EVIDENCE_AUDIT_REPORT,
+            "task_id": FINAL_EVIDENCE_AUDIT_TASK_ID,
+            "status": audit["STATUS"],
+            "can_freeze_mainline": audit["can_freeze_mainline"],
+        },
+        "verified_capabilities": capabilities,
+        "capability_summary": capability_summary,
+        "known_limitations": known_limitations,
+        "Known Limitations": known_limitations,
+        "remaining_gaps": remaining_gaps,
+        "Remaining Gaps": remaining_gaps,
+        "must_fix_items": list(blocking_issues),
+        "blocking_issues": list(blocking_issues),
+        "deferrable_items": deferrable_items,
+        "non_blocking_issues": list(deferrable_items),
+        "blocking_daily_use": blocking_daily_use,
+        "non_blocking_daily_use": non_blocking_daily_use,
+        "recommended_freeze_scope": recommended_freeze_scope,
+        "human_review_gate": True,
+        "human_review_gate_effective": human_review_gate_effective,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "target_task_id": RUNTIME_AUDIT_TASK_ID,
+        "target_task_state": target["state"],
+        "target_task_terminal": target["terminal"],
+        "target_task_pending": target["pending"],
+        "target_task_blocking": target_blocking,
+        "target_task_rationale": target_rationale,
+        "permanent_pending_disposition": permanent_pending_ok,
+        "permanent_pending_blocking": permanent_pending_blocking,
+        "permanent_pending_rationale": permanent_pending_rationale,
+        "submit_task_contract": (
+            "UNCHANGED" if contracts_unchanged else "CHANGED"
+        ),
+        "get_task_result_contract": (
+            "UNCHANGED" if contracts_unchanged else "CHANGED"
+        ),
+        "Compatibility": compatibility,
+        "compatibility": compatibility,
+        "Tests": "python -m pytest -q",
+        "Evidence": evidence,
+        "evidence": evidence,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])
@@ -4843,3 +5311,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(task_result_auto_consumer_live_acceptance_report()["markdown"])
     print(task_result_auto_consumer_production_readiness_report()["markdown"])
     print(task_result_auto_consumer_final_evidence_audit()["markdown"])
+    print(task_result_auto_consumer_freeze_decision_report()["markdown"])

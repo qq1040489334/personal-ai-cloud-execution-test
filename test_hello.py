@@ -25,6 +25,10 @@ from hello import (
     FINAL_EVIDENCE_AUDIT_GOAL,
     FINAL_EVIDENCE_AUDIT_REPORT,
     FINAL_EVIDENCE_AUDIT_TASK_ID,
+    FREEZE_DECISION_GOAL,
+    FREEZE_DECISION_REPORT,
+    FREEZE_DECISION_TASK_ID,
+    FREEZE_DECISIONS,
     GAP_CLOSE_GOAL,
     GAP_CLOSE_LAYERS,
     GAP_CLOSE_REPORT,
@@ -88,6 +92,7 @@ from hello import (
     security_test,
     submit_task,
     task_result_auto_consumer_final_evidence_audit,
+    task_result_auto_consumer_freeze_decision_report,
     task_result_auto_consumer_gap_close_report,
     task_result_auto_consumer_golden_e2e_verify,
     task_result_auto_consumer_live_acceptance_report,
@@ -1860,5 +1865,164 @@ def test_final_evidence_audit_checks_and_markdown() -> None:
         "## Known Limitations",
         "## Compatibility",
         "## Remaining Gaps",
+    ):
+        assert token in markdown
+
+
+def test_freeze_decision_report_shape() -> None:
+    report = task_result_auto_consumer_freeze_decision_report()
+    assert report["report"] == FREEZE_DECISION_REPORT
+    assert report["goal"] == FREEZE_DECISION_GOAL
+    assert report["task_id"] == FREEZE_DECISION_TASK_ID == "cf-a91f8e558e59"
+    assert report["FREEZE_DECISION"] in FREEZE_DECISIONS
+    assert report["FREEZE_DECISION"] == report["freeze_decision"]
+    assert report["Tests"] == "python -m pytest -q"
+    assert set(report) >= {
+        "report",
+        "goal",
+        "task_id",
+        "FREEZE_DECISION",
+        "STATUS",
+        "can_freeze_daily_use",
+        "source_audit",
+        "verified_capabilities",
+        "capability_summary",
+        "Known Limitations",
+        "known_limitations",
+        "Remaining Gaps",
+        "remaining_gaps",
+        "must_fix_items",
+        "blocking_issues",
+        "deferrable_items",
+        "non_blocking_issues",
+        "blocking_daily_use",
+        "non_blocking_daily_use",
+        "recommended_freeze_scope",
+        "human_review_gate",
+        "auto_pass",
+        "auto_trigger_next",
+        "target_task_id",
+        "target_task_blocking",
+        "target_task_rationale",
+        "permanent_pending_blocking",
+        "permanent_pending_rationale",
+        "submit_task_contract",
+        "get_task_result_contract",
+        "Compatibility",
+        "checks",
+        "markdown",
+    }
+    assert report["source_audit"]["status"] == "PASS"
+    assert report["source_audit"]["can_freeze_mainline"] is True
+
+
+def test_freeze_decision_is_freeze() -> None:
+    report = task_result_auto_consumer_freeze_decision_report()
+    assert report["FREEZE_DECISION"] == "FREEZE"
+    assert report["can_freeze_daily_use"] is True
+    assert report["must_fix_items"] == []
+    assert report["blocking_issues"] == []
+    assert report["blocking_daily_use"] == []
+
+
+def test_freeze_decision_lists_verified_capabilities_and_evidence() -> None:
+    report = task_result_auto_consumer_freeze_decision_report()
+    capabilities = report["verified_capabilities"]
+    assert capabilities
+    names = {item["capability"] for item in capabilities}
+    assert set(hello_module.FREEZE_DECISIONS) == {"FREEZE", "DO_NOT_FREEZE", "BLOCKED"}
+    assert {
+        "auto_discovery_without_manual_query",
+        "no_missed_or_duplicate_consumption",
+        "repeated_and_restart_scan_idempotent",
+        "durable_queryable_consumption_evidence",
+        "human_review_gate_only_close_action",
+        "long_pending_task_terminal_disposition",
+        "submit_task_get_task_result_contracts_unchanged",
+    } <= names
+    for item in capabilities:
+        assert set(item) >= {"capability", "status", "evidence"}
+        assert item["status"] in VALID_STATUSES
+        assert item["evidence"]
+    assert report["capability_summary"]
+    assert all(
+        item["status"] != "FAIL" for item in report["verified_capabilities"]
+    )
+
+
+def test_freeze_decision_known_limitations_and_remaining_gaps() -> None:
+    report = task_result_auto_consumer_freeze_decision_report()
+    assert isinstance(report["Known Limitations"], list)
+    assert report["Known Limitations"]
+    assert isinstance(report["Remaining Gaps"], list)
+    assert report["Remaining Gaps"]
+    assert report["known_limitations"] == report["Known Limitations"]
+    assert report["remaining_gaps"] == report["Remaining Gaps"]
+    assert report["deferrable_items"] == report["non_blocking_issues"]
+    assert len(report["deferrable_items"]) == len(
+        report["Known Limitations"]
+    ) + len(report["Remaining Gaps"])
+    assert report["non_blocking_daily_use"]
+    assert report["recommended_freeze_scope"]
+
+
+def test_freeze_decision_human_review_gate_and_contracts() -> None:
+    report = task_result_auto_consumer_freeze_decision_report()
+    assert report["human_review_gate"] is True
+    assert report["human_review_gate_effective"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert report["Compatibility"]["submit_task"] == "UNCHANGED"
+    assert report["Compatibility"]["get_task_result"] == "UNCHANGED"
+    assert list(inspect.signature(submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(get_task_result).parameters) == ["task_id"]
+
+
+def test_freeze_decision_target_task_and_permanent_pending_rationale() -> None:
+    report = task_result_auto_consumer_freeze_decision_report()
+    assert report["target_task_id"] == RUNTIME_AUDIT_TASK_ID == "cf-62e0f30e0d02"
+    assert report["target_task_blocking"] is False
+    assert report["target_task_rationale"]
+    assert "NON-BLOCKING" in report["target_task_rationale"]
+    assert report["permanent_pending_disposition"] is True
+    assert report["permanent_pending_blocking"] is False
+    assert report["permanent_pending_rationale"]
+    assert "NON-BLOCKING" in report["permanent_pending_rationale"]
+    assert any(
+        "cf-62e0f30e0d02" in item for item in report["non_blocking_daily_use"]
+    )
+
+
+def test_freeze_decision_checks_and_markdown() -> None:
+    report = task_result_auto_consumer_freeze_decision_report()
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in VALID_STATUSES
+        assert check["detail"]
+    assert all(check["status"] != "FAIL" for check in report["checks"])
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {FREEZE_DECISION_REPORT}")
+    assert f"- task_id: {FREEZE_DECISION_TASK_ID}" in markdown
+    assert f"FREEZE_DECISION: {report['FREEZE_DECISION']}" in markdown
+    for token in (
+        "## Verified capabilities and evidence",
+        "## Must-fix / blocking items",
+        "## Deferrable / non-blocking items",
+        "## Known Limitations",
+        "## Remaining Gaps",
+        "## Blocking vs non-blocking for daily use",
+        "## Recommended freeze scope",
+        "## Human review gate",
+        "## Checks",
+        "## Compatibility",
     ):
         assert token in markdown
