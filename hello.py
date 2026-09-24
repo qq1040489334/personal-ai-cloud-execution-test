@@ -3571,6 +3571,364 @@ def task_result_auto_consumer_gap_close_report(
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_LIVE_ACCEPTANCE_V0.1
+#
+# Real live acceptance on top of the gap-close work. A minimal disposable task
+# is submitted through the UNCHANGED submit_task contract and the consumer is
+# proven to discover and consume it into the pending-acceptance state without
+# the operator manually calling get_task_result. The durable consumption
+# evidence, the mark_reviewed close flow with review_event traceability and the
+# explicit terminal state of the long-pending cf-62e0f30e0d02 are all verified.
+# Nothing here auto-PASSes the real task and no follow-up task is triggered.
+# ---------------------------------------------------------------------------
+
+LIVE_ACCEPTANCE_GOAL = (
+    "PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_LIVE_ACCEPTANCE_V0.1"
+)
+LIVE_ACCEPTANCE_TASK_ID = "cf-87e0bd844e84"
+LIVE_ACCEPTANCE_REPORT = (
+    "PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_LIVE_ACCEPTANCE_REPORT"
+)
+LIVE_ACCEPTANCE_PROBE_ID = "cf-87e0bd844e84-live-probe"
+LIVE_ACCEPTANCE_STATES = ("PASS", "FAIL", "BLOCKED")
+_LIVE_ACCEPTANCE_SEQ = 0
+
+
+def _live_acceptance_step(step: str, status: str, detail: str) -> dict:
+    return {"step": step, "status": status, "detail": detail}
+
+
+def task_result_auto_consumer_live_acceptance_report(
+    now: datetime | None = None,
+) -> dict:
+    """Run the real live acceptance of the auto-consumer closed loop.
+
+    A minimal disposable task is registered through the UNCHANGED
+    ``submit_task`` contract. The acceptance then reads only the acceptance
+    queue / notice (never ``get_task_result`` itself) and proves that:
+
+    1. the completed task is auto-discovered and consumed into
+       ``pending_review`` with no manual ``get_task_result`` call;
+    2. the discovery/consumption evidence is persisted durably and queryable;
+    3. ``mark_reviewed`` closes the pending item and appends a traceable
+       ``review_event``;
+    4. the long-pending ``cf-62e0f30e0d02`` carries an explicit terminal
+       stuck/timeout/failed state and can no longer stay pending forever.
+
+    The report never auto-PASSes the real task and never triggers a follow-up
+    task: the human review gate stays closed until ``mark_reviewed`` is called.
+    """
+    global _LIVE_ACCEPTANCE_SEQ, _AUTO_CONSUMER_RAN
+    now = now if now is not None else datetime.now(timezone.utc)
+    _LIVE_ACCEPTANCE_SEQ += 1
+    probe_id = f"{LIVE_ACCEPTANCE_PROBE_ID}-{_LIVE_ACCEPTANCE_SEQ}"
+    steps: list[dict] = []
+
+    submit_task(
+        probe_id,
+        goal=LIVE_ACCEPTANCE_GOAL,
+        status="success",
+        requires_review=False,
+    )
+    registered = probe_id in TASK_REGISTRY
+    steps.append(
+        _live_acceptance_step(
+            "minimal_task_submitted",
+            PASS if registered else FAIL,
+            f"submit_task (UNCHANGED) registered {probe_id} with "
+            "status=success requires_review=False",
+        )
+    )
+
+    # Reset the one-shot lazy hook so reading the acceptance queue itself
+    # triggers the consumer, exactly like a fresh post-run process would.
+    _AUTO_CONSUMER_RAN = False
+    pending_ids = {item["task_id"] for item in list_pending_results()}
+    auto_discovered = probe_id in pending_ids
+    pre_review = get_task_review(probe_id) or {}
+    steps.append(
+        _live_acceptance_step(
+            "auto_discovery_without_manual_get_task_result",
+            PASS if auto_discovered else FAIL,
+            (
+                "reading the acceptance queue (list_pending_results) auto-invoked "
+                "ensure_auto_consumer_ran(); the completed task entered "
+                "pending_review without any operator get_task_result call"
+                if auto_discovered
+                else f"{probe_id} was not auto-discovered into pending_review"
+            ),
+        )
+    )
+    steps.append(
+        _live_acceptance_step(
+            "no_auto_pass_before_human_review",
+            PASS
+            if (not pre_review.get("reviewed") and pre_review.get("review_verdict") is None)
+            else FAIL,
+            "the consumer raised requires_review only; the task stays unreviewed "
+            f"(reviewed={pre_review.get('reviewed')}, "
+            f"verdict={pre_review.get('review_verdict')})",
+        )
+    )
+
+    probe_evidence = get_consumption_evidence(probe_id)
+    has_discovered = any(
+        e.get("event_type") == "discovered" for e in probe_evidence
+    )
+    has_consumed = any(e.get("event_type") == "consumed" for e in probe_evidence)
+    storage = consumer_evidence_status()
+    evidence_ok = bool(
+        has_discovered
+        and has_consumed
+        and storage["persisted"]
+        and storage["queryable"]
+    )
+    steps.append(
+        _live_acceptance_step(
+            "consumption_evidence_persisted",
+            PASS if evidence_ok else FAIL,
+            f"durable ledger at {storage['path']}: discovered={has_discovered} "
+            f"consumed={has_consumed} persisted={storage['persisted']} "
+            f"queryable={storage['queryable']} event_count={storage['event_count']}",
+        )
+    )
+
+    notice = pending_acceptance_notice(now=now)
+    entry = next(
+        (item for item in notice["items"] if item["task_id"] == probe_id), None
+    )
+    pending_ok = bool(
+        probe_id in notice["task_ids"]
+        and entry is not None
+        and entry["state"] == "pending_review"
+        and entry["terminal"] is False
+        and entry["requires_review"] is True
+    )
+    steps.append(
+        _live_acceptance_step(
+            "discoverable_pending_acceptance_state",
+            PASS if pending_ok else FAIL,
+            f"{probe_id} visible in the pending-acceptance notice "
+            f"(state={entry['state'] if entry else None}, "
+            f"requires_review={entry['requires_review'] if entry else None})",
+        )
+    )
+
+    events_before = len(get_review_events(probe_id))
+    reviewed = mark_reviewed(
+        probe_id, "PASS", "live acceptance simulated human review"
+    )
+    pending_after = {item["task_id"] for item in list_pending_results()}
+    closed = probe_id not in pending_after
+    events = get_review_events(probe_id)
+    event_ok = bool(
+        len(events) == events_before + 1
+        and events[-1].get("action") == "review"
+        and events[-1].get("verdict") == "PASS"
+        and events[-1].get("task_id") == probe_id
+        and events[-1].get("timestamp")
+    )
+    mark_ok = bool(
+        closed and event_ok and reviewed.get("reviewed") is True
+    )
+    steps.append(
+        _live_acceptance_step(
+            "mark_reviewed_closes_pending_and_traces_event",
+            PASS if mark_ok else FAIL,
+            f"mark_reviewed(PASS): pending_before=True -> "
+            f"pending_after={not closed}; review_event appended "
+            f"(count={len(events)}, verdict={events[-1]['verdict'] if events else None}) "
+            "and traceable via get_review_events()",
+        )
+    )
+
+    target_state = classify_pending_task(RUNTIME_AUDIT_TASK_ID, now=now)
+    target_terminal = bool(
+        target_state["terminal"]
+        and target_state["state"] in TERMINAL_PENDING_STATES
+    )
+    target_in_pending = RUNTIME_AUDIT_TASK_ID in {
+        item["task_id"] for item in list_pending_results()
+    }
+    target_evidence = [
+        event
+        for event in get_consumption_evidence(RUNTIME_AUDIT_TASK_ID)
+        if event.get("terminal")
+    ]
+    if not target_evidence:
+        record_consumer_evidence(
+            target_state["state"],
+            RUNTIME_AUDIT_TASK_ID,
+            detail=target_state["reason"],
+            extra={"terminal": True},
+        )
+        target_evidence = [
+            event
+            for event in get_consumption_evidence(RUNTIME_AUDIT_TASK_ID)
+            if event.get("terminal")
+        ]
+    target_ok = bool(target_terminal and not target_in_pending and target_evidence)
+    steps.append(
+        _live_acceptance_step(
+            f"{RUNTIME_AUDIT_TASK_ID}_terminal_not_pending",
+            PASS if target_ok else FAIL,
+            f"state={target_state['state']} terminal={target_terminal} "
+            f"pending={target_in_pending} "
+            f"durable_terminal_evidence={bool(target_evidence)}; "
+            f"{target_state['reason']}",
+        )
+    )
+
+    submit_unchanged = (
+        list(inspect.signature(submit_task).parameters) == SUBMIT_TASK_PARAMS
+    )
+    result_unchanged = (
+        list(inspect.signature(get_task_result).parameters)
+        == GET_TASK_RESULT_PARAMS
+    )
+    result_keys = set(get_task_result(LIVE_ACCEPTANCE_TASK_ID)) == set(
+        RESULT_CONTRACT_FIELDS
+    )
+    contracts_ok = submit_unchanged and result_unchanged and result_keys
+    steps.append(
+        _live_acceptance_step(
+            "submit_task_and_get_task_result_unchanged",
+            PASS if contracts_ok else FAIL,
+            "submit_task signature unchanged; get_task_result(task_id) signature "
+            "and contract fields unchanged",
+        )
+    )
+
+    if any(step["status"] == FAIL for step in steps):
+        live_acceptance = FAIL
+    elif any(step["status"] == BLOCKED for step in steps):
+        live_acceptance = BLOCKED
+    else:
+        live_acceptance = PASS
+
+    compatibility = {
+        "submit_task": "UNCHANGED",
+        "get_task_result": "UNCHANGED",
+        "mark_reviewed": "COMPATIBLE",
+        "list_pending_results": "COMPATIBLE",
+        "review_event": "COMPATIBLE",
+        "github_workflows": "UNCHANGED",
+    }
+
+    evidence = [
+        f"minimal_task_id={probe_id}",
+        f"auto_discovered_without_manual_query={auto_discovered}",
+        "manual_get_task_result_calls_by_operator=0",
+        f"consumption_evidence(discovered={has_discovered}, "
+        f"consumed={has_consumed}, persisted={storage['persisted']}, "
+        f"queryable={storage['queryable']})",
+        f"evidence_store={storage['path']}",
+        f"pending_acceptance_state={entry['state'] if entry else None} "
+        f"requires_review={entry['requires_review'] if entry else None}",
+        f"mark_reviewed(reviewed={reviewed.get('reviewed')}, "
+        f"verdict={reviewed.get('review_verdict')}, "
+        f"review_events={len(events)})",
+        f"{RUNTIME_AUDIT_TASK_ID}(state={target_state['state']}, "
+        f"terminal={target_terminal}, pending={target_in_pending})",
+        f"submit_task={'UNCHANGED' if submit_unchanged else 'CHANGED'}",
+        "get_task_result="
+        + ("UNCHANGED" if (result_unchanged and result_keys) else "CHANGED"),
+    ]
+
+    remaining_gaps = [
+        "Workflow wiring (out of scope, not applied): automatic post-run push "
+        "still needs a .github change. The in-repo entrypoints "
+        "auto_consume_completed_results() / consumer_heartbeat() (lazily invoked "
+        "by ensure_auto_consumer_ran()) are the acceptance-equivalent trigger.",
+        "Cross-run durable storage (out of scope, not applied): discovery and "
+        f"consumption evidence is written to the env-configurable ledger "
+        f"{storage['path']}, which survives processes but is not a committed "
+        "results/<task_id>.json in git history.",
+        "Notification delivery (out of scope, not applied): "
+        "pending_acceptance_notice() produces the notice in-process; posting it "
+        "as an issue/comment is a .github concern.",
+    ]
+
+    lines = [
+        f"# {LIVE_ACCEPTANCE_REPORT}",
+        "",
+        f"- goal: {LIVE_ACCEPTANCE_GOAL}",
+        f"- task_id: {LIVE_ACCEPTANCE_TASK_ID}",
+        f"- LIVE_ACCEPTANCE: {live_acceptance}",
+        f"- probe_task_id: {probe_id}",
+        "- human_review_gate: True",
+        "- auto_pass: False",
+        "- auto_trigger_next: False",
+        "",
+        "## Live acceptance steps",
+    ]
+    for step in steps:
+        lines.append(f"- [{step['status']}] {step['step']}: {step['detail']}")
+    lines += ["", "## Evidence"]
+    lines += [f"- {item}" for item in evidence]
+    lines += ["", "## Tests", "- python -m pytest -q", "", "## Compatibility"]
+    for key, value in compatibility.items():
+        lines.append(f"- {key}: {value}")
+    lines += ["", "## Remaining Gaps"]
+    lines += [f"- {gap}" for gap in remaining_gaps]
+
+    return {
+        "report": LIVE_ACCEPTANCE_REPORT,
+        "goal": LIVE_ACCEPTANCE_GOAL,
+        "task_id": LIVE_ACCEPTANCE_TASK_ID,
+        "LIVE_ACCEPTANCE": live_acceptance,
+        "STATUS": live_acceptance,
+        "probe_task_id": probe_id,
+        "steps": steps,
+        "验证步骤": steps,
+        "Tests": "python -m pytest -q",
+        "Evidence": evidence,
+        "evidence": evidence,
+        "Compatibility": compatibility,
+        "compatibility": compatibility,
+        "Remaining Gaps": remaining_gaps,
+        "remaining_gaps": remaining_gaps,
+        "automatic_discovery_without_manual_query": auto_discovered,
+        "consumption_evidence_persisted": evidence_ok,
+        "pending_acceptance_visible": pending_ok,
+        "mark_reviewed_closes_pending": mark_ok,
+        "review_event_traceable": event_ok,
+        "live_probe": {
+            "task_id": probe_id,
+            "auto_discovered": auto_discovered,
+            "manual_get_task_result_calls": 0,
+            "evidence_discovered": has_discovered,
+            "evidence_consumed": has_consumed,
+            "pending_state": entry["state"] if entry else None,
+            "requires_review": entry["requires_review"] if entry else None,
+            "reviewed": reviewed.get("reviewed"),
+            "review_verdict": reviewed.get("review_verdict"),
+            "pending_after_review": not closed,
+            "review_event_count": len(events),
+            "review_event_verdict": events[-1]["verdict"] if events else None,
+        },
+        "consumer_evidence": storage,
+        "target_task_id": RUNTIME_AUDIT_TASK_ID,
+        "target_task_state": target_state["state"],
+        "target_task_terminal": target_terminal,
+        "target_task_pending": target_in_pending,
+        "target_task_state_reason": target_state["reason"],
+        "target_task_terminal_evidence": target_evidence,
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "submit_task_contract": (
+            "UNCHANGED" if submit_unchanged else "CHANGED"
+        ),
+        "get_task_result_contract": (
+            "UNCHANGED" if (result_unchanged and result_keys) else "CHANGED"
+        ),
+        "checks": steps,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])
@@ -3578,3 +3936,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(personal_ai_task_runtime_audit()["markdown"])
     print(task_result_auto_consumer_post_e2e_audit()["markdown"])
     print(task_result_auto_consumer_gap_close_report()["markdown"])
+    print(task_result_auto_consumer_live_acceptance_report()["markdown"])

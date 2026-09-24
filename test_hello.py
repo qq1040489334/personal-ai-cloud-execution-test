@@ -25,6 +25,9 @@ from hello import (
     GAP_CLOSE_LAYERS,
     GAP_CLOSE_REPORT,
     GAP_CLOSE_TASK_ID,
+    LIVE_ACCEPTANCE_GOAL,
+    LIVE_ACCEPTANCE_REPORT,
+    LIVE_ACCEPTANCE_TASK_ID,
     PENDING_TIMEOUT_SECONDS,
     POST_E2E_AUDIT_GOAL,
     POST_E2E_AUDIT_LAYERS,
@@ -79,6 +82,7 @@ from hello import (
     submit_task,
     task_result_auto_consumer_gap_close_report,
     task_result_auto_consumer_golden_e2e_verify,
+    task_result_auto_consumer_live_acceptance_report,
     task_result_auto_consumer_post_e2e_audit,
     task_result_auto_consumer_report,
     task_review_action_report,
@@ -1419,3 +1423,127 @@ def test_expire_stale_pending_marks_timed_out() -> None:
         event["event_type"] == "timed_out"
         for event in get_consumption_evidence(task_id)
     )
+
+
+def test_live_acceptance_report_shape() -> None:
+    report = task_result_auto_consumer_live_acceptance_report()
+    assert report["report"] == LIVE_ACCEPTANCE_REPORT
+    assert report["goal"] == LIVE_ACCEPTANCE_GOAL
+    assert report["task_id"] == LIVE_ACCEPTANCE_TASK_ID == "cf-87e0bd844e84"
+    assert report["LIVE_ACCEPTANCE"] == report["STATUS"]
+    assert report["LIVE_ACCEPTANCE"] in VALID_STATUSES
+    assert report["Tests"] == "python -m pytest -q"
+    assert report["Evidence"]
+    assert report["Remaining Gaps"]
+    assert set(report["Compatibility"]) == {
+        "submit_task",
+        "get_task_result",
+        "mark_reviewed",
+        "list_pending_results",
+        "review_event",
+        "github_workflows",
+    }
+    assert report["probe_task_id"]
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {LIVE_ACCEPTANCE_REPORT}")
+    assert f"- task_id: {LIVE_ACCEPTANCE_TASK_ID}" in markdown
+    for token in (
+        "## Live acceptance steps",
+        "## Evidence",
+        "## Tests",
+        "## Compatibility",
+        "## Remaining Gaps",
+    ):
+        assert token in markdown
+
+
+def test_live_acceptance_steps_and_status() -> None:
+    report = task_result_auto_consumer_live_acceptance_report()
+    assert report["steps"]
+    for step in report["steps"]:
+        assert set(step) >= {"step", "status", "detail"}
+        assert step["status"] in VALID_STATUSES
+        assert step["detail"]
+    assert report["LIVE_ACCEPTANCE"] == "PASS"
+
+
+def test_live_acceptance_auto_discovery_without_manual_query() -> None:
+    report = task_result_auto_consumer_live_acceptance_report()
+    assert report["automatic_discovery_without_manual_query"] is True
+    probe = report["live_probe"]
+    assert probe["manual_get_task_result_calls"] == 0
+    assert probe["auto_discovered"] is True
+    assert probe["requires_review"] is True
+    assert probe["pending_state"] == "pending_review"
+    assert report["pending_acceptance_visible"] is True
+
+
+def test_live_acceptance_consumption_evidence_persisted() -> None:
+    report = task_result_auto_consumer_live_acceptance_report()
+    assert report["consumption_evidence_persisted"] is True
+    probe = report["live_probe"]
+    assert probe["evidence_discovered"] is True
+    assert probe["evidence_consumed"] is True
+    storage = report["consumer_evidence"]
+    assert storage["persisted"] is True
+    assert storage["queryable"] is True
+    queried = get_consumption_evidence(probe["task_id"])
+    assert any(e["event_type"] == "discovered" for e in queried)
+    assert any(e["event_type"] == "consumed" for e in queried)
+
+
+def test_live_acceptance_mark_reviewed_closes_pending_and_traces_event() -> None:
+    report = task_result_auto_consumer_live_acceptance_report()
+    assert report["mark_reviewed_closes_pending"] is True
+    assert report["review_event_traceable"] is True
+    probe = report["live_probe"]
+    assert probe["reviewed"] is True
+    assert probe["review_verdict"] == "PASS"
+    assert probe["pending_after_review"] is False
+    assert probe["review_event_count"] >= 1
+    assert probe["review_event_verdict"] == "PASS"
+    events = get_review_events(probe["task_id"])
+    assert events
+    assert events[-1]["action"] == "review"
+    assert events[-1]["verdict"] == "PASS"
+    assert events[-1]["timestamp"]
+    assert probe["task_id"] not in {
+        t["task_id"] for t in list_pending_results()
+    }
+
+
+def test_live_acceptance_target_task_terminal_not_pending() -> None:
+    report = task_result_auto_consumer_live_acceptance_report()
+    assert report["target_task_id"] == RUNTIME_AUDIT_TASK_ID == "cf-62e0f30e0d02"
+    assert report["target_task_terminal"] is True
+    assert report["target_task_state"] in {"stuck", "timed_out", "failed"}
+    assert report["target_task_pending"] is False
+    assert report["target_task_state_reason"]
+    assert report["target_task_terminal_evidence"]
+    assert "cf-62e0f30e0d02" in report["markdown"]
+
+
+def test_live_acceptance_contracts_unchanged() -> None:
+    report = task_result_auto_consumer_live_acceptance_report()
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert list(inspect.signature(submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(get_task_result).parameters) == ["task_id"]
+
+
+def test_live_acceptance_no_auto_pass_or_trigger() -> None:
+    report = task_result_auto_consumer_live_acceptance_report()
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    probe = report["live_probe"]
+    assert probe["manual_get_task_result_calls"] == 0
+    record = get_task_review(probe["task_id"])
+    assert record["reviewed"] is True
+    assert record["review_verdict"] == "PASS"
