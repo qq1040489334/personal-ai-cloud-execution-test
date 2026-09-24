@@ -2,7 +2,7 @@
 
 import inspect
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -18,8 +18,14 @@ from hello import (
     CLOUDFLARE_AUDIT_TASK_ID,
     CLOUDFLARE_AUDIT_TOKENS,
     CLOUDFLARE_WORKER_NAME,
+    CONSUMER_EVIDENCE_ENV,
     DEPLOY_VERIFY_COMMIT,
     DEPLOY_VERIFY_TASK_ID,
+    GAP_CLOSE_GOAL,
+    GAP_CLOSE_LAYERS,
+    GAP_CLOSE_REPORT,
+    GAP_CLOSE_TASK_ID,
+    PENDING_TIMEOUT_SECONDS,
     POST_E2E_AUDIT_GOAL,
     POST_E2E_AUDIT_LAYERS,
     POST_E2E_AUDIT_REPORT,
@@ -36,14 +42,21 @@ from hello import (
     RESULT_DETAIL_FIELDS,
     STATUS_MODEL_EXPECTED_FIELDS,
     TASK_REVIEW_GOAL,
+    auto_consume_completed_results,
+    classify_pending_task,
     cloud_agent_test,
     cloud_agent_test_2,
     cloud_asset_status,
     cloudflare_mcp_test,
     cloudflare_runtime_audit_report,
     consume_task_result,
+    consumer_evidence_status,
+    consumer_heartbeat,
     discover_completed_results,
     execution_result_detail_exposure_verify,
+    expire_stale_pending,
+    get_consumer_evidence_path,
+    get_consumption_evidence,
     get_review_events,
     get_task_result,
     get_task_review,
@@ -56,12 +69,15 @@ from hello import (
     mcp_bridge_test,
     mcp_runtime_deploy_verify,
     oauth_mcp_test,
+    pending_acceptance_notice,
     personal_ai_task_runtime_audit,
+    record_consumer_evidence,
     result_consumer_test,
     result_consumer_test2,
     runtime_provenance_report,
     security_test,
     submit_task,
+    task_result_auto_consumer_gap_close_report,
     task_result_auto_consumer_golden_e2e_verify,
     task_result_auto_consumer_post_e2e_audit,
     task_result_auto_consumer_report,
@@ -1198,3 +1214,208 @@ def test_post_e2e_audit_checks_and_markdown() -> None:
     assert "## Layer gap assessment" in markdown
     assert "## Status model gap" in markdown
     assert "## Minimal fix suggestions" in markdown
+
+
+def test_gap_close_report_shape() -> None:
+    report = task_result_auto_consumer_gap_close_report()
+    assert report["report"] == GAP_CLOSE_REPORT
+    assert report["goal"] == GAP_CLOSE_GOAL
+    assert report["task_id"] == GAP_CLOSE_TASK_ID == "cf-95b618168963"
+    assert report["STATUS"] in {"PASS", "FAIL", "BLOCKED", "PARTIAL"}
+    assert report["变更项"]
+    assert report["Tests"] == "python -m pytest -q"
+    assert report["Compatibility"] == {
+        "submit_task": "UNCHANGED",
+        "get_task_result": "UNCHANGED",
+        "mark_reviewed": "COMPATIBLE",
+        "list_pending_results": "COMPATIBLE",
+        "review_event": "COMPATIBLE",
+        "github_workflows": "UNCHANGED",
+    }
+    assert isinstance(report["Remaining Gaps"], list)
+    assert report["Remaining Gaps"]
+    assert set(report["layers"]) == set(GAP_CLOSE_LAYERS)
+    for name, info in report["layers"].items():
+        assert set(info) >= {"present", "detail"}
+        assert isinstance(info["present"], bool)
+        assert info["detail"]
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {GAP_CLOSE_REPORT}")
+    for token in ("## 变更项", "## Tests", "## Compatibility", "## Remaining Gaps"):
+        assert token in markdown
+
+
+def test_gap_close_layers_equivalents_present() -> None:
+    report = task_result_auto_consumer_gap_close_report()
+    for name in GAP_CLOSE_LAYERS:
+        assert report["layers"][name]["present"] is True
+    assert report["gap_layers"] == []
+    assert report["STATUS"] == "PASS"
+    assert report["consumer_evidence"]["persisted"] is True
+    assert report["consumer_evidence"]["queryable"] is True
+    assert report["consumer_evidence"]["event_count"] >= 1
+
+
+def test_gap_close_target_long_pending_is_terminal() -> None:
+    report = task_result_auto_consumer_gap_close_report()
+    assert report["target_task_id"] == RUNTIME_AUDIT_TASK_ID == "cf-62e0f30e0d02"
+    assert report["target_task_state"] in {"stuck", "timed_out", "failed"}
+    assert report["target_task_terminal"] is True
+    assert report["target_task_state_reason"]
+    evidence = [
+        event
+        for event in report["consumption_evidence"]
+        if event["task_id"] == RUNTIME_AUDIT_TASK_ID
+    ]
+    assert evidence
+
+
+def test_gap_close_evidence_persisted_and_queryable(tmp_path, monkeypatch) -> None:
+    state = tmp_path / "consumer_state.json"
+    monkeypatch.setenv(CONSUMER_EVIDENCE_ENV, str(state))
+    event = record_consumer_evidence(
+        "consumed", "gap-close-evidence-001", detail="probe"
+    )
+    assert event["task_id"] == "gap-close-evidence-001"
+    assert event["event_type"] == "consumed"
+    assert event["consumed"] is True
+    assert state.is_file()
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["kind"]
+    assert any(
+        e["task_id"] == "gap-close-evidence-001" for e in saved["events"]
+    )
+    queried = get_consumption_evidence("gap-close-evidence-001")
+    assert queried
+    assert queried[-1]["event_type"] == "consumed"
+    assert get_consumer_evidence_path() == state
+    status = consumer_evidence_status()
+    assert status["persisted"] is True
+    assert status["queryable"] is True
+    assert status["event_count"] >= 1
+
+
+def test_record_consumer_evidence_requires_args() -> None:
+    with pytest.raises(ValueError):
+        record_consumer_evidence("", "gap-close-bad")
+    with pytest.raises(ValueError):
+        record_consumer_evidence("consumed", "")
+
+
+def test_consumer_heartbeat_auto_consumes_and_records() -> None:
+    task_id = "gap-close-heartbeat-001"
+    submit_task(
+        task_id, goal=GAP_CLOSE_GOAL, status="success", requires_review=False
+    )
+    heartbeat = consumer_heartbeat(force=True)
+    assert heartbeat["ran"] is True
+    assert heartbeat["wired"] is True
+    assert task_id in heartbeat["discovered"]
+    consumed_ids = {item["task_id"] for item in heartbeat["result"]["consumed"]}
+    assert task_id in consumed_ids
+    assert heartbeat["result"]["auto_pass"] is False
+    assert heartbeat["result"]["auto_trigger_next"] is False
+    evidence = get_consumption_evidence(task_id)
+    assert any(e["event_type"] == "discovered" for e in evidence)
+    assert any(e["event_type"] == "consumed" for e in evidence)
+    record = get_task_review(task_id)
+    assert record["reviewed"] is False
+    assert record["review_verdict"] is None
+    assert task_id in {item["task_id"] for item in list_pending_results()}
+
+
+def test_auto_consume_entrypoint_returns_evidence() -> None:
+    task_id = "gap-close-entrypoint-001"
+    submit_task(task_id, goal=GAP_CLOSE_GOAL, status="success")
+    result = auto_consume_completed_results()
+    assert task_id in result["discovered"]
+    assert result["consumption_record_count"] == len(result["consumed"])
+    assert result["human_review_gate"] is True
+    assert get_task_review(task_id)["reviewed"] is False
+
+
+def test_pending_acceptance_notice_exposes_pending() -> None:
+    task_id = "gap-close-notice-001"
+    submit_task(task_id, goal=GAP_CLOSE_GOAL, status="success", requires_review=True)
+    notice = pending_acceptance_notice()
+    assert notice["present"] is True
+    assert notice["count"] >= 1
+    assert "PENDING ACCEPTANCE" in notice["notice"]
+    assert task_id in notice["task_ids"]
+    entry = next(item for item in notice["items"] if item["task_id"] == task_id)
+    assert entry["state"] == "pending_review"
+    assert entry["terminal"] is False
+    assert entry["requires_review"] is True
+
+
+def test_classify_pending_task_non_success_not_pending() -> None:
+    task_id = "gap-close-failed-001"
+    submit_task(task_id, goal=GAP_CLOSE_GOAL, status="fail")
+    info = classify_pending_task(task_id)
+    assert info["state"] == "failed"
+    assert info["terminal"] is True
+
+
+def test_gap_close_mark_reviewed_compatibility() -> None:
+    report = task_result_auto_consumer_gap_close_report()
+    probe = report["review_probe"]
+    assert probe["ok"] is True
+    assert probe["pending_before"] is True
+    assert probe["pending_after"] is False
+    record = get_task_review(probe["probe_id"])
+    assert record["reviewed"] is True
+    assert record["review_verdict"] == "PASS"
+    events = get_review_events(probe["probe_id"])
+    assert events
+    assert events[-1]["action"] == "review"
+    assert events[-1]["verdict"] == "PASS"
+
+
+def test_gap_close_contracts_unchanged() -> None:
+    assert list(inspect.signature(submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(get_task_result).parameters) == ["task_id"]
+    assert list(inspect.signature(consume_task_result).parameters) == ["task_id"]
+    assert list(inspect.signature(mark_reviewed).parameters) == [
+        "task_id",
+        "verdict",
+        "note",
+    ]
+
+
+def test_expire_stale_pending_marks_timed_out() -> None:
+    task_id = "gap-close-timeout-001"
+    submit_task(
+        task_id, goal=GAP_CLOSE_GOAL, status="success", requires_review=True
+    )
+    assert task_id in {item["task_id"] for item in list_pending_results()}
+    future = datetime.now(timezone.utc) + timedelta(
+        seconds=PENDING_TIMEOUT_SECONDS + 10
+    )
+    info = classify_pending_task(task_id, now=future)
+    assert info["state"] == "timed_out"
+    assert info["terminal"] is True
+    expired = expire_stale_pending(now=future)
+    assert any(item["task_id"] == task_id for item in expired)
+    assert task_id not in {item["task_id"] for item in list_pending_results()}
+    record = get_task_review(task_id)
+    assert record["timed_out"] is True
+    assert record["terminal_state"] == "timed_out"
+    assert record["timeout_reason"]
+    assert any(
+        event["event_type"] == "timed_out"
+        for event in get_consumption_evidence(task_id)
+    )
