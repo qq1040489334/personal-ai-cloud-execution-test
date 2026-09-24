@@ -127,6 +127,7 @@ def test_cloud_agent_test() -> None:
 
 def test_cloud_agent_test_2() -> None:
     assert cloud_agent_test_2() == "second cloud run"
+    assert isinstance(cloud_agent_test_2(), str)
 
 
 def test_trigger_bridge_test() -> None:
