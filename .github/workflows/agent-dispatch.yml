@@ -82,6 +82,38 @@ jobs:
           MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
         run: git show "${{ steps.base.outputs.base }}:scripts/secret_guard.py" | python - "${{ steps.base.outputs.base }}"
 
+      # ---- Publish --------------------------------------------------------
+      - name: Push (credentials added only here)
+        run: |
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          max_attempts=5
+          attempt=1
+          while [ "$attempt" -le "$max_attempts" ]; do
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              echo "Push rebase conflict; refusing to overwrite main."
+              exit 1
+            fi
+
+            push_output="$(git push origin HEAD:main 2>&1)" && push_status=0 || push_status=$?
+            printf '%s\n' "$push_output"
+            if [ "$push_status" -eq 0 ]; then
+              exit 0
+            fi
+
+            if ! printf '%s' "$push_output" | grep -Eqi 'non-fast-forward|fetch first|stale info|tip of your current branch is behind'; then
+              exit "$push_status"
+            fi
+
+            if [ "$attempt" -eq "$max_attempts" ]; then
+              echo "Push remained non-fast-forward after $max_attempts attempts."
+              exit "$push_status"
+            fi
+            attempt=$((attempt + 1))
+            sleep "$attempt"
+          done
+
       # ---- Evidence -------------------------------------------------------
       - name: Build execution_result.json
         run: |
@@ -105,9 +137,3 @@ jobs:
           echo '```json' >> "$GITHUB_STEP_SUMMARY"
           cat "$RUNNER_TEMP/execution_result.json" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-
-      # ---- Publish --------------------------------------------------------
-      - name: Push (credentials added only here)
-        run: |
-          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-          git push origin HEAD:main
