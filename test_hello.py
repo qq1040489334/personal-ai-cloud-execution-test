@@ -22,6 +22,9 @@ from hello import (
     CONSUMER_EVIDENCE_ENV,
     DEPLOY_VERIFY_COMMIT,
     DEPLOY_VERIFY_TASK_ID,
+    FINAL_EVIDENCE_AUDIT_GOAL,
+    FINAL_EVIDENCE_AUDIT_REPORT,
+    FINAL_EVIDENCE_AUDIT_TASK_ID,
     GAP_CLOSE_GOAL,
     GAP_CLOSE_LAYERS,
     GAP_CLOSE_REPORT,
@@ -84,6 +87,7 @@ from hello import (
     runtime_provenance_report,
     security_test,
     submit_task,
+    task_result_auto_consumer_final_evidence_audit,
     task_result_auto_consumer_gap_close_report,
     task_result_auto_consumer_golden_e2e_verify,
     task_result_auto_consumer_live_acceptance_report,
@@ -1713,3 +1717,148 @@ def test_consumer_evidence_ledger_survives_restart(tmp_path, monkeypatch) -> Non
     finally:
         hello_module.CONSUMPTION_EVIDENCE.clear()
         hello_module.CONSUMPTION_EVIDENCE.extend(saved)
+
+
+def test_final_evidence_audit_report_shape() -> None:
+    report = task_result_auto_consumer_final_evidence_audit()
+    assert report["report"] == FINAL_EVIDENCE_AUDIT_REPORT
+    assert report["goal"] == FINAL_EVIDENCE_AUDIT_GOAL
+    assert report["task_id"] == FINAL_EVIDENCE_AUDIT_TASK_ID == "cf-55462c30f4f9"
+    assert report["FINAL_EVIDENCE_AUDIT"] == report["STATUS"]
+    assert report["FINAL_EVIDENCE_AUDIT"] in VALID_STATUSES
+    assert report["Tests"] == "python -m pytest -q"
+    assert report["Evidence"]
+    assert report["Known Limitations"]
+    assert report["Remaining Gaps"]
+    assert set(report["Compatibility"]) == {
+        "submit_task",
+        "get_task_result",
+        "mark_reviewed",
+        "list_pending_results",
+        "review_event",
+        "github_workflows",
+    }
+    assert report["steps"]
+    assert report["checks"]
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {FINAL_EVIDENCE_AUDIT_REPORT}")
+    assert f"- task_id: {FINAL_EVIDENCE_AUDIT_TASK_ID}" in markdown
+    assert f"FINAL_EVIDENCE_AUDIT: {report['FINAL_EVIDENCE_AUDIT']}" in markdown
+
+
+def test_final_evidence_audit_consumer_idempotency_evidence() -> None:
+    report = task_result_auto_consumer_final_evidence_audit()
+    assert report["missed_consumption"] == []
+    assert report["duplicate_consumption"] == []
+    assert report["repeated_scan_idempotent"] is True
+    assert report["restart_scan_idempotent"] is True
+    assert report["restart_scan_reconsumed"] == []
+    assert report["durable_consumed_task_ids"]
+    idempotency = report["consumer_idempotency"]
+    assert idempotency["evidence_persisted"] is True
+    assert idempotency["evidence_queryable"] is True
+    assert idempotency["batch_size"] == 3
+    assert set(idempotency["batch_task_ids"]) <= set(
+        idempotency["durable_consumed_task_ids"]
+    )
+
+
+def test_final_evidence_audit_review_event_audit() -> None:
+    report = task_result_auto_consumer_final_evidence_audit()
+    audit = report["review_event_audit"]
+    assert audit["mark_reviewed_only_close_action"] is True
+    assert audit["auto_pass"] is False
+    assert audit["auto_trigger_next"] is False
+    assert audit["review_event_traceable"] is True
+    assert audit["review_event_count"] >= 1
+    events = audit["review_events"]
+    assert events
+    last = events[-1]
+    assert last["task_id"] == audit["reviewed_task_id"] == report["reviewed_task_id"]
+    assert last["action"] == "review"
+    assert last["verdict"] == "PASS"
+    assert last["timestamp"]
+    assert get_review_events(audit["reviewed_task_id"]) == events
+
+
+def test_final_evidence_audit_target_task_terminal() -> None:
+    report = task_result_auto_consumer_final_evidence_audit()
+    assert report["target_task_id"] == RUNTIME_AUDIT_TASK_ID == "cf-62e0f30e0d02"
+    assert report["target_task_terminal"] is True
+    assert report["target_task_pending"] is False
+    assert report["target_task_state"] in {"stuck", "timed_out", "failed"}
+    assert report["target_task_state_reason"]
+    assert report["target_task_terminal_evidence"]
+    disposition = report["target_task_disposition"]
+    assert disposition["permanently_pending_possible"] is False
+    assert "cf-62e0f30e0d02" in report["markdown"]
+
+
+def test_final_evidence_audit_discoverable_without_manual_query() -> None:
+    report = task_result_auto_consumer_final_evidence_audit()
+    assert report["auto_discovery_without_manual_query"] is True
+    probe = report["discoverability"]
+    assert probe["manual_get_task_result_calls"] == 0
+    assert probe["auto_discovered_without_manual_query"] is True
+    assert probe["pending_review"] is True
+    assert probe["not_auto_reviewed"] is True
+    assert report["probe_task_id"] in {
+        item["task_id"] for item in list_pending_results()
+    }
+
+
+def test_final_evidence_audit_freeze_recommendation() -> None:
+    report = task_result_auto_consumer_final_evidence_audit()
+    assert report["FINAL_EVIDENCE_AUDIT"] == "PASS"
+    assert report["can_freeze_mainline"] is True
+    assert "FREEZE" in report["freeze_recommendation"]
+    assert "FREEZE" in report["markdown"]
+
+
+def test_final_evidence_audit_known_limitations_and_gaps() -> None:
+    report = task_result_auto_consumer_final_evidence_audit()
+    assert report["known_limitations"] == report["Known Limitations"]
+    assert report["remaining_gaps"] == report["Remaining Gaps"]
+    assert isinstance(report["Known Limitations"], list)
+    assert report["Known Limitations"]
+    assert isinstance(report["Remaining Gaps"], list)
+    assert report["Remaining Gaps"]
+
+
+def test_final_evidence_audit_contracts_unchanged() -> None:
+    report = task_result_auto_consumer_final_evidence_audit()
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert report["Compatibility"]["submit_task"] == "UNCHANGED"
+    assert report["Compatibility"]["get_task_result"] == "UNCHANGED"
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    assert list(inspect.signature(submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(get_task_result).parameters) == ["task_id"]
+
+
+def test_final_evidence_audit_checks_and_markdown() -> None:
+    report = task_result_auto_consumer_final_evidence_audit()
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in VALID_STATUSES
+        assert check["detail"]
+    assert all(check["status"] != "FAIL" for check in report["checks"])
+    markdown = report["markdown"]
+    for token in (
+        "## Consumer idempotency / recovery / duplicate-missed protection",
+        "## review_event / mark_reviewed audit evidence",
+        "## Checks",
+        "## Freeze recommendation",
+        "## Known Limitations",
+        "## Compatibility",
+        "## Remaining Gaps",
+    ):
+        assert token in markdown
