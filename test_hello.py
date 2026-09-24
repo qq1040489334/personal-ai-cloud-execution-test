@@ -113,6 +113,7 @@ VALID_STATUSES = {"PASS", "FAIL", "BLOCKED"}
 
 def test_hello() -> None:
     assert hello() == "hello from cloud execution golden test"
+    assert isinstance(hello(), str)
 
 
 def test_goodbye() -> None:
