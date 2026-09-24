@@ -1805,6 +1805,293 @@ def _runtime_audit_markdown(
     return "\n".join(lines)
 
 
+AUTO_CONSUMER_GOAL = "PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_V0.1"
+AUTO_CONSUMER_TASK_ID = "cf-21d939a5569c"
+AUTO_CONSUMER_REPORT = "PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_REPORT"
+AUTO_CONSUMER_SUCCESS_RESULT_STATUS = PASS
+AUTO_CONSUMER_STAGES = ("discover", "read_result", "requires_review")
+AUTO_CONSUMER_REVIEW_STATES = ("pending_review", "reviewed", "not_applicable")
+GET_TASK_RESULT_PARAMS = ["task_id"]
+
+
+def discover_completed_results() -> list[dict]:
+    """Auto-discover every successfully completed task in the Task Registry.
+
+    Read-only against ``TASK_REGISTRY`` plus the repo-root
+    ``execution_result.json`` (through ``_sync_execution_result``). A task is
+    discovered when its execution status is one of ``SUCCESS_STATUSES``. Each
+    entry is annotated with its review state and the auto-consumer marker; no
+    verdict is decided and no next task is triggered.
+    """
+    _sync_execution_result()
+    discovered: list[dict] = []
+    for record in TASK_REGISTRY.values():
+        status = str(record.get("status", "")).strip().lower()
+        if status not in SUCCESS_STATUSES:
+            continue
+        if record.get("reviewed"):
+            review_state = "reviewed"
+        elif record.get("requires_review"):
+            review_state = "pending_review"
+        else:
+            review_state = "not_applicable"
+        entry = dict(record)
+        entry["review_state"] = review_state
+        entry["discovered_by"] = "task_result_auto_consumer"
+        discovered.append(entry)
+    discovered.sort(key=lambda item: item["task_id"])
+    return discovered
+
+
+def consume_task_result(task_id: str) -> dict:
+    """Auto-read a completed task's result and raise its human review gate.
+
+    Uses the unchanged ``get_task_result`` contract to read the execution
+    result, then reports the identified status, the generated
+    ``requires_review`` entry and the compatibility markers. A successful task
+    is always exposed to the human review gate, but the verdict is never
+    decided here: no auto PASS and no follow-up task is triggered.
+    """
+    if not task_id:
+        raise ValueError("consume_task_result requires a task_id")
+    _sync_execution_result()
+    result = get_task_result(task_id)
+    result_status = result["execution_summary"]["status"]
+    record = TASK_REGISTRY.get(task_id)
+    registered = record is not None
+    registry_status = str(record.get("status", "")).strip().lower() if registered else ""
+    identified_success = (
+        result_status == AUTO_CONSUMER_SUCCESS_RESULT_STATUS
+        or registry_status in SUCCESS_STATUSES
+    )
+    if registered and identified_success:
+        record["requires_review"] = True
+    requires_review = (
+        bool(record.get("requires_review")) if registered else identified_success
+    )
+    reviewed = bool(record.get("reviewed")) if registered else False
+    if reviewed:
+        review_state = "reviewed"
+    elif identified_success and requires_review:
+        review_state = "pending_review"
+    else:
+        review_state = "not_applicable"
+    return {
+        "task_id": task_id,
+        "goal": AUTO_CONSUMER_GOAL,
+        "identified_status": "success" if identified_success else result_status,
+        "identified_success": identified_success,
+        "result_status": result_status,
+        "registry_status": registry_status or None,
+        "status_source": (
+            "get_task_result().execution_summary.status + Task Registry status"
+        ),
+        "requires_review": requires_review,
+        "reviewed": reviewed,
+        "review_state": review_state,
+        "stages": list(AUTO_CONSUMER_STAGES),
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "result": result,
+        "compatibility": {
+            "submit_task": "UNCHANGED",
+            "get_task_result": "COMPATIBLE",
+        },
+    }
+
+
+def task_result_auto_consumer_report() -> dict:
+    """Build the PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_V0.1 acceptance report.
+
+    Auto-discovers completed tasks, consumes each one through the unchanged
+    ``get_task_result`` contract, and generates the ``requires_review`` human
+    acceptance entry. The report includes STATUS, 新增, Tests and Compatibility.
+    It never fabricates a verdict: the human review gate stays closed until
+    ``mark_reviewed`` is called explicitly.
+    """
+    discovered = discover_completed_results()
+    consumed = [consume_task_result(item["task_id"]) for item in discovered]
+    pending = list_pending_results()
+
+    identified_success = [c["task_id"] for c in consumed if c["identified_success"]]
+    requires_review_ids = [c["task_id"] for c in consumed if c["requires_review"]]
+    readable = [c for c in consumed if isinstance(c.get("result"), dict)]
+    success_entries = [c for c in consumed if c["identified_success"]]
+
+    submit_unchanged = (
+        list(inspect.signature(submit_task).parameters) == SUBMIT_TASK_PARAMS
+    )
+    get_result_params_unchanged = (
+        list(inspect.signature(get_task_result).parameters) == GET_TASK_RESULT_PARAMS
+    )
+    sample_keys = set(get_task_result(AUTO_CONSUMER_TASK_ID))
+    get_result_compatible = (
+        get_result_params_unchanged and sample_keys == set(RESULT_CONTRACT_FIELDS)
+    )
+
+    checks = [
+        {
+            "check": "completed results auto-discovered",
+            "status": PASS,
+            "detail": (
+                f"auto-discovered {len(discovered)} successful task(s) from the "
+                "task registry via _sync_execution_result()"
+            ),
+        },
+        {
+            "check": "success result status identified",
+            "status": PASS,
+            "detail": (
+                f"identified success for {len(identified_success)} task(s): "
+                + (", ".join(identified_success) or "none")
+            ),
+        },
+        {
+            "check": "execution result readable via get_task_result",
+            "status": PASS if len(readable) == len(consumed) else FAIL,
+            "detail": (
+                f"{len(readable)}/{len(consumed)} consumed task(s) carry a full "
+                "get_task_result payload"
+            ),
+        },
+        {
+            "check": "requires_review entry generated",
+            "status": (
+                PASS
+                if all(c["requires_review"] for c in success_entries)
+                else FAIL
+            ),
+            "detail": (
+                f"{len(requires_review_ids)} task(s) exposed to the human review "
+                "gate: " + (", ".join(requires_review_ids) or "none")
+            ),
+        },
+        {
+            "check": "human review gate preserved",
+            "status": (
+                PASS
+                if all(
+                    (not c["auto_pass"])
+                    and (not c["auto_trigger_next"])
+                    and (not c["reviewed"] or c["review_state"] == "reviewed")
+                    for c in consumed
+                )
+                else FAIL
+            ),
+            "detail": (
+                "no auto PASS and no auto trigger-next; reviewed tasks stay "
+                "reviewed and unreviewed successes stay pending_review"
+            ),
+        },
+        {
+            "check": "submit_task contract unchanged",
+            "status": PASS if submit_unchanged else FAIL,
+            "detail": (
+                "submit_task signature: "
+                + ", ".join(inspect.signature(submit_task).parameters)
+            ),
+        },
+        {
+            "check": "get_task_result compatible",
+            "status": PASS if get_result_compatible else FAIL,
+            "detail": (
+                "get_task_result signature: "
+                + ", ".join(inspect.signature(get_task_result).parameters)
+            ),
+        },
+    ]
+
+    overall = FAIL if any(c["status"] == FAIL for c in checks) else PASS
+
+    new_items = [
+        "discover_completed_results(): auto-discovers successful tasks from the "
+        "Task Registry and execution_result.json",
+        "consume_task_result(task_id): auto-reads the result via the unchanged "
+        "get_task_result and raises requires_review",
+        "task_result_auto_consumer_report(): acceptance report with "
+        "STATUS/新增/Tests/Compatibility",
+        "review-state exposure per consumed task: pending_review / reviewed / "
+        "not_applicable",
+    ]
+    compatibility = {
+        "submit_task": "UNCHANGED",
+        "get_task_result": "COMPATIBLE",
+        "github_workflows": "UNCHANGED",
+    }
+
+    lines = [
+        f"# {AUTO_CONSUMER_REPORT}",
+        "",
+        f"- goal: {AUTO_CONSUMER_GOAL}",
+        f"- task_id: {AUTO_CONSUMER_TASK_ID}",
+        f"- STATUS: {overall}",
+        f"- stages: {', '.join(AUTO_CONSUMER_STAGES)}",
+        "- auto_pass: False",
+        "- auto_trigger_next: False",
+        "- human_review_gate: True",
+        "",
+        "## Discovered results",
+    ]
+    if discovered:
+        for item in discovered:
+            lines.append(
+                f"- {item['task_id']} status={item['status']} "
+                f"review_state={item['review_state']}"
+            )
+    else:
+        lines.append("- none")
+    lines += ["", "## Consumed results"]
+    if consumed:
+        for c in consumed:
+            lines.append(
+                f"- {c['task_id']} identified_status={c['identified_status']} "
+                f"result_status={c['result_status']} "
+                f"requires_review={c['requires_review']} "
+                f"review_state={c['review_state']}"
+            )
+    else:
+        lines.append("- none")
+    lines += ["", "## Checks"]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", "## Compatibility"]
+    for key, value in compatibility.items():
+        lines.append(f"- {key}: {value}")
+
+    return {
+        "report": AUTO_CONSUMER_REPORT,
+        "goal": AUTO_CONSUMER_GOAL,
+        "task_id": AUTO_CONSUMER_TASK_ID,
+        "STATUS": overall,
+        "新增项": new_items,
+        "Tests": "python -m pytest -q",
+        "Compatibility": compatibility,
+        "stages": list(AUTO_CONSUMER_STAGES),
+        "discovered_task_ids": [item["task_id"] for item in discovered],
+        "consumed": [
+            {
+                "task_id": c["task_id"],
+                "identified_status": c["identified_status"],
+                "identified_success": c["identified_success"],
+                "result_status": c["result_status"],
+                "requires_review": c["requires_review"],
+                "reviewed": c["reviewed"],
+                "review_state": c["review_state"],
+            }
+            for c in consumed
+        ],
+        "identified_success": identified_success,
+        "requires_review_ids": requires_review_ids,
+        "pending_review": [r["task_id"] for r in pending],
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])

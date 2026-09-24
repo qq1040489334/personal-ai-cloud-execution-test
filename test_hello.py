@@ -7,6 +7,9 @@ from datetime import datetime
 import pytest
 
 from hello import (
+    AUTO_CONSUMER_GOAL,
+    AUTO_CONSUMER_REPORT,
+    AUTO_CONSUMER_TASK_ID,
     CLOUDFLARE_AUDIT_GOAL,
     CLOUDFLARE_AUDIT_TASK_ID,
     CLOUDFLARE_AUDIT_TOKENS,
@@ -29,6 +32,8 @@ from hello import (
     cloud_asset_status,
     cloudflare_mcp_test,
     cloudflare_runtime_audit_report,
+    consume_task_result,
+    discover_completed_results,
     execution_result_detail_exposure_verify,
     get_review_events,
     get_task_result,
@@ -48,6 +53,7 @@ from hello import (
     runtime_provenance_report,
     security_test,
     submit_task,
+    task_result_auto_consumer_report,
     task_review_action_report,
     trigger_bridge_test,
 )
@@ -783,3 +789,153 @@ def test_detail_exposure_submit_task_still_unchanged() -> None:
         "requires_review",
         "extra",
     ]
+
+
+def _auto_task(
+    task_id: str, status: str = "success", requires_review: bool = True
+) -> None:
+    submit_task(
+        task_id,
+        goal=AUTO_CONSUMER_GOAL,
+        status=status,
+        requires_review=requires_review,
+    )
+
+
+def test_auto_consumer_report_shape() -> None:
+    report = task_result_auto_consumer_report()
+    assert report["report"] == AUTO_CONSUMER_REPORT
+    assert report["goal"] == AUTO_CONSUMER_GOAL
+    assert report["task_id"] == AUTO_CONSUMER_TASK_ID == "cf-21d939a5569c"
+    assert report["STATUS"] in {"PASS", "FAIL"}
+    assert report["新增项"]
+    assert report["Tests"] == "python -m pytest -q"
+    assert report["Compatibility"] == {
+        "submit_task": "UNCHANGED",
+        "get_task_result": "COMPATIBLE",
+        "github_workflows": "UNCHANGED",
+    }
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {AUTO_CONSUMER_REPORT}")
+    assert f"- task_id: {AUTO_CONSUMER_TASK_ID}" in markdown
+    assert "## Compatibility" in markdown
+
+
+def test_auto_consumer_discovers_success_only() -> None:
+    success_id = "auto-consumer-discover-ok"
+    fail_id = "auto-consumer-discover-fail"
+    _auto_task(success_id, status="success")
+    _auto_task(fail_id, status="fail")
+    discovered = {item["task_id"]: item for item in discover_completed_results()}
+    assert success_id in discovered
+    assert fail_id not in discovered
+    entry = discovered[success_id]
+    assert entry["status"] == "success"
+    assert entry["review_state"] == "pending_review"
+    assert entry["discovered_by"] == "task_result_auto_consumer"
+
+
+def test_auto_consumer_identifies_success_and_reads_result() -> None:
+    task_id = "auto-consumer-read-ok"
+    _auto_task(task_id)
+    consumed = consume_task_result(task_id)
+    assert consumed["identified_success"] is True
+    assert consumed["identified_status"] == "success"
+    assert consumed["result_status"] in VALID_STATUSES
+    assert isinstance(consumed["result"], dict)
+    assert set(consumed["result"]) == {
+        "execution_summary",
+        "commit",
+        "tests",
+        "artifacts",
+        "execution_result_json",
+        "evidence",
+    }
+    assert consumed["result"]["execution_summary"]["task_id"] == task_id
+    assert consumed["status_source"]
+
+
+def test_auto_consumer_generates_requires_review_entry() -> None:
+    task_id = "auto-consumer-requires-review"
+    _auto_task(task_id, requires_review=False)
+    consumed = consume_task_result(task_id)
+    assert consumed["identified_success"] is True
+    assert consumed["requires_review"] is True
+    assert consumed["review_state"] == "pending_review"
+    assert consumed["human_review_gate"] is True
+    assert task_id in {t["task_id"] for t in list_pending_results()}
+
+
+def test_auto_consumer_does_not_auto_review_or_trigger_next() -> None:
+    task_id = "auto-consumer-no-auto"
+    _auto_task(task_id)
+    consume_task_result(task_id)
+    record = get_task_review(task_id)
+    assert record["reviewed"] is False
+    assert record["review_verdict"] is None
+    assert record["reviewed_at"] is None
+
+
+def test_auto_consumer_preserves_human_review_flow() -> None:
+    task_id = "auto-consumer-human-review"
+    _auto_task(task_id)
+    consume_task_result(task_id)
+    assert task_id in _pending_ids()
+    reviewed = mark_reviewed(task_id, "PASS", "human consumes result")
+    assert reviewed["review_verdict"] == "PASS"
+    assert task_id not in _pending_ids()
+    again = consume_task_result(task_id)
+    assert again["reviewed"] is True
+    assert again["review_state"] == "reviewed"
+
+
+def test_auto_consumer_non_success_is_not_pending() -> None:
+    task_id = "auto-consumer-blocked"
+    submit_task(
+        task_id, goal=AUTO_CONSUMER_GOAL, status="fail", requires_review=True
+    )
+    consumed = consume_task_result(task_id)
+    assert consumed["identified_success"] is False
+    assert consumed["review_state"] == "not_applicable"
+    assert task_id not in _pending_ids()
+
+
+def test_auto_consumer_rejects_empty_task_id() -> None:
+    with pytest.raises(ValueError):
+        consume_task_result("")
+
+
+def test_auto_consumer_contracts_unchanged() -> None:
+    signature = inspect.signature(submit_task)
+    assert list(signature.parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    result_signature = inspect.signature(get_task_result)
+    assert list(result_signature.parameters) == ["task_id"]
+    report = task_result_auto_consumer_report()
+    assert report["Compatibility"]["submit_task"] == "UNCHANGED"
+    assert report["Compatibility"]["get_task_result"] == "COMPATIBLE"
+
+
+def test_auto_consumer_report_consumes_discovered() -> None:
+    task_id = "auto-consumer-report"
+    _auto_task(task_id)
+    report = task_result_auto_consumer_report()
+    assert task_id in report["discovered_task_ids"]
+    assert task_id in report["requires_review_ids"]
+    assert task_id in report["identified_success"]
+    entries = {c["task_id"]: c for c in report["consumed"]}
+    assert entries[task_id]["review_state"] == "pending_review"
+    assert report["STATUS"] == "PASS"
