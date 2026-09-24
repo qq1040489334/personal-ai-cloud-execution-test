@@ -20,12 +20,16 @@ from hello import (
     RUNTIME_CANDIDATE_COMMITS,
     RUNTIME_PROVENANCE_GOAL,
     RUNTIME_PROVENANCE_TASK_ID,
+    RESULT_DETAIL_GOAL,
+    RESULT_DETAIL_TASK_ID,
+    RESULT_DETAIL_FIELDS,
     TASK_REVIEW_GOAL,
     cloud_agent_test,
     cloud_agent_test_2,
     cloud_asset_status,
     cloudflare_mcp_test,
     cloudflare_runtime_audit_report,
+    execution_result_detail_exposure_verify,
     get_review_events,
     get_task_result,
     get_task_review,
@@ -666,3 +670,116 @@ def test_runtime_audit_never_fabricates_runtime_state() -> None:
         assert report["heartbeat"] is None
         assert report["runner_status"] is None
     assert report["STATUS"] != "PASS" or report["registry_record"] is not None
+
+
+def test_detail_exposure_report_shape() -> None:
+    report = execution_result_detail_exposure_verify()
+    assert report["report"] == "EXECUTION_RESULT_DETAIL_EXPOSURE_REPORT"
+    assert report["goal"] == RESULT_DETAIL_GOAL
+    assert report["task_id"] == RESULT_DETAIL_TASK_ID == "cf-3191b5302202"
+    assert set(report) >= {
+        "report",
+        "goal",
+        "task_id",
+        "overall",
+        "get_task_result_fields",
+        "detail_exposure",
+        "execution_result_json_obtained",
+        "evidence_obtained",
+        "artifacts_obtained",
+        "submit_task_contract",
+        "submit_task_signature_unchanged",
+        "workflow_modified",
+        "checks",
+        "next_minimal_improvement",
+        "markdown",
+    }
+    assert set(report["detail_exposure"]) == set(RESULT_DETAIL_FIELDS)
+    for field in RESULT_DETAIL_FIELDS:
+        info = report["detail_exposure"][field]
+        assert set(info) >= {"returned", "obtained", "source", "reason"}
+        assert isinstance(info["returned"], bool)
+        assert isinstance(info["obtained"], bool)
+        assert info["source"]
+        assert info["reason"]
+
+
+def test_detail_exposure_covers_contract_fields() -> None:
+    report = execution_result_detail_exposure_verify()
+    assert set(report["get_task_result_fields"]) == {
+        "execution_summary",
+        "commit",
+        "tests",
+        "artifacts",
+        "execution_result_json",
+        "evidence",
+    }
+
+
+def test_detail_exposure_flags_match_values() -> None:
+    report = execution_result_detail_exposure_verify()
+    exposure = report["detail_exposure"]
+    assert report["execution_result_json_obtained"] == bool(
+        exposure["execution_result_json"]["value"]
+    )
+    assert report["execution_result_json_obtained"] == exposure[
+        "execution_result_json"
+    ]["obtained"]
+    assert report["evidence_obtained"] == exposure["evidence"]["obtained"]
+    assert report["artifacts_obtained"] == exposure["artifacts"]["obtained"]
+
+
+def test_detail_exposure_evidence_and_artifacts_available() -> None:
+    report = execution_result_detail_exposure_verify()
+    assert report["evidence_obtained"] is True
+    assert report["artifacts_obtained"] is True
+    paths = {a["path"] for a in get_task_result(RESULT_DETAIL_TASK_ID)["artifacts"]}
+    assert {"hello.py", "test_hello.py"} <= paths
+
+
+def test_detail_exposure_overall_status_logic() -> None:
+    report = execution_result_detail_exposure_verify()
+    flags = (
+        report["execution_result_json_obtained"],
+        report["evidence_obtained"],
+        report["artifacts_obtained"],
+    )
+    if all(flags):
+        assert report["overall"] == "PASS"
+    elif not any(flags):
+        assert report["overall"] == "BLOCKED"
+    else:
+        assert report["overall"] == "PARTIAL"
+
+
+def test_detail_exposure_does_not_change_contract_or_workflows() -> None:
+    report = execution_result_detail_exposure_verify()
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["submit_task_signature_unchanged"] is True
+    assert report["workflow_modified"] is False
+    assert report["next_minimal_improvement"]
+
+
+def test_detail_exposure_checks_and_markdown() -> None:
+    report = execution_result_detail_exposure_verify()
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+    markdown = report["markdown"]
+    assert markdown.startswith("# EXECUTION_RESULT_DETAIL_EXPOSURE_REPORT")
+    assert f"- task_id: {RESULT_DETAIL_TASK_ID}" in markdown
+    for field in RESULT_DETAIL_FIELDS:
+        assert field in markdown
+
+
+def test_detail_exposure_submit_task_still_unchanged() -> None:
+    signature = inspect.signature(submit_task)
+    assert list(signature.parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]

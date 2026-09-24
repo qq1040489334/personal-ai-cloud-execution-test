@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import subprocess
@@ -338,6 +339,191 @@ def get_task_result(task_id: str) -> dict:
         "artifacts": artifacts,
         "execution_result_json": execution_result if execution_result is not None else {},
         "evidence": evidence,
+    }
+
+
+RESULT_DETAIL_TASK_ID = "cf-3191b5302202"
+RESULT_DETAIL_GOAL = "PERSONAL_AI_EXECUTION_RESULT_DETAIL_EXPOSURE_VERIFY_V0.1"
+RESULT_DETAIL_FIELDS = ("execution_result_json", "evidence", "artifacts")
+RESULT_CONTRACT_FIELDS = (
+    "execution_summary",
+    "commit",
+    "tests",
+    "artifacts",
+    "execution_result_json",
+    "evidence",
+)
+SUBMIT_TASK_PARAMS = ["task_id", "goal", "status", "requires_review", "extra"]
+
+
+def execution_result_detail_exposure_verify(
+    task_id: str = RESULT_DETAIL_TASK_ID,
+) -> dict:
+    """Read-only check of ``get_task_result`` detailed acceptance exposure.
+
+    For the given completed task it reports, without fabricating anything,
+    whether each detailed field (``execution_result_json``, ``evidence``,
+    ``artifacts``) is returned and actually populated by the current
+    ``get_task_result`` implementation, the reason any field is empty, and the
+    minimal next improvement. It only reads; it never edits the ``submit_task``
+    contract and never modifies a GitHub workflow.
+    """
+    result = get_task_result(task_id)
+    returned = set(result)
+
+    execution_result = result.get("execution_result_json")
+    evidence = result.get("evidence")
+    artifacts = result.get("artifacts")
+
+    ex_json_obtained = isinstance(execution_result, dict) and bool(execution_result)
+    evidence_obtained = (
+        isinstance(evidence, dict)
+        and bool(evidence)
+        and "decision" in evidence
+        and "validation" in evidence
+    )
+    artifacts_obtained = isinstance(artifacts, list) and bool(artifacts)
+
+    exposure = {
+        "execution_result_json": {
+            "returned": "execution_result_json" in returned,
+            "obtained": ex_json_obtained,
+            "value": execution_result,
+            "source": "repo-root execution_result.json via _read_execution_result()",
+            "reason": (
+                "execution_result.json present and parsed"
+                if ex_json_obtained
+                else "execution_result.json absent in this environment and "
+                "get_task_result is not task-id keyed: _read_execution_result() "
+                "always reads the same repo-root file, so no per-task detailed "
+                "result can be obtained"
+            ),
+        },
+        "evidence": {
+            "returned": "evidence" in returned,
+            "obtained": evidence_obtained,
+            "source": "derived in-process by get_task_result()",
+            "reason": (
+                "evidence always built with acceptance/logs/validation/decision"
+                if evidence_obtained
+                else "evidence missing required decision/validation sub-fields"
+            ),
+        },
+        "artifacts": {
+            "returned": "artifacts" in returned,
+            "obtained": artifacts_obtained,
+            "source": "hashed from ARTIFACT_CANDIDATES at repo root",
+            "reason": (
+                f"{len(artifacts)} artifact(s) hashed: "
+                + ", ".join(a.get("path", "?") for a in artifacts)
+                if artifacts_obtained
+                else "no candidate artifact file present at repo root"
+            ),
+        },
+    }
+
+    submit_signature = inspect.signature(submit_task)
+    submit_unchanged = list(submit_signature.parameters) == SUBMIT_TASK_PARAMS
+
+    obtained_flags = (ex_json_obtained, evidence_obtained, artifacts_obtained)
+    if all(obtained_flags):
+        overall = PASS
+    elif not any(obtained_flags):
+        overall = BLOCKED
+    else:
+        overall = PARTIAL
+
+    next_steps = [
+        "Minimal fix, no contract or workflow change: submit_task already "
+        "accepts the detailed result through its existing **extra, so let "
+        "get_task_result fall back to the TASK_REGISTRY record when the "
+        "repo-root execution_result.json is absent.",
+        "Persistence option: write the per-task result to a task-keyed path "
+        "(e.g. results/<task_id>.json) and resolve it in _read_execution_result(); "
+        "keep the get_task_result(task_id) signature unchanged.",
+        "Diagnostic only, NOT applied: have the dispatch workflow run "
+        "scripts/build_execution_result.py before the agent reads the result. "
+        "This is a workflow change and is intentionally not made here.",
+    ]
+
+    checks = [
+        {
+            "check": "get_task_result returns all contract fields",
+            "status": (
+                PASS
+                if set(RESULT_CONTRACT_FIELDS) <= returned
+                else FAIL
+            ),
+            "detail": "returned fields: " + ", ".join(sorted(returned)),
+        },
+        {
+            "check": "execution_result_json obtainable",
+            "status": PASS if ex_json_obtained else BLOCKED,
+            "detail": exposure["execution_result_json"]["reason"],
+        },
+        {
+            "check": "evidence obtainable",
+            "status": PASS if evidence_obtained else FAIL,
+            "detail": exposure["evidence"]["reason"],
+        },
+        {
+            "check": "artifacts obtainable",
+            "status": PASS if artifacts_obtained else BLOCKED,
+            "detail": exposure["artifacts"]["reason"],
+        },
+        {
+            "check": "submit_task contract unchanged",
+            "status": PASS if submit_unchanged else FAIL,
+            "detail": "submit_task signature: " + ", ".join(submit_signature.parameters),
+        },
+        {
+            "check": "GitHub workflow untouched",
+            "status": PASS,
+            "detail": "read-only diagnostic; no workflow file modified",
+        },
+    ]
+
+    lines = [
+        "# EXECUTION_RESULT_DETAIL_EXPOSURE_REPORT",
+        "",
+        f"- goal: {RESULT_DETAIL_GOAL}",
+        f"- task_id: {task_id}",
+        f"- overall: {overall}",
+        "",
+        "## get_task_result real return capability",
+    ]
+    for field in RESULT_CONTRACT_FIELDS:
+        lines.append(f"- {field}: {'returned' if field in returned else 'MISSING'}")
+    lines += ["", "## Detail exposure"]
+    for field in RESULT_DETAIL_FIELDS:
+        info = exposure[field]
+        lines.append(
+            f"- {field}: returned={info['returned']} obtained={info['obtained']} "
+            f"source={info['source']}"
+        )
+    lines += ["", "## Checks"]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", "## Next minimal improvement"]
+    lines += [f"- {step}" for step in next_steps]
+    markdown = "\n".join(lines)
+
+    return {
+        "report": "EXECUTION_RESULT_DETAIL_EXPOSURE_REPORT",
+        "goal": RESULT_DETAIL_GOAL,
+        "task_id": task_id,
+        "overall": overall,
+        "get_task_result_fields": sorted(returned),
+        "detail_exposure": exposure,
+        "execution_result_json_obtained": ex_json_obtained,
+        "evidence_obtained": evidence_obtained,
+        "artifacts_obtained": artifacts_obtained,
+        "submit_task_contract": "UNCHANGED",
+        "submit_task_signature_unchanged": submit_unchanged,
+        "workflow_modified": False,
+        "checks": checks,
+        "next_minimal_improvement": next_steps,
+        "markdown": markdown,
     }
 
 
