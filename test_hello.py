@@ -132,6 +132,7 @@ def test_cloud_agent_test_2() -> None:
 
 def test_trigger_bridge_test() -> None:
     assert trigger_bridge_test() == "triggered from github issue"
+    assert isinstance(trigger_bridge_test(), str)
 
 
 def test_security_test() -> None:
