@@ -9,6 +9,10 @@ import pytest
 import hello as hello_module
 from hello import (
     AUTO_CONSUMER_GOAL,
+    AUTO_RESULT_GOLDEN_TEST_FIELDS,
+    AUTO_RESULT_GOLDEN_TEST_GOAL,
+    AUTO_RESULT_GOLDEN_TEST_REPORT,
+    AUTO_RESULT_GOLDEN_TEST_TASK_ID,
     AUTO_CONSUMER_GOLDEN_E2E_GOAL,
     AUTO_CONSUMER_GOLDEN_E2E_REPORT,
     AUTO_CONSUMER_GOLDEN_E2E_STEPS,
@@ -61,6 +65,7 @@ from hello import (
     STATUS_MODEL_EXPECTED_FIELDS,
     TASK_REVIEW_GOAL,
     auto_consume_completed_results,
+    auto_result_golden_test_verify,
     classify_pending_task,
     cloud_agent_test,
     cloud_agent_test_2,
@@ -2184,3 +2189,117 @@ def test_exposure_audit_detail_export_contracts_unchanged() -> None:
         "execution_result_json",
         "evidence",
     }
+
+
+def test_auto_result_golden_test_result_contract_fields() -> None:
+    report = auto_result_golden_test_verify()
+    assert report["report"] == AUTO_RESULT_GOLDEN_TEST_REPORT
+    assert report["goal"] == AUTO_RESULT_GOLDEN_TEST_GOAL
+    assert report["task_id"] == AUTO_RESULT_GOLDEN_TEST_TASK_ID == "cf-7c1c40b4ae63"
+    for field in AUTO_RESULT_GOLDEN_TEST_FIELDS:
+        assert field in report
+    assert report["status"] in VALID_STATUSES
+    assert isinstance(report["round"], int)
+    assert report["summary"]
+    assert isinstance(report["tests"], str) and report["tests"]
+    assert isinstance(report["artifacts"], list)
+    for artifact in report["artifacts"]:
+        assert set(artifact) >= {"name", "path", "sha256", "bytes"}
+        assert artifact["sha256"]
+        assert artifact["bytes"] > 0
+    assert isinstance(report["execution_result_json"], dict)
+    assert set(report["evidence"]) >= {"acceptance", "dispatch", "decision"}
+    assert report["evidence"]["decision"]["status"] == report["status"]
+    assert report["evidence"]["decision"]["reason"]
+
+
+def test_auto_result_golden_test_task_id_and_dispatch() -> None:
+    report = auto_result_golden_test_verify()
+    assert report["task_id"] == AUTO_RESULT_GOLDEN_TEST_TASK_ID
+    dispatch = report["dispatch"]
+    assert dispatch["dispatch_capable"] is True
+    assert dispatch["dispatching_workflows"]
+    assert dispatch["detail"]
+    checks = {check["check"]: check["status"] for check in report["checks"]}
+    assert checks["task_id returned"] == "PASS"
+    assert checks["GitHub workflow dispatch-capable"] == "PASS"
+
+
+def test_auto_result_golden_test_no_premature_completion() -> None:
+    report = auto_result_golden_test_verify()
+    execution = report["execution_result_json"]
+    run_terminal = bool(
+        execution
+        and str(execution.get("status", "")).strip().lower()
+        in {
+            "success",
+            "succeed",
+            "pass",
+            "passed",
+            "ok",
+            "fail",
+            "failed",
+            "error",
+        }
+    )
+    if not run_terminal:
+        assert report["final_conclusion"] is False
+        assert report["status"] == "BLOCKED"
+    assert report["evidence"]["decision"]["status"] == report["status"]
+
+
+def test_auto_result_golden_test_pass_with_final_conclusion(monkeypatch) -> None:
+    fake = {
+        "task_id": AUTO_RESULT_GOLDEN_TEST_TASK_ID,
+        "status": "success",
+        "tests": "146 passed in 60.54s",
+        "summary": "final conclusion from the cloud agent run",
+    }
+    monkeypatch.setattr(hello_module, "_read_execution_result", lambda: fake)
+    report = auto_result_golden_test_verify()
+    assert report["final_conclusion"] is True
+    assert report["status"] == "PASS"
+    assert report["tests"] == "146 passed in 60.54s"
+    assert report["summary"] == "final conclusion from the cloud agent run"
+    assert report["execution_result_json"] == fake
+
+
+def test_auto_result_golden_test_ignores_unrelated_run(monkeypatch) -> None:
+    monkeypatch.setattr(
+        hello_module,
+        "_read_execution_result",
+        lambda: {
+            "task_id": "some-other-task",
+            "status": "success",
+            "tests": "1 passed",
+            "summary": "other",
+        },
+    )
+    report = auto_result_golden_test_verify()
+    assert report["final_conclusion"] is False
+    assert report["status"] == "BLOCKED"
+
+
+def test_auto_result_golden_test_round_and_contracts() -> None:
+    report = auto_result_golden_test_verify(round_number=3)
+    assert report["round"] == 3
+    assert list(inspect.signature(submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(get_task_result).parameters) == ["task_id"]
+    checks = {check["check"]: check["status"] for check in report["checks"]}
+    assert checks["submit_task / get_task_result contracts unchanged"] == "PASS"
+    assert checks["bounded scope (no follow-up task, no workflow change)"] == "PASS"
+
+
+def test_auto_result_golden_test_markdown() -> None:
+    report = auto_result_golden_test_verify()
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {AUTO_RESULT_GOLDEN_TEST_REPORT}")
+    assert f"- task_id: {AUTO_RESULT_GOLDEN_TEST_TASK_ID}" in markdown
+    assert f"- status: {report['status']}" in markdown
+    assert "## Checks" in markdown

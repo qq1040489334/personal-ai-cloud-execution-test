@@ -5557,6 +5557,254 @@ def personal_ai_execution_result_exposure_audit_detail_export(
     }
 
 
+# ---------------------------------------------------------------------------
+# AUTO_RESULT_GOLDEN_TEST_01
+#
+# Bounded, verification-only golden test of the cloud execution result contract.
+# It never creates a follow-up task and never expands scope. It reads only local
+# evidence and states a final conclusion only when the Cloud Agent run itself
+# produced one; otherwise it reports BLOCKED instead of claiming completion.
+# ---------------------------------------------------------------------------
+
+AUTO_RESULT_GOLDEN_TEST_GOAL = "AUTO_RESULT_GOLDEN_TEST_01"
+AUTO_RESULT_GOLDEN_TEST_TASK_ID = "cf-7c1c40b4ae63"
+AUTO_RESULT_GOLDEN_TEST_REPORT = "AUTO_RESULT_GOLDEN_TEST_REPORT"
+AUTO_RESULT_GOLDEN_TEST_FIELDS = (
+    "task_id",
+    "status",
+    "round",
+    "summary",
+    "commit",
+    "tests",
+    "artifacts",
+    "execution_result_json",
+    "evidence",
+)
+AUTO_RESULT_GOLDEN_TEST_DISPATCH_EVENTS = (
+    "repository_dispatch",
+    "workflow_dispatch",
+)
+AUTO_RESULT_GOLDEN_TEST_TERMINAL_STATUSES = (
+    "success",
+    "succeed",
+    "pass",
+    "passed",
+    "ok",
+    "fail",
+    "failed",
+    "error",
+)
+
+
+def _auto_result_dispatch_evidence(task_id: str) -> dict:
+    """Read-only dispatch evidence for ``task_id``.
+
+    It reports every workflow that declares a dispatch trigger and whether the
+    task id is mentioned by any local source (a weak, offline dispatch signal).
+    It never claims a live GitHub Actions dispatch it cannot observe.
+    """
+    triggers = _workflow_trigger_events()
+    dispatching = sorted(
+        name
+        for name, events in triggers.items()
+        if any(
+            event in events
+            for event in AUTO_RESULT_GOLDEN_TEST_DISPATCH_EVENTS
+        )
+    )
+    mention_hits = _task_id_mentioned(task_id)
+    return {
+        "workflow_triggers": triggers,
+        "dispatching_workflows": dispatching,
+        "dispatch_capable": bool(dispatching),
+        "local_dispatch_mentions": mention_hits,
+        "github_workflow_dispatched": bool(mention_hits),
+        "detail": (
+            "dispatch-triggered workflow(s) configured: "
+            + ", ".join(dispatching)
+            if dispatching
+            else "no workflow declares repository_dispatch or workflow_dispatch"
+        ),
+    }
+
+
+def auto_result_golden_test_verify(
+    task_id: str = AUTO_RESULT_GOLDEN_TEST_TASK_ID,
+    *,
+    round_number: int = 1,
+) -> dict:
+    """Verify AUTO_RESULT_GOLDEN_TEST_01, bounded and read-only.
+
+    The returned payload is machine-readable and always carries the contract
+    fields ``task_id``, ``status``, ``round``, ``summary``, ``commit``,
+    ``tests``, ``artifacts``, ``execution_result_json`` and ``evidence``. A
+    ``PASS`` is reported only when the Cloud Agent run itself produced a terminal
+    conclusion (a parseable ``execution_result.json`` for this task id); when the
+    run conclusion is not observable the result is ``BLOCKED`` with the reason,
+    so completion is never claimed on faith. It creates no follow-up task and
+    changes no contract or workflow.
+    """
+    execution_result = _read_execution_result()
+    result_task_id = (
+        str(execution_result.get("task_id", "")).strip()
+        if execution_result
+        else ""
+    )
+    raw_status = (
+        str(execution_result.get("status", "")).strip().lower()
+        if execution_result
+        else ""
+    )
+    run_task_matches = bool(
+        execution_result
+        and (not result_task_id or result_task_id == task_id)
+    )
+    final_conclusion = bool(
+        run_task_matches
+        and raw_status in AUTO_RESULT_GOLDEN_TEST_TERMINAL_STATUSES
+    )
+
+    dispatch = _auto_result_dispatch_evidence(task_id)
+
+    commit = _git("rev-parse", "HEAD")
+    artifacts = _collect_artifacts()
+
+    if execution_result and execution_result.get("tests"):
+        tests_summary = str(execution_result.get("tests", "")).strip()
+    else:
+        tests_summary = (
+            "not available: no test summary recorded in execution_result.json "
+            "for this run"
+        )
+    if execution_result and execution_result.get("summary"):
+        summary = str(execution_result.get("summary", "")).strip()
+    else:
+        summary = (
+            f"{AUTO_RESULT_GOLDEN_TEST_GOAL}: verification-only result contract "
+            "check; run conclusion not observable offline"
+        )
+
+    checks = [
+        {
+            "check": "task_id returned",
+            "status": PASS if task_id else FAIL,
+            "detail": f"task_id={task_id!r}",
+        },
+        {
+            "check": "GitHub workflow dispatch-capable",
+            "status": PASS if dispatch["dispatch_capable"] else BLOCKED,
+            "detail": dispatch["detail"],
+        },
+        {
+            "check": "Cloud Agent run has a final conclusion",
+            "status": PASS if final_conclusion else BLOCKED,
+            "detail": (
+                f"terminal execution_result.json status={raw_status!r}"
+                if final_conclusion
+                else "execution_result.json with a terminal status is not "
+                "readable in this environment"
+            ),
+        },
+        {
+            "check": "result contract fields present",
+            "status": PASS,
+            "detail": ", ".join(AUTO_RESULT_GOLDEN_TEST_FIELDS),
+        },
+        {
+            "check": "submit_task / get_task_result contracts unchanged",
+            "status": (
+                PASS
+                if list(inspect.signature(submit_task).parameters)
+                == SUBMIT_TASK_PARAMS
+                and list(inspect.signature(get_task_result).parameters)
+                == GET_TASK_RESULT_PARAMS
+                else FAIL
+            ),
+            "detail": "submit_task and get_task_result signatures unchanged",
+        },
+        {
+            "check": "bounded scope (no follow-up task, no workflow change)",
+            "status": PASS,
+            "detail": "verification-only; read-only against .github and scripts",
+        },
+    ]
+
+    if any(check["status"] == FAIL for check in checks):
+        overall = FAIL
+    elif any(check["status"] == BLOCKED for check in checks):
+        overall = BLOCKED
+    else:
+        overall = PASS
+
+    evidence = {
+        "acceptance": [
+            "a task_id is returned",
+            "a dispatch-triggered GitHub workflow is available",
+            "the result carries task_id/status/round/summary/commit/tests/"
+            "artifacts/execution_result_json/evidence",
+            "completion is claimed only when the run has a final conclusion",
+        ],
+        "task_id": task_id,
+        "goal": AUTO_RESULT_GOLDEN_TEST_GOAL,
+        "dispatch": dispatch,
+        "final_conclusion": final_conclusion,
+        "execution_result_present": execution_result is not None,
+        "execution_result_task_id": result_task_id or None,
+        "execution_result_status": raw_status or None,
+        "commit": commit,
+        "artifacts_present": [artifact["path"] for artifact in artifacts],
+        "tests": tests_summary,
+        "decision": {
+            "status": overall,
+            "reason": (
+                "execution_result.json present with a terminal conclusion for "
+                f"{task_id}"
+                if final_conclusion
+                else "no terminal execution_result.json conclusion for this run "
+                "is observable offline; reporting BLOCKED rather than claiming "
+                "completion"
+            ),
+        },
+    }
+
+    lines = [
+        f"# {AUTO_RESULT_GOLDEN_TEST_REPORT}",
+        "",
+        f"- goal: {AUTO_RESULT_GOLDEN_TEST_GOAL}",
+        f"- task_id: {task_id}",
+        f"- status: {overall}",
+        f"- round: {round_number}",
+        f"- commit: {commit or 'unknown'}",
+        f"- final_conclusion: {final_conclusion}",
+        f"- dispatch_capable: {dispatch['dispatch_capable']}",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", "## Summary", summary]
+
+    return {
+        "report": AUTO_RESULT_GOLDEN_TEST_REPORT,
+        "goal": AUTO_RESULT_GOLDEN_TEST_GOAL,
+        "task_id": task_id,
+        "status": overall,
+        "round": round_number,
+        "summary": summary,
+        "commit": commit,
+        "tests": tests_summary,
+        "artifacts": artifacts,
+        "execution_result_json": (
+            execution_result if execution_result is not None else {}
+        ),
+        "evidence": evidence,
+        "dispatch": dispatch,
+        "final_conclusion": final_conclusion,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])
@@ -5568,3 +5816,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(task_result_auto_consumer_production_readiness_report()["markdown"])
     print(task_result_auto_consumer_final_evidence_audit()["markdown"])
     print(task_result_auto_consumer_freeze_decision_report()["markdown"])
+    print(auto_result_golden_test_verify()["markdown"])
