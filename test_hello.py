@@ -1,5 +1,6 @@
 """Automated test for hello.py."""
 
+import inspect
 import json
 from datetime import datetime
 
@@ -494,3 +495,116 @@ def test_task_review_action_report_contract() -> None:
         "get_task_result": "UNCHANGED",
         "github_workflows": "UNCHANGED",
     }
+
+
+GOLDEN_E2E_TASK_ID = "review-golden-e2e-001"
+
+
+def test_golden_e2e_list_pending_returns_success_review_task() -> None:
+    submit_task(
+        GOLDEN_E2E_TASK_ID,
+        goal="PERSONAL_AI_TASK_REVIEW_GOLDEN_E2E_VERIFY_V0.1",
+        status="success",
+        requires_review=True,
+    )
+    pending = {task["task_id"]: task for task in list_pending_results()}
+    assert GOLDEN_E2E_TASK_ID in pending
+    record = pending[GOLDEN_E2E_TASK_ID]
+    assert record["requires_review"] is True
+    assert record["status"] == "success"
+    assert record["review_state"] == "pending_review"
+
+
+def test_golden_e2e_get_task_result_returns_execution_result() -> None:
+    result = get_task_result(GOLDEN_E2E_TASK_ID)
+    assert set(result) == {
+        "execution_summary",
+        "commit",
+        "tests",
+        "artifacts",
+        "execution_result_json",
+        "evidence",
+    }
+    assert result["execution_summary"]["task_id"] == GOLDEN_E2E_TASK_ID
+    assert set(result["evidence"]) >= {"acceptance", "logs", "validation", "decision"}
+
+
+def test_golden_e2e_full_closed_loop() -> None:
+    submit_task(
+        GOLDEN_E2E_TASK_ID,
+        goal="PERSONAL_AI_TASK_REVIEW_GOLDEN_E2E_VERIFY_V0.1",
+        status="success",
+        requires_review=True,
+    )
+
+    assert GOLDEN_E2E_TASK_ID in _pending_ids()
+
+    result_before = get_task_result(GOLDEN_E2E_TASK_ID)
+    snapshot_before = json.dumps(result_before, sort_keys=True)
+
+    reviewed = mark_reviewed(GOLDEN_E2E_TASK_ID, "PASS", "golden e2e")
+    assert reviewed["reviewed"] is True
+    assert reviewed["review_verdict"] == "PASS"
+    assert reviewed["reviewed_at"]
+
+    assert GOLDEN_E2E_TASK_ID not in _pending_ids()
+
+    events = get_review_events(GOLDEN_E2E_TASK_ID)
+    assert len(events) == 1
+    event = events[0]
+    assert event["task_id"] == GOLDEN_E2E_TASK_ID
+    assert event["action"] == "review"
+    assert event["verdict"] == "PASS"
+    assert event["timestamp"]
+
+    snapshot_after = json.dumps(get_task_result(GOLDEN_E2E_TASK_ID), sort_keys=True)
+    assert snapshot_after == snapshot_before
+
+
+def test_golden_e2e_review_preserves_audit_history() -> None:
+    record = get_task_review(GOLDEN_E2E_TASK_ID)
+    assert record is not None
+    assert record["reviewed"] is True
+    assert record["review_verdict"] == "PASS"
+    assert get_review_events(GOLDEN_E2E_TASK_ID) == get_review_events(GOLDEN_E2E_TASK_ID)
+    events = [e for e in get_review_events() if e["task_id"] == GOLDEN_E2E_TASK_ID]
+    assert len(events) == 1
+
+
+def test_submit_task_signature_unchanged() -> None:
+    signature = inspect.signature(submit_task)
+    assert list(signature.parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert signature.parameters["goal"].default == ""
+    assert signature.parameters["status"].default == "success"
+    assert signature.parameters["requires_review"].default is True
+    assert signature.parameters["extra"].kind is inspect.Parameter.VAR_KEYWORD
+
+
+def test_get_task_result_signature_unchanged() -> None:
+    signature = inspect.signature(get_task_result)
+    assert list(signature.parameters) == ["task_id"]
+    result = get_task_result("cf-compat-check")
+    assert set(result) == {
+        "execution_summary",
+        "commit",
+        "tests",
+        "artifacts",
+        "execution_result_json",
+        "evidence",
+    }
+    assert result["execution_summary"]["task_id"] == "cf-compat-check"
+
+
+def test_golden_e2e_report_outputs_status_tests_compatibility() -> None:
+    report = task_review_action_report()
+    assert report["STATUS"] == "PASS"
+    assert report["Tests"] == "python -m pytest -q"
+    assert report["Compatibility"]["submit_task"] == "UNCHANGED"
+    assert report["Compatibility"]["get_task_result"] == "UNCHANGED"
+    assert report["Compatibility"]["github_workflows"] == "UNCHANGED"
