@@ -9,6 +9,13 @@ import pytest
 import hello as hello_module
 from hello import (
     AUTO_CONSUMER_GOAL,
+    AUTO_RESULT_CLOSE_LOOP_FIELDS,
+    AUTO_RESULT_CLOSE_LOOP_GOAL,
+    AUTO_RESULT_CLOSE_LOOP_REPORT,
+    AUTO_RESULT_CLOSE_LOOP_ROUNDS,
+    AUTO_RESULT_CLOSE_LOOP_SUBMIT_STATUS,
+    AUTO_RESULT_CLOSE_LOOP_TASK_ID,
+    AUTO_RESULT_CLOSE_LOOP_TERMINAL_STATUSES,
     AUTO_RESULT_GOLDEN_TEST_FIELDS,
     AUTO_RESULT_GOLDEN_TEST_GOAL,
     AUTO_RESULT_GOLDEN_TEST_REPORT,
@@ -65,6 +72,7 @@ from hello import (
     STATUS_MODEL_EXPECTED_FIELDS,
     TASK_REVIEW_GOAL,
     auto_consume_completed_results,
+    auto_result_close_loop_golden_verify,
     auto_result_golden_test_verify,
     classify_pending_task,
     cloud_agent_test,
@@ -2302,4 +2310,121 @@ def test_auto_result_golden_test_markdown() -> None:
     assert markdown.startswith(f"# {AUTO_RESULT_GOLDEN_TEST_REPORT}")
     assert f"- task_id: {AUTO_RESULT_GOLDEN_TEST_TASK_ID}" in markdown
     assert f"- status: {report['status']}" in markdown
+    assert "## Checks" in markdown
+
+
+def test_auto_result_close_loop_contract_fields() -> None:
+    report = auto_result_close_loop_golden_verify()
+    assert report["report"] == AUTO_RESULT_CLOSE_LOOP_REPORT
+    assert report["goal"] == AUTO_RESULT_CLOSE_LOOP_GOAL
+    assert report["task_id"] == AUTO_RESULT_CLOSE_LOOP_TASK_ID == "cf-771df5ccf2b6"
+    for field in AUTO_RESULT_CLOSE_LOOP_FIELDS:
+        assert field in report
+    assert report["status"] in VALID_STATUSES
+    assert isinstance(report["round"], int)
+    assert report["summary"]
+    assert isinstance(report["tests"], str) and report["tests"]
+    assert isinstance(report["artifacts"], list)
+    for artifact in report["artifacts"]:
+        assert set(artifact) >= {"name", "path", "sha256", "bytes"}
+        assert artifact["sha256"]
+        assert artifact["bytes"] > 0
+    assert isinstance(report["execution_result_json"], dict)
+    assert set(report["evidence"]) >= {"acceptance", "decision"}
+    assert report["evidence"]["decision"]["status"] == report["status"]
+
+
+def test_auto_result_close_loop_terminal_no_user_intervention() -> None:
+    report = auto_result_close_loop_golden_verify()
+    assert report["status"] in {"PASS", "FAIL"}
+    assert report["status"] != "BLOCKED"
+    assert report["terminal"] is True
+    assert report["requires_review"] is False
+    assert report["follow_up_task_submitted"] is False
+    assert report["evidence"]["requires_review"] is False
+    assert report["evidence"]["follow_up_task_submitted"] is False
+    assert report["evidence"]["user_input_requested"] is False
+
+
+def test_auto_result_close_loop_single_bounded_round() -> None:
+    report = auto_result_close_loop_golden_verify()
+    assert report["round"] == 1
+    assert report["bounded_rounds"] == AUTO_RESULT_CLOSE_LOOP_ROUNDS == 1
+    assert report["evidence"]["round"] == 1
+    overridden = auto_result_close_loop_golden_verify(round_number=1)
+    assert overridden["round"] == 1
+
+
+def test_auto_result_close_loop_task_id_from_submit_task_path() -> None:
+    report = auto_result_close_loop_golden_verify()
+    task_id = AUTO_RESULT_CLOSE_LOOP_TASK_ID
+    assert report["task_id"] == task_id
+    assert report["evidence"]["submitted_via"] == "submit_task"
+    assert report["evidence"]["submitted_task_id"] == task_id
+    record = get_task_review(task_id)
+    assert record is not None
+    assert record["task_id"] == task_id
+    assert str(record["status"]).lower() == AUTO_RESULT_CLOSE_LOOP_SUBMIT_STATUS
+    assert record["requires_review"] is False
+    checks = {check["check"]: check["status"] for check in report["checks"]}
+    assert checks["task_id created through submit_task path"] == "PASS"
+    assert checks["terminal status (no user intervention required)"] == "PASS"
+    assert checks["single bounded execution round recorded"] == "PASS"
+
+
+def test_auto_result_close_loop_commit_tests_artifacts_present() -> None:
+    report = auto_result_close_loop_golden_verify()
+    assert report["commit"]
+    assert isinstance(report["tests"], str) and report["tests"]
+    paths = {artifact["path"] for artifact in report["artifacts"]}
+    assert {"hello.py", "test_hello.py"} <= paths
+    execution = report["execution_result_json"]
+    assert execution.get("task_id") == AUTO_RESULT_CLOSE_LOOP_TASK_ID
+    for field in ("commit", "tests", "artifacts", "execution_result_json", "evidence"):
+        assert report[field] is not None
+
+
+def test_auto_result_close_loop_evidence_decision() -> None:
+    report = auto_result_close_loop_golden_verify()
+    evidence = report["evidence"]
+    assert evidence["decision"]["status"] == report["status"]
+    assert evidence["decision"]["reason"]
+    assert evidence["goal"] == AUTO_RESULT_CLOSE_LOOP_GOAL
+    assert evidence["task_id"] == AUTO_RESULT_CLOSE_LOOP_TASK_ID
+    assert set(evidence["acceptance"]) >= {
+        "status is a terminal result with no user intervention required",
+        "round is present and records the single bounded execution round",
+        "commit, tests, artifacts, execution_result_json, and evidence are all present",
+        "the reported task_id is the task created by this submission",
+    }
+
+
+def test_auto_result_close_loop_terminal_status_set() -> None:
+    assert AUTO_RESULT_CLOSE_LOOP_SUBMIT_STATUS in (
+        AUTO_RESULT_CLOSE_LOOP_TERMINAL_STATUSES
+    )
+
+
+def test_auto_result_close_loop_contracts_unchanged() -> None:
+    report = auto_result_close_loop_golden_verify()
+    assert list(inspect.signature(submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(get_task_result).parameters) == ["task_id"]
+    checks = {check["check"]: check["status"] for check in report["checks"]}
+    assert checks["submit_task / get_task_result contracts unchanged"] == "PASS"
+    assert checks["bounded scope (no follow-up task, no workflow change)"] == "PASS"
+
+
+def test_auto_result_close_loop_markdown() -> None:
+    report = auto_result_close_loop_golden_verify()
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {AUTO_RESULT_CLOSE_LOOP_REPORT}")
+    assert f"- task_id: {AUTO_RESULT_CLOSE_LOOP_TASK_ID}" in markdown
+    assert f"- status: {report['status']}" in markdown
+    assert f"- round: {report['round']}" in markdown
     assert "## Checks" in markdown
