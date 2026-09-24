@@ -117,6 +117,7 @@ def test_hello() -> None:
 
 def test_goodbye() -> None:
     assert goodbye() == "goodbye from cloud execution golden test"
+    assert isinstance(goodbye(), str)
 
 
 def test_cloud_agent_test() -> None:
