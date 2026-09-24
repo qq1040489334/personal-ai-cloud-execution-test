@@ -122,6 +122,7 @@ def test_goodbye() -> None:
 
 def test_cloud_agent_test() -> None:
     assert cloud_agent_test() == "executed inside github actions"
+    assert isinstance(cloud_agent_test(), str)
 
 
 def test_cloud_agent_test_2() -> None:
