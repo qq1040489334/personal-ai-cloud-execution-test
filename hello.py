@@ -1284,7 +1284,343 @@ def task_review_action_report() -> dict:
     }
 
 
+RUNTIME_AUDIT_TASK_ID = "cf-62e0f30e0d02"
+RUNTIME_AUDIT_GOAL = "PERSONAL_AI_EXECUTION_TASK_RUNTIME_AUDIT_V0.1"
+RUNTIME_AUDIT_LOG_EVIDENCE = (
+    "execution_result.json",
+    "gpt_verification.json",
+    ".agent/logs",
+    "logs",
+)
+RUNTIME_AUDIT_STATUS_FIELDS = (
+    "status",
+    "started_at",
+    "heartbeat",
+    "runner_status",
+    "execution_log",
+)
+
+
+def _workflow_trigger_events() -> dict[str, list[str]]:
+    """Map each workflow filename to the dispatch/manual events it declares."""
+    directory = REPO_ROOT / ".github" / "workflows"
+    triggers: dict[str, list[str]] = {}
+    for name in _workflow_names():
+        try:
+            text = (directory / name).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        lowered = text.lower()
+        events: list[str] = []
+        for event, needle in (
+            ("repository_dispatch", "repository_dispatch"),
+            ("workflow_dispatch", "workflow_dispatch"),
+            ("schedule", "schedule"),
+        ):
+            if needle in lowered:
+                events.append(event)
+        triggers[name] = events
+    return triggers
+
+
+def _task_id_mentioned(task_id: str) -> list[str]:
+    """Return local evidence sources that mention ``task_id`` (read-only)."""
+    hits: list[str] = []
+    for rel in (
+        "execution_result.json",
+        "gpt_verification.json",
+        "dispatch_payload.json",
+        "task_contract_v0.json",
+    ):
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            continue
+        try:
+            if task_id in path.read_text(encoding="utf-8", errors="ignore"):
+                hits.append(rel)
+        except OSError:
+            continue
+    if _git("log", "--all", "--oneline", "--grep", task_id):
+        hits.append("git log")
+    return hits
+
+
+def _execution_log_evidence(task_id: str) -> list[str]:
+    """Return local execution-log artifacts that reference ``task_id``."""
+    present: list[str] = []
+    for rel in RUNTIME_AUDIT_LOG_EVIDENCE:
+        path = REPO_ROOT / rel
+        if path.is_dir():
+            try:
+                if any(task_id in child.name for child in path.rglob("*")):
+                    present.append(rel)
+            except OSError:
+                continue
+        elif path.is_file():
+            try:
+                if task_id in path.read_text(encoding="utf-8", errors="ignore"):
+                    present.append(rel)
+            except OSError:
+                continue
+    return present
+
+
+def personal_ai_task_runtime_audit(task_id: str = RUNTIME_AUDIT_TASK_ID) -> dict:
+    """Read-only runtime diagnosis of a pending cloud task.
+
+    Resolves the task's registry record (if any) and checks for the runtime
+    state a running task would leave behind: ``started_at``, ``heartbeat``,
+    ``runner_status`` and an execution log. The GitHub Actions run history is
+    not reachable from this offline sandbox, so a workflow trigger is only
+    reported when there is local evidence; it is never fabricated. No repair
+    is performed and no task is resubmitted.
+    """
+    _sync_execution_result()
+    record = TASK_REGISTRY.get(task_id)
+    registry_record = dict(record) if record is not None else None
+
+    field_presence = {
+        field: bool(record and record.get(field)) for field in RUNTIME_AUDIT_STATUS_FIELDS
+    }
+    started_at = (record or {}).get("started_at")
+    heartbeat = (record or {}).get("heartbeat") or (record or {}).get("heartbeat_at")
+    runner_status = (record or {}).get("runner_status")
+    registry_status = (record or {}).get("status")
+
+    workflow_triggers = _workflow_trigger_events()
+    dispatch_workflows = sorted(
+        name
+        for name, events in workflow_triggers.items()
+        if "repository_dispatch" in events or "workflow_dispatch" in events
+    )
+    mention_hits = _task_id_mentioned(task_id)
+    github_workflow_triggered = bool(mention_hits)
+    workflow_trigger_source = (
+        "local evidence: " + ", ".join(mention_hits)
+        if github_workflow_triggered
+        else "no local evidence of a run for this task id; GitHub Actions run "
+        "history is unreachable from this offline sandbox"
+    )
+
+    log_evidence = _execution_log_evidence(task_id)
+    execution_log_present = bool(log_evidence)
+
+    if record is not None:
+        status_source = f"in-memory task registry record for {task_id}"
+    else:
+        status_source = (
+            "no task registry record for this task id; status can only be "
+            "inferred from repository evidence"
+        )
+
+    runtime_state_present = any(field_presence.values())
+    if record is None and not github_workflow_triggered and not execution_log_present:
+        stuck = True
+        stuck_reason = (
+            "pending without any runtime state: the task was never started "
+            "(no registry record, started_at, heartbeat, runner_status, "
+            "workflow trigger or execution log) and is not progressing"
+        )
+    elif not runtime_state_present:
+        stuck = True
+        stuck_reason = (
+            "task is registered but carries no runtime state (no started_at, "
+            "heartbeat, runner_status or execution log); it is not progressing"
+        )
+    else:
+        stuck = False
+        stuck_reason = "runtime state present; task is progressing or awaiting resources"
+
+    checks = [
+        {
+            "check": "task registry record present",
+            "status": PASS if record is not None else BLOCKED,
+            "detail": (
+                f"registry record found for {task_id} (status={registry_status!r})"
+                if record is not None
+                else f"no registry record for {task_id}; it was never submitted to "
+                "the in-memory task registry"
+            ),
+        },
+        {
+            "check": "started_at field",
+            "status": PASS if field_presence["started_at"] else BLOCKED,
+            "detail": (
+                f"started_at={started_at}"
+                if field_presence["started_at"]
+                else "started_at absent; no evidence the task ever began executing"
+            ),
+        },
+        {
+            "check": "heartbeat field",
+            "status": PASS if field_presence["heartbeat"] else BLOCKED,
+            "detail": (
+                f"heartbeat={heartbeat}"
+                if field_presence["heartbeat"]
+                else "heartbeat absent; no liveness signal from a runner"
+            ),
+        },
+        {
+            "check": "runner_status field",
+            "status": PASS if field_presence["runner_status"] else BLOCKED,
+            "detail": (
+                f"runner_status={runner_status}"
+                if field_presence["runner_status"]
+                else "runner_status absent; no runner was ever attached"
+            ),
+        },
+        {
+            "check": "GitHub workflow triggered",
+            "status": PASS if github_workflow_triggered else BLOCKED,
+            "detail": (
+                "workflow run evidenced locally by: " + ", ".join(mention_hits)
+                if github_workflow_triggered
+                else "no local evidence of a run for this task id; declared dispatch "
+                "workflows: " + (", ".join(dispatch_workflows) or "none")
+            ),
+        },
+        {
+            "check": "execution log present",
+            "status": PASS if execution_log_present else BLOCKED,
+            "detail": (
+                "execution log artifacts: " + ", ".join(log_evidence)
+                if execution_log_present
+                else "no execution log artifact referencing this task id"
+            ),
+        },
+        {
+            "check": "status source identified",
+            "status": PASS,
+            "detail": status_source,
+        },
+    ]
+
+    if any(c["status"] == FAIL for c in checks):
+        overall = FAIL
+    elif any(c["status"] == BLOCKED for c in checks):
+        overall = BLOCKED
+    else:
+        overall = PASS
+
+    evidence = [
+        f"task_registry_record_present={record is not None}",
+        f"started_at={started_at or 'ABSENT'}",
+        f"heartbeat={heartbeat or 'ABSENT'}",
+        f"runner_status={runner_status or 'ABSENT'}",
+        f"github_workflow_triggered={github_workflow_triggered}",
+        f"execution_log_present={execution_log_present}",
+        f"status_source={status_source}",
+    ]
+
+    if overall == PASS:
+        conclusion = (
+            f"{task_id} has complete runtime evidence and is not stuck."
+        )
+    else:
+        conclusion = (
+            f"{task_id} is pending and cannot be advanced: it has no started_at, "
+            "heartbeat, runner_status or execution log, and no local evidence that "
+            "a GitHub workflow run was triggered. It is diagnosed as STUCK "
+            "(never started), not as executing or waiting on resources. No repair "
+            "was attempted per the read-only contract."
+        )
+
+    markdown = _runtime_audit_markdown(
+        task_id=task_id,
+        overall=overall,
+        stuck=stuck,
+        stuck_reason=stuck_reason,
+        github_workflow_triggered=github_workflow_triggered,
+        workflow_trigger_source=workflow_trigger_source,
+        execution_log_present=execution_log_present,
+        status_source=status_source,
+        started_at=started_at,
+        heartbeat=heartbeat,
+        runner_status=runner_status,
+        checks=checks,
+        evidence=evidence,
+        conclusion=conclusion,
+    )
+
+    return {
+        "report": "PERSONAL_AI_EXECUTION_TASK_RUNTIME_AUDIT_REPORT",
+        "task_id": task_id,
+        "goal": RUNTIME_AUDIT_GOAL,
+        "STATUS": overall,
+        "Evidence": evidence,
+        "Conclusion": conclusion,
+        "stuck": stuck,
+        "stuck_reason": stuck_reason,
+        "github_workflow_triggered": github_workflow_triggered,
+        "workflow_trigger_source": workflow_trigger_source,
+        "dispatch_workflows": dispatch_workflows,
+        "execution_log_present": execution_log_present,
+        "execution_log_evidence": log_evidence,
+        "status_source": status_source,
+        "registry_status": registry_status,
+        "registry_record": registry_record,
+        "started_at": started_at,
+        "heartbeat": heartbeat,
+        "runner_status": runner_status,
+        "status_field_presence": field_presence,
+        "checks": checks,
+        "markdown": markdown,
+    }
+
+
+def _runtime_audit_markdown(
+    *,
+    task_id: str,
+    overall: str,
+    stuck: bool,
+    stuck_reason: str,
+    github_workflow_triggered: bool,
+    workflow_trigger_source: str,
+    execution_log_present: bool,
+    status_source: str,
+    started_at: str | None,
+    heartbeat: str | None,
+    runner_status: str | None,
+    checks: list[dict],
+    evidence: list[str],
+    conclusion: str,
+) -> str:
+    lines = [
+        "# PERSONAL_AI_EXECUTION_TASK_RUNTIME_AUDIT_REPORT",
+        "",
+        f"- goal: {RUNTIME_AUDIT_GOAL}",
+        f"- task_id: {task_id}",
+        f"- STATUS: {overall}",
+        f"- stuck: {stuck}",
+        f"- started_at: {started_at or 'ABSENT'}",
+        f"- heartbeat: {heartbeat or 'ABSENT'}",
+        f"- runner_status: {runner_status or 'ABSENT'}",
+        f"- github_workflow_triggered: {github_workflow_triggered}",
+        f"- execution_log_present: {execution_log_present}",
+        f"- status_source: {status_source}",
+        "",
+        "## Evidence",
+    ]
+    lines += [f"- {item}" for item in evidence]
+    lines += [
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += [
+        "",
+        "## Stuck judgment",
+        f"{stuck_reason}",
+        "",
+        "## Conclusion",
+        conclusion,
+    ]
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])
     print(runtime_provenance_report()["markdown"])
+    print(personal_ai_task_runtime_audit()["markdown"])

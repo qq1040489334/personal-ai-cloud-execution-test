@@ -15,6 +15,8 @@ from hello import (
     DEPLOY_VERIFY_TASK_ID,
     REQUIRED_RESULT_FIELDS,
     REVIEW_VERDICTS,
+    RUNTIME_AUDIT_GOAL,
+    RUNTIME_AUDIT_TASK_ID,
     RUNTIME_CANDIDATE_COMMITS,
     RUNTIME_PROVENANCE_GOAL,
     RUNTIME_PROVENANCE_TASK_ID,
@@ -36,6 +38,7 @@ from hello import (
     mcp_bridge_test,
     mcp_runtime_deploy_verify,
     oauth_mcp_test,
+    personal_ai_task_runtime_audit,
     result_consumer_test,
     result_consumer_test2,
     runtime_provenance_report,
@@ -608,3 +611,58 @@ def test_golden_e2e_report_outputs_status_tests_compatibility() -> None:
     assert report["Compatibility"]["submit_task"] == "UNCHANGED"
     assert report["Compatibility"]["get_task_result"] == "UNCHANGED"
     assert report["Compatibility"]["github_workflows"] == "UNCHANGED"
+
+
+def test_runtime_audit_targets_requested_task() -> None:
+    report = personal_ai_task_runtime_audit()
+    assert report["report"] == "PERSONAL_AI_EXECUTION_TASK_RUNTIME_AUDIT_REPORT"
+    assert report["task_id"] == RUNTIME_AUDIT_TASK_ID == "cf-62e0f30e0d02"
+    assert report["goal"] == RUNTIME_AUDIT_GOAL
+
+
+def test_runtime_audit_outputs_status_evidence_conclusion() -> None:
+    report = personal_ai_task_runtime_audit()
+    assert report["STATUS"] in {"PASS", "FAIL", "BLOCKED", "PARTIAL"}
+    assert report["Evidence"]
+    assert all(isinstance(item, str) and item for item in report["Evidence"])
+    assert report["Conclusion"]
+    assert report["status_source"]
+
+
+def test_runtime_audit_reports_trigger_and_log_state() -> None:
+    report = personal_ai_task_runtime_audit()
+    assert isinstance(report["github_workflow_triggered"], bool)
+    assert isinstance(report["execution_log_present"], bool)
+    assert report["workflow_trigger_source"]
+    assert isinstance(report["execution_log_evidence"], list)
+
+
+def test_runtime_audit_gives_stuck_judgment() -> None:
+    report = personal_ai_task_runtime_audit()
+    assert isinstance(report["stuck"], bool)
+    assert report["stuck_reason"]
+    if not report["github_workflow_triggered"] and not report["execution_log_present"]:
+        assert report["stuck"] is True
+        assert report["STATUS"] != "PASS"
+
+
+def test_runtime_audit_checks_and_markdown() -> None:
+    report = personal_ai_task_runtime_audit()
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+    markdown = report["markdown"]
+    assert markdown.startswith("# PERSONAL_AI_EXECUTION_TASK_RUNTIME_AUDIT_REPORT")
+    for token in ("STATUS", "Evidence", "Conclusion", "Stuck judgment"):
+        assert token in markdown
+
+
+def test_runtime_audit_never_fabricates_runtime_state() -> None:
+    report = personal_ai_task_runtime_audit()
+    if report["registry_record"] is None:
+        assert report["started_at"] is None
+        assert report["heartbeat"] is None
+        assert report["runner_status"] is None
+    assert report["STATUS"] != "PASS" or report["registry_record"] is not None
