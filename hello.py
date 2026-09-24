@@ -2330,8 +2330,417 @@ def task_result_auto_consumer_golden_e2e_verify(
     }
 
 
+POST_E2E_AUDIT_GOAL = "PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_POST_E2E_AUDIT_V0.1"
+POST_E2E_AUDIT_TASK_ID = "cf-e114822ee2ae"
+POST_E2E_AUDIT_REPORT = (
+    "PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_POST_E2E_AUDIT_REPORT"
+)
+POST_E2E_AUDIT_LAYERS = ("trigger", "storage", "read", "notification")
+CONSUMER_AUTO_TRIGGER_MARKERS = (
+    "consume_task_result",
+    "discover_completed_results",
+    "task_result_auto_consumer",
+)
+REVIEW_NOTIFICATION_MARKERS = (
+    "pending_review",
+    "requires_review",
+    "pending acceptance",
+    "待验收",
+)
+STATUS_MODEL_EXPECTED_FIELDS = (
+    "started_at",
+    "heartbeat",
+    "last_update_at",
+    "timeout",
+    "stuck",
+)
+
+
+def _workflow_texts() -> dict[str, str]:
+    """Return the text of every workflow file, read-only."""
+    directory = REPO_ROOT / ".github" / "workflows"
+    texts: dict[str, str] = {}
+    for name in _workflow_names():
+        try:
+            texts[name] = (directory / name).read_text(
+                encoding="utf-8", errors="ignore"
+            )
+        except OSError:
+            continue
+    return texts
+
+
+def _consumer_automation_evidence() -> dict:
+    """Report whether any workflow automatically invokes the result consumer."""
+    hits: dict[str, list[str]] = {}
+    for name, text in _workflow_texts().items():
+        lowered = text.lower()
+        matched = [m for m in CONSUMER_AUTO_TRIGGER_MARKERS if m.lower() in lowered]
+        if matched:
+            hits[name] = matched
+    return {
+        "auto_trigger_present": bool(hits),
+        "consumer_invoking_workflows": hits,
+        "detail": (
+            "workflow(s) invoke the consumer: " + ", ".join(sorted(hits))
+            if hits
+            else "no workflow invokes consume_task_result() / "
+            "discover_completed_results(); consumption is pull-only"
+        ),
+    }
+
+
+def _execution_result_persistence_evidence() -> dict:
+    """Report where a completed task's result is stored after a run."""
+    in_repo = (REPO_ROOT / "execution_result.json").is_file()
+    location_lines: list[str] = []
+    for name, text in _workflow_texts().items():
+        for line in text.splitlines():
+            if "execution_result" in line.lower():
+                location_lines.append(f"{name}: {line.strip()}")
+    return {
+        "in_repo_execution_result_present": in_repo,
+        "persisted_to_repo": in_repo,
+        "location_evidence": location_lines,
+        "detail": (
+            "repo-root execution_result.json is committed; _sync_execution_result() "
+            "can discover it across runs"
+            if in_repo
+            else "execution_result.json is built into $RUNNER_TEMP and uploaded as a "
+            "GitHub artifact, not committed; the in-memory TASK_REGISTRY and the "
+            "repo-root file the consumer reads are therefore empty after a run"
+        ),
+    }
+
+
+def _notification_evidence() -> dict:
+    """Report whether a completed task raises a pending-acceptance notice."""
+    hits: dict[str, list[str]] = {}
+    for name, text in _workflow_texts().items():
+        lowered = text.lower()
+        matched = [m for m in REVIEW_NOTIFICATION_MARKERS if m.lower() in lowered]
+        if matched:
+            hits[name] = matched
+    return {
+        "present": bool(hits),
+        "notification_workflows": hits,
+        "detail": (
+            "pending-acceptance notification workflow(s): "
+            + ", ".join(sorted(hits))
+            if hits
+            else "no pending-acceptance notification: only the raw "
+            "execution_result artifact / step summary and the issue run-status "
+            "comment are emitted; nothing tells the user a result awaits acceptance"
+        ),
+    }
+
+
+def task_result_auto_consumer_post_e2e_audit() -> dict:
+    """Read-only post-Golden-E2E audit of the result auto-consumer automation.
+
+    Re-runs the Golden E2E verification to capture the consumer's real
+    observable evidence (consumption record, pending-review state, append-only
+    review events), locates the long-pending ``cf-62e0f30e0d02`` runtime state,
+    and reports whether a completed task reaches the consumable /
+    pending-acceptance state without manual follow-up. Each gap is attributed to
+    the trigger, storage, read or notification layer, and the missing status
+    model fields are reported with minimal fix suggestions only.
+
+    It only reads: the ``submit_task`` and ``get_task_result`` contracts stay
+    UNCHANGED, nothing is auto-PASSed and no follow-up task is triggered.
+    """
+    e2e = task_result_auto_consumer_golden_e2e_verify()
+    consumed = e2e["consumed"]
+    discovered = discover_completed_results()
+    pending = list_pending_results()
+    events = get_review_events()
+
+    automation = _consumer_automation_evidence()
+    persistence = _execution_result_persistence_evidence()
+    notification = _notification_evidence()
+
+    read_ok = (
+        list(inspect.signature(get_task_result).parameters)
+        == GET_TASK_RESULT_PARAMS
+    )
+    layers = {
+        "trigger": {
+            "present": automation["auto_trigger_present"],
+            "detail": automation["detail"],
+        },
+        "storage": {
+            "present": persistence["persisted_to_repo"],
+            "detail": persistence["detail"],
+        },
+        "read": {
+            "present": read_ok,
+            "detail": (
+                "get_task_result(task_id) is unchanged and returns the full "
+                "execution result contract"
+                if read_ok
+                else "get_task_result contract signature changed"
+            ),
+        },
+        "notification": {
+            "present": notification["present"],
+            "detail": notification["detail"],
+        },
+    }
+    gap_layers = [
+        name for name in POST_E2E_AUDIT_LAYERS if not layers[name]["present"]
+    ]
+    primary_gap = gap_layers[0] if gap_layers else None
+    auto_consumer_reached = not gap_layers
+
+    target = personal_ai_task_runtime_audit(RUNTIME_AUDIT_TASK_ID)
+    registry_record = target.get("registry_record")
+    missing_status_fields = [
+        field
+        for field in STATUS_MODEL_EXPECTED_FIELDS
+        if not (registry_record and registry_record.get(field))
+    ]
+    status_model_gap = (
+        f"no registry record exists for {RUNTIME_AUDIT_TASK_ID}; the status model "
+        "cannot express started_at / heartbeat / last_update_at / timeout / stuck "
+        "for it"
+        if registry_record is None
+        else "registry record exists but lacks field(s): "
+        + ", ".join(missing_status_fields)
+    )
+
+    consumed_ids = [consumed["task_id"]]
+    pending_ids = sorted(item["task_id"] for item in pending)
+    discovered_ids = sorted(item["task_id"] for item in discovered)
+
+    evidence = {
+        "golden_e2e_report": AUTO_CONSUMER_GOLDEN_E2E_REPORT,
+        "golden_e2e_status": e2e["STATUS"],
+        "golden_e2e_steps": e2e["steps"],
+        "consumed_records": [
+            {
+                "task_id": consumed["task_id"],
+                "identified_status": consumed["identified_status"],
+                "identified_success": consumed["identified_success"],
+                "requires_review": consumed["requires_review"],
+                "review_state": consumed["review_state"],
+            }
+        ],
+        "pending_review_ids": pending_ids,
+        "review_event_count": len(events),
+        "discovered_success_ids": discovered_ids,
+    }
+
+    suggestions = [
+        "Trigger layer (primary gap): add a post-run step that invokes the consumer "
+        "when a task completes (call discover_completed_results() + "
+        "consume_task_result(task_id) after the agent run, or expose a consumer "
+        "entrypoint the runner calls). Wiring only; NOT applied here.",
+        "Storage layer: persist the per-task result to a task-keyed in-repo path "
+        "(e.g. results/<task_id>.json) or a durable store and read it in "
+        "_sync_execution_result(); the in-memory TASK_REGISTRY and the uncommitted "
+        "$RUNNER_TEMP/execution_result.json do not survive a run.",
+        "Notification layer: emit a pending-acceptance notification (issue/comment "
+        "or a dedicated step-summary section) once requires_review is raised, so "
+        "the user is told a result is waiting without having to ask.",
+        "Status model: add optional last_update_at / timeout / stuck fields to "
+        "registry records. submit_task already stores unknown **extra keys, so the "
+        "submit_task signature stays UNCHANGED; compute timeout/stuck read-only in "
+        "the audit instead of restructuring the registry.",
+    ]
+
+    checks = [
+        {
+            "check": "Golden E2E consumer evidence observable",
+            "status": PASS if e2e["STATUS"] == PASS else FAIL,
+            "detail": (
+                f"golden e2e STATUS={e2e['STATUS']}; consumed "
+                f"{consumed['task_id']} review_state={consumed['review_state']}"
+            ),
+        },
+        {
+            "check": "consumption record observable",
+            "status": (
+                PASS
+                if consumed["identified_success"]
+                and consumed["requires_review"]
+                and consumed["review_state"] == "pending_review"
+                else FAIL
+            ),
+            "detail": (
+                f"consumed task {consumed['task_id']}: "
+                f"identified_success={consumed['identified_success']} "
+                f"requires_review={consumed['requires_review']} "
+                f"review_state={consumed['review_state']}"
+            ),
+        },
+        {
+            "check": "pending acceptance queue observable",
+            "status": PASS if pending_ids else BLOCKED,
+            "detail": (
+                f"{len(pending_ids)} task(s) awaiting human acceptance: "
+                + (", ".join(pending_ids) or "none")
+            ),
+        },
+        {
+            "check": "append-only audit trail observable",
+            "status": PASS if events else BLOCKED,
+            "detail": f"{len(events)} review_event(s) recorded",
+        },
+        {
+            "check": "auto-consumer reached without manual follow-up",
+            "status": PASS if auto_consumer_reached else BLOCKED,
+            "detail": (
+                "completed tasks reach pending_review automatically"
+                if auto_consumer_reached
+                else "NOT reached; gap layer(s): "
+                + ", ".join(gap_layers)
+                + f" (primary: {primary_gap})"
+            ),
+        },
+        {
+            "check": f"{RUNTIME_AUDIT_TASK_ID} state located",
+            "status": PASS if target.get("STATUS") else BLOCKED,
+            "detail": (
+                f"target STATUS={target.get('STATUS')}; stuck={target.get('stuck')}; "
+                f"{target.get('stuck_reason')}"
+            ),
+        },
+        {
+            "check": "submit_task contract unchanged",
+            "status": (
+                PASS
+                if list(inspect.signature(submit_task).parameters)
+                == SUBMIT_TASK_PARAMS
+                else FAIL
+            ),
+            "detail": "submit_task signature: "
+            + ", ".join(inspect.signature(submit_task).parameters),
+        },
+        {
+            "check": "get_task_result contract unchanged",
+            "status": PASS if read_ok else FAIL,
+            "detail": "get_task_result signature: "
+            + ", ".join(inspect.signature(get_task_result).parameters),
+        },
+    ]
+
+    report_ok = all(check["status"] != FAIL for check in checks)
+    if not report_ok:
+        overall = FAIL
+    elif auto_consumer_reached:
+        overall = PASS
+    else:
+        overall = BLOCKED
+
+    compatibility = {
+        "submit_task": "UNCHANGED",
+        "get_task_result": "UNCHANGED",
+        "github_workflows": "UNCHANGED",
+    }
+
+    lines = [
+        f"# {POST_E2E_AUDIT_REPORT}",
+        "",
+        f"- goal: {POST_E2E_AUDIT_GOAL}",
+        f"- task_id: {POST_E2E_AUDIT_TASK_ID}",
+        f"- STATUS: {overall}",
+        f"- report_status: {'PASS' if report_ok else 'FAIL'}",
+        f"- auto_consumer_reached: {auto_consumer_reached}",
+        f"- primary_gap: {primary_gap}",
+        f"- gap_layers: {', '.join(gap_layers) or 'none'}",
+        "- human_review_gate: True",
+        "- auto_pass: False",
+        "- auto_trigger_next: False",
+        "",
+        "## Golden E2E consumer evidence",
+        f"- report: {evidence['golden_e2e_report']}",
+        f"- golden_e2e_status: {evidence['golden_e2e_status']}",
+        f"- consumed: {consumed['task_id']} "
+        f"review_state={consumed['review_state']} "
+        f"requires_review={consumed['requires_review']}",
+        f"- pending_review: {', '.join(pending_ids) or 'none'}",
+        f"- review_event_count: {len(events)}",
+        "",
+        "## Layer gap assessment",
+    ]
+    for name in POST_E2E_AUDIT_LAYERS:
+        info = layers[name]
+        lines.append(
+            f"- [{PASS if info['present'] else BLOCKED}] {name}: {info['detail']}"
+        )
+    lines += [
+        "",
+        f"## {RUNTIME_AUDIT_TASK_ID} status",
+        f"- STATUS: {target.get('STATUS')}",
+        f"- stuck: {target.get('stuck')}",
+        f"- stuck_reason: {target.get('stuck_reason')}",
+        f"- started_at: {target.get('started_at') or 'ABSENT'}",
+        f"- heartbeat: {target.get('heartbeat') or 'ABSENT'}",
+        f"- runner_status: {target.get('runner_status') or 'ABSENT'}",
+        f"- conclusion: {target.get('Conclusion')}",
+        "",
+        "## Status model gap",
+        f"- expected_fields: {', '.join(STATUS_MODEL_EXPECTED_FIELDS)}",
+        f"- missing_fields: {', '.join(missing_status_fields) or 'none'}",
+        f"- {status_model_gap}",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", "## Minimal fix suggestions"]
+    lines += [f"- {suggestion}" for suggestion in suggestions]
+    lines += [
+        "",
+        "## Compatibility",
+        "- submit_task: UNCHANGED",
+        "- get_task_result: UNCHANGED",
+        "- github_workflows: UNCHANGED",
+    ]
+
+    return {
+        "report": POST_E2E_AUDIT_REPORT,
+        "goal": POST_E2E_AUDIT_GOAL,
+        "task_id": POST_E2E_AUDIT_TASK_ID,
+        "STATUS": overall,
+        "report_status": PASS if report_ok else FAIL,
+        "auto_consumer_reached": auto_consumer_reached,
+        "primary_gap": primary_gap,
+        "gap_layers": gap_layers,
+        "layers": layers,
+        "evidence": evidence,
+        "golden_e2e_status": e2e["STATUS"],
+        "golden_e2e_steps": e2e["steps"],
+        "consumed": consumed,
+        "consumed_task_ids": consumed_ids,
+        "pending_review": pending_ids,
+        "discovered_task_ids": discovered_ids,
+        "review_event_count": len(events),
+        "target_task_id": RUNTIME_AUDIT_TASK_ID,
+        "target_task_status": target.get("STATUS"),
+        "target_task_stuck": target.get("stuck"),
+        "target_task_stuck_reason": target.get("stuck_reason"),
+        "target_task_conclusion": target.get("Conclusion"),
+        "target_task_registry_record": registry_record,
+        "target_task_started_at": target.get("started_at"),
+        "target_task_heartbeat": target.get("heartbeat"),
+        "target_task_runner_status": target.get("runner_status"),
+        "status_model_expected_fields": list(STATUS_MODEL_EXPECTED_FIELDS),
+        "status_model_missing_fields": missing_status_fields,
+        "status_model_gap": status_model_gap,
+        "minimal_fix_suggestions": suggestions,
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "compatibility": compatibility,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])
     print(runtime_provenance_report()["markdown"])
     print(personal_ai_task_runtime_audit()["markdown"])
+    print(task_result_auto_consumer_post_e2e_audit()["markdown"])

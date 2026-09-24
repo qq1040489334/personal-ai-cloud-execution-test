@@ -20,6 +20,10 @@ from hello import (
     CLOUDFLARE_WORKER_NAME,
     DEPLOY_VERIFY_COMMIT,
     DEPLOY_VERIFY_TASK_ID,
+    POST_E2E_AUDIT_GOAL,
+    POST_E2E_AUDIT_LAYERS,
+    POST_E2E_AUDIT_REPORT,
+    POST_E2E_AUDIT_TASK_ID,
     REQUIRED_RESULT_FIELDS,
     REVIEW_VERDICTS,
     RUNTIME_AUDIT_GOAL,
@@ -30,6 +34,7 @@ from hello import (
     RESULT_DETAIL_GOAL,
     RESULT_DETAIL_TASK_ID,
     RESULT_DETAIL_FIELDS,
+    STATUS_MODEL_EXPECTED_FIELDS,
     TASK_REVIEW_GOAL,
     cloud_agent_test,
     cloud_agent_test_2,
@@ -58,6 +63,7 @@ from hello import (
     security_test,
     submit_task,
     task_result_auto_consumer_golden_e2e_verify,
+    task_result_auto_consumer_post_e2e_audit,
     task_result_auto_consumer_report,
     task_review_action_report,
     trigger_bridge_test,
@@ -1041,3 +1047,154 @@ def test_auto_consumer_golden_e2e_contracts_unchanged() -> None:
 def test_auto_consumer_golden_e2e_rejects_empty_task_id() -> None:
     with pytest.raises(ValueError):
         task_result_auto_consumer_golden_e2e_verify("")
+
+
+def test_post_e2e_audit_report_shape() -> None:
+    report = task_result_auto_consumer_post_e2e_audit()
+    assert report["report"] == POST_E2E_AUDIT_REPORT
+    assert report["goal"] == POST_E2E_AUDIT_GOAL
+    assert report["task_id"] == POST_E2E_AUDIT_TASK_ID == "cf-e114822ee2ae"
+    assert report["STATUS"] in VALID_STATUSES
+    assert report["report_status"] in VALID_STATUSES
+    assert set(report) >= {
+        "report",
+        "goal",
+        "task_id",
+        "STATUS",
+        "report_status",
+        "auto_consumer_reached",
+        "primary_gap",
+        "gap_layers",
+        "layers",
+        "evidence",
+        "golden_e2e_status",
+        "golden_e2e_steps",
+        "consumed",
+        "consumed_task_ids",
+        "pending_review",
+        "discovered_task_ids",
+        "review_event_count",
+        "target_task_id",
+        "target_task_status",
+        "target_task_stuck",
+        "target_task_stuck_reason",
+        "status_model_expected_fields",
+        "status_model_missing_fields",
+        "status_model_gap",
+        "minimal_fix_suggestions",
+        "human_review_gate",
+        "auto_pass",
+        "auto_trigger_next",
+        "compatibility",
+        "checks",
+        "markdown",
+    }
+
+
+def test_post_e2e_audit_captures_real_consumer_evidence() -> None:
+    report = task_result_auto_consumer_post_e2e_audit()
+    assert report["golden_e2e_status"] == "PASS"
+    assert report["golden_e2e_steps"]
+    consumed = report["consumed"]
+    assert consumed["identified_success"] is True
+    assert consumed["requires_review"] is True
+    assert consumed["review_state"] == "pending_review"
+    assert consumed["task_id"] in report["pending_review"]
+    assert report["review_event_count"] >= 1
+    assert report["discovered_task_ids"]
+    evidence = report["evidence"]
+    assert evidence["golden_e2e_status"] == "PASS"
+    assert evidence["consumed_records"][0]["task_id"] == consumed["task_id"]
+
+
+def test_post_e2e_audit_layer_assessment() -> None:
+    report = task_result_auto_consumer_post_e2e_audit()
+    assert set(report["layers"]) == set(POST_E2E_AUDIT_LAYERS)
+    for name, info in report["layers"].items():
+        assert set(info) >= {"present", "detail"}
+        assert isinstance(info["present"], bool)
+        assert info["detail"]
+    assert report["layers"]["read"]["present"] is True
+    assert report["gap_layers"] == [
+        name
+        for name in POST_E2E_AUDIT_LAYERS
+        if not report["layers"][name]["present"]
+    ]
+    assert report["auto_consumer_reached"] is (not report["gap_layers"])
+
+
+def test_post_e2e_audit_not_reached_without_manual_follow_up() -> None:
+    report = task_result_auto_consumer_post_e2e_audit()
+    assert report["auto_consumer_reached"] is False
+    assert report["STATUS"] != "PASS"
+    assert report["primary_gap"] in POST_E2E_AUDIT_LAYERS
+    assert report["gap_layers"]
+    assert report["layers"]["trigger"]["present"] is False
+    assert report["layers"]["notification"]["present"] is False
+
+
+def test_post_e2e_audit_reports_cf62_state_and_root_cause() -> None:
+    report = task_result_auto_consumer_post_e2e_audit()
+    assert report["target_task_id"] == RUNTIME_AUDIT_TASK_ID == "cf-62e0f30e0d02"
+    assert report["target_task_status"] in {"PASS", "FAIL", "BLOCKED", "PARTIAL"}
+    assert report["target_task_status"] != "PASS"
+    assert report["target_task_stuck"] is True
+    assert report["target_task_stuck_reason"]
+    assert report["target_task_conclusion"]
+    assert "cf-62e0f30e0d02" in report["markdown"]
+
+
+def test_post_e2e_audit_status_model_gap_and_fixes() -> None:
+    report = task_result_auto_consumer_post_e2e_audit()
+    assert report["status_model_expected_fields"] == list(
+        STATUS_MODEL_EXPECTED_FIELDS
+    )
+    missing = set(report["status_model_missing_fields"])
+    assert {"last_update_at", "timeout", "stuck"} <= missing
+    assert report["status_model_gap"]
+    assert len(report["minimal_fix_suggestions"]) >= 3
+    for suggestion in report["minimal_fix_suggestions"]:
+        assert suggestion
+
+
+def test_post_e2e_audit_never_auto_pass_or_trigger() -> None:
+    report = task_result_auto_consumer_post_e2e_audit()
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    record = get_task_review(AUTO_CONSUMER_GOLDEN_E2E_TASK_ID)
+    assert record["reviewed"] is False
+    assert record["review_verdict"] is None
+
+
+def test_post_e2e_audit_contracts_unchanged() -> None:
+    report = task_result_auto_consumer_post_e2e_audit()
+    assert report["compatibility"] == {
+        "submit_task": "UNCHANGED",
+        "get_task_result": "UNCHANGED",
+        "github_workflows": "UNCHANGED",
+    }
+    assert list(inspect.signature(submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(get_task_result).parameters) == ["task_id"]
+
+
+def test_post_e2e_audit_checks_and_markdown() -> None:
+    report = task_result_auto_consumer_post_e2e_audit()
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {POST_E2E_AUDIT_REPORT}")
+    assert f"- task_id: {POST_E2E_AUDIT_TASK_ID}" in markdown
+    assert "## Golden E2E consumer evidence" in markdown
+    assert "## Layer gap assessment" in markdown
+    assert "## Status model gap" in markdown
+    assert "## Minimal fix suggestions" in markdown
