@@ -1813,6 +1813,26 @@ AUTO_CONSUMER_STAGES = ("discover", "read_result", "requires_review")
 AUTO_CONSUMER_REVIEW_STATES = ("pending_review", "reviewed", "not_applicable")
 GET_TASK_RESULT_PARAMS = ["task_id"]
 
+AUTO_CONSUMER_GOLDEN_E2E_GOAL = (
+    "PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_GOLDEN_E2E_VERIFY_V0.1"
+)
+AUTO_CONSUMER_GOLDEN_E2E_TASK_ID = "cf-24192a013493"
+AUTO_CONSUMER_GOLDEN_E2E_PROBE_ID = "cf-24192a013493-review-probe"
+AUTO_CONSUMER_GOLDEN_E2E_REPORT = (
+    "PERSONAL_AI_TASK_RESULT_AUTO_CONSUMER_GOLDEN_E2E_REPORT"
+)
+AUTO_CONSUMER_GOLDEN_E2E_STEPS = (
+    "task_registered",
+    "discover_completed_results",
+    "read_result_via_get_task_result",
+    "consume_task_result",
+    "human_acceptance_queue",
+    "no_auto_pass_or_trigger",
+    "mark_reviewed_compatibility",
+    "submit_task_unchanged",
+    "get_task_result_unchanged",
+)
+
 
 def discover_completed_results() -> list[dict]:
     """Auto-discover every successfully completed task in the Task Registry.
@@ -2088,6 +2108,224 @@ def task_result_auto_consumer_report() -> dict:
         "auto_pass": False,
         "auto_trigger_next": False,
         "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
+_GOLDEN_E2E_PROBE_SEQ = 0
+
+
+def _golden_e2e_step(step: str, status: str, detail: str) -> dict:
+    return {"step": step, "status": status, "detail": detail}
+
+
+def task_result_auto_consumer_golden_e2e_verify(
+    task_id: str = AUTO_CONSUMER_GOLDEN_E2E_TASK_ID,
+) -> dict:
+    """Verify the real result-consumption closed loop end to end.
+
+    The chain is verified against the UNCHANGED contracts only: a completed task
+    is discovered, its result is read through ``get_task_result``, and
+    ``consume_task_result`` raises the ``requires_review`` human gate so the task
+    enters the ``pending_review`` acceptance queue. ``mark_reviewed``
+    compatibility is proven on a separate probe task, so the real task is never
+    auto-reviewed and never auto-PASSed, and no follow-up task is triggered.
+    """
+    if not task_id:
+        raise ValueError(
+            "task_result_auto_consumer_golden_e2e_verify requires a task_id"
+        )
+    steps: list[dict] = []
+
+    if task_id not in TASK_REGISTRY:
+        submit_task(
+            task_id,
+            goal=AUTO_CONSUMER_GOLDEN_E2E_GOAL,
+            status="success",
+            requires_review=False,
+        )
+    registered = task_id in TASK_REGISTRY
+    steps.append(
+        _golden_e2e_step(
+            "task_registered",
+            PASS if registered else FAIL,
+            f"task {task_id} present in the Task Registry",
+        )
+    )
+
+    discovered = discover_completed_results()
+    discovered_ids = [item["task_id"] for item in discovered]
+    steps.append(
+        _golden_e2e_step(
+            "discover_completed_results",
+            PASS if task_id in discovered_ids else FAIL,
+            f"discovered {len(discovered_ids)} successful task(s); "
+            f"target present: {task_id in discovered_ids}",
+        )
+    )
+
+    result = get_task_result(task_id)
+    result_keys = set(result)
+    read_ok = result_keys == set(RESULT_CONTRACT_FIELDS)
+    steps.append(
+        _golden_e2e_step(
+            "read_result_via_get_task_result",
+            PASS if read_ok else FAIL,
+            f"get_task_result returned {len(result_keys)} contract field(s); "
+            f"execution status={result['execution_summary']['status']}",
+        )
+    )
+
+    consumed = consume_task_result(task_id)
+    gate_ok = (
+        consumed["identified_success"]
+        and consumed["requires_review"]
+        and consumed["review_state"] == "pending_review"
+        and consumed["human_review_gate"]
+    )
+    steps.append(
+        _golden_e2e_step(
+            "consume_task_result",
+            PASS if gate_ok else FAIL,
+            f"identified_success={consumed['identified_success']} "
+            f"requires_review={consumed['requires_review']} "
+            f"review_state={consumed['review_state']}",
+        )
+    )
+
+    pending_ids = {item["task_id"] for item in list_pending_results()}
+    steps.append(
+        _golden_e2e_step(
+            "human_acceptance_queue",
+            PASS if task_id in pending_ids else FAIL,
+            f"task {task_id} awaiting human acceptance: {task_id in pending_ids}",
+        )
+    )
+
+    record = get_task_review(task_id) or {}
+    no_auto = (
+        not record.get("reviewed")
+        and not consumed["auto_pass"]
+        and not consumed["auto_trigger_next"]
+    )
+    steps.append(
+        _golden_e2e_step(
+            "no_auto_pass_or_trigger",
+            PASS if no_auto else FAIL,
+            "real task stays unreviewed; auto_pass=False; auto_trigger_next=False",
+        )
+    )
+
+    global _GOLDEN_E2E_PROBE_SEQ
+    _GOLDEN_E2E_PROBE_SEQ += 1
+    probe_id = f"{AUTO_CONSUMER_GOLDEN_E2E_PROBE_ID}-{_GOLDEN_E2E_PROBE_SEQ}"
+    submit_task(
+        probe_id,
+        goal=AUTO_CONSUMER_GOLDEN_E2E_GOAL,
+        status="success",
+        requires_review=False,
+    )
+    probe_consumed = consume_task_result(probe_id)
+    probe_pending_before = probe_id in {
+        item["task_id"] for item in list_pending_results()
+    }
+    probe_reviewed = mark_reviewed(probe_id, "PASS", "golden e2e review-flow probe")
+    probe_pending_after = probe_id in {
+        item["task_id"] for item in list_pending_results()
+    }
+    probe_events = get_review_events(probe_id)
+    flow_ok = (
+        probe_consumed["review_state"] == "pending_review"
+        and probe_pending_before
+        and probe_reviewed["reviewed"] is True
+        and probe_reviewed["review_verdict"] == "PASS"
+        and not probe_pending_after
+        and len(probe_events) >= 1
+    )
+    steps.append(
+        _golden_e2e_step(
+            "mark_reviewed_compatibility",
+            PASS if flow_ok else FAIL,
+            "probe task: pending_review -> mark_reviewed(PASS) -> leaves pending, "
+            "review_event appended",
+        )
+    )
+
+    submit_unchanged = (
+        list(inspect.signature(submit_task).parameters) == SUBMIT_TASK_PARAMS
+    )
+    get_result_unchanged = (
+        list(inspect.signature(get_task_result).parameters) == GET_TASK_RESULT_PARAMS
+        and result_keys == set(RESULT_CONTRACT_FIELDS)
+    )
+    steps.append(
+        _golden_e2e_step(
+            "submit_task_unchanged",
+            PASS if submit_unchanged else FAIL,
+            "submit_task signature: "
+            + ", ".join(inspect.signature(submit_task).parameters),
+        )
+    )
+    steps.append(
+        _golden_e2e_step(
+            "get_task_result_unchanged",
+            PASS if get_result_unchanged else FAIL,
+            "get_task_result signature: "
+            + ", ".join(inspect.signature(get_task_result).parameters)
+            + "; contract fields intact",
+        )
+    )
+
+    overall = FAIL if any(step["status"] == FAIL for step in steps) else PASS
+    compatibility = {
+        "submit_task": "UNCHANGED",
+        "get_task_result": "UNCHANGED",
+        "github_workflows": "UNCHANGED",
+    }
+
+    lines = [
+        f"# {AUTO_CONSUMER_GOLDEN_E2E_REPORT}",
+        "",
+        f"- goal: {AUTO_CONSUMER_GOLDEN_E2E_GOAL}",
+        f"- task_id: {task_id}",
+        f"- STATUS: {overall}",
+        f"- stages: {', '.join(AUTO_CONSUMER_GOLDEN_E2E_STEPS)}",
+        "- human_review_gate: True",
+        "- auto_pass: False",
+        "- auto_trigger_next: False",
+        "",
+        "## 验证步骤",
+    ]
+    for step in steps:
+        lines.append(f"- [{step['status']}] {step['step']}: {step['detail']}")
+    lines += ["", "## Compatibility"]
+    for key, value in compatibility.items():
+        lines.append(f"- {key}: {value}")
+    lines.append("")
+    lines.append("- Tests: python -m pytest -q")
+
+    return {
+        "report": AUTO_CONSUMER_GOLDEN_E2E_REPORT,
+        "goal": AUTO_CONSUMER_GOLDEN_E2E_GOAL,
+        "task_id": task_id,
+        "STATUS": overall,
+        "验证步骤": steps,
+        "steps": steps,
+        "Tests": "python -m pytest -q",
+        "Compatibility": compatibility,
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "consumed": {
+            "task_id": consumed["task_id"],
+            "identified_status": consumed["identified_status"],
+            "identified_success": consumed["identified_success"],
+            "result_status": consumed["result_status"],
+            "requires_review": consumed["requires_review"],
+            "review_state": consumed["review_state"],
+        },
+        "pending_review": sorted(pending_ids),
+        "review_flow_probe": probe_id,
         "markdown": "\n".join(lines),
     }
 

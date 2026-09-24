@@ -8,6 +8,10 @@ import pytest
 
 from hello import (
     AUTO_CONSUMER_GOAL,
+    AUTO_CONSUMER_GOLDEN_E2E_GOAL,
+    AUTO_CONSUMER_GOLDEN_E2E_REPORT,
+    AUTO_CONSUMER_GOLDEN_E2E_STEPS,
+    AUTO_CONSUMER_GOLDEN_E2E_TASK_ID,
     AUTO_CONSUMER_REPORT,
     AUTO_CONSUMER_TASK_ID,
     CLOUDFLARE_AUDIT_GOAL,
@@ -53,6 +57,7 @@ from hello import (
     runtime_provenance_report,
     security_test,
     submit_task,
+    task_result_auto_consumer_golden_e2e_verify,
     task_result_auto_consumer_report,
     task_review_action_report,
     trigger_bridge_test,
@@ -939,3 +944,100 @@ def test_auto_consumer_report_consumes_discovered() -> None:
     entries = {c["task_id"]: c for c in report["consumed"]}
     assert entries[task_id]["review_state"] == "pending_review"
     assert report["STATUS"] == "PASS"
+
+
+def test_auto_consumer_golden_e2e_report_shape() -> None:
+    report = task_result_auto_consumer_golden_e2e_verify()
+    assert report["report"] == AUTO_CONSUMER_GOLDEN_E2E_REPORT
+    assert report["goal"] == AUTO_CONSUMER_GOLDEN_E2E_GOAL
+    assert report["task_id"] == AUTO_CONSUMER_GOLDEN_E2E_TASK_ID == "cf-24192a013493"
+    assert report["STATUS"] in {"PASS", "FAIL"}
+    assert report["Tests"] == "python -m pytest -q"
+    assert report["Compatibility"] == {
+        "submit_task": "UNCHANGED",
+        "get_task_result": "UNCHANGED",
+        "github_workflows": "UNCHANGED",
+    }
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    assert report["验证步骤"] == report["steps"]
+    assert report["pending_review"]
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {AUTO_CONSUMER_GOLDEN_E2E_REPORT}")
+    assert f"- task_id: {AUTO_CONSUMER_GOLDEN_E2E_TASK_ID}" in markdown
+    assert "## 验证步骤" in markdown
+    assert "## Compatibility" in markdown
+    assert "python -m pytest -q" in markdown
+
+
+def test_auto_consumer_golden_e2e_steps_cover_required_checks() -> None:
+    report = task_result_auto_consumer_golden_e2e_verify()
+    step_names = [step["step"] for step in report["steps"]]
+    assert step_names == list(AUTO_CONSUMER_GOLDEN_E2E_STEPS)
+    for step in report["steps"]:
+        assert set(step) >= {"step", "status", "detail"}
+        assert step["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert step["detail"]
+    assert report["STATUS"] == "PASS"
+
+
+def test_auto_consumer_golden_e2e_real_task_enters_human_review() -> None:
+    report = task_result_auto_consumer_golden_e2e_verify()
+    task_id = AUTO_CONSUMER_GOLDEN_E2E_TASK_ID
+    assert report["consumed"]["task_id"] == task_id
+    assert report["consumed"]["identified_success"] is True
+    assert report["consumed"]["requires_review"] is True
+    assert report["consumed"]["review_state"] == "pending_review"
+    assert task_id in report["pending_review"]
+    assert task_id in _pending_ids()
+
+
+def test_auto_consumer_golden_e2e_never_auto_reviews_real_task() -> None:
+    task_result_auto_consumer_golden_e2e_verify()
+    record = get_task_review(AUTO_CONSUMER_GOLDEN_E2E_TASK_ID)
+    assert record["reviewed"] is False
+    assert record["review_verdict"] is None
+    assert record["reviewed_at"] is None
+
+
+def test_auto_consumer_golden_e2e_mark_reviewed_flow_compatible() -> None:
+    report = task_result_auto_consumer_golden_e2e_verify()
+    probe_id = report["review_flow_probe"]
+    probe = get_task_review(probe_id)
+    assert probe["reviewed"] is True
+    assert probe["review_verdict"] == "PASS"
+    assert probe_id not in _pending_ids()
+    events = get_review_events(probe_id)
+    assert events
+    assert events[-1]["action"] == "review"
+    assert events[-1]["verdict"] == "PASS"
+    assert AUTO_CONSUMER_GOLDEN_E2E_TASK_ID in _pending_ids()
+
+
+def test_auto_consumer_golden_e2e_contracts_unchanged() -> None:
+    task_result_auto_consumer_golden_e2e_verify()
+    signature = inspect.signature(submit_task)
+    assert list(signature.parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    result_signature = inspect.signature(get_task_result)
+    assert list(result_signature.parameters) == ["task_id"]
+    result = get_task_result(AUTO_CONSUMER_GOLDEN_E2E_TASK_ID)
+    assert set(result) == {
+        "execution_summary",
+        "commit",
+        "tests",
+        "artifacts",
+        "execution_result_json",
+        "evidence",
+    }
+
+
+def test_auto_consumer_golden_e2e_rejects_empty_task_id() -> None:
+    with pytest.raises(ValueError):
+        task_result_auto_consumer_golden_e2e_verify("")
