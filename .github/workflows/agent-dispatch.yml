@@ -131,14 +131,14 @@ jobs:
             fi
             if [ ! -s "$RUNNER_TEMP/execution_result.json" ]; then
               python - "$RUNNER_TEMP/task.json" "$RUNNER_TEMP/execution_result.json" "$JOB_STATUS" "$PUSH_OUTCOME" <<'PY'
-              import json,sys
-              src,out,job_status,push_outcome=sys.argv[1:]
-              d=json.load(open(src))
-              if isinstance(d,str): d=json.loads(d)
-              failure_stage = "push" if push_outcome == "failure" else "workflow"
-              r={"task_id":d.get("task_id",""),"status":"failure","summary":"cloud-agent-dispatch terminated before normal result publication","failure_stage":failure_stage,"job_status":job_status,"push_outcome":push_outcome}
-              json.dump(r,open(out,"w"),ensure_ascii=False,indent=2)
-              PY
+          import json,sys
+          src,out,job_status,push_outcome=sys.argv[1:]
+          d=json.load(open(src))
+          if isinstance(d,str): d=json.loads(d)
+          failure_stage = "push" if push_outcome == "failure" else "workflow"
+          r={"task_id":d.get("task_id",""),"status":"failure","summary":"cloud-agent-dispatch terminated before normal result publication","failure_stage":failure_stage,"job_status":job_status,"push_outcome":push_outcome}
+          json.dump(r,open(out,"w"),ensure_ascii=False,indent=2)
+          PY
             fi
           fi
 
