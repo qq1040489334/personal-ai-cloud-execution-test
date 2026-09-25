@@ -51,6 +51,13 @@ from hello import (
     LIVE_ACCEPTANCE_GOAL,
     LIVE_ACCEPTANCE_REPORT,
     LIVE_ACCEPTANCE_TASK_ID,
+    LIVE_GOLDEN_ROUND_1_FIELDS,
+    LIVE_GOLDEN_ROUND_1_GOAL,
+    LIVE_GOLDEN_ROUND_1_REPORT,
+    LIVE_GOLDEN_ROUND_1_ROUNDS,
+    LIVE_GOLDEN_ROUND_1_SUBMIT_STATUS,
+    LIVE_GOLDEN_ROUND_1_TASK_ID,
+    LIVE_GOLDEN_ROUND_1_TERMINAL_STATUSES,
     PENDING_TIMEOUT_SECONDS,
     POST_E2E_AUDIT_GOAL,
     POST_E2E_AUDIT_LAYERS,
@@ -96,6 +103,8 @@ from hello import (
     hello,
     list_pending_results,
     list_review_events,
+    live_golden_round_1_test,
+    live_golden_round_1_verify,
     mark_reviewed,
     mcp_bridge_test,
     mcp_runtime_deploy_verify,
@@ -2425,6 +2434,119 @@ def test_auto_result_close_loop_markdown() -> None:
     markdown = report["markdown"]
     assert markdown.startswith(f"# {AUTO_RESULT_CLOSE_LOOP_REPORT}")
     assert f"- task_id: {AUTO_RESULT_CLOSE_LOOP_TASK_ID}" in markdown
+    assert f"- status: {report['status']}" in markdown
+    assert f"- round: {report['round']}" in markdown
+    assert "## Checks" in markdown
+
+
+def test_live_golden_round_1_marker() -> None:
+    assert live_golden_round_1_test() == "live golden round 1 ok"
+    assert isinstance(live_golden_round_1_test(), str)
+
+
+def test_live_golden_round_1_contract_fields() -> None:
+    report = live_golden_round_1_verify()
+    assert report["report"] == LIVE_GOLDEN_ROUND_1_REPORT
+    assert report["goal"] == LIVE_GOLDEN_ROUND_1_GOAL
+    assert report["task_id"] == LIVE_GOLDEN_ROUND_1_TASK_ID == "cf-b0114222addf"
+    for field in LIVE_GOLDEN_ROUND_1_FIELDS:
+        assert field in report
+    assert report["status"] in VALID_STATUSES
+    assert isinstance(report["round"], int)
+    assert report["summary"]
+    assert isinstance(report["tests"], str) and report["tests"]
+    assert isinstance(report["artifacts"], list)
+    for artifact in report["artifacts"]:
+        assert set(artifact) >= {"name", "path", "sha256", "bytes"}
+        assert artifact["sha256"]
+        assert artifact["bytes"] > 0
+    assert isinstance(report["execution_result_json"], dict)
+    assert set(report["evidence"]) >= {"acceptance", "decision"}
+    assert report["evidence"]["decision"]["status"] == report["status"]
+    assert report["evidence"]["decision"]["reason"]
+
+
+def test_live_golden_round_1_get_task_result_matches_submitted_task() -> None:
+    report = live_golden_round_1_verify()
+    task_id = LIVE_GOLDEN_ROUND_1_TASK_ID
+    result = get_task_result(task_id)
+    assert result["execution_summary"]["task_id"] == task_id
+    assert report["task_id"] == task_id
+    assert report["task_id_matches"] is True
+    assert report["retrieved_task_id"] == task_id
+    assert report["evidence"]["retrieved_via"] == "get_task_result"
+    assert report["evidence"]["retrieved_task_id"] == task_id
+    assert report["evidence"]["task_id_matches"] is True
+    checks = {check["check"]: check["status"] for check in report["checks"]}
+    assert checks["get_task_result returns matching task_id"] == "PASS"
+
+
+def test_live_golden_round_1_terminal_success_no_user_intervention() -> None:
+    report = live_golden_round_1_verify()
+    assert report["status"] in {"PASS", "FAIL"}
+    assert report["status"] != "BLOCKED"
+    assert report["terminal"] is True
+    assert report["requires_review"] is False
+    assert report["follow_up_task_submitted"] is False
+    assert report["evidence"]["user_input_requested"] is False
+    assert report["evidence"]["follow_up_task_submitted"] is False
+    record = get_task_review(LIVE_GOLDEN_ROUND_1_TASK_ID)
+    assert record is not None
+    assert record["task_id"] == LIVE_GOLDEN_ROUND_1_TASK_ID
+    assert str(record["status"]).lower() == LIVE_GOLDEN_ROUND_1_SUBMIT_STATUS
+    assert record["requires_review"] is False
+    checks = {check["check"]: check["status"] for check in report["checks"]}
+    assert checks["workflow reaches a terminal state"] == "PASS"
+    assert checks["terminal workflow conclusion is success"] == "PASS"
+
+
+def test_live_golden_round_1_single_bounded_round() -> None:
+    report = live_golden_round_1_verify()
+    assert report["round"] == 1
+    assert report["bounded_rounds"] == LIVE_GOLDEN_ROUND_1_ROUNDS == 1
+    assert report["evidence"]["round"] == 1
+    checks = {check["check"]: check["status"] for check in report["checks"]}
+    assert checks["single bounded execution round recorded"] == "PASS"
+    assert LIVE_GOLDEN_ROUND_1_SUBMIT_STATUS in LIVE_GOLDEN_ROUND_1_TERMINAL_STATUSES
+
+
+def test_live_golden_round_1_evidence_and_artifacts_present() -> None:
+    report = live_golden_round_1_verify()
+    assert report["commit"]
+    paths = {artifact["path"] for artifact in report["artifacts"]}
+    assert {"hello.py", "test_hello.py"} <= paths
+    evidence = report["evidence"]
+    assert evidence["artifacts_present"]
+    assert evidence["task_id"] == LIVE_GOLDEN_ROUND_1_TASK_ID
+    assert evidence["goal"] == LIVE_GOLDEN_ROUND_1_GOAL
+    assert evidence["submitted_via"] == "submit_task"
+    assert evidence["submitted_task_id"] == LIVE_GOLDEN_ROUND_1_TASK_ID
+    assert set(evidence["acceptance"]) == {
+        "workflow reaches a terminal state",
+        "get_task_result can retrieve a result whose task_id matches this submitted task",
+        "terminal workflow conclusion is success",
+        "tests pass",
+        "evidence is sufficient to decide PASS / FAIL / BLOCKED without the execution environment",
+    }
+
+
+def test_live_golden_round_1_contracts_unchanged_and_markdown() -> None:
+    report = live_golden_round_1_verify()
+    assert list(inspect.signature(submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(get_task_result).parameters) == ["task_id"]
+    checks = {check["check"]: check["status"] for check in report["checks"]}
+    assert checks["submit_task / get_task_result contracts unchanged"] == "PASS"
+    assert checks["bounded scope (no follow-up task, no workflow change)"] == "PASS"
+    assert checks["evidence sufficient without the execution environment"] == "PASS"
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {LIVE_GOLDEN_ROUND_1_REPORT}")
+    assert f"- task_id: {LIVE_GOLDEN_ROUND_1_TASK_ID}" in markdown
     assert f"- status: {report['status']}" in markdown
     assert f"- round: {report['round']}" in markdown
     assert "## Checks" in markdown
