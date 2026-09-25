@@ -112,6 +112,7 @@ from hello import (
     get_review_events,
     get_task_result,
     get_task_review,
+    golden_e2e_round_1_marker,
     goodbye,
     gpt_bridge_test,
     hello,
@@ -200,6 +201,10 @@ def test_result_consumer_test() -> None:
 
 def test_result_consumer_test2() -> None:
     assert result_consumer_test2() == "result consumer two ok"
+
+
+def test_golden_e2e_round_1_marker() -> None:
+    assert golden_e2e_round_1_marker() == "GOLDEN_E2E_ROUND_1_OK"
 
 
 def test_cloud_asset_status_report_shape() -> None:

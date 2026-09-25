@@ -106,6 +106,11 @@ def result_consumer_test2() -> str:
     return "result consumer two ok"
 
 
+def golden_e2e_round_1_marker() -> str:
+    """Return the golden E2E round 1 marker."""
+    return "GOLDEN_E2E_ROUND_1_OK"
+
+
 def _git(*args: str) -> str:
     try:
         result = subprocess.run(
