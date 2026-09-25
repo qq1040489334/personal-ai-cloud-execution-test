@@ -111,6 +111,11 @@ def golden_e2e_round_1_marker() -> str:
     return "GOLDEN_E2E_ROUND_1_OK"
 
 
+def golden_e2e_round_1_retry_marker() -> str:
+    """Return the golden E2E round 1 retry marker."""
+    return "GOLDEN_E2E_ROUND_1_RETRY_OK"
+
+
 def _git(*args: str) -> str:
     try:
         result = subprocess.run(
