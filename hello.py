@@ -7227,6 +7227,885 @@ def knowledge_ground_truth_audit_v0_1() -> dict:
     }
 
 
+# PERSONAL_AI_AUTO_REVIEW_LOOP_V0_1
+#
+# Closes the acceptance-advance gap left by the existing auto-consumer: the
+# consumer discovered a completed result and raised ``requires_review`` but the
+# machine never produced a verdict. This loop discovers pending results, reads
+# the full ``get_task_result`` payload, decides PASS / FAIL / BLOCKED from
+# status + tests + evidence + artifacts, writes the verdict through the stable
+# ``mark_reviewed`` contract, stops auto-advance on FAIL/BLOCKED, and only
+# permits a next-task dispatch when the task explicitly carries an approved
+# ``next_task``. It never rewrites ``submit_task`` / ``get_task_result`` and
+# never touches workflows, tokens or secrets.
+AUTO_REVIEW_LOOP_GOAL = "PERSONAL_AI_AUTO_REVIEW_LOOP_V0_1"
+AUTO_REVIEW_LOOP_TASK_ID = "cf-99260a669a85"
+AUTO_REVIEW_LOOP_REPORT = "PERSONAL_AI_AUTO_REVIEW_LOOP_REPORT"
+AUTO_REVIEW_EVENT = "auto_reviewed"
+AUTO_DISPATCH_EVENT = "auto_dispatched"
+AUTO_REVIEW_EVIDENCE_FIELDS = (
+    "execution_summary",
+    "commit",
+    "tests",
+    "artifacts",
+    "execution_result_json",
+    "evidence",
+)
+AUTO_REVIEW_NEXT_TASK_FIELDS = (
+    "next_task",
+    "approved_next_task",
+    "next_task_id",
+)
+AUTO_REVIEW_MIN_ARTIFACTS = 1
+CHATGPT_WAKEUP_ENV_HINTS = (
+    "CHATGPT_PROACTIVE_WAKEUP_URL",
+    "MCP_PROACTIVE_WAKEUP_URL",
+    "PROACTIVE_WAKEUP_CHANNEL",
+)
+CHATGPT_WAKEUP_BLOCKED_REASON = "BLOCKED_NO_EVENT_DRIVEN_WAKEUP_CHANNEL"
+
+
+def chatgpt_proactive_wakeup_status() -> dict:
+    """Report whether ChatGPT/MCP can proactively wake the cloud agent.
+
+    The in-repo loop can reach a server-side closed loop by being polled, but a
+    genuine event-driven proactive wakeup requires a configured inbound channel.
+    When no such channel is configured the capability is reported as an explicit
+    ``BLOCKED_<reason>`` instead of a fabricated PASS.
+    """
+    channel = _env_value(CHATGPT_WAKEUP_ENV_HINTS)
+    if channel:
+        return {
+            "CHATGPT_PROACTIVE_WAKEUP": PASS,
+            "channel": channel,
+            "proactive": True,
+            "reason": (
+                "an event-driven proactive wakeup channel is configured; the "
+                "server may push a wakeup without a user prompt"
+            ),
+        }
+    return {
+        "CHATGPT_PROACTIVE_WAKEUP": CHATGPT_WAKEUP_BLOCKED_REASON,
+        "channel": None,
+        "proactive": False,
+        "reason": (
+            "the ChatGPT/MCP platform provides no inbound event push and no "
+            "wakeup channel is configured, so the cloud agent cannot be woken "
+            "proactively; it must be polled/heartbeated. Server-side closed loop "
+            "is available, proactive wakeup is not."
+        ),
+    }
+
+
+def _auto_review_pending_records() -> list[dict]:
+    """Return registry records awaiting machine auto-review (read-only)."""
+    pending: list[dict] = []
+    for record in TASK_REGISTRY.values():
+        if not record.get("requires_review"):
+            continue
+        if record.get("reviewed"):
+            continue
+        if record.get("timed_out") or record.get("terminal_state") in (
+            "timed_out",
+            "stuck",
+            "failed",
+        ):
+            continue
+        pending.append(record)
+    return pending
+
+
+def auto_review_loop_discover(goal: str | None = None) -> list[dict]:
+    """AUTO_DISCOVERY: find tasks awaiting a machine auto-review verdict.
+
+    A task is discoverable when it requires review, has not been reviewed yet
+    and is not in a terminal timed-out/stuck/failed state. Unlike
+    ``list_pending_results`` this also surfaces non-success tasks, so a failed
+    execution can be explicitly stopped by the machine. No verdict is decided
+    here.
+    """
+    _sync_execution_result()
+    discovered: list[dict] = []
+    for record in _auto_review_pending_records():
+        if goal is not None and str(record.get("goal", "")) != goal:
+            continue
+        entry = dict(record)
+        entry["review_state"] = "pending_auto_review"
+        entry["discovered_by"] = "personal_ai_auto_review_loop"
+        discovered.append(entry)
+    discovered.sort(key=lambda item: item["task_id"])
+    return discovered
+
+
+def auto_review_loop_read_result(task_id: str) -> dict:
+    """AUTO_GET_RESULT: read the full ``get_task_result`` payload and evidence.
+
+    Prefers the task's own submitted evidence fields (``tests``, ``artifacts``,
+    ``evidence``) when present, then falls back to the result contract, so the
+    decision is made on the most complete machine-readable evidence available.
+    """
+    if not task_id:
+        raise ValueError("auto_review_loop_read_result requires a task_id")
+    result = get_task_result(task_id)
+    record = TASK_REGISTRY.get(task_id) or {}
+
+    tests = record.get("tests")
+    if not tests:
+        tests = result.get("tests", "")
+    artifacts = record.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        artifacts = result.get("artifacts") or []
+    evidence = record.get("evidence")
+    if not isinstance(evidence, dict) or not evidence:
+        evidence = result.get("evidence") or {}
+
+    missing = [
+        name for name in AUTO_REVIEW_EVIDENCE_FIELDS if name not in result
+    ]
+    return {
+        "task_id": task_id,
+        "result": result,
+        "execution_status": str(record.get("status", "")).strip().lower(),
+        "result_status": str(
+            result.get("execution_summary", {}).get("status", "")
+        ).strip(),
+        "tests": str(tests).strip(),
+        "artifacts": artifacts if isinstance(artifacts, list) else [],
+        "evidence": evidence if isinstance(evidence, dict) else {},
+        "missing_contract_fields": missing,
+        "result_contract_complete": not missing,
+    }
+
+
+def auto_review_decide(task_id: str, read: dict | None = None) -> dict:
+    """Decide PASS / FAIL / BLOCKED without ever guessing a PASS.
+
+    PASS is produced only when the execution status is success, the test
+    summary is present and passing, at least one artifact is readable and the
+    evidence block is readable. Any missing evidence yields BLOCKED; a terminal
+    failure status or failing tests yields FAIL. Both FAIL and BLOCKED set
+    ``stop_gate`` true so auto-advance stops.
+    """
+    if not task_id:
+        raise ValueError("auto_review_decide requires a task_id")
+    read = read if read is not None else auto_review_loop_read_result(task_id)
+    execution_status = str(read.get("execution_status", "")).strip().lower()
+    result_status = str(read.get("result_status", "")).strip()
+    tests = str(read.get("tests", "")).strip()
+    artifacts = read.get("artifacts")
+    evidence = read.get("evidence")
+
+    artifact_list = artifacts if isinstance(artifacts, list) else []
+    evidence_readable = isinstance(evidence, dict) and bool(evidence)
+    tests_lower = tests.lower()
+    test_failed = "fail" in tests_lower or "error" in tests_lower
+    blockers: list[str] = []
+
+    if execution_status in FAILURE_STATUSES:
+        verdict = FAIL
+        reason = (
+            "AUTO_REVIEW_FAIL: execution status "
+            f"{execution_status!r} is a terminal failure"
+        )
+        blockers.append(f"execution status {execution_status!r}")
+    elif test_failed:
+        verdict = FAIL
+        reason = (
+            "AUTO_REVIEW_FAIL: test evidence indicates failure "
+            f"(tests={tests!r})"
+        )
+        blockers.append(f"tests={tests!r}")
+    elif execution_status not in SUCCESS_STATUSES:
+        verdict = BLOCKED
+        reason = (
+            "AUTO_REVIEW_BLOCKED: execution status "
+            f"{execution_status!r} is not a success status"
+        )
+        blockers.append(f"non-success execution status {execution_status!r}")
+    else:
+        if not read.get("result_contract_complete", True):
+            blockers.append(
+                "result contract fields missing: "
+                + ", ".join(read.get("missing_contract_fields", []))
+            )
+        if not tests or "not available" in tests_lower:
+            blockers.append("test summary unavailable")
+        if len(artifact_list) < AUTO_REVIEW_MIN_ARTIFACTS:
+            blockers.append("no readable artifacts")
+        if not evidence_readable:
+            blockers.append("evidence missing or unreadable")
+        if blockers:
+            verdict = BLOCKED
+            reason = (
+                "AUTO_REVIEW_BLOCKED: evidence insufficient ("
+                + "; ".join(blockers)
+                + ")"
+            )
+        else:
+            verdict = PASS
+            reason = (
+                "AUTO_REVIEW_PASS: status=success, tests pass, "
+                f"{len(artifact_list)} artifact(s) readable, evidence readable"
+            )
+
+    return {
+        "task_id": task_id,
+        "verdict": verdict,
+        "reason": reason,
+        "blockers": blockers,
+        "stop_gate": verdict != PASS,
+        "auto_advance_allowed": verdict == PASS,
+        "execution_status": execution_status,
+        "result_status": result_status,
+        "tests": tests,
+        "artifact_count": len(artifact_list),
+        "evidence_readable": evidence_readable,
+    }
+
+
+def next_task_gate(task_id: str, next_task=None) -> dict:
+    """NEXT_TASK_GATE: allow advance only for an explicitly approved next_task.
+
+    The gate resolves a next_task from the explicit argument or the task
+    registry and requires an explicit approval marker. A next_task that is
+    present but not approved is refused, so no unapproved follow-up can be
+    dispatched. With no next_task the loop ends normally and no task is
+    invented.
+    """
+    if not task_id:
+        raise ValueError("next_task_gate requires a task_id")
+    record = TASK_REGISTRY.get(task_id) or {}
+    resolved = None
+    source = None
+    approval = bool(record.get("next_task_approved", False))
+
+    if next_task is not None:
+        resolved = next_task
+        source = "explicit_argument"
+    else:
+        for field in AUTO_REVIEW_NEXT_TASK_FIELDS:
+            value = record.get(field)
+            if value:
+                resolved = value
+                source = f"registry.{field}"
+                break
+
+    if isinstance(resolved, dict):
+        approval = approval or bool(resolved.get("approved", False))
+        next_task_id = resolved.get("task_id") or resolved.get("id")
+        next_task_goal = resolved.get("goal")
+    elif resolved:
+        next_task_id = str(resolved)
+        next_task_goal = record.get("next_task_goal")
+    else:
+        next_task_id = None
+        next_task_goal = None
+
+    allowed = bool(next_task_id) and approval
+    if not next_task_id:
+        reason = (
+            "no next_task carried or parsed; loop ends normally (no task invented)"
+        )
+    elif not approval:
+        reason = (
+            "next_task present but not explicitly approved; auto-dispatch refused"
+        )
+    else:
+        reason = f"approved next_task resolved from {source}; dispatch allowed"
+    return {
+        "task_id": task_id,
+        "allowed": allowed,
+        "next_task": resolved,
+        "next_task_id": next_task_id,
+        "next_task_goal": next_task_goal,
+        "approved": approval,
+        "source": source,
+        "reason": reason,
+    }
+
+
+def auto_review_dispatch_next(task_id: str, next_task=None) -> dict:
+    """Dispatch the approved next_task at most once, after a PASS verdict.
+
+    Refuses to dispatch before a PASS, refuses an unapproved next_task and
+    refuses a second dispatch for the same task_id. The dispatch is recorded as
+    a durable ``auto_dispatched`` evidence event (an approval-gated in-repo
+    dispatch record); no workflow, token or secret is modified.
+    """
+    if not task_id:
+        raise ValueError("auto_review_dispatch_next requires a task_id")
+    record = TASK_REGISTRY.get(task_id)
+    if record is None:
+        raise KeyError(f"unknown task_id: {task_id}")
+    if str(record.get("review_verdict") or "") != PASS:
+        return {
+            "task_id": task_id,
+            "action": "blocked_not_passed",
+            "dispatched": False,
+            "reason": "next-task dispatch requires a PASS verdict",
+        }
+
+    prior = [
+        event
+        for event in get_consumption_evidence(task_id)
+        if event.get("event_type") == AUTO_DISPATCH_EVENT
+    ]
+    if prior:
+        return {
+            "task_id": task_id,
+            "action": "skipped_duplicate_dispatch",
+            "dispatched": False,
+            "duplicate_prevented": True,
+            "reason": "idempotency guard: next_task already dispatched for this task_id",
+        }
+
+    gate = next_task_gate(task_id, next_task)
+    if not gate["allowed"]:
+        return {
+            "task_id": task_id,
+            "action": "blocked_no_approved_next_task",
+            "dispatched": False,
+            "duplicate_prevented": False,
+            "gate": gate,
+            "reason": gate["reason"],
+        }
+
+    event = record_consumer_evidence(
+        AUTO_DISPATCH_EVENT,
+        task_id,
+        detail=gate["reason"],
+        extra={
+            "next_task_id": gate["next_task_id"],
+            "mode": "approval_gated_in_repo_dispatch_record",
+        },
+    )
+    return {
+        "task_id": task_id,
+        "action": "dispatched_next_task",
+        "dispatched": True,
+        "duplicate_prevented": False,
+        "next_task_id": gate["next_task_id"],
+        "next_task_goal": gate["next_task_goal"],
+        "gate": gate,
+        "event": event,
+    }
+
+
+def auto_review_loop_run(task_id: str, next_task=None) -> dict:
+    """Run the closed loop for one task: discover -> read -> decide -> record.
+
+    The verdict is written through the unchanged ``mark_reviewed`` contract.
+    Re-running for the same task_id is a no-op (idempotency), and the
+    next-task dispatch only happens for a PASS with an approved next_task.
+    """
+    if not task_id:
+        raise ValueError("auto_review_loop_run requires a task_id")
+    if task_id not in TASK_REGISTRY:
+        raise KeyError(f"unknown task_id: {task_id}")
+    record = TASK_REGISTRY[task_id]
+
+    prior_reviews = [
+        event
+        for event in get_consumption_evidence(task_id)
+        if event.get("event_type") == AUTO_REVIEW_EVENT
+    ]
+    if record.get("reviewed") or prior_reviews:
+        return {
+            "task_id": task_id,
+            "action": "skipped_already_reviewed",
+            "side_effect": False,
+            "duplicate_prevented": True,
+            "verdict": record.get("review_verdict"),
+            "reason": (
+                "idempotency guard: task already reviewed; a second review was "
+                "refused and no side effect was produced"
+            ),
+            "dispatch": None,
+        }
+
+    read = auto_review_loop_read_result(task_id)
+    decision = auto_review_decide(task_id, read)
+    reviewed = mark_reviewed(task_id, decision["verdict"], decision["reason"])
+    event = record_consumer_evidence(
+        AUTO_REVIEW_EVENT,
+        task_id,
+        detail=decision["reason"],
+        extra={
+            "verdict": decision["verdict"],
+            "blockers": decision["blockers"],
+        },
+    )
+    dispatch = None
+    if decision["verdict"] == PASS:
+        dispatch = auto_review_dispatch_next(task_id, next_task=next_task)
+    return {
+        "task_id": task_id,
+        "action": "auto_reviewed",
+        "side_effect": True,
+        "duplicate_prevented": False,
+        "verdict": reviewed["review_verdict"],
+        "reason": reviewed["review_note"],
+        "stop_gate": decision["stop_gate"],
+        "decision": decision,
+        "reviewed_at": reviewed["reviewed_at"],
+        "review_event": event,
+        "dispatch": dispatch,
+    }
+
+
+def _auto_review_probe_id(kind: str) -> str:
+    return f"auto-review-{kind}-{uuid.uuid4().hex[:10]}"
+
+
+def _auto_review_success_evidence(probe_id: str) -> dict:
+    return {
+        "tests": "4 passed in 0.11s",
+        "artifacts": [
+            {
+                "name": "hello.py",
+                "path": "hello.py",
+                "sha256": "c" * 64,
+                "bytes": 42,
+            }
+        ],
+        "evidence": {
+            "validation": {"pytest": "4 passed"},
+            "decision": {"status": PASS, "reason": "golden auto review"},
+        },
+        "execution_result_json": {
+            "task_id": probe_id,
+            "status": "success",
+            "tests": "4 passed",
+        },
+    }
+
+
+def _auto_review_golden_tasks() -> dict:
+    """Execute the auditable golden cases for the auto review loop."""
+    cases: list[dict] = []
+    ids: dict = {}
+
+    def dispatch_events(task_id: str) -> list[dict]:
+        return [
+            event
+            for event in get_consumption_evidence(task_id)
+            if event.get("event_type") == AUTO_DISPATCH_EVENT
+        ]
+
+    def review_events(task_id: str) -> list[dict]:
+        return [
+            event
+            for event in get_consumption_evidence(task_id)
+            if event.get("event_type") == AUTO_REVIEW_EVENT
+        ]
+
+    # Golden 1: a successful, well-evidenced task auto-PASSes.
+    success_id = _auto_review_probe_id("golden-success")
+    ids["success"] = success_id
+    success_evidence = _auto_review_success_evidence(success_id)
+    submit_task(
+        success_id,
+        goal=AUTO_REVIEW_LOOP_GOAL,
+        status="success",
+        requires_review=True,
+        **success_evidence,
+    )
+    discovered = {
+        item["task_id"]
+        for item in auto_review_loop_discover(goal=AUTO_REVIEW_LOOP_GOAL)
+    }
+    success_run = auto_review_loop_run(success_id)
+    success_reviews = review_events(success_id)
+    success_discovered = success_id in discovered
+    success_ok = (
+        success_discovered
+        and success_run["action"] == "auto_reviewed"
+        and success_run["verdict"] == PASS
+        and len(success_reviews) == 1
+    )
+    cases.append(
+        {
+            "case": "golden_success_auto_pass",
+            "status": PASS if success_ok else FAIL,
+            "evidence": (
+                f"{success_id} discovered={success_discovered} "
+                f"action={success_run['action']} verdict={success_run['verdict']} "
+                f"review_events={len(success_reviews)}"
+            ),
+            "probe_id": success_id,
+            "discovered": success_discovered,
+            "verdict": success_run["verdict"],
+        }
+    )
+
+    # Golden 2: failing tests on a success-status task auto-FAIL and stop.
+    fail_id = _auto_review_probe_id("golden-fail")
+    ids["fail"] = fail_id
+    submit_task(
+        fail_id,
+        goal=AUTO_REVIEW_LOOP_GOAL,
+        status="success",
+        requires_review=True,
+        tests="2 failed, 1 passed",
+        artifacts=success_evidence["artifacts"],
+        evidence=success_evidence["evidence"],
+        execution_result_json={
+            "task_id": fail_id,
+            "status": "success",
+            "tests": "2 failed",
+        },
+    )
+    fail_run = auto_review_loop_run(fail_id)
+    fail_ok = (
+        fail_run["verdict"] == FAIL
+        and fail_run["stop_gate"] is True
+        and fail_run["dispatch"] is None
+        and not dispatch_events(fail_id)
+    )
+    cases.append(
+        {
+            "case": "golden_failed_tests_auto_fail",
+            "status": PASS if fail_ok else FAIL,
+            "evidence": (
+                f"{fail_id} verdict={fail_run['verdict']} "
+                f"stop_gate={fail_run['stop_gate']} "
+                f"dispatch={fail_run['dispatch']}"
+            ),
+            "probe_id": fail_id,
+            "stop_gate": fail_run["stop_gate"],
+        }
+    )
+
+    # Golden 3: insufficient evidence auto-BLOCKs, never guesses PASS.
+    blocked_id = _auto_review_probe_id("golden-blocked")
+    ids["blocked"] = blocked_id
+    submit_task(
+        blocked_id,
+        goal=AUTO_REVIEW_LOOP_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    blocked_run = auto_review_loop_run(blocked_id)
+    blocked_ok = (
+        blocked_run["verdict"] == BLOCKED
+        and blocked_run["stop_gate"] is True
+        and blocked_run["dispatch"] is None
+    )
+    cases.append(
+        {
+            "case": "golden_insufficient_evidence_blocked",
+            "status": PASS if blocked_ok else FAIL,
+            "evidence": (
+                f"{blocked_id} verdict={blocked_run['verdict']} "
+                f"blockers={blocked_run['decision']['blockers']}"
+            ),
+            "probe_id": blocked_id,
+            "stop_gate": blocked_run["stop_gate"],
+        }
+    )
+
+    # Golden 4: a repeated scan produces no second review side effect.
+    before = get_consumption_evidence(success_id)
+    repeat_run = auto_review_loop_run(success_id)
+    after = get_consumption_evidence(success_id)
+    repeat_ok = (
+        repeat_run["action"] == "skipped_already_reviewed"
+        and repeat_run["side_effect"] is False
+        and before == after
+    )
+    cases.append(
+        {
+            "case": "golden_repeat_scan_idempotent",
+            "status": PASS if repeat_ok else FAIL,
+            "evidence": (
+                f"{success_id} action={repeat_run['action']} "
+                f"side_effect={repeat_run['side_effect']} "
+                f"events_unchanged={before == after}"
+            ),
+            "probe_id": success_id,
+        }
+    )
+
+    # Golden 5: a PASS with no next_task must not dispatch anything.
+    unapproved_id = _auto_review_probe_id("golden-unapproved")
+    ids["unapproved"] = unapproved_id
+    submit_task(
+        unapproved_id,
+        goal=AUTO_REVIEW_LOOP_GOAL,
+        status="success",
+        requires_review=True,
+        **_auto_review_success_evidence(unapproved_id),
+    )
+    unapproved_run = auto_review_loop_run(unapproved_id)
+    unapproved_no_dispatch = not dispatch_events(unapproved_id)
+    unapproved_ok = (
+        unapproved_run["verdict"] == PASS
+        and unapproved_run["dispatch"]["action"]
+        == "blocked_no_approved_next_task"
+        and unapproved_no_dispatch
+    )
+    cases.append(
+        {
+            "case": "golden_unapproved_next_task_blocked",
+            "status": PASS if unapproved_ok else FAIL,
+            "evidence": (
+                f"{unapproved_id} verdict={unapproved_run['verdict']} "
+                f"dispatch_action={unapproved_run['dispatch']['action']} "
+                f"dispatch_events={0 if unapproved_no_dispatch else 1}"
+            ),
+            "probe_id": unapproved_id,
+            "no_dispatch": unapproved_no_dispatch,
+        }
+    )
+
+    # Golden 6: an explicitly approved next_task dispatches exactly once.
+    approved_id = _auto_review_probe_id("golden-approved")
+    ids["approved"] = approved_id
+    submit_task(
+        approved_id,
+        goal=AUTO_REVIEW_LOOP_GOAL,
+        status="success",
+        requires_review=True,
+        next_task={
+            "task_id": f"next-{approved_id}",
+            "goal": "approved follow-up",
+            "approved": True,
+        },
+        next_task_approved=True,
+        **_auto_review_success_evidence(approved_id),
+    )
+    approved_run = auto_review_loop_run(approved_id)
+    approved_dispatch_list = dispatch_events(approved_id)
+    approved_ok = (
+        approved_run["verdict"] == PASS
+        and approved_run["dispatch"]["dispatched"] is True
+        and len(approved_dispatch_list) == 1
+    )
+    cases.append(
+        {
+            "case": "golden_approved_next_task_dispatched",
+            "status": PASS if approved_ok else FAIL,
+            "evidence": (
+                f"{approved_id} verdict={approved_run['verdict']} "
+                f"dispatched={approved_run['dispatch']['dispatched']} "
+                f"dispatch_events={len(approved_dispatch_list)}"
+            ),
+            "probe_id": approved_id,
+        }
+    )
+
+    # Golden 7: a second dispatch for the same task_id is refused.
+    duplicate_run = auto_review_dispatch_next(approved_id)
+    duplicate_ok = (
+        duplicate_run["action"] == "skipped_duplicate_dispatch"
+        and duplicate_run["dispatched"] is False
+        and duplicate_run.get("duplicate_prevented") is True
+        and len(dispatch_events(approved_id)) == 1
+    )
+    cases.append(
+        {
+            "case": "golden_duplicate_dispatch_prevented",
+            "status": PASS if duplicate_ok else FAIL,
+            "evidence": (
+                f"{approved_id} action={duplicate_run['action']} "
+                f"dispatched={duplicate_run['dispatched']} "
+                f"dispatch_events={len(dispatch_events(approved_id))}"
+            ),
+            "probe_id": approved_id,
+        }
+    )
+
+    # Golden 8: a carried but unapproved next_task is refused.
+    explicit_id = _auto_review_probe_id("golden-explicit-unapproved")
+    ids["explicit_unapproved"] = explicit_id
+    submit_task(
+        explicit_id,
+        goal=AUTO_REVIEW_LOOP_GOAL,
+        status="success",
+        requires_review=True,
+        next_task=f"next-{explicit_id}",
+        **_auto_review_success_evidence(explicit_id),
+    )
+    explicit_run = auto_review_loop_run(explicit_id)
+    explicit_no_dispatch = not dispatch_events(explicit_id)
+    explicit_ok = (
+        explicit_run["verdict"] == PASS
+        and explicit_run["dispatch"]["action"]
+        == "blocked_no_approved_next_task"
+        and explicit_no_dispatch
+    )
+    cases.append(
+        {
+            "case": "golden_explicit_unapproved_refused",
+            "status": PASS if explicit_ok else FAIL,
+            "evidence": (
+                f"{explicit_id} verdict={explicit_run['verdict']} "
+                f"dispatch_action={explicit_run['dispatch']['action']} "
+                f"dispatch_events={0 if explicit_no_dispatch else 1}"
+            ),
+            "probe_id": explicit_id,
+            "no_dispatch": explicit_no_dispatch,
+        }
+    )
+
+    return {"cases": cases, "ids": ids}
+
+
+def auto_review_loop_report() -> dict:
+    """Build the PERSONAL_AI_AUTO_REVIEW_LOOP_V0_1 evidence report.
+
+    Runs the auditable golden cases, aggregates the acceptance flags, and
+    reports the server-side closed loop (PASS) separately from the
+    ChatGPT/MCP proactive wakeup capability (PASS or ``BLOCKED_<reason>``).
+    """
+    golden = _auto_review_golden_tasks()
+    case_map = {case["case"]: case for case in golden["cases"]}
+    success_id = golden["ids"]["success"]
+
+    read = auto_review_loop_read_result(success_id)
+    auto_get_result_ok = (
+        read["result_contract_complete"]
+        and set(read["result"]) >= set(AUTO_REVIEW_EVIDENCE_FIELDS)
+    )
+
+    discovery_ok = bool(case_map["golden_success_auto_pass"].get("discovered"))
+    pass_path_ok = case_map["golden_success_auto_pass"]["status"] == PASS
+    stop_gate_ok = (
+        case_map["golden_failed_tests_auto_fail"]["status"] == PASS
+        and case_map["golden_insufficient_evidence_blocked"]["status"] == PASS
+    )
+    idempotency_ok = case_map["golden_repeat_scan_idempotent"]["status"] == PASS
+    next_task_gate_ok = (
+        case_map["golden_unapproved_next_task_blocked"]["status"] == PASS
+        and case_map["golden_approved_next_task_dispatched"]["status"] == PASS
+    )
+    no_unapproved_ok = bool(
+        case_map["golden_unapproved_next_task_blocked"].get("no_dispatch")
+    ) and bool(case_map["golden_explicit_unapproved_refused"].get("no_dispatch"))
+
+    wake = chatgpt_proactive_wakeup_status()
+    acceptance = {
+        "AUTO_DISCOVERY": PASS if discovery_ok else FAIL,
+        "AUTO_GET_RESULT": PASS if auto_get_result_ok else FAIL,
+        "AUTO_REVIEW_PASS_PATH": PASS if pass_path_ok else FAIL,
+        "FAIL_OR_BLOCKED_STOP_GATE": PASS if stop_gate_ok else FAIL,
+        "IDEMPOTENCY": PASS if idempotency_ok else FAIL,
+        "NEXT_TASK_GATE": PASS if next_task_gate_ok else FAIL,
+        "NO_UNAPPROVED_AUTO_DISPATCH": PASS if no_unapproved_ok else FAIL,
+        "CHATGPT_PROACTIVE_WAKEUP": wake["CHATGPT_PROACTIVE_WAKEUP"],
+    }
+    core_flags = [
+        acceptance[name]
+        for name in (
+            "AUTO_DISCOVERY",
+            "AUTO_GET_RESULT",
+            "AUTO_REVIEW_PASS_PATH",
+            "FAIL_OR_BLOCKED_STOP_GATE",
+            "IDEMPOTENCY",
+            "NEXT_TASK_GATE",
+            "NO_UNAPPROVED_AUTO_DISPATCH",
+        )
+    ]
+    golden_all_pass = all(case["status"] == PASS for case in golden["cases"])
+    final = PASS if all(flag == PASS for flag in core_flags) and golden_all_pass else FAIL
+
+    root_cause = (
+        "The existing auto-consumer stopped at requires_review and never produced "
+        "a machine verdict: there was no automatic PASS/FAIL/BLOCKED decision, no "
+        "stop gate for FAIL/BLOCKED, no idempotency guard against a repeated review "
+        "and no approval-gated next-task dispatch. A completed result was "
+        "discoverable and readable, but advancing acceptance still required a human "
+        "mark_reviewed call."
+    )
+    implementation = [
+        "auto_review_loop_discover(): discovers tasks awaiting machine review "
+        "(requires_review, not reviewed, not terminal)",
+        "auto_review_loop_read_result(): reads the full get_task_result payload "
+        "plus the task's own tests/artifacts/evidence",
+        "auto_review_decide(): PASS only on success status + passing tests + "
+        "readable artifacts/evidence; otherwise FAIL/BLOCKED with machine-readable "
+        "reason and blockers",
+        "auto_review_loop_run(): discover -> read -> decide -> mark_reviewed, "
+        "idempotent per task_id",
+        "next_task_gate(): allows next-task advance only for an explicitly "
+        "approved next_task",
+        "auto_review_dispatch_next(): approval-gated, exactly-once dispatch; "
+        "refuses pre-PASS, unapproved and duplicate dispatch",
+        "auto_review_loop_report(): aggregates acceptance flags and golden evidence",
+    ]
+    deployment = {
+        "baseline_worker_deployment": "3e2fed43",
+        "deployment_required": False,
+        "workflow_changed": False,
+        "token_changed": False,
+        "auto_dispatch_mode": (
+            "approval-gated in-repo dispatch record (no unapproved network dispatch)"
+        ),
+        "status": PASS,
+        "detail": (
+            "baseline Worker deployment 3e2fed43 is the starting point; no "
+            "dispatch/token/workflow change is introduced by this loop"
+        ),
+    }
+    markdown_lines = [
+        f"# {AUTO_REVIEW_LOOP_REPORT}",
+        "",
+        f"- goal: {AUTO_REVIEW_LOOP_GOAL}",
+        f"- task_id: {AUTO_REVIEW_LOOP_TASK_ID}",
+        f"- FINAL: {final}",
+        f"- CHATGPT_PROACTIVE_WAKEUP: {wake['CHATGPT_PROACTIVE_WAKEUP']}",
+        f"- CHATGPT_PROACTIVE_WAKEUP_REASON: {wake['reason']}",
+        "",
+        "## Acceptance",
+    ]
+    for name, value in acceptance.items():
+        markdown_lines.append(f"- {name}={value}")
+    markdown_lines += ["", "## Golden cases"]
+    for case in golden["cases"]:
+        markdown_lines.append(
+            f"- [{case['status']}] {case['case']}: {case['evidence']}"
+        )
+    markdown_lines += [
+        "",
+        "## Root cause",
+        root_cause,
+        "",
+        f"## Deployment ({deployment['baseline_worker_deployment']})",
+        deployment["detail"],
+    ]
+
+    return {
+        "report": AUTO_REVIEW_LOOP_REPORT,
+        "goal": AUTO_REVIEW_LOOP_GOAL,
+        "task_id": AUTO_REVIEW_LOOP_TASK_ID,
+        "acceptance": acceptance,
+        "AUTO_DISCOVERY": acceptance["AUTO_DISCOVERY"],
+        "AUTO_GET_RESULT": acceptance["AUTO_GET_RESULT"],
+        "AUTO_REVIEW_PASS_PATH": acceptance["AUTO_REVIEW_PASS_PATH"],
+        "FAIL_OR_BLOCKED_STOP_GATE": acceptance["FAIL_OR_BLOCKED_STOP_GATE"],
+        "IDEMPOTENCY": acceptance["IDEMPOTENCY"],
+        "NEXT_TASK_GATE": acceptance["NEXT_TASK_GATE"],
+        "NO_UNAPPROVED_AUTO_DISPATCH": acceptance["NO_UNAPPROVED_AUTO_DISPATCH"],
+        "CHATGPT_PROACTIVE_WAKEUP": wake["CHATGPT_PROACTIVE_WAKEUP"],
+        "CHATGPT_PROACTIVE_WAKEUP_REASON": wake["reason"],
+        "chatgpt_proactive_wakeup": wake,
+        "ROOT_CAUSE": root_cause,
+        "IMPLEMENTATION": implementation,
+        "TESTS": "python -m pytest -q",
+        "COMMIT": _git("rev-parse", "HEAD"),
+        "DEPLOYMENT": deployment,
+        "GOLDEN_TASKS": golden["cases"],
+        "golden_tasks": golden["cases"],
+        "FINAL": final,
+        "human_review_gate": True,
+        "submit_task_contract": "UNCHANGED",
+        "get_task_result_contract": "UNCHANGED",
+        "mark_reviewed_contract": "COMPATIBLE",
+        "workflow_modified": False,
+        "markdown": "\n".join(markdown_lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])
@@ -7243,3 +8122,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(live_golden_round_1_verify()["markdown"])
     print(personal_ai_execution_dispatch_live_failure_audit()["markdown"])
     print(knowledge_ground_truth_audit_v0_1()["markdown"])
+    print(auto_review_loop_report()["markdown"])

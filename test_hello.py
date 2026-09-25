@@ -2820,3 +2820,310 @@ def test_knowledge_ground_truth_audit_markdown() -> None:
         assert token in markdown
     assert KNOWLEDGE_CANDIDATE_GOLDEN in markdown
     assert KNOWLEDGE_CANDIDATE_ANTHROPIC in markdown
+
+
+AUTO_REVIEW_ACCEPTANCE_FLAGS = (
+    "AUTO_DISCOVERY",
+    "AUTO_GET_RESULT",
+    "AUTO_REVIEW_PASS_PATH",
+    "FAIL_OR_BLOCKED_STOP_GATE",
+    "IDEMPOTENCY",
+    "NEXT_TASK_GATE",
+    "NO_UNAPPROVED_AUTO_DISPATCH",
+)
+
+
+def _auto_review_test_id(kind: str) -> str:
+    return f"auto-review-test-{kind}-{hello_module.uuid.uuid4().hex[:10]}"
+
+
+def _auto_review_test_evidence(probe_id: str) -> dict:
+    return {
+        "tests": "6 passed in 0.30s",
+        "artifacts": [
+            {
+                "name": "hello.py",
+                "path": "hello.py",
+                "sha256": "d" * 64,
+                "bytes": 42,
+            }
+        ],
+        "evidence": {"validation": {"pytest": "6 passed"}},
+        "execution_result_json": {
+            "task_id": probe_id,
+            "status": "success",
+            "tests": "6 passed",
+        },
+    }
+
+
+def test_auto_review_loop_report_shape() -> None:
+    report = hello_module.auto_review_loop_report()
+    assert report["report"] == hello_module.AUTO_REVIEW_LOOP_REPORT
+    assert report["goal"] == hello_module.AUTO_REVIEW_LOOP_GOAL
+    assert report["task_id"] == hello_module.AUTO_REVIEW_LOOP_TASK_ID == "cf-99260a669a85"
+    assert report["FINAL"] == "PASS"
+    assert set(report) >= {
+        "acceptance",
+        "ROOT_CAUSE",
+        "IMPLEMENTATION",
+        "TESTS",
+        "COMMIT",
+        "DEPLOYMENT",
+        "GOLDEN_TASKS",
+        "FINAL",
+    }
+    assert report["TESTS"] == "python -m pytest -q"
+    assert report["COMMIT"]
+    assert report["ROOT_CAUSE"]
+    assert report["IMPLEMENTATION"]
+    assert report["DEPLOYMENT"]["status"] == "PASS"
+    assert report["DEPLOYMENT"]["baseline_worker_deployment"] == "3e2fed43"
+    assert report["DEPLOYMENT"]["workflow_changed"] is False
+    assert report["DEPLOYMENT"]["token_changed"] is False
+
+
+def test_auto_review_loop_acceptance_flags() -> None:
+    report = hello_module.auto_review_loop_report()
+    for flag in AUTO_REVIEW_ACCEPTANCE_FLAGS:
+        assert report["acceptance"][flag] == "PASS"
+        assert report[flag] == "PASS"
+
+
+def test_auto_review_loop_golden_cases_auditable() -> None:
+    report = hello_module.auto_review_loop_report()
+    cases = report["GOLDEN_TASKS"]
+    assert isinstance(cases, list)
+    assert len(cases) >= 3
+    for case in cases:
+        assert set(case) >= {"case", "status", "evidence"}
+        assert case["status"] in VALID_STATUSES
+        assert case["evidence"]
+    names = {case["case"] for case in cases}
+    assert {
+        "golden_success_auto_pass",
+        "golden_failed_tests_auto_fail",
+        "golden_insufficient_evidence_blocked",
+        "golden_repeat_scan_idempotent",
+        "golden_unapproved_next_task_blocked",
+        "golden_approved_next_task_dispatched",
+        "golden_duplicate_dispatch_prevented",
+        "golden_explicit_unapproved_refused",
+    } <= names
+
+
+def test_auto_review_loop_success_auto_pass() -> None:
+    probe = _auto_review_test_id("success")
+    hello_module.submit_task(
+        probe,
+        goal=hello_module.AUTO_REVIEW_LOOP_GOAL,
+        status="success",
+        requires_review=True,
+        **_auto_review_test_evidence(probe),
+    )
+    result = hello_module.auto_review_loop_run(probe)
+    assert result["verdict"] == "PASS"
+    assert result["action"] == "auto_reviewed"
+    assert result["stop_gate"] is False
+    record = hello_module.get_task_review(probe)
+    assert record["reviewed"] is True
+    assert record["review_verdict"] == "PASS"
+    assert record["reviewed_at"]
+    events = [
+        event
+        for event in hello_module.get_consumption_evidence(probe)
+        if event["event_type"] == hello_module.AUTO_REVIEW_EVENT
+    ]
+    assert len(events) == 1
+    assert events[0]["verdict"] == "PASS"
+
+
+def test_auto_review_loop_is_idempotent() -> None:
+    probe = _auto_review_test_id("idempotent")
+    hello_module.submit_task(
+        probe,
+        goal=hello_module.AUTO_REVIEW_LOOP_GOAL,
+        status="success",
+        requires_review=True,
+        **_auto_review_test_evidence(probe),
+    )
+    first = hello_module.auto_review_loop_run(probe)
+    assert first["action"] == "auto_reviewed"
+    before = hello_module.get_consumption_evidence(probe)
+    second = hello_module.auto_review_loop_run(probe)
+    assert second["action"] == "skipped_already_reviewed"
+    assert second["side_effect"] is False
+    assert second["duplicate_prevented"] is True
+    after = hello_module.get_consumption_evidence(probe)
+    assert after == before
+    assert len(hello_module.get_review_events(probe)) == 1
+
+
+def test_auto_review_loop_failed_tests_stop_gate() -> None:
+    probe = _auto_review_test_id("failed")
+    evidence = _auto_review_test_evidence(probe)
+    hello_module.submit_task(
+        probe,
+        goal=hello_module.AUTO_REVIEW_LOOP_GOAL,
+        status="success",
+        requires_review=True,
+        tests="1 failed, 2 passed",
+        artifacts=evidence["artifacts"],
+        evidence=evidence["evidence"],
+        execution_result_json=evidence["execution_result_json"],
+    )
+    result = hello_module.auto_review_loop_run(probe)
+    assert result["verdict"] == "FAIL"
+    assert result["stop_gate"] is True
+    assert result["dispatch"] is None
+    assert hello_module.get_task_review(probe)["review_verdict"] == "FAIL"
+    assert not [
+        event
+        for event in hello_module.get_consumption_evidence(probe)
+        if event["event_type"] == hello_module.AUTO_DISPATCH_EVENT
+    ]
+
+
+def test_auto_review_loop_insufficient_evidence_blocked() -> None:
+    probe = _auto_review_test_id("blocked")
+    hello_module.submit_task(
+        probe,
+        goal=hello_module.AUTO_REVIEW_LOOP_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    decision = hello_module.auto_review_decide(probe)
+    assert decision["verdict"] == "BLOCKED"
+    assert decision["stop_gate"] is True
+    assert decision["blockers"]
+    result = hello_module.auto_review_loop_run(probe)
+    assert result["verdict"] == "BLOCKED"
+    assert result["stop_gate"] is True
+    assert result["dispatch"] is None
+    assert hello_module.get_task_review(probe)["review_verdict"] == "BLOCKED"
+
+
+def test_auto_review_discover_includes_non_success() -> None:
+    probe = _auto_review_test_id("discover-fail")
+    hello_module.submit_task(
+        probe,
+        goal=hello_module.AUTO_REVIEW_LOOP_GOAL,
+        status="fail",
+        requires_review=True,
+    )
+    discovered = hello_module.auto_review_loop_discover(
+        goal=hello_module.AUTO_REVIEW_LOOP_GOAL
+    )
+    entry = next(item for item in discovered if item["task_id"] == probe)
+    assert entry["review_state"] == "pending_auto_review"
+    assert entry["discovered_by"] == "personal_ai_auto_review_loop"
+
+
+def test_next_task_gate_requires_explicit_approval() -> None:
+    probe = _auto_review_test_id("gate")
+    hello_module.submit_task(
+        probe,
+        goal=hello_module.AUTO_REVIEW_LOOP_GOAL,
+        status="success",
+        requires_review=False,
+        next_task=f"next-{probe}",
+    )
+    unapproved = hello_module.next_task_gate(probe)
+    assert unapproved["allowed"] is False
+    assert unapproved["approved"] is False
+    assert unapproved["next_task_id"] == f"next-{probe}"
+
+    approved = hello_module.next_task_gate(
+        probe, next_task={"task_id": "next-ok", "approved": True}
+    )
+    assert approved["allowed"] is True
+    assert approved["next_task_id"] == "next-ok"
+
+    empty = hello_module.next_task_gate(_auto_review_test_id("gate-empty"))
+    assert empty["allowed"] is False
+    assert empty["next_task_id"] is None
+    assert "no next_task" in empty["reason"]
+
+
+def test_auto_review_approved_dispatch_exactly_once() -> None:
+    probe = _auto_review_test_id("approved")
+    hello_module.submit_task(
+        probe,
+        goal=hello_module.AUTO_REVIEW_LOOP_GOAL,
+        status="success",
+        requires_review=True,
+        next_task={"task_id": "next-approved", "approved": True},
+        next_task_approved=True,
+        **_auto_review_test_evidence(probe),
+    )
+    run = hello_module.auto_review_loop_run(probe)
+    assert run["verdict"] == "PASS"
+    assert run["dispatch"]["dispatched"] is True
+    assert run["dispatch"]["next_task_id"] == "next-approved"
+    events = [
+        event
+        for event in hello_module.get_consumption_evidence(probe)
+        if event["event_type"] == hello_module.AUTO_DISPATCH_EVENT
+    ]
+    assert len(events) == 1
+
+    again = hello_module.auto_review_dispatch_next(probe)
+    assert again["action"] == "skipped_duplicate_dispatch"
+    assert again["dispatched"] is False
+    assert again["duplicate_prevented"] is True
+
+
+def test_auto_review_no_unapproved_dispatch() -> None:
+    probe = _auto_review_test_id("no-dispatch")
+    hello_module.submit_task(
+        probe,
+        goal=hello_module.AUTO_REVIEW_LOOP_GOAL,
+        status="success",
+        requires_review=True,
+        next_task=f"next-{probe}",
+        **_auto_review_test_evidence(probe),
+    )
+    run = hello_module.auto_review_loop_run(probe)
+    assert run["verdict"] == "PASS"
+    assert run["dispatch"]["action"] == "blocked_no_approved_next_task"
+    assert run["dispatch"]["dispatched"] is False
+    assert not [
+        event
+        for event in hello_module.get_consumption_evidence(probe)
+        if event["event_type"] == hello_module.AUTO_DISPATCH_EVENT
+    ]
+
+
+def test_chatgpt_proactive_wakeup_is_reported_explicitly() -> None:
+    report = hello_module.auto_review_loop_report()
+    wake = report["CHATGPT_PROACTIVE_WAKEUP"]
+    assert wake == "PASS" or wake.startswith("BLOCKED_")
+    assert report["CHATGPT_PROACTIVE_WAKEUP_REASON"]
+    status = hello_module.chatgpt_proactive_wakeup_status()
+    assert status["CHATGPT_PROACTIVE_WAKEUP"] == wake
+    assert isinstance(status["proactive"], bool)
+    markdown = report["markdown"]
+    assert f"CHATGPT_PROACTIVE_WAKEUP: {wake}" in markdown
+
+
+def test_auto_review_loop_contracts_unchanged() -> None:
+    report = hello_module.auto_review_loop_report()
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert report["mark_reviewed_contract"] == "COMPATIBLE"
+    assert report["workflow_modified"] is False
+    assert list(inspect.signature(hello_module.submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(hello_module.get_task_result).parameters) == [
+        "task_id"
+    ]
+    assert list(inspect.signature(hello_module.mark_reviewed).parameters) == [
+        "task_id",
+        "verdict",
+        "note",
+    ]
