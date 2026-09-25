@@ -114,6 +114,7 @@ from hello import (
     get_task_review,
     golden_e2e_round_1_marker,
     golden_e2e_round_1_retry_marker,
+    golden_e2e_round_2_marker,
     goodbye,
     gpt_bridge_test,
     hello,
@@ -210,6 +211,10 @@ def test_golden_e2e_round_1_marker() -> None:
 
 def test_golden_e2e_round_1_retry_marker() -> None:
     assert golden_e2e_round_1_retry_marker() == "GOLDEN_E2E_ROUND_1_RETRY_OK"
+
+
+def test_golden_e2e_round_2_marker() -> None:
+    assert golden_e2e_round_2_marker() == "GOLDEN_E2E_ROUND_2_OK"
 
 
 def test_cloud_asset_status_report_shape() -> None:
