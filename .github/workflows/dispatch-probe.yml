@@ -1,0 +1,17 @@
+name: dispatch-probe
+on:
+  repository_dispatch:
+    types: [gpt_task]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Confirm dispatch delivery
+        run: |
+          echo "repository_dispatch received"
+          echo "task_id=${{ github.event.client_payload.task.task_id }}"
