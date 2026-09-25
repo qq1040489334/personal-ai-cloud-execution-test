@@ -33,6 +33,12 @@ from hello import (
     CONSUMER_EVIDENCE_ENV,
     DEPLOY_VERIFY_COMMIT,
     DEPLOY_VERIFY_TASK_ID,
+    DISPATCH_AUDIT_BLOCKED_NEEDS_CHANGE,
+    DISPATCH_AUDIT_CHAIN,
+    DISPATCH_AUDIT_GOAL,
+    DISPATCH_AUDIT_REPORT,
+    DISPATCH_AUDIT_STUCK_TASK_ID,
+    DISPATCH_AUDIT_TASK_ID,
     EXPOSURE_AUDIT_DETAIL_EXPORT_GOAL,
     EXPOSURE_AUDIT_DETAIL_EXPORT_TASK_ID,
     EXPOSURE_AUDIT_FIELD_CLIPPING_LAYERS,
@@ -110,6 +116,7 @@ from hello import (
     mcp_runtime_deploy_verify,
     oauth_mcp_test,
     pending_acceptance_notice,
+    personal_ai_execution_dispatch_live_failure_audit,
     personal_ai_execution_result_exposure_audit_detail_export,
     personal_ai_task_runtime_audit,
     record_consumer_evidence,
@@ -2550,3 +2557,132 @@ def test_live_golden_round_1_contracts_unchanged_and_markdown() -> None:
     assert f"- status: {report['status']}" in markdown
     assert f"- round: {report['round']}" in markdown
     assert "## Checks" in markdown
+
+
+def test_dispatch_live_failure_audit_shape() -> None:
+    report = personal_ai_execution_dispatch_live_failure_audit()
+    assert report["report"] == DISPATCH_AUDIT_REPORT
+    assert report["goal"] == DISPATCH_AUDIT_GOAL
+    assert report["task_id"] == DISPATCH_AUDIT_TASK_ID == "cf-68511fc1a253"
+    assert (
+        report["primary_trace_target"]
+        == DISPATCH_AUDIT_STUCK_TASK_ID
+        == "cf-b0114222addf"
+    )
+    assert report["status"] in {
+        "PASS",
+        "FAIL",
+        "BLOCKED",
+        DISPATCH_AUDIT_BLOCKED_NEEDS_CHANGE,
+    }
+    assert report["chain"] == list(DISPATCH_AUDIT_CHAIN)
+    assert set(report["layers"]) == set(DISPATCH_AUDIT_CHAIN)
+    for name, info in report["layers"].items():
+        assert set(info) >= {"status", "evidence"}
+        assert info["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert info["evidence"]
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+
+
+def test_dispatch_live_failure_audit_names_first_failing_layer() -> None:
+    report = personal_ai_execution_dispatch_live_failure_audit()
+    assert report["first_failing_layer"] == "execution_result_artifact"
+    assert report["first_failing_layer"] in DISPATCH_AUDIT_CHAIN
+    assert report["layers"]["execution_result_artifact"]["status"] == "FAIL"
+    assert report["layers"]["result_discovery"]["status"] == "FAIL"
+    assert report["layers"]["submit_task"]["status"] == "PASS"
+    assert report["checks"] and all(
+        check["status"] != "FAIL" for check in report["checks"]
+    )
+
+
+def test_dispatch_live_failure_audit_distinguishes_dispatch_from_run() -> None:
+    report = personal_ai_execution_dispatch_live_failure_audit()
+    assert report["dispatch_accepted"] is True
+    assert isinstance(report["workflow_actually_created"], bool)
+    assert isinstance(report["task_specific_workflow_created"], bool)
+    assert report["layers"]["repository_dispatch"]["status"] == "PASS"
+    evidence = report["dispatch_evidence"]
+    assert evidence["payload_event_type"] == "gpt_task"
+    assert evidence["event_type_match"] is True
+    assert evidence["dispatch_workflows"]
+    run = report["workflow_run_evidence"]
+    assert run["run_environment"] == report["run_environment"]
+    assert "mechanism_run_created" in run
+
+
+def test_dispatch_live_failure_audit_root_cause_evidence() -> None:
+    report = personal_ai_execution_dispatch_live_failure_audit()
+    assert report["root_cause"]
+    assert "execution_result" in report["root_cause"]
+    assert report["root_cause_evidence"]
+    joined = " ".join(report["root_cause_evidence"])
+    assert "dispatch_accepted" in joined
+    assert "workflow_actually_created" in joined
+    assert report["execution_result_present"] is False
+    assert report["execution_result_ever_committed"] is False
+    assert report["derived_result_status"] == "BLOCKED"
+    assert report["layers"]["result_discovery"]["status"] == "FAIL"
+
+
+def test_dispatch_live_failure_audit_minimal_next_action() -> None:
+    report = personal_ai_execution_dispatch_live_failure_audit()
+    assert report["minimal_next_action"]
+    assert report["change_required"] is True
+    assert report["change_type"]
+    assert report["requires_code_change"] is True
+    assert report["requires_config_change"] is True
+    assert report["requires_secret_change"] is False
+    assert report["status"] == DISPATCH_AUDIT_BLOCKED_NEEDS_CHANGE
+
+
+def test_dispatch_live_failure_audit_no_production_mutation() -> None:
+    report = personal_ai_execution_dispatch_live_failure_audit()
+    assert report["production_mutation"] is False
+    assert report["workflow_modified"] is False
+    assert report["scripts_modified"] is False
+    assert report["secrets_modified"] is False
+
+
+def test_dispatch_live_failure_audit_stuck_task_traced() -> None:
+    report = personal_ai_execution_dispatch_live_failure_audit()
+    assert report["stuck_task_id"] == "cf-b0114222addf"
+    assert isinstance(report["stuck_task_stuck"], bool)
+    assert report["stuck_task_stuck"] == report["stuck_task_audit"]["stuck"]
+    assert report["stuck_task_status"] in {"PASS", "FAIL", "BLOCKED"}
+    assert report["stuck_task_audit"]["task_id"] == "cf-b0114222addf"
+
+
+def test_dispatch_live_failure_audit_contracts_unchanged() -> None:
+    report = personal_ai_execution_dispatch_live_failure_audit()
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert list(inspect.signature(submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(get_task_result).parameters) == ["task_id"]
+
+
+def test_dispatch_live_failure_audit_markdown() -> None:
+    report = personal_ai_execution_dispatch_live_failure_audit()
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {DISPATCH_AUDIT_REPORT}")
+    assert f"- task_id: {DISPATCH_AUDIT_TASK_ID}" in markdown
+    assert f"- primary_trace_target: {DISPATCH_AUDIT_STUCK_TASK_ID}" in markdown
+    assert f"- first_failing_layer: {report['first_failing_layer']}" in markdown
+    for token in (
+        "## Chain layers",
+        "## Root cause",
+        "## Root cause evidence",
+        "## Minimal next action",
+        "## Checks",
+    ):
+        assert token in markdown

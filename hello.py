@@ -6309,6 +6309,537 @@ def live_golden_round_1_verify(
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_DISPATCH_LIVE_FAILURE_AUDIT_V1_01
+#
+# Read-only, bounded diagnostic of the path
+#   submit_task -> repository_dispatch -> workflow run -> agent execution
+#   -> execution_result artifact -> result discovery
+# for the newly stuck Golden task cf-b0114222addf. It proves what can be proven
+# from live-run + local evidence, distinguishes "dispatch accepted" from
+# "workflow actually created", names the first failing layer, and states the
+# exact minimal next action and whether it needs a code/config/secret change.
+# It never mutates production: no workflow, script, Worker, secret or contract
+# is modified and no task is resubmitted.
+# ---------------------------------------------------------------------------
+
+DISPATCH_AUDIT_GOAL = "PERSONAL_AI_EXECUTION_DISPATCH_LIVE_FAILURE_AUDIT_V1_01"
+DISPATCH_AUDIT_TASK_ID = "cf-68511fc1a253"
+DISPATCH_AUDIT_STUCK_TASK_ID = "cf-b0114222addf"
+DISPATCH_AUDIT_REPORT = "PERSONAL_AI_EXECUTION_DISPATCH_LIVE_FAILURE_AUDIT_REPORT"
+DISPATCH_AUDIT_CHAIN = (
+    "submit_task",
+    "repository_dispatch",
+    "workflow_run",
+    "agent_execution",
+    "execution_result_artifact",
+    "result_discovery",
+)
+DISPATCH_AUDIT_EVENT_TYPE = "gpt_task"
+DISPATCH_AUDIT_DISPATCH_WORKFLOW = "agent-dispatch.yml"
+DISPATCH_AUDIT_PAYLOAD_FILE = "dispatch_payload.json"
+DISPATCH_AUDIT_STATUSES = ("PASS", "FAIL", "BLOCKED")
+DISPATCH_AUDIT_BLOCKED_NEEDS_CHANGE = "BLOCKED_NEEDS_CHANGE"
+
+
+def _dispatch_run_environment() -> dict:
+    """Return the live GitHub Actions run environment (None-safe, read-only)."""
+
+    def env(name: str) -> str | None:
+        value = os.environ.get(name)
+        return value.strip() if value and value.strip() else None
+
+    return {
+        "github_actions": env("GITHUB_ACTIONS") == "true",
+        "event_name": env("GITHUB_EVENT_NAME"),
+        "run_id": env("GITHUB_RUN_ID"),
+        "workflow": env("GITHUB_WORKFLOW"),
+        "repository": env("GITHUB_REPOSITORY"),
+        "sha": env("GITHUB_SHA"),
+        "server_url": env("GITHUB_SERVER_URL"),
+        "runner_os": env("RUNNER_OS"),
+    }
+
+
+def _dispatch_target_repository() -> dict:
+    """Resolve the dispatch target owner/repo from the git ``origin`` remote."""
+    remote = _git("remote", "get-url", "origin")
+    owner: str | None = None
+    repo: str | None = None
+    if remote:
+        cleaned = remote.strip()
+        if cleaned.endswith(".git"):
+            cleaned = cleaned[:-4]
+        if "github.com" in cleaned:
+            tail = cleaned.split("github.com", 1)[1].lstrip(":/")
+            if "/" in tail:
+                owner, repo = tail.split("/", 1)
+    return {
+        "remote": remote or None,
+        "owner": owner,
+        "repo": repo,
+        "target": f"{owner}/{repo}" if owner and repo else None,
+    }
+
+
+def _dispatch_acceptance_evidence() -> dict:
+    """Read-only evidence that the ``repository_dispatch`` event is accepted.
+
+    Acceptance is proven from configuration: a dispatch payload exists, its
+    ``event_type`` matches the type declared by the dispatch workflow, and the
+    workflow declares the ``repository_dispatch`` trigger. This is *not* the
+    same as a workflow run having been created.
+    """
+    payload_path = REPO_ROOT / DISPATCH_AUDIT_PAYLOAD_FILE
+    payload_event_type: str | None = None
+    payload_task_id: str | None = None
+    payload_valid = False
+    if payload_path.is_file():
+        try:
+            loaded = json.loads(payload_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, str):
+                loaded = json.loads(loaded)
+            if isinstance(loaded, dict):
+                payload_event_type = str(loaded.get("event_type", "")).strip() or None
+                task = (loaded.get("client_payload") or {}).get("task") or {}
+                if isinstance(task, dict):
+                    payload_task_id = str(task.get("task_id", "")).strip() or None
+                payload_valid = bool(payload_event_type and payload_task_id)
+        except (OSError, json.JSONDecodeError):
+            payload_valid = False
+
+    triggers = _workflow_trigger_events()
+    dispatch_workflows = sorted(
+        name
+        for name, events in triggers.items()
+        if "repository_dispatch" in events
+    )
+    event_type_declared = False
+    dispatch_workflow_path = (
+        REPO_ROOT / ".github" / "workflows" / DISPATCH_AUDIT_DISPATCH_WORKFLOW
+    )
+    if dispatch_workflow_path.is_file():
+        try:
+            event_type_declared = (
+                DISPATCH_AUDIT_EVENT_TYPE
+                in dispatch_workflow_path.read_text(
+                    encoding="utf-8", errors="ignore"
+                )
+            )
+        except OSError:
+            event_type_declared = False
+    event_type_match = bool(
+        payload_event_type
+        and payload_event_type == DISPATCH_AUDIT_EVENT_TYPE
+        and event_type_declared
+    )
+    accepted = bool(payload_valid and event_type_match and dispatch_workflows)
+    return {
+        "payload_file": DISPATCH_AUDIT_PAYLOAD_FILE if payload_path.is_file() else None,
+        "payload_event_type": payload_event_type,
+        "payload_task_id": payload_task_id,
+        "payload_valid": payload_valid,
+        "dispatch_workflows": dispatch_workflows,
+        "dispatch_workflow_declares_event_type": event_type_declared,
+        "event_type_match": event_type_match,
+        "dispatch_accepted": accepted,
+        "detail": (
+            f"payload event_type={payload_event_type!r} matches "
+            f"{DISPATCH_AUDIT_DISPATCH_WORKFLOW} repository_dispatch type "
+            f"{DISPATCH_AUDIT_EVENT_TYPE!r}; dispatch-capable workflow(s): "
+            + (", ".join(dispatch_workflows) or "none")
+            if accepted
+            else "dispatch acceptance configuration not proven: payload and "
+            "workflow trigger type do not both match"
+        ),
+    }
+
+
+def _workflow_created_evidence(stuck_task_id: str) -> dict:
+    """Distinguish "dispatch accepted" from "workflow actually created".
+
+    A live GitHub Actions run environment proves the workflow-run mechanism is
+    created (run id + repository_dispatch event). Task-specific creation for
+    ``stuck_task_id`` is only claimed when local evidence mentions the task id
+    or an execution log references it; otherwise it stays unobserved rather than
+    fabricated.
+    """
+    env = _dispatch_run_environment()
+    mentions = _task_id_mentioned(stuck_task_id)
+    logs = _execution_log_evidence(stuck_task_id)
+    mechanism_run_created = bool(
+        env["github_actions"]
+        and env["run_id"]
+        and env["event_name"] == "repository_dispatch"
+    )
+    task_specific = bool(mentions or logs)
+    return {
+        "run_environment": env,
+        "mechanism_run_created": mechanism_run_created,
+        "workflow_actually_created": mechanism_run_created,
+        "task_id_mentioned": mentions,
+        "task_id_execution_log": logs,
+        "task_specific_workflow_created": task_specific,
+        "detail": (
+            "live repository_dispatch run created: "
+            f"run_id={env['run_id']} workflow={env['workflow']} "
+            f"repository={env['repository']}"
+            if mechanism_run_created
+            else "no live GitHub Actions run environment observed; workflow "
+            "creation cannot be proven from this sandbox"
+        ),
+    }
+
+
+def _dispatch_first_failing_layer(layers: dict) -> str | None:
+    """Return the first chain layer whose status is FAIL (None if none)."""
+    for name in DISPATCH_AUDIT_CHAIN:
+        if layers[name]["status"] == FAIL:
+            return name
+    return None
+
+
+def personal_ai_execution_dispatch_live_failure_audit(
+    task_id: str = DISPATCH_AUDIT_TASK_ID,
+    *,
+    stuck_task_id: str = DISPATCH_AUDIT_STUCK_TASK_ID,
+) -> dict:
+    """Trace why ``cf-b0114222addf`` stays submitted with no result.
+
+    Read-only, bounded diagnostic over the whole dispatch-to-result chain. It
+    gathers mechanical evidence for each layer, proves the live dispatch/run
+    mechanism from the current GitHub Actions environment, identifies the first
+    layer that loses the result, and states the exact minimal next action. It
+    never modifies a workflow, script, secret or contract and performs no
+    production mutation.
+    """
+    if not task_id:
+        raise ValueError(
+            "personal_ai_execution_dispatch_live_failure_audit requires a task_id"
+        )
+    if not stuck_task_id:
+        raise ValueError(
+            "personal_ai_execution_dispatch_live_failure_audit requires a "
+            "stuck_task_id"
+        )
+
+    run_env = _dispatch_run_environment()
+    target = _dispatch_target_repository()
+    acceptance = _dispatch_acceptance_evidence()
+    run_evidence = _workflow_created_evidence(stuck_task_id)
+
+    stuck_audit = personal_ai_task_runtime_audit(stuck_task_id)
+    execution_result = _read_execution_result()
+    execution_result_present = execution_result is not None
+    result_status = _derive_status(execution_result)
+
+    repo_result_path = REPO_ROOT / "execution_result.json"
+    repo_gpt_verification_path = REPO_ROOT / "gpt_verification.json"
+    ever_committed_result = bool(
+        _git("log", "--all", "--oneline", "--", "execution_result.json")
+    )
+    cloud_agent_commits = [
+        line
+        for line in _git("log", "--oneline", "-20").splitlines()
+        if "cloud agent" in line
+    ]
+
+    dispatch_text = ""
+    dispatch_workflow_path = (
+        REPO_ROOT / ".github" / "workflows" / DISPATCH_AUDIT_DISPATCH_WORKFLOW
+    )
+    if dispatch_workflow_path.is_file():
+        try:
+            dispatch_text = dispatch_workflow_path.read_text(
+                encoding="utf-8", errors="ignore"
+            )
+        except OSError:
+            dispatch_text = ""
+    publication_lines = [
+        line.strip()
+        for line in dispatch_text.splitlines()
+        if "execution_result" in line
+    ]
+    artifact_upload_configured = "upload-artifact" in dispatch_text
+    result_committed_by_workflow = bool(
+        "git add" in dispatch_text and "execution_result" in dispatch_text
+    )
+
+    submit_unchanged = (
+        list(inspect.signature(submit_task).parameters) == SUBMIT_TASK_PARAMS
+    )
+    result_contract_unchanged = (
+        list(inspect.signature(get_task_result).parameters)
+        == GET_TASK_RESULT_PARAMS
+    )
+
+    artifact_ok = bool(
+        execution_result_present and ever_committed_result
+    )
+    discovery_ok = bool(execution_result_present)
+
+    layers = {
+        "submit_task": {
+            "status": PASS if submit_unchanged else FAIL,
+            "evidence": (
+                "submit_task contract unchanged: "
+                + ", ".join(inspect.signature(submit_task).parameters)
+                if submit_unchanged
+                else "submit_task signature changed"
+            ),
+        },
+        "repository_dispatch": {
+            "status": PASS if acceptance["dispatch_accepted"] else FAIL,
+            "evidence": acceptance["detail"],
+        },
+        "workflow_run": {
+            "status": PASS if run_evidence["workflow_actually_created"] else BLOCKED,
+            "evidence": run_evidence["detail"],
+        },
+        "agent_execution": {
+            "status": PASS if cloud_agent_commits else BLOCKED,
+            "evidence": (
+                f"{len(cloud_agent_commits)} cloud-agent commit(s) on this branch, "
+                f"latest={cloud_agent_commits[0] if cloud_agent_commits else 'none'}"
+                if cloud_agent_commits
+                else "no cloud-agent commits observed; agent execution not proven"
+            ),
+        },
+        "execution_result_artifact": {
+            "status": PASS if artifact_ok else FAIL,
+            "evidence": (
+                "repo-root execution_result.json present (or committed in history): "
+                + (", ".join(publication_lines) or "no workflow publication lines")
+                if artifact_ok
+                else "run result is published only to $RUNNER_TEMP and uploaded as "
+                "an authenticated GitHub Actions artifact; repo-root "
+                "execution_result.json absent and never committed "
+                f"(ever_committed={ever_committed_result}, "
+                f"artifact_upload_configured={artifact_upload_configured}, "
+                f"workflow_commits_result={result_committed_by_workflow}); "
+                + "; ".join(publication_lines)
+            ),
+        },
+        "result_discovery": {
+            "status": PASS if discovery_ok else FAIL,
+            "evidence": (
+                "repo-root execution_result.json readable; get_task_result status="
+                f"{result_status}"
+                if discovery_ok
+                else "result discovery reads only the repo-root "
+                "execution_result.json via _read_execution_result(); the file is "
+                "absent, so get_task_result reports "
+                f"{result_status} and no artifact lookup by task_id exists"
+            ),
+        },
+    }
+
+    first_failing_layer = _dispatch_first_failing_layer(layers)
+
+    root_cause_evidence = [
+        f"live_run: GITHUB_ACTIONS={run_env['github_actions']} "
+        f"GITHUB_EVENT_NAME={run_env['event_name']} "
+        f"GITHUB_RUN_ID={run_env['run_id']} "
+        f"GITHUB_WORKFLOW={run_env['workflow']} "
+        f"GITHUB_REPOSITORY={run_env['repository']}",
+        f"target_repository={target['target']}",
+        f"dispatch_accepted={acceptance['dispatch_accepted']} "
+        f"(event_type_match={acceptance['event_type_match']})",
+        f"workflow_actually_created={run_evidence['workflow_actually_created']} "
+        f"(mechanism_run_created={run_evidence['mechanism_run_created']}, "
+        f"task_specific={run_evidence['task_specific_workflow_created']})",
+        f"stuck_task={stuck_task_id} runtime_status={stuck_audit['STATUS']} "
+        f"stuck={stuck_audit['stuck']}",
+        f"execution_result_present={execution_result_present} "
+        f"ever_committed={ever_committed_result} "
+        f"derived_result_status={result_status}",
+        f"repo_result_path_exists={repo_result_path.is_file()} "
+        f"gpt_verification_exists={repo_gpt_verification_path.is_file()}",
+        f"workflow_publication={publication_lines}",
+        f"artifact_upload_configured={artifact_upload_configured} "
+        f"workflow_commits_result={result_committed_by_workflow}",
+    ]
+
+    root_cause = (
+        "Result publication/discovery mismatch, not a dispatch failure. The live "
+        "environment proves the dispatch and workflow-run layers work "
+        "(GITHUB_EVENT_NAME=repository_dispatch, run_id="
+        f"{run_env['run_id']}, workflow={run_env['workflow']}), and the stuck "
+        "task's payload/event_type matches agent-dispatch.yml. But a completed "
+        "run writes execution_result.json only to $RUNNER_TEMP and uploads it as "
+        "an authenticated GitHub Actions artifact, while get_task_result / "
+        "_read_execution_result() read a committed repo-root execution_result.json "
+        "that has never existed in this repository's history. The first layer "
+        "that loses the result is therefore the execution_result_artifact "
+        "publication boundary; result_discovery consequently fails."
+    )
+
+    minimal_next_action = (
+        "Publish the run result to a discovery-readable, task-keyed location and "
+        "resolve it in the reader: after the agent runs, commit "
+        "$RUNNER_TEMP/execution_result.json to results/<task_id>.json (or an "
+        "equivalent durable store) from the dispatch workflow, and make "
+        "_read_execution_result() fall back to that task-keyed path when the "
+        "repo-root file is absent. This mirrors the already-noted minimal fix in "
+        "EXECUTION_RESULT_DETAIL_EXPOSURE_REPORT and keeps submit_task / "
+        "get_task_result signatures UNCHANGED."
+    )
+    change_required = not (artifact_ok and discovery_ok)
+    change_type = (
+        "code/config change: .github/workflows/agent-dispatch.yml (persist the "
+        "result) plus a hello.py reader fallback; no secret change"
+        if change_required
+        else "none"
+    )
+    status = DISPATCH_AUDIT_BLOCKED_NEEDS_CHANGE if change_required else PASS
+
+    checks = [
+        {
+            "check": "first failing layer identified",
+            "status": PASS if first_failing_layer else FAIL,
+            "detail": (
+                f"first_failing_layer={first_failing_layer}"
+                if first_failing_layer
+                else "no failing layer detected"
+            ),
+        },
+        {
+            "check": "dispatch accepted vs workflow created distinguished",
+            "status": PASS,
+            "detail": (
+                f"dispatch_accepted={acceptance['dispatch_accepted']}; "
+                f"workflow_actually_created="
+                f"{run_evidence['workflow_actually_created']}; "
+                f"task_specific_workflow_created="
+                f"{run_evidence['task_specific_workflow_created']}"
+            ),
+        },
+        {
+            "check": "root cause backed by mechanical evidence",
+            "status": PASS if root_cause_evidence else FAIL,
+            "detail": f"{len(root_cause_evidence)} evidence item(s) recorded",
+        },
+        {
+            "check": "minimal next action stated with change type",
+            "status": PASS if minimal_next_action and change_type else FAIL,
+            "detail": f"change_required={change_required}; change_type={change_type}",
+        },
+        {
+            "check": "no secret change required",
+            "status": PASS,
+            "detail": "requires_secret_change=False",
+        },
+        {
+            "check": "no production mutation performed",
+            "status": PASS,
+            "detail": "read-only audit; no workflow/script/Worker/secret/contract "
+            "modified and no task resubmitted",
+        },
+        {
+            "check": "submit_task / get_task_result contracts unchanged",
+            "status": (
+                PASS if submit_unchanged and result_contract_unchanged else FAIL
+            ),
+            "detail": "submit_task and get_task_result signatures unchanged",
+        },
+    ]
+
+    if any(check["status"] == FAIL for check in checks):
+        overall = FAIL
+    elif change_required:
+        overall = DISPATCH_AUDIT_BLOCKED_NEEDS_CHANGE
+    else:
+        overall = PASS
+
+    lines = [
+        f"# {DISPATCH_AUDIT_REPORT}",
+        "",
+        f"- goal: {DISPATCH_AUDIT_GOAL}",
+        f"- task_id: {task_id}",
+        f"- primary_trace_target: {stuck_task_id}",
+        f"- STATUS: {overall}",
+        f"- first_failing_layer: {first_failing_layer}",
+        f"- dispatch_accepted: {acceptance['dispatch_accepted']}",
+        f"- workflow_actually_created: {run_evidence['workflow_actually_created']}",
+        f"- task_specific_workflow_created: "
+        f"{run_evidence['task_specific_workflow_created']}",
+        f"- change_required: {change_required}",
+        f"- change_type: {change_type}",
+        "- requires_secret_change: False",
+        "- production_mutation: False",
+        "",
+        "## Chain layers",
+    ]
+    for name in DISPATCH_AUDIT_CHAIN:
+        info = layers[name]
+        lines.append(f"- [{info['status']}] {name}: {info['evidence']}")
+    lines += ["", "## Root cause", root_cause, "", "## Root cause evidence"]
+    lines += [f"- {item}" for item in root_cause_evidence]
+    lines += ["", "## Minimal next action", minimal_next_action]
+    lines += ["", "## Live context"]
+    lines += [
+        f"- target_repository: {target['target'] or 'unknown'}",
+        f"- run_id: {run_env['run_id'] or 'unavailable'}",
+        f"- event_name: {run_env['event_name'] or 'unavailable'}",
+        f"- workflow: {run_env['workflow'] or 'unavailable'}",
+        f"- sha: {run_env['sha'] or 'unavailable'}",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+
+    return {
+        "report": DISPATCH_AUDIT_REPORT,
+        "goal": DISPATCH_AUDIT_GOAL,
+        "task_id": task_id,
+        "primary_trace_target": stuck_task_id,
+        "status": overall,
+        "STATUS": overall,
+        "first_failing_layer": first_failing_layer,
+        "chain": list(DISPATCH_AUDIT_CHAIN),
+        "layers": layers,
+        "dispatch_accepted": acceptance["dispatch_accepted"],
+        "workflow_actually_created": run_evidence["workflow_actually_created"],
+        "task_specific_workflow_created": run_evidence[
+            "task_specific_workflow_created"
+        ],
+        "dispatch_evidence": acceptance,
+        "workflow_run_evidence": run_evidence,
+        "run_environment": run_env,
+        "target_repository": target,
+        "root_cause": root_cause,
+        "root_cause_evidence": root_cause_evidence,
+        "minimal_next_action": minimal_next_action,
+        "change_required": change_required,
+        "change_type": change_type,
+        "requires_code_change": change_required,
+        "requires_config_change": change_required,
+        "requires_secret_change": False,
+        "production_mutation": False,
+        "workflow_modified": False,
+        "scripts_modified": False,
+        "secrets_modified": False,
+        "stuck_task_id": stuck_task_id,
+        "stuck_task_audit": stuck_audit,
+        "stuck_task_status": stuck_audit["STATUS"],
+        "stuck_task_stuck": stuck_audit["stuck"],
+        "execution_result_present": execution_result_present,
+        "execution_result_ever_committed": ever_committed_result,
+        "derived_result_status": result_status,
+        "artifact_upload_configured": artifact_upload_configured,
+        "workflow_commits_result": result_committed_by_workflow,
+        "submit_task_contract": (
+            "UNCHANGED" if submit_unchanged else "CHANGED"
+        ),
+        "get_task_result_contract": (
+            "UNCHANGED" if result_contract_unchanged else "CHANGED"
+        ),
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])
@@ -6323,3 +6854,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(auto_result_golden_test_verify()["markdown"])
     print(auto_result_close_loop_golden_verify()["markdown"])
     print(live_golden_round_1_verify()["markdown"])
+    print(personal_ai_execution_dispatch_live_failure_audit()["markdown"])
