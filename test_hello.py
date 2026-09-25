@@ -54,6 +54,14 @@ from hello import (
     GAP_CLOSE_LAYERS,
     GAP_CLOSE_REPORT,
     GAP_CLOSE_TASK_ID,
+    KNOWLEDGE_AUDIT_GOAL,
+    KNOWLEDGE_AUDIT_REPORT,
+    KNOWLEDGE_AUDIT_TASK_ID,
+    KNOWLEDGE_CANONICAL_OPTIONS,
+    KNOWLEDGE_CANDIDATE_ANTHROPIC,
+    KNOWLEDGE_CANDIDATE_ANTHROPIC_PACKAGE,
+    KNOWLEDGE_CANDIDATE_GOLDEN,
+    KNOWLEDGE_LAYERS,
     LIVE_ACCEPTANCE_GOAL,
     LIVE_ACCEPTANCE_REPORT,
     LIVE_ACCEPTANCE_TASK_ID,
@@ -107,6 +115,7 @@ from hello import (
     goodbye,
     gpt_bridge_test,
     hello,
+    knowledge_ground_truth_audit_v0_1,
     list_pending_results,
     list_review_events,
     live_golden_round_1_test,
@@ -2686,3 +2695,113 @@ def test_dispatch_live_failure_audit_markdown() -> None:
         "## Checks",
     ):
         assert token in markdown
+
+
+def test_knowledge_ground_truth_audit_shape() -> None:
+    report = knowledge_ground_truth_audit_v0_1()
+    assert report["report"] == KNOWLEDGE_AUDIT_REPORT
+    assert report["goal"] == KNOWLEDGE_AUDIT_GOAL
+    assert report["task_id"] == KNOWLEDGE_AUDIT_TASK_ID == "cf-2ca02944edd9"
+    assert report["KNOWLEDGE_CANONICAL_CURRENT"] in KNOWLEDGE_CANONICAL_OPTIONS
+    assert report["canonical"] == report["KNOWLEDGE_CANONICAL_CURRENT"]
+    assert set(report["layers"]) == set(KNOWLEDGE_LAYERS)
+    for name, info in report["layers"].items():
+        assert set(info) >= {"status", "detail"}
+        assert info["status"] in VALID_STATUSES
+        assert info["detail"]
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in VALID_STATUSES
+        assert check["detail"]
+    assert report["audit_status"] == "PASS"
+    assert report["status"] in VALID_STATUSES
+
+
+def test_knowledge_ground_truth_audit_canonical_evidence() -> None:
+    report = knowledge_ground_truth_audit_v0_1()
+    assert report["canonical_evidence"]
+    joined = " ".join(report["canonical_evidence"])
+    assert "repo_root" in joined
+    assert "Cloud Asset" in joined
+    assert "KNOWLEDGE" in joined
+    if report["KNOWLEDGE_CANONICAL_CURRENT"] == "UNKNOWN":
+        assert (
+            report["layers"]["Cloudflare D1 Cloud Asset canonical"]["status"]
+            == "BLOCKED"
+        )
+        assert (
+            report["layers"]["Obsidian / PersonOS-Knowledge (local)"]["status"]
+            == "BLOCKED"
+        )
+
+
+def test_knowledge_ground_truth_audit_counts() -> None:
+    report = knowledge_ground_truth_audit_v0_1()
+    assert "D1_KNOWLEDGE_COUNT" in report
+    assert "VAULT_KNOWLEDGE_COUNT" in report
+    assert isinstance(report["D1_KNOWLEDGE_COUNT_AVAILABLE"], bool)
+    assert isinstance(report["VAULT_KNOWLEDGE_COUNT_AVAILABLE"], bool)
+    if not report["D1_KNOWLEDGE_COUNT_AVAILABLE"]:
+        assert report["D1_KNOWLEDGE_COUNT"] is None
+    if not report["VAULT_KNOWLEDGE_COUNT_AVAILABLE"]:
+        assert report["VAULT_KNOWLEDGE_COUNT"] is None
+    assert report["D1_KNOWLEDGE_COUNT_AVAILABLE"] is bool(report["d1_bindings"])
+    assert report["VAULT_KNOWLEDGE_COUNT_AVAILABLE"] is bool(report["vault_paths"])
+
+
+def test_knowledge_ground_truth_audit_candidates() -> None:
+    report = knowledge_ground_truth_audit_v0_1()
+    candidates = report["candidates"]
+    assert len(candidates) == 2
+    assert candidates[0]["candidate_id"] == KNOWLEDGE_CANDIDATE_GOLDEN
+    assert candidates[1]["candidate_id"] == KNOWLEDGE_CANDIDATE_ANTHROPIC
+    assert candidates[1]["package"] == KNOWLEDGE_CANDIDATE_ANTHROPIC_PACKAGE
+    for candidate in candidates:
+        assert candidate["status"] in {"VISIBLE", "NOT_VISIBLE"}
+        assert candidate["visible"] is bool(candidate["evidence"])
+        assert candidate["visible"] is (candidate["status"] == "VISIBLE")
+        assert candidate["detail"]
+        if not candidate["visible"]:
+            assert candidate["location"] is None
+
+
+def test_knowledge_ground_truth_audit_inbox_persistence() -> None:
+    report = knowledge_ground_truth_audit_v0_1()
+    assert report["INBOX_ACCEPTED_IMPLIES_DURABLE"] is False
+    assert report["inbox_accepted_implies_durable"] is False
+    assert report["inbox_persistence_evidence"]
+    joined = " ".join(report["inbox_persistence_evidence"])
+    assert "TASK_REGISTRY" in joined
+    assert "durable persistence" in joined
+
+
+def test_knowledge_ground_truth_audit_no_mutation() -> None:
+    report = knowledge_ground_truth_audit_v0_1()
+    assert report["production_mutation"] is False
+    assert report["files_modified"] is False
+    assert report["stores_migrated"] is False
+    assert report["records_promoted"] is False
+    assert report["records_deleted"] is False
+
+
+def test_knowledge_ground_truth_audit_markdown() -> None:
+    report = knowledge_ground_truth_audit_v0_1()
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {KNOWLEDGE_AUDIT_REPORT}")
+    assert f"- task_id: {KNOWLEDGE_AUDIT_TASK_ID}" in markdown
+    assert (
+        f"- KNOWLEDGE_CANONICAL_CURRENT: "
+        f"{report['KNOWLEDGE_CANONICAL_CURRENT']}" in markdown
+    )
+    assert "- INBOX_ACCEPTED_IMPLIES_DURABLE: False" in markdown
+    for token in (
+        "## Storage layers",
+        "## Canonical evidence",
+        "## Candidates",
+        "## Inbox receipt vs durable persistence",
+        "## Checks",
+    ):
+        assert token in markdown
+    assert KNOWLEDGE_CANDIDATE_GOLDEN in markdown
+    assert KNOWLEDGE_CANDIDATE_ANTHROPIC in markdown

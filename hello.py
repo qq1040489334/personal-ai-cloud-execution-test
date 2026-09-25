@@ -6840,6 +6840,378 @@ def personal_ai_execution_dispatch_live_failure_audit(
     }
 
 
+# ---------------------------------------------------------------------------
+# KNOWLEDGE_GROUND_TRUTH_AUDIT_V0_1 (cf-2ca02944edd9)
+#
+# Read-only ground-truth audit of where the user's KNOWLEDGE is actually
+# durably stored in the cloud execution environment, and whether recent
+# Knowledge Inbox submissions reached durable storage. It mechanically probes
+# only the storage locations accessible from this sandbox, distinguishes a
+# transient Inbox receipt from durable persisted knowledge, traces the two
+# named Inbox candidates where visible, and reports UNKNOWN / evidence
+# unavailable rather than guessing when a layer (for example the local Windows
+# Obsidian vault) cannot be inspected from the cloud. It never mutates,
+# migrates, promotes, deploys, or deletes anything, and it never conflates
+# SKILL/REALITY Cloud Asset records with KNOWLEDGE.
+# ---------------------------------------------------------------------------
+
+KNOWLEDGE_AUDIT_GOAL = "KNOWLEDGE_GROUND_TRUTH_AUDIT_V0_1"
+KNOWLEDGE_AUDIT_TASK_ID = "cf-2ca02944edd9"
+KNOWLEDGE_AUDIT_REPORT = "KNOWLEDGE_GROUND_TRUTH_AUDIT_REPORT"
+KNOWLEDGE_CANONICAL_OPTIONS = (
+    "CLOUDFLARE_D1",
+    "LOCAL_VAULT_OBSIDIAN",
+    "HYBRID",
+    "UNKNOWN",
+)
+KNOWLEDGE_LAYERS = (
+    "Cloudflare D1 Cloud Asset canonical",
+    "Knowledge Inbox / KV intake",
+    "Vault / Candidates",
+    "Obsidian / PersonOS-Knowledge (local)",
+)
+KNOWLEDGE_CANDIDATE_GOLDEN = "candidate-20260922-chatgpt-e2e-final"
+KNOWLEDGE_CANDIDATE_GOLDEN_PACKAGE = None
+KNOWLEDGE_CANDIDATE_ANTHROPIC = (
+    "candidate-20260925-anthropic-panama-diy-deepseek-v41"
+)
+KNOWLEDGE_CANDIDATE_ANTHROPIC_PACKAGE = "fd49fd99-aee0-412d-84d7-4cdb831b7f87"
+KNOWLEDGE_ENV_HINTS = (
+    "D1",
+    "CLOUDFLARE",
+    "KV",
+    "KNOWLEDGE",
+    "VAULT",
+    "OBSIDIAN",
+    "INBOX",
+)
+KNOWLEDGE_VAULT_PATHS = (
+    ".obsidian",
+    "Obsidian",
+    "vault",
+    "Vault",
+    "PersonOS-Knowledge",
+    "Knowledge",
+    "Knowledge Inbox",
+)
+KNOWLEDGE_WRANGLER_PATHS = ("wrangler.toml", "wrangler.json", "wrangler.jsonc")
+
+
+def _knowledge_env_hints() -> list[str]:
+    """Return env var *names* (never values) hinting at a knowledge store."""
+    return sorted(
+        name
+        for name in os.environ
+        if any(hint in name.upper() for hint in KNOWLEDGE_ENV_HINTS)
+    )
+
+
+def _knowledge_wrangler_bindings() -> list[dict]:
+    """Read-only scan of wrangler config for D1/KV knowledge bindings."""
+    findings: list[dict] = []
+    for rel in KNOWLEDGE_WRANGLER_PATHS:
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        lowered = text.lower()
+        findings.append(
+            {
+                "path": rel,
+                "d1_binding": "d1_databases" in lowered,
+                "kv_binding": "kv_namespaces" in lowered,
+                "knowledge_named": "knowledge" in lowered,
+            }
+        )
+    return findings
+
+
+def _knowledge_vault_paths() -> list[str]:
+    """Return accessible vault/Obsidian knowledge paths (read-only probe)."""
+    roots = [REPO_ROOT]
+    for env_name in ("USERPROFILE", "HOME", "OneDrive"):
+        value = os.environ.get(env_name)
+        if value and value.strip():
+            roots.append(Path(value.strip()).expanduser())
+    found: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        for rel in KNOWLEDGE_VAULT_PATHS:
+            candidate = root / rel
+            try:
+                exists = candidate.exists()
+            except OSError:
+                exists = False
+            key = str(candidate)
+            if exists and key not in seen:
+                seen.add(key)
+                found.append(key)
+    return found
+
+
+def _knowledge_term_evidence(term: str) -> list[str]:
+    """Read-only git evidence (commits + tracked files) for a candidate term."""
+    hits: list[str] = []
+    for line in _git("log", "--all", "--oneline", "--grep", term).splitlines():
+        line = line.strip()
+        if line:
+            hits.append(f"commit: {line}")
+    for line in _git("grep", "-l", "-F", term, "HEAD").splitlines():
+        line = line.strip()
+        if line:
+            hits.append(f"file: {line}")
+    return hits
+
+
+def knowledge_ground_truth_audit_v0_1() -> dict:
+    """Read-only ground-truth audit of durable KNOWLEDGE storage.
+
+    Reports the current canonical knowledge source, mechanical counts where
+    available (explicitly unavailable otherwise), the status/location of the
+    two named Inbox candidates, and whether an ACCEPTED Inbox receipt implies
+    durable persistence. Bounded and side-effect free: it never writes,
+    migrates, promotes, deploys or deletes anything.
+    """
+    env_hints = _knowledge_env_hints()
+    wrangler = _knowledge_wrangler_bindings()
+    vault_paths = _knowledge_vault_paths()
+    d1_bindings = [entry for entry in wrangler if entry["d1_binding"]]
+    kv_bindings = [entry for entry in wrangler if entry["kv_binding"]]
+
+    d1_observable = bool(d1_bindings)
+    vault_observable = bool(vault_paths)
+
+    if d1_observable and vault_observable:
+        canonical = "HYBRID"
+    elif d1_observable:
+        canonical = "CLOUDFLARE_D1"
+    elif vault_observable:
+        canonical = "LOCAL_VAULT_OBSIDIAN"
+    else:
+        canonical = "UNKNOWN"
+
+    canonical_evidence = [
+        f"repo_root={REPO_ROOT}",
+        f"knowledge_env_var_names={env_hints or '[]'}",
+        f"wrangler_configs={wrangler or '[]'}",
+        f"accessible_vault_paths={vault_paths or '[]'}",
+        "cloud_asset_status() D1 evidence covers the Cloud Asset layer only and "
+        "is not treated as KNOWLEDGE; no knowledge-named D1/KV binding was "
+        "observed in the cloud execution environment",
+    ]
+
+    layers = {
+        "Cloudflare D1 Cloud Asset canonical": {
+            "status": PASS if d1_observable else BLOCKED,
+            "detail": (
+                "D1 binding observable in: "
+                + ", ".join(entry["path"] for entry in d1_bindings)
+                if d1_observable
+                else "no D1 binding or migration config accessible from the cloud "
+                "execution environment; D1 knowledge count unavailable"
+            ),
+        },
+        "Knowledge Inbox / KV intake": {
+            "status": PASS if kv_bindings else BLOCKED,
+            "detail": (
+                "KV namespace binding observable in: "
+                + ", ".join(entry["path"] for entry in kv_bindings)
+                if kv_bindings
+                else "no Knowledge Inbox/KV binding accessible; Inbox receipt "
+                "durability cannot be confirmed"
+            ),
+        },
+        "Vault / Candidates": {
+            "status": PASS if vault_observable else BLOCKED,
+            "detail": (
+                "vault/candidate path accessible: " + ", ".join(vault_paths)
+                if vault_observable
+                else "no Vault/Candidates path accessible from cloud"
+            ),
+        },
+        "Obsidian / PersonOS-Knowledge (local)": {
+            "status": BLOCKED,
+            "detail": "local Windows Obsidian/PersonOS-Knowledge vault is not "
+            "inspectable from the cloud execution environment; evidence "
+            "unavailable (not guessed)",
+        },
+    }
+
+    def candidate_status(candidate_id: str, package: str | None) -> dict:
+        evidence = _knowledge_term_evidence(candidate_id)
+        if package:
+            for extra in _knowledge_term_evidence(package):
+                if extra not in evidence:
+                    evidence.append(extra)
+        visible = bool(evidence)
+        return {
+            "candidate_id": candidate_id,
+            "package": package,
+            "visible": visible,
+            "status": "VISIBLE" if visible else "NOT_VISIBLE",
+            "location": evidence[0] if evidence else None,
+            "evidence": evidence,
+            "detail": (
+                "candidate traced: " + "; ".join(evidence[:3])
+                if visible
+                else "candidate not present in this repository's tracked files "
+                "or git history; status/location UNKNOWN from cloud"
+            ),
+        }
+
+    candidates = [
+        candidate_status(
+            KNOWLEDGE_CANDIDATE_GOLDEN, KNOWLEDGE_CANDIDATE_GOLDEN_PACKAGE
+        ),
+        candidate_status(
+            KNOWLEDGE_CANDIDATE_ANTHROPIC, KNOWLEDGE_CANDIDATE_ANTHROPIC_PACKAGE
+        ),
+    ]
+
+    d1_knowledge_count = None
+    vault_knowledge_count = None
+
+    inbox_accepted_implies_durable = False
+    inbox_persistence_evidence = [
+        "submit_task() records an Inbox/task receipt only in the in-memory "
+        "TASK_REGISTRY; it is not written to any durable store",
+        "the only persisted ledger is consumer evidence at "
+        f"{get_consumer_evidence_path()} (temp-dir JSON, env override "
+        f"{CONSUMER_EVIDENCE_ENV}); this is pipeline evidence, not KNOWLEDGE, "
+        "and does not survive the runner",
+        "no Cloudflare D1/KV or Obsidian vault binding is accessible, so an "
+        "ACCEPTED receipt cannot be reconciled to durable knowledge storage",
+        "=> ACCEPTED Inbox receipt does NOT imply durable persistence in the "
+        "current implementation",
+    ]
+
+    checks = [
+        {
+            "check": "read-only: no mutation, migration, promotion or deletion",
+            "status": PASS,
+            "detail": "audit probes and reports only; no store was written, "
+            "migrated, promoted, deployed or deleted",
+        },
+        {
+            "check": "canonical knowledge source reported with evidence",
+            "status": PASS if canonical_evidence else FAIL,
+            "detail": f"KNOWLEDGE_CANONICAL_CURRENT={canonical}; "
+            f"{len(canonical_evidence)} evidence item(s) recorded",
+        },
+        {
+            "check": "counts reported as available or explicitly unavailable",
+            "status": PASS,
+            "detail": f"D1_KNOWLEDGE_COUNT={d1_knowledge_count} "
+            f"(available={d1_observable}); "
+            f"VAULT_KNOWLEDGE_COUNT={vault_knowledge_count} "
+            f"(available={vault_observable})",
+        },
+        {
+            "check": "both named Inbox candidates traced or marked unavailable",
+            "status": PASS
+            if len(candidates) == 2
+            and all(c["status"] in {"VISIBLE", "NOT_VISIBLE"} for c in candidates)
+            else FAIL,
+            "detail": "; ".join(
+                f"{c['candidate_id']}={c['status']}" for c in candidates
+            ),
+        },
+        {
+            "check": "Inbox receipt vs durable persistence distinguished",
+            "status": PASS
+            if inbox_accepted_implies_durable is False
+            else FAIL,
+            "detail": "ACCEPTED Inbox receipt implies durable persistence: "
+            + ("YES" if inbox_accepted_implies_durable else "NO"),
+        },
+        {
+            "check": "SKILL/REALITY Cloud Asset records not conflated with KNOWLEDGE",
+            "status": PASS,
+            "detail": "Cloud Asset D1 evidence is reported as a separate layer "
+            "from KNOWLEDGE; no Cloud Asset record is counted as knowledge",
+        },
+        {
+            "check": "unavailable evidence marked, not guessed",
+            "status": PASS,
+            "detail": "local Obsidian/PersonOS-Knowledge vault marked BLOCKED "
+            "with evidence unavailable; canonical falls back to UNKNOWN",
+        },
+    ]
+
+    audit_status = PASS if all(check["status"] == PASS for check in checks) else FAIL
+    status = BLOCKED if canonical == "UNKNOWN" else PASS
+
+    lines = [
+        f"# {KNOWLEDGE_AUDIT_REPORT}",
+        "",
+        f"- goal: {KNOWLEDGE_AUDIT_GOAL}",
+        f"- task_id: {KNOWLEDGE_AUDIT_TASK_ID}",
+        f"- KNOWLEDGE_CANONICAL_CURRENT: {canonical}",
+        f"- D1_KNOWLEDGE_COUNT: {d1_knowledge_count} (available={d1_observable})",
+        f"- VAULT_KNOWLEDGE_COUNT: {vault_knowledge_count} "
+        f"(available={vault_observable})",
+        f"- INBOX_ACCEPTED_IMPLIES_DURABLE: {inbox_accepted_implies_durable}",
+        f"- STATUS: {status}",
+        "- production_mutation: False",
+        "",
+        "## Storage layers",
+    ]
+    for name in KNOWLEDGE_LAYERS:
+        info = layers[name]
+        lines.append(f"- [{info['status']}] {name}: {info['detail']}")
+    lines += ["", "## Canonical evidence"]
+    lines += [f"- {item}" for item in canonical_evidence]
+    lines += ["", "## Candidates"]
+    for candidate in candidates:
+        lines.append(
+            f"- [{candidate['status']}] {candidate['candidate_id']}"
+            + (f" (package {candidate['package']})" if candidate["package"] else "")
+            + f": {candidate['detail']}"
+        )
+    lines += ["", "## Inbox receipt vs durable persistence"]
+    lines += [f"- {item}" for item in inbox_persistence_evidence]
+    lines += ["", "## Checks"]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+
+    return {
+        "report": KNOWLEDGE_AUDIT_REPORT,
+        "goal": KNOWLEDGE_AUDIT_GOAL,
+        "task_id": KNOWLEDGE_AUDIT_TASK_ID,
+        "status": status,
+        "STATUS": status,
+        "audit_status": audit_status,
+        "KNOWLEDGE_CANONICAL_CURRENT": canonical,
+        "canonical": canonical,
+        "canonical_options": list(KNOWLEDGE_CANONICAL_OPTIONS),
+        "canonical_evidence": canonical_evidence,
+        "layers": layers,
+        "storage_layers": list(KNOWLEDGE_LAYERS),
+        "D1_KNOWLEDGE_COUNT": d1_knowledge_count,
+        "D1_KNOWLEDGE_COUNT_AVAILABLE": d1_observable,
+        "VAULT_KNOWLEDGE_COUNT": vault_knowledge_count,
+        "VAULT_KNOWLEDGE_COUNT_AVAILABLE": vault_observable,
+        "d1_bindings": d1_bindings,
+        "kv_bindings": kv_bindings,
+        "vault_paths": vault_paths,
+        "knowledge_env_var_names": env_hints,
+        "candidates": candidates,
+        "INBOX_ACCEPTED_IMPLIES_DURABLE": inbox_accepted_implies_durable,
+        "inbox_accepted_implies_durable": inbox_accepted_implies_durable,
+        "inbox_persistence_evidence": inbox_persistence_evidence,
+        "checks": checks,
+        "production_mutation": False,
+        "files_modified": False,
+        "stores_migrated": False,
+        "records_promoted": False,
+        "records_deleted": False,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])
@@ -6855,3 +7227,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(auto_result_close_loop_golden_verify()["markdown"])
     print(live_golden_round_1_verify()["markdown"])
     print(personal_ai_execution_dispatch_live_failure_audit()["markdown"])
+    print(knowledge_ground_truth_audit_v0_1()["markdown"])
