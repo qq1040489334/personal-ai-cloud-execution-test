@@ -288,16 +288,167 @@ def _read_execution_result() -> dict | None:
     return loaded if isinstance(loaded, dict) else None
 
 
-def _derive_status(execution_result: dict | None) -> str:
+WORKFLOW_CONCLUSION_FIELDS = (
+    "workflow_run_conclusion",
+    "workflow_conclusion",
+    "conclusion",
+    "github_workflow_conclusion",
+    "run_conclusion",
+)
+WORKFLOW_SUCCESS_CONCLUSIONS = ("success",)
+WORKFLOW_FAILURE_CONCLUSIONS = ("failure", "timed_out", "startup_failure", "error")
+WORKFLOW_BLOCKED_CONCLUSIONS = (
+    "cancelled",
+    "canceled",
+    "action_required",
+    "stale",
+    "neutral",
+    "skipped",
+)
+PLACEHOLDER_ARTIFACTS = ("hello.py", "test_hello.py")
+
+
+def workflow_run_conclusion(execution_result: dict | None) -> str | None:
+    """Return the recorded GitHub Actions workflow conclusion, if any.
+
+    The conclusion is authoritative execution ground truth. It is read from any
+    of the known result field spellings so that a self-reported ``status`` can
+    never silently override a cancelled / failed workflow run.
+    """
+    if not isinstance(execution_result, dict):
+        return None
+    for field in WORKFLOW_CONCLUSION_FIELDS:
+        value = execution_result.get(field)
+        if value is None:
+            continue
+        text = str(value).strip().lower()
+        if text:
+            return text
+    return None
+
+
+def _workflow_conclusion_status(conclusion: str) -> str:
+    """Map a workflow conclusion to PASS / FAIL / BLOCKED (fail-closed)."""
+    if conclusion in WORKFLOW_SUCCESS_CONCLUSIONS:
+        return PASS
+    if conclusion in WORKFLOW_FAILURE_CONCLUSIONS:
+        return FAIL
+    if conclusion in WORKFLOW_BLOCKED_CONCLUSIONS:
+        return BLOCKED
+    return BLOCKED
+
+
+def _canonical_conclusion_status(conclusion: str) -> str:
+    """Map a workflow conclusion to a canonical registry status."""
+    return {
+        PASS: "success",
+        FAIL: "failed",
+        BLOCKED: "blocked",
+    }[_workflow_conclusion_status(conclusion)]
+
+
+def _self_reported_status(execution_result: dict | None) -> str:
     if execution_result is None:
         return BLOCKED
     raw_status = str(execution_result.get("status", "")).strip().lower()
     tests = str(execution_result.get("tests", "")).strip().lower()
     if "fail" in tests or raw_status in {"fail", "failed", "error"}:
         return FAIL
-    if raw_status in {"success", "succeed", "pass", "passed", "ok"} or "passed" in tests:
+    if raw_status in SUCCESS_STATUSES or "passed" in tests:
         return PASS
     return BLOCKED
+
+
+def _missing_expected_files(execution_result: dict | None) -> list[str]:
+    """Return expected files the run did not actually produce.
+
+    A file merely present in the repository (for example the pre-existing
+    placeholder ``hello.py`` / ``test_hello.py``) is not proof of production:
+    it must appear in the run's ``changed_files``. When a result declares both
+    ``expected_files`` and ``changed_files`` this exposes placeholder or
+    unrelated artifacts that must not satisfy the task.
+    """
+    if not isinstance(execution_result, dict):
+        return []
+    expected = execution_result.get("expected_files")
+    if not isinstance(expected, list) or not expected:
+        return []
+    changed = execution_result.get("changed_files")
+    if not isinstance(changed, list):
+        return [str(path) for path in expected]
+    changed_set = {str(path) for path in changed}
+    return [str(path) for path in expected if str(path) not in changed_set]
+
+
+def result_integrity_assessment(execution_result: dict | None) -> dict:
+    """Return the authoritative integrity assessment of an execution result.
+
+    The GitHub Actions workflow conclusion is authoritative ground truth. A
+    non-success conclusion can never be represented as a successful completed
+    task solely because ``execution_result.json`` self-reports
+    ``status=success``. When no conclusion is recorded the self-reported status
+    is used exactly as before (backward compatible). Declared expected files
+    that were not actually produced also downgrade a claimed success.
+    """
+    self_status = _self_reported_status(execution_result)
+    conclusion = workflow_run_conclusion(execution_result)
+    missing_expected = _missing_expected_files(execution_result)
+    if conclusion is None:
+        assessment = {
+            "self_reported_status": self_status,
+            "workflow_conclusion": None,
+            "authoritative_status": self_status,
+            "mismatch": False,
+            "conclusion_authoritative": False,
+            "missing_expected_files": missing_expected,
+            "reason": (
+                "no workflow conclusion recorded; execution_result.json "
+                f"statuses used as-is -> {self_status}"
+            ),
+        }
+    elif conclusion in WORKFLOW_SUCCESS_CONCLUSIONS:
+        assessment = {
+            "self_reported_status": self_status,
+            "workflow_conclusion": conclusion,
+            "authoritative_status": self_status,
+            "mismatch": False,
+            "conclusion_authoritative": True,
+            "missing_expected_files": missing_expected,
+            "reason": (
+                "workflow conclusion 'success' agrees with execution_result.json "
+                f"-> {self_status}"
+            ),
+        }
+    else:
+        authoritative = _workflow_conclusion_status(conclusion)
+        mismatched = self_status == PASS
+        assessment = {
+            "self_reported_status": self_status,
+            "workflow_conclusion": conclusion,
+            "authoritative_status": authoritative,
+            "mismatch": mismatched,
+            "conclusion_authoritative": True,
+            "missing_expected_files": missing_expected,
+            "reason": (
+                f"workflow conclusion {conclusion!r} is authoritative and "
+                f"overrides execution_result.json self-reported {self_status}"
+                + (" (CONCLUSION/RESULT MISMATCH)" if mismatched else "")
+            ),
+        }
+    if assessment["authoritative_status"] == PASS and missing_expected:
+        assessment["authoritative_status"] = FAIL
+        assessment["mismatch"] = True
+        assessment["reason"] = (
+            assessment["reason"]
+            + "; expected files not produced by the run: "
+            + ", ".join(missing_expected)
+        )
+    return assessment
+
+
+def _derive_status(execution_result: dict | None) -> str:
+    """Derive PASS / FAIL / BLOCKED, treating workflow conclusion as truth."""
+    return result_integrity_assessment(execution_result)["authoritative_status"]
 
 
 def get_task_result(task_id: str) -> dict:
@@ -311,7 +462,8 @@ def get_task_result(task_id: str) -> dict:
         record = TASK_REGISTRY.get(task_id)
         if record is not None:
             execution_result = _terminal_result_from_record(record)
-    status = _derive_status(execution_result)
+    assessment = result_integrity_assessment(execution_result)
+    status = assessment["authoritative_status"]
     commit = _git("rev-parse", "HEAD")
     artifacts = _collect_artifacts()
 
@@ -345,10 +497,15 @@ def get_task_result(task_id: str) -> dict:
         },
         "decision": {
             "status": status,
+            "self_reported_status": assessment["self_reported_status"],
+            "workflow_conclusion": assessment["workflow_conclusion"],
+            "conclusion_authoritative": assessment["conclusion_authoritative"],
+            "conclusion_result_mismatch": assessment["mismatch"],
+            "missing_expected_files": assessment["missing_expected_files"],
             "reason": (
                 "execution_result.json missing; cannot verify remotely"
                 if execution_result is None
-                else f"execution_result.json status={execution_result.get('status')!r} tests={tests_summary!r}"
+                else assessment["reason"]
             ),
         },
     }
@@ -1395,6 +1552,13 @@ def list_pending_results() -> list[dict]:
         status = str(record.get("status", "")).strip().lower()
         if status not in SUCCESS_STATUSES:
             continue
+        terminal = _terminal_result_from_record(record)
+        if terminal is not None:
+            assessment = result_integrity_assessment(terminal)
+            if assessment["conclusion_authoritative"] and (
+                assessment["authoritative_status"] != PASS
+            ):
+                continue
         if not record.get("requires_review"):
             continue
         if record.get("reviewed"):
@@ -8178,9 +8342,18 @@ _RESULT_REGISTRY_SYNC_SEQ = 0
 
 
 def _terminal_result_status(result: dict | None) -> str | None:
-    """Return the normalized status if ``result`` is a terminal execution result."""
+    """Return the normalized status if ``result`` is a terminal execution result.
+
+    A recorded non-success workflow conclusion is terminal ground truth even
+    when the result body self-reports ``status=success``; such a result is
+    classified ``failed`` / ``blocked`` so it can never be reconciled as a
+    successful completed task.
+    """
     if not isinstance(result, dict):
         return None
+    conclusion = workflow_run_conclusion(result)
+    if conclusion is not None and conclusion not in WORKFLOW_SUCCESS_CONCLUSIONS:
+        return _canonical_conclusion_status(conclusion)
     status = str(result.get("status", "")).strip().lower()
     return status if status in RESULT_REGISTRY_TERMINAL_STATUSES else None
 
@@ -9324,6 +9497,128 @@ def personal_ai_production_registry_close_loop_fix_v1(
         "mark_reviewed_contract": "COMPATIBLE",
         "workflow_modified": False,
         "markdown": "\n".join(lines),
+    }
+
+
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_RESULT_INTEGRITY_V0_1  (task cf-55c078a1f5be)
+#
+# Result-integrity gate: a GitHub Actions workflow conclusion other than
+# success is authoritative, so a cancelled / failed / timed-out run can never
+# be surfaced as a successful completed task merely because
+# execution_result.json self-reports status=success. It also documents the
+# evidence-backed diagnosis of the cancelled EVENT_SYNC run
+# cf-33ef3836eb27 / workflow run 36220934446. This section is read-only: it
+# never edits a workflow, a secret, the submit_task contract or a scope gate.
+# ---------------------------------------------------------------------------
+CANCELLED_RUN_TASK_ID = "cf-33ef3836eb27"
+CANCELLED_RUN_WORKFLOW_RUN_ID = "36220934446"
+EVENT_SYNC_GOAL = "PERSONAL_AI_EXECUTION_EVENT_SYNC_V0.1"
+CANCELLED_RUN_DIAGNOSIS_REPORT = "CANCELLED_RUN_DIAGNOSIS_REPORT"
+CANCELLED_RUN_DIAGNOSIS_FIELDS = (
+    "report",
+    "goal",
+    "task_id",
+    "workflow_run_id",
+    "workflow_conclusion",
+    "status",
+    "cause_known",
+    "cause",
+    "evidence_backed",
+    "local_evidence",
+    "required_evidence",
+    "event_sync_retry",
+    "retry_allowed",
+    "reason",
+)
+CANCELLED_RUN_REQUIRED_EVIDENCE = (
+    "GitHub Actions run metadata (run.conclusion, run.status, run.event, "
+    "run.created_at)",
+    "the run's jobs and per-step conclusions",
+    "the workflow concurrency group and any superseding run",
+    "whether a newer dispatch cancelled this in-progress run",
+)
+
+
+def diagnose_cancelled_run(
+    task_id: str = CANCELLED_RUN_TASK_ID,
+    workflow_run_id: str = CANCELLED_RUN_WORKFLOW_RUN_ID,
+    *,
+    evidence: dict | None = None,
+) -> dict:
+    """Evidence-backed diagnosis of a workflow run that concluded cancelled.
+
+    GitHub Actions run history is not reachable from this offline sandbox, so
+    when no local evidence pins the cause the diagnosis is explicitly BLOCKED
+    rather than guessed, and an EVENT_SYNC retry is refused. A supplied
+    ``evidence`` mapping identifying the cancellation cause is classified when
+    present; no cause is ever fabricated.
+    """
+    task_id = str(task_id or "").strip()
+    workflow_run_id = str(workflow_run_id or "").strip()
+    local_hits = _task_id_mentioned(task_id) if task_id else []
+    run_hits = _task_id_mentioned(workflow_run_id) if workflow_run_id else []
+    observed = list(dict.fromkeys(local_hits + run_hits))
+
+    if evidence is not None:
+        conclusion = str(evidence.get("conclusion", "")).strip().lower() or "unknown"
+        cause = str(evidence.get("cause", "")).strip()
+        classified = conclusion == "cancelled" and bool(cause)
+        return {
+            "report": CANCELLED_RUN_DIAGNOSIS_REPORT,
+            "goal": EVENT_SYNC_GOAL,
+            "task_id": task_id,
+            "workflow_run_id": workflow_run_id,
+            "workflow_conclusion": conclusion,
+            "status": PASS if classified else BLOCKED,
+            "cause_known": classified,
+            "cause": cause or None,
+            "evidence_backed": True,
+            "local_evidence": observed,
+            "required_evidence": list(CANCELLED_RUN_REQUIRED_EVIDENCE),
+            "event_sync_retry": "NOT_ATTEMPTED",
+            "retry_allowed": classified,
+            "reason": (
+                "caller-supplied run evidence identifies the cancellation cause"
+                if classified
+                else "caller-supplied evidence does not identify the "
+                "cancellation cause"
+            ),
+        }
+
+    return {
+        "report": CANCELLED_RUN_DIAGNOSIS_REPORT,
+        "goal": EVENT_SYNC_GOAL,
+        "task_id": task_id,
+        "workflow_run_id": workflow_run_id,
+        "workflow_conclusion": "cancelled",
+        "status": BLOCKED,
+        "cause_known": False,
+        "cause": None,
+        "evidence_backed": True,
+        "local_evidence": observed,
+        "required_evidence": list(CANCELLED_RUN_REQUIRED_EVIDENCE),
+        "event_sync_retry": "NOT_ATTEMPTED",
+        "retry_allowed": False,
+        "reason": (
+            "no local evidence references task "
+            f"{task_id!r} or run {workflow_run_id!r}; GitHub Actions run "
+            "metadata is unreachable from this offline sandbox, so the "
+            "concrete cancellation cause cannot be established and an "
+            "EVENT_SYNC retry is unsafe"
+        ),
+    }
+
+
+def event_sync_retry_gate() -> dict:
+    """Gate the EVENT_SYNC retry on a known cancellation root cause."""
+    diagnosis = diagnose_cancelled_run()
+    return {
+        "goal": EVENT_SYNC_GOAL,
+        "diagnosis_status": diagnosis["status"],
+        "retry_allowed": diagnosis["retry_allowed"],
+        "event_sync_retry": diagnosis["event_sync_retry"],
+        "reason": diagnosis["reason"],
     }
 
 

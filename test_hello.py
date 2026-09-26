@@ -3445,3 +3445,216 @@ def test_production_registry_fix_markdown() -> None:
     assert "cf-99260a669a85" in markdown
     assert "cf-2b61b53778f3" in markdown
     assert f"- FINAL: {report['FINAL']}" in markdown
+
+
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_RESULT_INTEGRITY_V0_1 regression tests
+# Workflow conclusion is authoritative over execution_result.json.
+# ---------------------------------------------------------------------------
+
+
+def _integrity_result(**overrides) -> dict:
+    result = {
+        "task_id": "cf-integrity-probe",
+        "status": "success",
+        "tests": "221 passed in 66.20s",
+        "summary": "integrity probe",
+    }
+    result.update(overrides)
+    return result
+
+
+def test_workflow_success_result_success_is_pass() -> None:
+    assessment = hello_module.result_integrity_assessment(
+        _integrity_result(workflow_run_conclusion="success")
+    )
+    assert assessment["authoritative_status"] == "PASS"
+    assert assessment["mismatch"] is False
+    assert assessment["conclusion_authoritative"] is True
+
+
+def test_workflow_cancelled_result_success_is_blocked() -> None:
+    assessment = hello_module.result_integrity_assessment(
+        _integrity_result(workflow_run_conclusion="cancelled")
+    )
+    assert assessment["authoritative_status"] == "BLOCKED"
+    assert assessment["mismatch"] is True
+    assert assessment["conclusion_authoritative"] is True
+    assert assessment["self_reported_status"] == "PASS"
+
+
+def test_workflow_failure_result_success_is_failed() -> None:
+    assessment = hello_module.result_integrity_assessment(
+        _integrity_result(workflow_run_conclusion="failure")
+    )
+    assert assessment["authoritative_status"] == "FAIL"
+    assert assessment["mismatch"] is True
+
+
+@pytest.mark.parametrize(
+    "conclusion",
+    [
+        "cancelled",
+        "canceled",
+        "failure",
+        "timed_out",
+        "startup_failure",
+        "action_required",
+        "stale",
+        "skipped",
+        "neutral",
+        "some_unknown_conclusion",
+    ],
+)
+def test_non_success_conclusion_never_success(conclusion: str) -> None:
+    assessment = hello_module.result_integrity_assessment(
+        _integrity_result(workflow_run_conclusion=conclusion)
+    )
+    assert assessment["authoritative_status"] != "PASS"
+
+
+def test_no_conclusion_uses_self_reported_status() -> None:
+    assessment = hello_module.result_integrity_assessment(_integrity_result())
+    assert assessment["authoritative_status"] == "PASS"
+    assert assessment["conclusion_authoritative"] is False
+    assert hello_module._derive_status(None) == "BLOCKED"
+
+
+def test_missing_result_is_blocked() -> None:
+    assessment = hello_module.result_integrity_assessment(None)
+    assert assessment["authoritative_status"] == "BLOCKED"
+    assert assessment["conclusion_authoritative"] is False
+
+
+def test_get_task_result_exposes_conclusion_mismatch(monkeypatch) -> None:
+    monkeypatch.setattr(
+        hello_module,
+        "_read_execution_result",
+        lambda: _integrity_result(workflow_run_conclusion="cancelled"),
+    )
+    result = hello_module.get_task_result("cf-integrity-probe")
+    assert result["execution_summary"]["status"] == "BLOCKED"
+    decision = result["evidence"]["decision"]
+    assert decision["workflow_conclusion"] == "cancelled"
+    assert decision["self_reported_status"] == "PASS"
+    assert decision["conclusion_authoritative"] is True
+    assert decision["conclusion_result_mismatch"] is True
+    assert "cancelled" in decision["reason"]
+
+
+def test_reconcile_cancelled_conclusion_is_not_success() -> None:
+    task_id = f"cf-integrity-cancel-{hello_module.uuid.uuid4().hex[:8]}"
+    hello_module.submit_task(
+        task_id, goal="integrity", status="submitted", requires_review=True
+    )
+    info = hello_module.reconcile_task_result(
+        task_id,
+        _integrity_result(
+            task_id=task_id, workflow_run_conclusion="cancelled"
+        ),
+    )
+    assert info["reconciled"] is True
+    assert info["status"] == "blocked"
+    record = hello_module.get_task_review(task_id)
+    assert record["status"] == "blocked"
+    assert task_id not in {t["task_id"] for t in hello_module.list_pending_results()}
+
+
+def test_reconcile_failure_conclusion_is_failed() -> None:
+    task_id = f"cf-integrity-fail-{hello_module.uuid.uuid4().hex[:8]}"
+    hello_module.submit_task(
+        task_id, goal="integrity", status="submitted", requires_review=True
+    )
+    info = hello_module.reconcile_task_result(
+        task_id,
+        _integrity_result(
+            task_id=task_id, workflow_run_conclusion="failure"
+        ),
+    )
+    assert info["status"] == "failed"
+    assert task_id not in {t["task_id"] for t in hello_module.list_pending_results()}
+
+
+def test_reconcile_success_conclusion_is_success() -> None:
+    task_id = f"cf-integrity-ok-{hello_module.uuid.uuid4().hex[:8]}"
+    info = hello_module.reconcile_task_result(
+        task_id,
+        _integrity_result(
+            task_id=task_id, workflow_run_conclusion="success"
+        ),
+    )
+    assert info["status"] == "success"
+    assert task_id in {t["task_id"] for t in hello_module.list_pending_results()}
+
+
+def test_pending_guard_blocks_non_success_conclusion_record() -> None:
+    task_id = f"cf-integrity-guard-{hello_module.uuid.uuid4().hex[:8]}"
+    hello_module.submit_task(
+        task_id, goal="integrity", status="success", requires_review=True
+    )
+    hello_module.TASK_REGISTRY[task_id]["execution_result_json"] = (
+        _integrity_result(task_id=task_id, workflow_run_conclusion="cancelled")
+    )
+    pending_ids = {t["task_id"] for t in hello_module.list_pending_results()}
+    assert task_id not in pending_ids
+    assert hello_module.TASK_REGISTRY[task_id]["status"] == "blocked"
+
+
+def test_expected_files_must_be_produced_not_placeholder() -> None:
+    assessment = hello_module.result_integrity_assessment(
+        _integrity_result(
+            workflow_run_conclusion="success",
+            expected_files=["event_sync.py"],
+            changed_files=["hello.py", "test_hello.py"],
+        )
+    )
+    assert assessment["authoritative_status"] == "FAIL"
+    assert assessment["missing_expected_files"] == ["event_sync.py"]
+    assert "hello.py" not in assessment["missing_expected_files"]
+
+
+def test_expected_files_produced_is_success() -> None:
+    assessment = hello_module.result_integrity_assessment(
+        _integrity_result(
+            workflow_run_conclusion="success",
+            expected_files=["event_sync.py"],
+            changed_files=["event_sync.py"],
+        )
+    )
+    assert assessment["authoritative_status"] == "PASS"
+    assert assessment["missing_expected_files"] == []
+
+
+def test_cancelled_run_diagnosis_is_evidence_backed_blocked() -> None:
+    report = hello_module.diagnose_cancelled_run()
+    assert report["task_id"] == "cf-33ef3836eb27"
+    assert report["workflow_run_id"] == "36220934446"
+    assert report["status"] == "BLOCKED"
+    assert report["cause_known"] is False
+    assert report["evidence_backed"] is True
+    assert report["retry_allowed"] is False
+    assert report["event_sync_retry"] == "NOT_ATTEMPTED"
+    assert report["reason"]
+    for field in hello_module.CANCELLED_RUN_DIAGNOSIS_FIELDS:
+        assert field in report
+
+
+def test_cancelled_run_diagnosis_classifies_supplied_cause() -> None:
+    report = hello_module.diagnose_cancelled_run(
+        evidence={
+            "conclusion": "cancelled",
+            "cause": "superseded by a newer dispatch in the same concurrency group",
+        }
+    )
+    assert report["status"] == "PASS"
+    assert report["cause_known"] is True
+    assert report["cause"]
+    assert report["retry_allowed"] is True
+
+
+def test_event_sync_retry_gate_refuses_without_cause() -> None:
+    gate = hello_module.event_sync_retry_gate()
+    assert gate["goal"] == hello_module.EVENT_SYNC_GOAL
+    assert gate["diagnosis_status"] == "BLOCKED"
+    assert gate["retry_allowed"] is False
+    assert gate["event_sync_retry"] == "NOT_ATTEMPTED"
