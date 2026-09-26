@@ -1,0 +1,19 @@
+{
+  "service": "personal-ai-execution-mcp",
+  "environment": "production",
+  "cloudflare_account_id": "78a22a0699aa94a39d8f7bfdbac18249",
+  "production_version": "3e2fed43",
+  "source_file": "worker/index.js",
+  "source_sha256": "8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1",
+  "source_bytes": 55278,
+  "source_lines": 1543,
+  "compatibility_date": "2026-09-23",
+  "bindings": {
+    "ASSET_DB": "45d6f18a-3a34-4ccd-8337-c00a775cd7a2",
+    "TASK_REGISTRY": "60f6203f262d44378abd0accfa7fef46",
+    "GITHUB_REPO": "qq1040489334/personal-ai-cloud-execution-test"
+  },
+  "secrets": "not captured; preserve existing production secrets",
+  "provenance": "Cloudflare Quick Edit active production version, copied through the editor without truncation",
+  "rollback_reference": "Restore Cloudflare version 3e2fed43 if a later deployment fails a pre-Golden gate"
+}

@@ -1,0 +1,14 @@
+name = "personal-ai-execution-mcp"
+main = "index.js"
+compatibility_date = "2026-09-23"
+
+# Production deploys must preserve the existing service bindings and secrets.
+# Secret values are intentionally not represented in this file.
+
+[[d1_databases]]
+binding = "ASSET_DB"
+database_id = "45d6f18a-3a34-4ccd-8337-c00a775cd7a2"
+
+[[kv_namespaces]]
+binding = "TASK_REGISTRY"
+id = "60f6203f262d44378abd0accfa7fef46"
