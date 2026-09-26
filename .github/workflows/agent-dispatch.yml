@@ -15,7 +15,7 @@ jobs:
   agent:
     name: cloud-agent-dispatch
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     env:
       CI: "true"
     steps:
@@ -128,6 +128,9 @@ jobs:
             SUMMARY="${{ steps.tests.outputs.summary }}"
             if [ -n "$BASE" ] && git cat-file -e "$BASE:scripts/build_execution_result.py" 2>/dev/null; then
               git show "$BASE:scripts/build_execution_result.py" | python - "$RUNNER_TEMP/task.json" "$BASE" "$SUMMARY" "$RUNNER_TEMP/execution_result.json" || true
+            fi
+            if [ "$JOB_STATUS" != "success" ]; then
+              rm -f "$RUNNER_TEMP/execution_result.json"
             fi
             if [ ! -s "$RUNNER_TEMP/execution_result.json" ]; then
               python - "$RUNNER_TEMP/task.json" "$RUNNER_TEMP/execution_result.json" "$JOB_STATUS" "$PUSH_OUTCOME" <<'PY'
