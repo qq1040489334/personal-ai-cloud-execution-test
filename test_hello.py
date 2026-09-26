@@ -3658,3 +3658,107 @@ def test_event_sync_retry_gate_refuses_without_cause() -> None:
     assert gate["diagnosis_status"] == "BLOCKED"
     assert gate["retry_allowed"] is False
     assert gate["event_sync_retry"] == "NOT_ATTEMPTED"
+
+
+def test_runtime_provenance_v0_1_report_shape() -> None:
+    report = hello_module.runtime_provenance_v0_1_report()
+    assert report["report"] == hello_module.RUNTIME_PROVENANCE_V01_REPORT
+    assert report["goal"] == hello_module.RUNTIME_PROVENANCE_V01_GOAL
+    assert report["goal"] == "PERSONAL_AI_RUNTIME_PROVENANCE_V0.1"
+    assert report["task_id"] == hello_module.RUNTIME_PROVENANCE_V01_TASK_ID
+    assert report["task_id"] == "cf-fc30ce98400d"
+    assert set(hello_module.RUNTIME_PROVENANCE_V01_FIELDS) <= set(report)
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+    assert report["overall"] in {"PASS", "FAIL", "BLOCKED", "PARTIAL"}
+
+
+def test_runtime_provenance_v0_1_identifies_deployed_version() -> None:
+    report = hello_module.runtime_provenance_v0_1_report()
+    assert isinstance(report["deployed_version"], str)
+    assert report["deployed_version"]
+    assert report["version_source"]
+    assert report["version_evidence"]
+    baseline = hello_module._load_repo_json(
+        hello_module.RUNTIME_PROVENANCE_BASELINE_PATH
+    )
+    if baseline and baseline.get("production_version"):
+        assert report["deployed_version"] == baseline["production_version"]
+        assert report["deployment_metadata_present"] is True
+        assert report["deployed_service"] == baseline["service"]
+
+
+def test_runtime_provenance_v0_1_verifies_source_commit_relationship() -> None:
+    report = hello_module.runtime_provenance_v0_1_report()
+    assert isinstance(report["relationship_verified"], bool)
+    assert isinstance(report["runtime_verified"], bool)
+    assert report["source_tracked"] is True
+    assert report["source_commit_on_history"] is True
+    assert report["source_last_commit"]
+    expected = bool(
+        report["deployment_metadata_present"]
+        and report["canonical_source_present"]
+        and report["source_tracked"]
+        and report["source_commit_on_history"]
+        and report["source_hash_matches"]
+        and report["source_size_matches"]
+        and report["source_lines_matches"]
+    )
+    assert report["relationship_verified"] is expected
+    if report["relationship_verified"]:
+        assert report["runtime_verified"] is True
+    else:
+        assert report["runtime_verified"] is False
+
+
+def test_runtime_provenance_v0_1_reports_metadata_source_mismatch() -> None:
+    report = hello_module.runtime_provenance_v0_1_report()
+    if report["recorded_source_hash"] and report["canonical_source_hash"]:
+        matches = (
+            report["recorded_source_hash"].lower()
+            == report["canonical_source_hash"].lower()
+        )
+        assert report["source_hash_matches"] is matches
+        check = next(
+            c
+            for c in report["checks"]
+            if c["check"] == "deployment metadata source matches canonical source"
+        )
+        if not matches:
+            assert check["status"] == "BLOCKED"
+            assert report["relationship_verified"] is False
+            assert report["runtime_verified"] is False
+
+
+def test_runtime_provenance_v0_1_no_production_mutation() -> None:
+    report = hello_module.runtime_provenance_v0_1_report()
+    assert report["production_mutated"] is False
+    assert report["read_only"] is True
+    assert report["live_endpoint_checked"] is False
+    check = next(
+        c for c in report["checks"] if c["check"] == "no production mutation"
+    )
+    assert check["status"] == "PASS"
+
+
+def test_runtime_provenance_v0_1_no_fabricated_pass() -> None:
+    report = hello_module.runtime_provenance_v0_1_report()
+    if not report["runtime_verified"]:
+        assert report["overall"] != "PASS"
+    if report["overall"] == "PASS":
+        assert report["runtime_verified"] is True
+        assert all(c["status"] == "PASS" for c in report["checks"])
+
+
+def test_runtime_provenance_v0_1_markdown_tokens() -> None:
+    report = hello_module.runtime_provenance_v0_1_report()
+    markdown = report["markdown"]
+    assert markdown.startswith("# PERSONAL_AI_RUNTIME_PROVENANCE_REPORT")
+    assert f"- task_id: {report['task_id']}" in markdown
+    assert f"DEPLOYED_VERSION={report['deployed_version']}" in markdown
+    assert f"RELATIONSHIP_VERIFIED={report['relationship_verified']}" in markdown
+    assert f"RUNTIME_VERIFIED={report['runtime_verified']}" in markdown
+    assert "PRODUCTION_MUTATED=False" in markdown

@@ -9622,7 +9622,396 @@ def event_sync_retry_gate() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_RUNTIME_PROVENANCE_V0.1 (cf-fc30ce98400d)
+#
+# Read-only audit of production runtime provenance for the Personal AI
+# execution infrastructure. It identifies the deployed runtime version from the
+# strongest available evidence (environment override, in-repo deployment
+# baseline, then the promoted source commit), verifies the relationship between
+# the deployment metadata and the canonical source commit, and records that no
+# production mutation was performed. The live runtime is not reachable offline,
+# so a live-verified PASS is never fabricated.
+# ---------------------------------------------------------------------------
+RUNTIME_PROVENANCE_V01_GOAL = "PERSONAL_AI_RUNTIME_PROVENANCE_V0.1"
+RUNTIME_PROVENANCE_V01_TASK_ID = "cf-fc30ce98400d"
+RUNTIME_PROVENANCE_V01_REPORT = "PERSONAL_AI_RUNTIME_PROVENANCE_REPORT"
+RUNTIME_PROVENANCE_BASELINE_PATH = "worker/PRODUCTION-BASELINE.json"
+RUNTIME_PROVENANCE_DEFAULT_SOURCE = "worker/index.js"
+RUNTIME_PROVENANCE_WORKER_CONFIG = (
+    "worker/wrangler.toml",
+    "worker/wrangler.json",
+    "worker/wrangler.jsonc",
+)
+RUNTIME_PROVENANCE_VERSION_ENV = (
+    "DEPLOYED_VERSION",
+    "RUNTIME_VERSION",
+    "PRODUCTION_VERSION",
+    "CLOUDFLARE_WORKER_VERSION_ID",
+    "WORKER_VERSION_ID",
+)
+RUNTIME_PROVENANCE_COMMIT_ENV = (
+    "DEPLOYED_COMMIT",
+    "RUNTIME_COMMIT",
+    "GITHUB_SHA",
+)
+RUNTIME_PROVENANCE_V01_FIELDS = (
+    "report",
+    "goal",
+    "task_id",
+    "deployed_version",
+    "version_source",
+    "version_evidence",
+    "source_commit",
+    "origin_main_commit",
+    "head_commit",
+    "deployment_metadata_present",
+    "deployment_metadata_path",
+    "deployed_service",
+    "deployed_environment",
+    "recorded_source_file",
+    "recorded_source_hash",
+    "recorded_source_bytes",
+    "recorded_source_lines",
+    "canonical_source_file",
+    "canonical_source_present",
+    "canonical_source_hash",
+    "canonical_source_bytes",
+    "canonical_source_lines",
+    "source_hash_matches",
+    "source_size_matches",
+    "source_lines_matches",
+    "source_tracked",
+    "source_last_commit",
+    "source_commit_on_history",
+    "relationship_verified",
+    "runtime_verified",
+    "production_mutated",
+    "read_only",
+    "live_endpoint_checked",
+    "checks",
+    "overall",
+    "markdown",
+)
+
+
+def _load_repo_json(rel: str) -> dict | None:
+    """Read a JSON object from a repo-relative path, or return None."""
+    path = REPO_ROOT / rel
+    if not path.is_file():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(loaded, str):
+        try:
+            loaded = json.loads(loaded)
+        except json.JSONDecodeError:
+            return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _baseline_int(baseline: dict, *keys: str) -> int | None:
+    value = _metadata_str(baseline, *keys)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def runtime_provenance_v0_1_report() -> dict:
+    """Audit the deployed Personal AI runtime against canonical source.
+
+    Read-only and offline. Identifies the deployed version from the in-repo
+    deployment baseline (``worker/PRODUCTION-BASELINE.json``) or an environment
+    override, then checks that the source file named by that metadata is the
+    canonical committed source (path tracked, commits on history, size/line/hash
+    agreement). A live endpoint check is explicitly not performed, so the report
+    never invents a verified live PASS and always records that no production
+    mutation was made by the audit.
+    """
+    head = _git("rev-parse", "HEAD")
+    origin_main = _git("rev-parse", "origin/main")
+    source_commit = origin_main or head
+
+    baseline_path = (
+        RUNTIME_PROVENANCE_BASELINE_PATH
+        if (REPO_ROOT / RUNTIME_PROVENANCE_BASELINE_PATH).is_file()
+        else None
+    )
+    baseline = _load_repo_json(baseline_path) if baseline_path else None
+    baseline = baseline or {}
+    deployment_metadata_present = baseline_path is not None
+
+    env_version = _env_value(RUNTIME_PROVENANCE_VERSION_ENV)
+    env_commit = _env_value(RUNTIME_PROVENANCE_COMMIT_ENV)
+
+    baseline_version = _metadata_str(
+        baseline, "production_version", "version", "version_id", "versionId"
+    )
+
+    if env_version:
+        deployed_version = env_version
+        version_source = "environment variable (live runtime supplied)"
+        version_evidence = "env: " + "|".join(RUNTIME_PROVENANCE_VERSION_ENV)
+    elif baseline_version:
+        deployed_version = baseline_version
+        version_source = f"deployment metadata: {baseline_path}"
+        version_evidence = str(baseline_path)
+    elif source_commit:
+        deployed_version = source_commit
+        version_source = (
+            "inferred from promoted source commit "
+            "(offline; live runtime unreachable)"
+        )
+        version_evidence = "git rev-parse origin/main || HEAD"
+    else:
+        deployed_version = "UNVERIFIED"
+        version_source = "unavailable"
+        version_evidence = "no deployment metadata, environment or commit available"
+
+    deployed_service = _metadata_str(baseline, "service", "worker_name", "name")
+    deployed_environment = _metadata_str(baseline, "environment", "env", "stage")
+
+    recorded_source_file = _metadata_str(
+        baseline, "source_file", "source_path", "entrypoint"
+    )
+    recorded_source_hash = _metadata_str(
+        baseline, "source_sha256", "source_hash", "sha256"
+    )
+    recorded_source_bytes = _baseline_int(baseline, "source_bytes", "bytes")
+    recorded_source_lines = _baseline_int(baseline, "source_lines", "lines")
+
+    canonical_source_file = recorded_source_file
+    if canonical_source_file and (
+        canonical_source_file.startswith("/")
+        or ".." in Path(canonical_source_file).parts
+    ):
+        canonical_source_file = None
+    if not canonical_source_file and (REPO_ROOT / RUNTIME_PROVENANCE_DEFAULT_SOURCE).is_file():
+        canonical_source_file = RUNTIME_PROVENANCE_DEFAULT_SOURCE
+
+    canonical_path = REPO_ROOT / canonical_source_file if canonical_source_file else None
+    canonical_source_present = bool(canonical_path and canonical_path.is_file())
+    canonical_source_hash = _sha256(canonical_path) if canonical_source_present else None
+    canonical_source_bytes = (
+        canonical_path.stat().st_size if canonical_source_present else None
+    )
+    canonical_source_lines = (
+        len(
+            canonical_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        )
+        if canonical_source_present
+        else None
+    )
+
+    source_tracked = bool(canonical_source_file) and _git_ok(
+        "ls-files", "--error-unmatch", canonical_source_file
+    )
+    source_last_commit = (
+        _git("log", "-1", "--format=%H", "--", canonical_source_file)
+        if canonical_source_file
+        else ""
+    )
+    source_commit_on_history = bool(source_last_commit) and _commit_on_history(
+        source_last_commit
+    )
+
+    source_hash_matches = (
+        bool(recorded_source_hash)
+        and bool(canonical_source_hash)
+        and recorded_source_hash.strip().lower() == canonical_source_hash.lower()
+    )
+    source_size_matches = (
+        recorded_source_bytes is not None
+        and recorded_source_bytes == canonical_source_bytes
+    )
+    source_lines_matches = (
+        recorded_source_lines is not None
+        and recorded_source_lines == canonical_source_lines
+    )
+
+    relationship_verified = bool(
+        deployment_metadata_present
+        and canonical_source_present
+        and source_tracked
+        and source_commit_on_history
+        and source_hash_matches
+        and source_size_matches
+        and source_lines_matches
+    )
+    runtime_verified = bool(
+        relationship_verified
+        and deployed_version
+        and deployed_version != "UNVERIFIED"
+    )
+
+    if source_hash_matches and source_size_matches and source_lines_matches:
+        source_match_status = PASS
+        source_match_detail = (
+            f"{canonical_source_file} matches recorded deployment source "
+            f"(sha256={recorded_source_hash}, bytes={recorded_source_bytes}, "
+            f"lines={recorded_source_lines})"
+        )
+    elif recorded_source_hash or recorded_source_bytes is not None:
+        source_match_status = BLOCKED
+        source_match_detail = (
+            "recorded deployment source does not match the canonical committed "
+            f"source {canonical_source_file or '(absent)'}: "
+            f"recorded sha256={recorded_source_hash or 'UNAVAILABLE'} "
+            f"bytes={recorded_source_bytes} lines={recorded_source_lines} vs "
+            f"canonical sha256={canonical_source_hash or 'UNAVAILABLE'} "
+            f"bytes={canonical_source_bytes} lines={canonical_source_lines}; the "
+            "deployed version is not traceable to a canonical source commit"
+        )
+    else:
+        source_match_status = BLOCKED
+        source_match_detail = (
+            "no machine-readable deployment source hash/size recorded; cannot "
+            "tie the deployed version to canonical source"
+        )
+
+    checks = [
+        {
+            "check": "deployment metadata present",
+            "status": PASS if deployment_metadata_present else BLOCKED,
+            "detail": (
+                f"deployment baseline present: {baseline_path}"
+                if deployment_metadata_present
+                else f"no deployment metadata baseline at {RUNTIME_PROVENANCE_BASELINE_PATH}"
+            ),
+        },
+        {
+            "check": "deployed version identified",
+            "status": PASS if deployed_version != "UNVERIFIED" else BLOCKED,
+            "detail": (
+                f"deployed version {deployed_version} resolved from {version_source}"
+                if deployed_version != "UNVERIFIED"
+                else "deployed version could not be identified from metadata, "
+                "environment or git"
+            ),
+        },
+        {
+            "check": "canonical source present",
+            "status": PASS if canonical_source_present else FAIL,
+            "detail": (
+                f"canonical source present: {canonical_source_file}"
+                if canonical_source_present
+                else f"canonical source {canonical_source_file or '(unresolved)'} not found"
+            ),
+        },
+        {
+            "check": "deployment metadata source matches canonical source",
+            "status": source_match_status,
+            "detail": source_match_detail,
+        },
+        {
+            "check": "source commit relationship",
+            "status": (
+                PASS if (source_tracked and source_commit_on_history) else BLOCKED
+            ),
+            "detail": (
+                f"{canonical_source_file} tracked and last commit "
+                f"{source_last_commit[:12]} is on HEAD history"
+                if (source_tracked and source_commit_on_history)
+                else f"{canonical_source_file or 'source'} not tied to a commit on "
+                "current history"
+            ),
+        },
+        {
+            "check": "no production mutation",
+            "status": PASS,
+            "detail": "read-only audit: no deploy, upload or write performed",
+        },
+    ]
+
+    if any(c["status"] == FAIL for c in checks):
+        overall = FAIL
+    elif not runtime_verified:
+        overall = BLOCKED
+    elif any(c["status"] == BLOCKED for c in checks):
+        overall = PARTIAL
+    else:
+        overall = PASS
+
+    lines = [
+        "# PERSONAL_AI_RUNTIME_PROVENANCE_REPORT",
+        "",
+        f"- goal: {RUNTIME_PROVENANCE_V01_GOAL}",
+        f"- task_id: {RUNTIME_PROVENANCE_V01_TASK_ID}",
+        f"- environment_commit: {env_commit or 'unset'}",
+        f"- repository_head: {head or 'unknown'}",
+        f"- origin_main: {origin_main or 'unknown'}",
+        f"- deployed_version: {deployed_version}",
+        f"- version_source: {version_source}",
+        f"- deployed_service: {deployed_service or 'unknown'}",
+        f"- deployment_metadata: {baseline_path or 'absent'}",
+        f"- canonical_source: {canonical_source_file or 'absent'}",
+        f"- relationship_verified: {relationship_verified}",
+        f"- runtime_verified: {runtime_verified}",
+        f"- production_mutated: False",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += [
+        "",
+        "## Answers",
+        f"DEPLOYED_VERSION={deployed_version}",
+        f"RUNTIME_SOURCE_COMMIT={source_commit or 'UNVERIFIED'}",
+        f"RELATIONSHIP_VERIFIED={relationship_verified}",
+        f"RUNTIME_VERIFIED={runtime_verified}",
+        f"PRODUCTION_MUTATED=False",
+        "",
+        f"## Overall: {overall}",
+    ]
+
+    return {
+        "report": RUNTIME_PROVENANCE_V01_REPORT,
+        "goal": RUNTIME_PROVENANCE_V01_GOAL,
+        "task_id": RUNTIME_PROVENANCE_V01_TASK_ID,
+        "deployed_version": deployed_version,
+        "version_source": version_source,
+        "version_evidence": version_evidence,
+        "source_commit": source_commit,
+        "origin_main_commit": origin_main,
+        "head_commit": head,
+        "deployment_metadata_present": deployment_metadata_present,
+        "deployment_metadata_path": baseline_path,
+        "deployed_service": deployed_service,
+        "deployed_environment": deployed_environment,
+        "recorded_source_file": recorded_source_file,
+        "recorded_source_hash": recorded_source_hash,
+        "recorded_source_bytes": recorded_source_bytes,
+        "recorded_source_lines": recorded_source_lines,
+        "canonical_source_file": canonical_source_file,
+        "canonical_source_present": canonical_source_present,
+        "canonical_source_hash": canonical_source_hash,
+        "canonical_source_bytes": canonical_source_bytes,
+        "canonical_source_lines": canonical_source_lines,
+        "source_hash_matches": source_hash_matches,
+        "source_size_matches": source_size_matches,
+        "source_lines_matches": source_lines_matches,
+        "source_tracked": source_tracked,
+        "source_last_commit": source_last_commit,
+        "source_commit_on_history": source_commit_on_history,
+        "relationship_verified": relationship_verified,
+        "runtime_verified": runtime_verified,
+        "production_mutated": False,
+        "read_only": True,
+        "live_endpoint_checked": False,
+        "checks": checks,
+        "overall": overall,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
+    print(runtime_provenance_v0_1_report()["markdown"])
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])
     print(runtime_provenance_report()["markdown"])
