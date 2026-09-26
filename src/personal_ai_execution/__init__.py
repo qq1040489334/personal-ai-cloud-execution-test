@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from . import event_sync, reconciliation, review_assistant
+from . import event_sync, reconciliation, review_assistant, review_validation
 from .event_sync import (
     GOLDEN_TASK_ID,
     PENDING_REVIEW,
@@ -53,6 +53,15 @@ from .review_assistant import (
     parse_test_evidence,
     recommend_pending_reviews,
 )
+from .review_validation import (
+    GOLDEN_GOAL,
+    GOLDEN_REVIEW_TASK_ID,
+    collect_mainline_evidence,
+    golden_report_markdown,
+    latest_successful_task,
+    production_task_stream,
+    run_review_assistant_golden,
+)
 
 __all__ = [
     "ALREADY_SYNCED",
@@ -61,6 +70,8 @@ __all__ = [
     "COMPLETED_WITH_RESULT",
     "FAIL",
     "FAILED_WITH_RESULT",
+    "GOLDEN_GOAL",
+    "GOLDEN_REVIEW_TASK_ID",
     "GOLDEN_TASK_ID",
     "IN_PROGRESS",
     "LEGACY_ORPHAN",
@@ -77,6 +88,7 @@ __all__ = [
     "audit_historical_tasks",
     "build_review_recommendation",
     "classify_record",
+    "collect_mainline_evidence",
     "default_registry",
     "event_sync",
     "event_sync_retry_allowed",
@@ -84,6 +96,8 @@ __all__ = [
     "get_review_events",
     "get_sync_events",
     "get_task_result",
+    "golden_report_markdown",
+    "latest_successful_task",
     "list_pending_results",
     "list_review_recommendations",
     "mark_reviewed",
@@ -91,12 +105,15 @@ __all__ = [
     "normalize_result",
     "normalize_self_reported_status",
     "parse_test_evidence",
+    "production_task_stream",
     "recommend_pending_reviews",
     "recommend_review",
     "reconcile_historical_tasks",
     "reconciliation",
     "reset_default_registry",
     "review_assistant",
+    "review_validation",
+    "run_review_assistant_golden",
     "submit_task",
     "sync_terminal_result",
     "workflow_conclusion",
