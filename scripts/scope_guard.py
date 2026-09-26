@@ -9,10 +9,10 @@ Run: python scripts/scope_guard.py <base_rev>
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
-ALLOWLIST = {"hello.py", "test_hello.py"}
 FORBIDDEN_PREFIXES = (".github/workflows/",)
 FORBIDDEN_SUBSTRINGS = ("secret", "token", "credential", ".env", ".pem", ".key")
 IGNORED = (".pytest_cache", "__pycache__")
@@ -29,7 +29,22 @@ def normalize(path: str) -> str:
 
 def main() -> int:
     base = sys.argv[1] if len(sys.argv) > 1 else "HEAD~1"
+    contract_path = sys.argv[2] if len(sys.argv) > 2 else ""
     violations: list[str] = []
+    if not contract_path:
+        print("BLOCK: task contract path required")
+        return 1
+    try:
+        contract = json.loads(open(contract_path, encoding="utf-8").read())
+        if isinstance(contract, str):
+            contract = json.loads(contract)
+        allowlist = {normalize(str(p)) for p in contract.get("expected_files", [])}
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"BLOCK: cannot load task allowlist: {exc}")
+        return 1
+    if not allowlist:
+        print("BLOCK: empty task allowlist")
+        return 1
 
     # Committed + uncommitted content changes relative to base.
     for line in git("diff", "--name-status", base).splitlines():
@@ -48,8 +63,8 @@ def main() -> int:
             continue
         if path.startswith(FORBIDDEN_PREFIXES) or any(s in path.lower() for s in FORBIDDEN_SUBSTRINGS):
             violations.append(f"forbidden target modified: {path}")
-        elif path not in ALLOWLIST:
-            violations.append(f"modification outside allowlist: {path}")
+        elif path not in allowlist:
+            violations.append(f"modification outside task allowlist: {path}")
 
     # Untracked, non-ignored files = new files the agent created.
     for path in git("ls-files", "--others", "--exclude-standard").splitlines():
