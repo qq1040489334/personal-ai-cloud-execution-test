@@ -57,10 +57,10 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         run: |
           CONTRACT="$(cat "$RUNNER_TEMP/task.json")"
-          opencode run --auto -m opencode-go/deepseek-v4.1-flash "You are working in a git repository in the current directory. Execute this structured task contract (JSON): ${CONTRACT}. Hard rules: only modify hello.py and test_hello.py; never touch .github/, scripts/, planner/, secrets; never delete files. Steps: 1) read the files; 2) implement the instructions; 3) add or update pytest tests; 4) run: python -m pytest -q and fix failures; 5) run: git add -A && git commit -m 'cloud agent: gpt task'. At the very end print a line beginning with AGENT_DONE followed by the pytest summary line and the commit hash."
+          opencode run --auto -m opencode-go/deepseek-v4.1-flash "You are working in a git repository in the current directory. Execute this structured task contract (JSON): ${CONTRACT}. Hard rules: modify only paths explicitly listed in task.expected_files; never touch .github/workflows/, secret/token/credential/.env/.pem/.key paths; never delete files. Steps: 1) read the files; 2) implement the instructions; 3) add or update pytest tests; 4) run: python -m pytest -q and fix failures; 5) run: git add -A && git commit -m 'cloud agent: gpt task'. At the very end print a line beginning with AGENT_DONE followed by the pytest summary line and the commit hash."
 
       - name: Gate 2 - scope guard (fail-closed)
-        run: git show "${{ steps.base.outputs.base }}:scripts/scope_guard.py" | python - "${{ steps.base.outputs.base }}"
+        run: git show "${{ steps.base.outputs.base }}:scripts/scope_guard.py" | python - "${{ steps.base.outputs.base }}" "$RUNNER_TEMP/task.json"
 
       - name: Verify tests (independent)
         id: tests
