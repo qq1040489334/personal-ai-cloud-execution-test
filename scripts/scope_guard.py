@@ -1,15 +1,10 @@
-"""Gate 2 — enforce the agent's modification scope.
-
-Compares the working tree (and any agent commit) against a base revision and
-blocks: deletions, new files, workflow edits, secret-ish paths, and any change
-outside the allowlist.
-
-Run: python scripts/scope_guard.py <base_rev>
-"""
+"""Gate 2 — enforce the agent's task-scoped modification scope."""
 
 from __future__ import annotations
 
+import fnmatch
 import json
+import posixpath
 import subprocess
 import sys
 
@@ -27,10 +22,38 @@ def normalize(path: str) -> str:
     return path.strip().replace("\\", "/")
 
 
+def unsafe_pattern(path: str) -> bool:
+    p = normalize(path)
+    return (
+        not p
+        or p.startswith("/")
+        or (len(p) >= 2 and p[1] == ":")
+        or any(part == ".." for part in p.split("/"))
+    )
+
+
+def forbidden(path: str) -> bool:
+    p = normalize(path)
+    low = p.lower()
+    return p.startswith(FORBIDDEN_PREFIXES) or any(s in low for s in FORBIDDEN_SUBSTRINGS)
+
+
+def matches(path: str, patterns: set[str]) -> bool:
+    p = normalize(path)
+    for raw in patterns:
+        pat = normalize(raw)
+        if p == pat:
+            return True
+        if pat.endswith("/**") and (p == pat[:-3] or p.startswith(pat[:-2])):
+            return True
+        if fnmatch.fnmatchcase(p, pat):
+            return True
+    return False
+
+
 def main() -> int:
     base = sys.argv[1] if len(sys.argv) > 1 else "HEAD~1"
     contract_path = sys.argv[2] if len(sys.argv) > 2 else ""
-    violations: list[str] = []
     if not contract_path:
         print("BLOCK: task contract path required")
         return 1
@@ -38,42 +61,55 @@ def main() -> int:
         contract = json.loads(open(contract_path, encoding="utf-8").read())
         if isinstance(contract, str):
             contract = json.loads(contract)
-        allowlist = {normalize(str(p)) for p in contract.get("expected_files", [])}
+        raw = contract.get("expected_files", [])
+        if not isinstance(raw, list) or not raw:
+            raise ValueError("expected_files must be a non-empty list")
+        allowlist = {normalize(str(p)) for p in raw}
     except (OSError, ValueError, TypeError) as exc:
         print(f"BLOCK: cannot load task allowlist: {exc}")
         return 1
-    if not allowlist:
-        print("BLOCK: empty task allowlist")
+
+    bad_patterns = [p for p in allowlist if unsafe_pattern(p) or forbidden(p)]
+    if bad_patterns:
+        for p in bad_patterns:
+            print(f"BLOCK: unsafe/forbidden expected_file: {p}")
         return 1
 
-    # Committed + uncommitted content changes relative to base.
+    violations: list[str] = []
+    seen: set[str] = set()
     for line in git("diff", "--name-status", base).splitlines():
         parts = line.split("\t")
         if len(parts) < 2:
             continue
         status = parts[0]
         path = normalize(parts[-1])
-        if status.startswith("D"):
-            violations.append(f"deletion forbidden: {path}")
-            continue
+        seen.add(path)
         if any(skip in path for skip in IGNORED):
             continue
-        if status.startswith(("A", "C")):
-            violations.append(f"new file forbidden: {path}")
-            continue
-        if path.startswith(FORBIDDEN_PREFIXES) or any(s in path.lower() for s in FORBIDDEN_SUBSTRINGS):
+        if status.startswith("D"):
+            violations.append(f"deletion forbidden: {path}")
+        elif unsafe_pattern(path):
+            violations.append(f"unsafe path modified: {path}")
+        elif forbidden(path):
             violations.append(f"forbidden target modified: {path}")
-        elif path not in allowlist:
+        elif not matches(path, allowlist):
             violations.append(f"modification outside task allowlist: {path}")
 
-    # Untracked, non-ignored files = new files the agent created.
     for path in git("ls-files", "--others", "--exclude-standard").splitlines():
         path = normalize(path)
-        if not path or any(skip in path for skip in IGNORED):
+        if not path or path in seen or any(skip in path for skip in IGNORED):
             continue
-        violations.append(f"new untracked file forbidden: {path}")
+        if unsafe_pattern(path):
+            violations.append(f"unsafe new file: {path}")
+        elif forbidden(path):
+            violations.append(f"forbidden target modified: {path}")
+        elif not matches(path, allowlist):
+            violations.append(f"new file outside task allowlist: {path}")
 
-    print("=== SCOPE_GUARD RESULT (base=%s) ===" % base)
+    print(f"=== SCOPE_GUARD RESULT (base={base}) ===")
+    print("task allowlist:")
+    for p in sorted(allowlist):
+        print(f"  {p}")
     print("changed files:")
     print(git("diff", "--name-status", base).strip() or "(none)")
     if violations:
