@@ -121,6 +121,11 @@ def golden_e2e_round_2_marker() -> str:
     return "GOLDEN_E2E_ROUND_2_OK"
 
 
+def opencode_go_provider_golden_e2e_marker() -> str:
+    """Return the OpenCode Go provider golden E2E marker."""
+    return "OPENCODE_GO_PROVIDER_GOLDEN_E2E_OK"
+
+
 def _git(*args: str) -> str:
     try:
         result = subprocess.run(

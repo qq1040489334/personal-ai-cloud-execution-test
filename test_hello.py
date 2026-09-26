@@ -127,6 +127,7 @@ from hello import (
     mcp_bridge_test,
     mcp_runtime_deploy_verify,
     oauth_mcp_test,
+    opencode_go_provider_golden_e2e_marker,
     pending_acceptance_notice,
     personal_ai_execution_dispatch_live_failure_audit,
     personal_ai_execution_result_exposure_audit_detail_export,
@@ -215,6 +216,12 @@ def test_golden_e2e_round_1_retry_marker() -> None:
 
 def test_golden_e2e_round_2_marker() -> None:
     assert golden_e2e_round_2_marker() == "GOLDEN_E2E_ROUND_2_OK"
+
+
+def test_opencode_go_provider_golden_e2e_marker() -> None:
+    marker = opencode_go_provider_golden_e2e_marker()
+    assert marker == "OPENCODE_GO_PROVIDER_GOLDEN_E2E_OK"
+    assert isinstance(marker, str)
 
 
 def test_cloud_asset_status_report_shape() -> None:
