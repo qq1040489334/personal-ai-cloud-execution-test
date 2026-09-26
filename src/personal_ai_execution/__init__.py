@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from . import event_sync, reconciliation
+from . import event_sync, reconciliation, review_assistant
 from .event_sync import (
     GOLDEN_TASK_ID,
     PENDING_REVIEW,
@@ -15,7 +15,9 @@ from .event_sync import (
     get_review_events,
     get_sync_events,
     list_pending_results,
+    list_review_recommendations,
     mark_reviewed,
+    recommend_review,
     reconcile_historical_tasks,
     reset_default_registry,
     submit_task,
@@ -45,6 +47,12 @@ from .result_normalization import (
     normalize_self_reported_status,
     workflow_conclusion,
 )
+from .review_assistant import (
+    RECOMMENDATION_VERDICTS,
+    build_review_recommendation,
+    parse_test_evidence,
+    recommend_pending_reviews,
+)
 
 __all__ = [
     "ALREADY_SYNCED",
@@ -59,6 +67,7 @@ __all__ = [
     "PASS",
     "PENDING",
     "PENDING_REVIEW",
+    "RECOMMENDATION_VERDICTS",
     "RECONCILABLE_CLASSES",
     "RECONCILE_ACTION",
     "REVIEWED",
@@ -66,6 +75,7 @@ __all__ = [
     "TERMINAL_STATUSES",
     "EventSyncRegistry",
     "audit_historical_tasks",
+    "build_review_recommendation",
     "classify_record",
     "default_registry",
     "event_sync",
@@ -75,13 +85,18 @@ __all__ = [
     "get_sync_events",
     "get_task_result",
     "list_pending_results",
+    "list_review_recommendations",
     "mark_reviewed",
     "normalize_conclusion",
     "normalize_result",
     "normalize_self_reported_status",
+    "parse_test_evidence",
+    "recommend_pending_reviews",
+    "recommend_review",
     "reconcile_historical_tasks",
     "reconciliation",
     "reset_default_registry",
+    "review_assistant",
     "submit_task",
     "sync_terminal_result",
     "workflow_conclusion",

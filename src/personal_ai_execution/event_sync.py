@@ -24,6 +24,7 @@ from typing import Any, Mapping
 
 from . import reconciliation as _reconciliation
 from . import result_normalization as _normalization
+from . import review_assistant as _review_assistant
 
 REVIEW_ACTION = "review"
 REVIEW_VERDICTS = ("PASS", "FAIL", "BLOCKED")
@@ -204,6 +205,24 @@ class EventSyncRegistry:
         result = dict(record)
         result["idempotent"] = False
         return result
+
+    def recommend_review(self, task_id: str) -> dict[str, Any]:
+        """Return an advisory review recommendation without mutating state.
+
+        This is read-only: it never calls ``mark_reviewed`` and never changes the
+        record. Human review remains the final gate.
+        """
+        record = self._tasks.get(str(task_id))
+        if record is None:
+            raise KeyError(f"unknown task_id: {task_id}")
+        return _review_assistant.build_review_recommendation(record)
+
+    def list_review_recommendations(self) -> list[dict[str, Any]]:
+        """Return recommendations for every pending-review task, in order."""
+        return [
+            _review_assistant.build_review_recommendation(record)
+            for record in self.list_pending_results()
+        ]
 
     def get_review_events(self, task_id: str | None = None) -> list[dict[str, Any]]:
         if task_id is None:
@@ -562,6 +581,14 @@ def list_pending_results() -> list[dict[str, Any]]:
 
 def mark_reviewed(*args: Any, **kwargs: Any) -> dict[str, Any]:
     return _DEFAULT_REGISTRY.mark_reviewed(*args, **kwargs)
+
+
+def recommend_review(task_id: str) -> dict[str, Any]:
+    return _DEFAULT_REGISTRY.recommend_review(task_id)
+
+
+def list_review_recommendations() -> list[dict[str, Any]]:
+    return _DEFAULT_REGISTRY.list_review_recommendations()
 
 
 def get_review_events(task_id: str | None = None) -> list[dict[str, Any]]:
