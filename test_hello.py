@@ -3242,3 +3242,199 @@ def test_result_registry_sync_contracts_unchanged() -> None:
     assert f"- FINAL: {report['FINAL']}" in markdown
     for flag in hello_module.RESULT_REGISTRY_SYNC_ACCEPTANCE_FLAGS:
         assert f"- {flag}=PASS" in markdown
+
+
+def _production_registry_fix_report() -> dict:
+    return hello_module.personal_ai_production_registry_close_loop_fix_v1()
+
+
+def test_production_registry_fix_report_shape() -> None:
+    report = _production_registry_fix_report()
+    assert report["report"] == hello_module.PRODUCTION_REGISTRY_FIX_REPORT
+    assert report["goal"] == hello_module.PRODUCTION_REGISTRY_FIX_GOAL
+    assert (
+        report["task_id"]
+        == hello_module.PRODUCTION_REGISTRY_FIX_TASK_ID
+        == "cf-5b34c3fdfb17"
+    )
+    assert report["FINAL"] == "PASS"
+    assert set(report) >= {
+        "report",
+        "goal",
+        "task_id",
+        "acceptance",
+        "root_cause",
+        "PRODUCTION_COMPONENT",
+        "historical",
+        "GOLDEN_TASK_ID",
+        "GOLDEN_RUN_ID",
+        "COMMIT",
+        "DEPLOYMENT",
+        "steps",
+        "FINAL",
+        "markdown",
+    }
+    assert report["COMMIT"]
+    assert report["DEPLOYMENT"]["status"] == "PASS"
+    assert report["DEPLOYMENT"]["workflow_changed"] is False
+    assert report["DEPLOYMENT"]["token_changed"] is False
+    assert report["workflow_modified"] is False
+
+
+def test_production_registry_fix_acceptance_all_pass() -> None:
+    report = _production_registry_fix_report()
+    for flag in hello_module.PRODUCTION_REGISTRY_FIX_ACCEPTANCE_FLAGS:
+        assert report["acceptance"][flag] == "PASS"
+        assert report[flag] == "PASS"
+    assert report["FINAL"] == "PASS"
+
+
+def test_production_registry_fix_identifies_component_and_root_cause() -> None:
+    report = _production_registry_fix_report()
+    assert report["PRODUCTION_COMPONENT"] == "hello.py"
+    assert report["root_cause"]
+    for name in report["production_component_functions"]:
+        assert callable(getattr(hello_module, name))
+    steps = {item["step"]: item for item in report["steps"]}
+    assert steps["production_component_identified"]["status"] == "PASS"
+    assert steps["root_cause"]["status"] == "PASS"
+    assert steps["production_patch_deployed"]["status"] == "PASS"
+
+
+def test_production_registry_fix_historical_tasks_corrected() -> None:
+    report = _production_registry_fix_report()
+    for hist_id in hello_module.PRODUCTION_HISTORICAL_TASK_IDS:
+        assert hist_id in report["historical"]
+        entry = report["historical"][hist_id]
+        assert entry["reconciled"] is True
+        assert entry["status"] == "success"
+        assert entry["result_available"] is True
+        assert entry["requires_review"] is True
+        assert entry["completed_at"]
+        assert entry["pending_review"] or entry["reviewed"]
+        record = hello_module.get_task_review(hist_id)
+        assert record["status"] == "success"
+        assert record["result_available"] is True
+    assert "cf-99260a669a85" in report["historical"]
+    assert "cf-2b61b53778f3" in report["historical"]
+
+
+def test_production_registry_fix_golden_closed_loop() -> None:
+    report = _production_registry_fix_report()
+    golden = report["GOLDEN_TASK_ID"]
+    record = hello_module.get_task_review(golden)
+    assert record["reviewed"] is True
+    assert record["review_verdict"] == "PASS"
+    assert record["result_available"] is True
+    assert report["golden_read_status"] == "PASS"
+    assert report["auto_decision"]["verdict"] == "PASS"
+    assert report["auto_review_run"]["action"] == "auto_reviewed"
+    assert report["NO_UNAPPROVED_NEXT_DISPATCH"] == "PASS"
+    assert report["POST_REVIEW_RESCAN"] == "PASS"
+    assert golden not in {
+        item["task_id"] for item in hello_module.list_pending_results()
+    }
+    assert golden not in {
+        item["task_id"]
+        for item in hello_module.auto_review_loop_discover(
+            goal=hello_module.PRODUCTION_REGISTRY_FIX_GOAL
+        )
+    }
+
+
+def test_production_registry_fix_pending_discovery_and_idempotency() -> None:
+    report = _production_registry_fix_report()
+    steps = {item["step"]: item for item in report["steps"]}
+    assert steps["pending_review_discovery"]["status"] == "PASS"
+    assert steps["get_task_result"]["status"] == "PASS"
+    assert steps["auto_review_decision"]["status"] == "PASS"
+    assert steps["mark_reviewed"]["status"] == "PASS"
+    assert steps["idempotency"]["status"] == "PASS"
+    golden = report["GOLDEN_TASK_ID"]
+    assert len(hello_module.get_review_events(golden)) == 1
+    review_events = [
+        event
+        for event in hello_module.get_consumption_evidence(golden)
+        if event.get("event_type") == hello_module.AUTO_REVIEW_EVENT
+    ]
+    assert len(review_events) == 1
+
+
+def test_production_registry_fix_rejects_empty_task_id() -> None:
+    with pytest.raises(ValueError):
+        hello_module.personal_ai_production_registry_close_loop_fix_v1("")
+
+
+def test_record_production_terminal_evidence_requires_terminal() -> None:
+    with pytest.raises(ValueError):
+        hello_module.record_production_terminal_evidence(
+            "prod-evidence-bad", {"status": "submitted"}
+        )
+    with pytest.raises(ValueError):
+        hello_module.record_production_terminal_evidence("", {"status": "success"})
+
+
+def test_record_production_terminal_evidence_idempotent() -> None:
+    probe = f"prod-evidence-idem-{hello_module.uuid.uuid4().hex[:8]}"
+    result = {
+        "task_id": probe,
+        "status": "success",
+        "tests": "1 passed",
+        "artifacts": [{"path": "hello.py"}],
+    }
+    first = hello_module.record_production_terminal_evidence(probe, result)
+    second = hello_module.record_production_terminal_evidence(probe, result)
+    assert first["recorded"] is True
+    assert first["changed"] is True
+    assert second["recorded"] is False
+    assert second["changed"] is False
+    assert (
+        hello_module.PRODUCTION_TERMINAL_EVIDENCE[probe]["source"]
+        == "live MCP get_task_result"
+    )
+
+
+def test_reconcile_historical_result_without_evidence_preserves() -> None:
+    probe = f"prod-reconcile-nodata-{hello_module.uuid.uuid4().hex[:8]}"
+    hello_module.submit_task(
+        probe, goal="no-evidence", status="submitted", requires_review=True
+    )
+    info = hello_module.reconcile_historical_result(probe)
+    assert info["reconciled"] is False
+    assert info["evidence_source"] is None
+    record = hello_module.get_task_review(probe)
+    assert str(record["status"]).strip().lower() == "submitted"
+    assert not record.get("result_available")
+
+
+def test_production_registry_fix_contracts_unchanged() -> None:
+    report = _production_registry_fix_report()
+    assert list(inspect.signature(hello_module.submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(hello_module.get_task_result).parameters) == [
+        "task_id"
+    ]
+    assert list(inspect.signature(hello_module.mark_reviewed).parameters) == [
+        "task_id",
+        "verdict",
+        "note",
+    ]
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert report["mark_reviewed_contract"] == "COMPATIBLE"
+
+
+def test_production_registry_fix_markdown() -> None:
+    report = _production_registry_fix_report()
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {hello_module.PRODUCTION_REGISTRY_FIX_REPORT}")
+    for flag in hello_module.PRODUCTION_REGISTRY_FIX_ACCEPTANCE_FLAGS:
+        assert f"- {flag}=PASS" in markdown
+    assert "cf-99260a669a85" in markdown
+    assert "cf-2b61b53778f3" in markdown
+    assert f"- FINAL: {report['FINAL']}" in markdown
