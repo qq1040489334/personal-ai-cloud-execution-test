@@ -85,7 +85,7 @@ jobs:
 
       - name: Gate 3 - secret leak check (fail-closed)
         env:
-          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         run: git show "${{ steps.base.outputs.base }}:scripts/secret_guard.py" | python - "${{ steps.base.outputs.base }}"
 
       - name: Push (credentials added only here)
