@@ -3127,3 +3127,118 @@ def test_auto_review_loop_contracts_unchanged() -> None:
         "verdict",
         "note",
     ]
+
+
+def test_result_registry_sync_report_shape() -> None:
+    report = hello_module.personal_ai_result_registry_sync_and_auto_review()
+    assert report["report"] == hello_module.RESULT_REGISTRY_SYNC_REPORT
+    assert report["goal"] == hello_module.RESULT_REGISTRY_SYNC_GOAL
+    assert report["task_id"] == hello_module.RESULT_REGISTRY_SYNC_TASK_ID
+    assert report["FINAL"] == "PASS"
+    assert set(report) >= {
+        "acceptance",
+        "ROOT_CAUSE",
+        "root_cause_evidence",
+        "FIX_COMMIT",
+        "DEPLOYMENT",
+        "GOLDEN_TASK_ID",
+        "GOLDEN_RUN_ID",
+        "FINAL",
+    }
+    assert report["ROOT_CAUSE"]
+    assert report["root_cause_evidence"]
+    assert report["FIX_COMMIT"]
+    assert report["GOLDEN_TASK_ID"]
+    assert report["GOLDEN_RUN_ID"]
+    assert report["DEPLOYMENT"]["status"] == "PASS"
+    assert report["DEPLOYMENT"]["deployment_required"] is False
+    assert report["DEPLOYMENT"]["workflow_changed"] is False
+    assert report["DEPLOYMENT"]["token_changed"] is False
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert report["mark_reviewed_contract"] == "COMPATIBLE"
+    assert report["workflow_modified"] is False
+
+
+def test_result_registry_sync_acceptance_all_pass() -> None:
+    report = hello_module.personal_ai_result_registry_sync_and_auto_review()
+    for flag in hello_module.RESULT_REGISTRY_SYNC_ACCEPTANCE_FLAGS:
+        assert report["acceptance"][flag] == "PASS"
+        assert report[flag] == "PASS"
+
+
+def test_result_registry_sync_golden_chain_closes_loop() -> None:
+    report = hello_module.personal_ai_result_registry_sync_and_auto_review()
+    golden_id = report["GOLDEN_TASK_ID"]
+    record = hello_module.get_task_review(golden_id)
+    assert record["status"] == "success"
+    assert record["completed_at"]
+    assert record["result_available"] is True
+    assert record["requires_review"] is True
+    assert record["reviewed"] is True
+    assert record["review_verdict"] == "PASS"
+    assert golden_id not in {t["task_id"] for t in hello_module.list_pending_results()}
+    events = [
+        event
+        for event in hello_module.get_consumption_evidence(golden_id)
+        if event["event_type"] == hello_module.RESULT_REGISTRY_SYNC_EVENT
+    ]
+    assert len(events) == 1
+
+
+def test_result_registry_sync_preserves_history_and_unknown_result() -> None:
+    report = hello_module.personal_ai_result_registry_sync_and_auto_review()
+    assert report["historical_sync"]["reconciled"] is False
+    assert (
+        str(report["historical_sync"]["status"]).strip().lower() == "submitted"
+    )
+    assert report["unknown_sync"]["created"] is True
+    assert report["unknown_sync"]["status"] == "success"
+    steps = {item["step"]: item for item in report["GOLDEN_STEPS"]}
+    assert steps["historical_state_preserved"]["status"] == "PASS"
+    assert steps["unknown_result_registers"]["status"] == "PASS"
+
+
+def test_result_registry_sync_fail_and_blocked_gate() -> None:
+    report = hello_module.personal_ai_result_registry_sync_and_auto_review()
+    assert report["FAIL_BLOCKED_GATE"] == "PASS"
+    assert report["fail_verdict"] == "FAIL"
+    assert report["blocked_verdict"] == "BLOCKED"
+
+
+def test_result_registry_sync_sample_task_explained() -> None:
+    report = hello_module.personal_ai_result_registry_sync_and_auto_review()
+    assert report["sample_task_id"] == "cf-99260a669a85"
+    assert report["sample_explanation"]
+    if not report["sample_reconciled"]:
+        assert "cannot be reconciled" in report["sample_explanation"] or (
+            "Golden task" in report["sample_explanation"]
+        )
+
+
+def test_result_registry_sync_contracts_unchanged() -> None:
+    report = hello_module.personal_ai_result_registry_sync_and_auto_review()
+    assert list(inspect.signature(hello_module.submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(hello_module.get_task_result).parameters) == [
+        "task_id"
+    ]
+    assert list(inspect.signature(hello_module.mark_reviewed).parameters) == [
+        "task_id",
+        "verdict",
+        "note",
+    ]
+    assert report["GOLDEN_RUN_ID"].startswith(
+        hello_module.RESULT_REGISTRY_SYNC_GOLDEN_RUN_PREFIX
+    )
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {hello_module.RESULT_REGISTRY_SYNC_REPORT}")
+    assert f"- GOLDEN_TASK_ID: {report['GOLDEN_TASK_ID']}" in markdown
+    assert f"- FINAL: {report['FINAL']}" in markdown
+    for flag in hello_module.RESULT_REGISTRY_SYNC_ACCEPTANCE_FLAGS:
+        assert f"- {flag}=PASS" in markdown

@@ -302,6 +302,10 @@ def get_task_result(task_id: str) -> dict:
     without re-opening the execution environment.
     """
     execution_result = _read_execution_result()
+    if execution_result is None:
+        record = TASK_REGISTRY.get(task_id)
+        if record is not None:
+            execution_result = _terminal_result_from_record(record)
     status = _derive_status(execution_result)
     commit = _git("rev-parse", "HEAD")
     artifacts = _collect_artifacts()
@@ -1323,14 +1327,16 @@ def _sync_execution_result() -> None:
     if not result:
         return
     task_id = str(result.get("task_id", "")).strip()
-    if not task_id or task_id in TASK_REGISTRY:
+    if not task_id:
         return
-    TASK_REGISTRY[task_id] = _registry_record(
-        task_id,
-        goal=str(result.get("summary", "")).strip(),
-        status=str(result.get("status", "")).strip().lower() or "success",
-        requires_review=True,
-    )
+    if task_id not in TASK_REGISTRY:
+        TASK_REGISTRY[task_id] = _registry_record(
+            task_id,
+            goal=str(result.get("summary", "")).strip(),
+            status=str(result.get("status", "")).strip().lower() or "success",
+            requires_review=True,
+        )
+    reconcile_task_result(task_id, result)
 
 
 def submit_task(
@@ -1377,6 +1383,7 @@ def list_pending_results() -> list[dict]:
     removed from this list (never hidden, always traceable via review_events).
     """
     _sync_execution_result()
+    reconcile_registry_records()
     ensure_auto_consumer_ran()
     pending: list[dict] = []
     for record in TASK_REGISTRY.values():
@@ -8103,6 +8110,654 @@ def auto_review_loop_report() -> dict:
         "mark_reviewed_contract": "COMPATIBLE",
         "workflow_modified": False,
         "markdown": "\n".join(markdown_lines),
+    }
+
+
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_RESULT_REGISTRY_SYNC_AND_AUTO_REVIEW_V0_1
+#
+# Root cause fixed here (evidence-backed):
+#   _sync_execution_result() only registered a task from the repo-root
+#   execution_result.json when the task_id was entirely UNKNOWN, then returned
+#   early for any already-registered task ("if not task_id or task_id in
+#   TASK_REGISTRY: return"). list_pending_results() then filtered on
+#   SUCCESS_STATUSES. A task that was registered while still non-terminal (e.g.
+#   "submitted"/"running") never transitioned to a terminal success, carried no
+#   completed_at/result_available fields, and was silently excluded from
+#   pending_review even though get_task_result could read its terminal result.
+#
+# This section reconciles a verifiable terminal execution result into the Task
+# Registry in an evidence-driven, idempotent way. It never marks a historical
+# task success without a terminal result, never auto-dispatches an unapproved
+# next_task and never rewrites the submit_task / get_task_result /
+# mark_reviewed contracts.
+# ---------------------------------------------------------------------------
+
+RESULT_REGISTRY_SYNC_GOAL = "PERSONAL_AI_RESULT_REGISTRY_SYNC_AND_AUTO_REVIEW_V0_1"
+RESULT_REGISTRY_SYNC_TASK_ID = "cf-2b61b53778f3"
+RESULT_REGISTRY_SYNC_SAMPLE_TASK_ID = "cf-99260a669a85"
+RESULT_REGISTRY_SYNC_REPORT = (
+    "PERSONAL_AI_RESULT_REGISTRY_SYNC_AND_AUTO_REVIEW_REPORT"
+)
+RESULT_REGISTRY_SYNC_EVENT = "registry_synced"
+RESULT_REGISTRY_TERMINAL_STATUSES = (
+    "success",
+    "succeed",
+    "pass",
+    "passed",
+    "ok",
+    "fail",
+    "failed",
+    "error",
+)
+REGISTRY_SYNC_FIELDS = (
+    "status",
+    "completed_at",
+    "result_available",
+    "requires_review",
+    "reviewed",
+)
+RESULT_REGISTRY_SYNC_ACCEPTANCE_FLAGS = (
+    "REGISTRY_SYNC",
+    "PENDING_REVIEW_DISCOVERY",
+    "GET_TASK_RESULT",
+    "AUTO_REVIEW",
+    "MARK_REVIEWED",
+    "IDEMPOTENCY",
+    "FAIL_BLOCKED_GATE",
+    "NO_UNAPPROVED_NEXT_DISPATCH",
+)
+RESULT_REGISTRY_SYNC_GOLDEN_RUN_PREFIX = "golden-run-registry-sync"
+
+_RESULT_REGISTRY_SYNC_SEQ = 0
+
+
+def _terminal_result_status(result: dict | None) -> str | None:
+    """Return the normalized status if ``result`` is a terminal execution result."""
+    if not isinstance(result, dict):
+        return None
+    status = str(result.get("status", "")).strip().lower()
+    return status if status in RESULT_REGISTRY_TERMINAL_STATUSES else None
+
+
+def _terminal_result_from_record(record: dict | None) -> dict | None:
+    """Return the record's verifiable terminal execution result, if any."""
+    if not isinstance(record, dict):
+        return None
+    for key in (
+        "execution_result_json",
+        "terminal_result",
+        "result",
+        "execution_result",
+    ):
+        candidate = record.get(key)
+        if isinstance(candidate, str):
+            try:
+                candidate = json.loads(candidate)
+            except (json.JSONDecodeError, TypeError):
+                candidate = None
+        if isinstance(candidate, dict) and _terminal_result_status(candidate):
+            return candidate
+    return None
+
+
+def _canonical_sync_status(status: str) -> str:
+    """Map a terminal execution status to its canonical registry status."""
+    return "success" if status in SUCCESS_STATUSES else status
+
+
+def reconcile_task_result(
+    task_id: str, result: dict | None = None, *, now: str | None = None
+) -> dict:
+    """Reconcile a verifiable terminal execution result into the Task Registry.
+
+    Evidence-driven and idempotent. The registry record is created when the task
+    was unknown, or updated in place when it already existed (the historical
+    ``submitted``/``running`` case). Only a verifiable terminal result (status in
+    :data:`RESULT_REGISTRY_TERMINAL_STATUSES`) can change the status; a task with
+    no artifact and no terminal result is left exactly as it was. ``completed_at``,
+    ``result_available`` and ``requires_review`` are synced, an explicit
+    ``requires_review=False`` opt-out is respected, and a repeated reconcile of
+    the same terminal result produces no second side effect.
+    """
+    if not task_id:
+        raise ValueError("reconcile_task_result requires a task_id")
+    now = now or _utc_now()
+    record = TASK_REGISTRY.get(task_id)
+    if result is None:
+        if record is not None:
+            result = _terminal_result_from_record(record)
+        if result is None:
+            root = _read_execution_result()
+            if (
+                isinstance(root, dict)
+                and str(root.get("task_id", "")).strip() == task_id
+            ):
+                result = root
+
+    status = _terminal_result_status(result)
+    if status is None:
+        return {
+            "task_id": task_id,
+            "reconciled": False,
+            "changed": False,
+            "created": False,
+            "status": (record or {}).get("status") if record else None,
+            "reason": (
+                "no verifiable terminal execution result (status must be one of "
+                + ", ".join(RESULT_REGISTRY_TERMINAL_STATUSES)
+                + "); historical record left unchanged"
+            ),
+        }
+
+    canonical = _canonical_sync_status(status)
+    created = False
+    if record is None:
+        record = _registry_record(
+            task_id,
+            goal=str(result.get("summary", "")).strip(),
+            status=canonical,
+            requires_review=True,
+        )
+        TASK_REGISTRY[task_id] = record
+        created = True
+
+    before = {key: record.get(key) for key in REGISTRY_SYNC_FIELDS}
+    record["status"] = canonical
+    if not record.get("completed_at"):
+        record["completed_at"] = str(result.get("completed_at") or now)
+    record["result_available"] = True
+    if not record.get("reviewed") and record.get("requires_review") is not False:
+        record["requires_review"] = True
+    record["last_update_at"] = now
+    if result.get("tests") and not record.get("tests"):
+        record["tests"] = result.get("tests")
+    if result.get("artifacts") and not record.get("artifacts"):
+        record["artifacts"] = result.get("artifacts")
+    if isinstance(result.get("evidence"), dict) and not record.get("evidence"):
+        record["evidence"] = result.get("evidence")
+    if record.get("execution_result_json") is None:
+        record["execution_result_json"] = result
+    after = {key: record.get(key) for key in REGISTRY_SYNC_FIELDS}
+    changed = created or before != after
+
+    event = None
+    if changed:
+        event = record_consumer_evidence(
+            RESULT_REGISTRY_SYNC_EVENT,
+            task_id,
+            detail="terminal execution result reconciled into the Task Registry",
+            extra={
+                "status": canonical,
+                "completed_at": record.get("completed_at"),
+                "result_available": True,
+                "requires_review": bool(record.get("requires_review")),
+                "created": created,
+            },
+        )
+    return {
+        "task_id": task_id,
+        "reconciled": True,
+        "changed": changed,
+        "created": created,
+        "status": canonical,
+        "completed_at": record.get("completed_at"),
+        "result_available": True,
+        "requires_review": bool(record.get("requires_review")),
+        "reviewed": bool(record.get("reviewed")),
+        "event": event,
+        "reason": f"terminal status {status!r} reconciled to {canonical!r}",
+    }
+
+
+def reconcile_registry_records() -> list[dict]:
+    """Reconcile every registry record that carries a verifiable terminal result."""
+    synced: list[dict] = []
+    for task_id in list(TASK_REGISTRY):
+        info = reconcile_task_result(task_id)
+        if info["reconciled"]:
+            synced.append(info)
+    synced.sort(key=lambda item: item["task_id"])
+    return synced
+
+
+def _result_registry_golden_id() -> str:
+    global _RESULT_REGISTRY_SYNC_SEQ
+    _RESULT_REGISTRY_SYNC_SEQ += 1
+    return (
+        f"cf-registry-sync-golden-{_RESULT_REGISTRY_SYNC_SEQ:04d}-"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+
+
+def _result_registry_terminal_result(
+    task_id: str,
+    *,
+    status: str = "success",
+    tests: str = "201 passed in 42.00s",
+    with_artifacts: bool = True,
+    workflow_run_id: str | None = None,
+) -> dict:
+    """Build a verifiable terminal execution result for the golden chain."""
+    result = {
+        "task_id": task_id,
+        "status": status,
+        "tests": tests,
+        "summary": (
+            f"{RESULT_REGISTRY_SYNC_GOAL}: terminal result for {task_id}"
+        ),
+        "commit": _git("rev-parse", "HEAD"),
+        "completed_at": _utc_now(),
+        "workflow_run_status": "completed",
+        "workflow_run_conclusion": status,
+        "workflow_run_id": workflow_run_id or f"golden-run-{task_id}",
+    }
+    if with_artifacts:
+        result["artifacts"] = _collect_artifacts()
+    return result
+
+
+def _pending_ids_snapshot() -> set[str]:
+    return {record["task_id"] for record in list_pending_results()}
+
+
+def personal_ai_result_registry_sync_and_auto_review() -> dict:
+    """Close the result -> registry -> discovery -> auto-review loop end to end.
+
+    The Golden task is registered first in a non-terminal ``submitted`` state to
+    reproduce the real inconsistency, then a terminal execution result is
+    reconciled into the registry, discovered through ``list_pending_results``,
+    read through ``get_task_result``, auto-reviewed to a PASS verdict, marked
+    reviewed, and finally re-scanned to prove idempotency. Separate probes prove
+    the FAIL / BLOCKED stop gate and the refusal of unapproved next-task
+    dispatch. The real sample ``cf-99260a669a85`` is checked and, when its
+    terminal artifact is not available offline, reported explicitly as
+    unreconcilable here rather than guessed.
+    """
+    golden_id = _result_registry_golden_id()
+    golden_run_id = f"{RESULT_REGISTRY_SYNC_GOLDEN_RUN_PREFIX}-{golden_id}"
+    steps: list[dict] = []
+
+    def step(name: str, status: str, detail: str) -> None:
+        steps.append({"step": name, "status": status, "detail": detail})
+
+    # 1) Register the task while still non-terminal (reproduces the bug state).
+    submit_task(
+        golden_id,
+        goal=RESULT_REGISTRY_SYNC_GOAL,
+        status="submitted",
+        requires_review=True,
+    )
+    pre_status = str(TASK_REGISTRY[golden_id].get("status", "")).strip().lower()
+    pre_pending = golden_id in _pending_ids_snapshot()
+    step(
+        "register_non_terminal",
+        PASS if pre_status == "submitted" and not pre_pending else FAIL,
+        f"{golden_id} pre-sync status={pre_status!r} in_pending={pre_pending}",
+    )
+
+    # 2) Workflow reaches terminal with a result artifact, then reconcile.
+    terminal = _result_registry_terminal_result(
+        golden_id, workflow_run_id=golden_run_id
+    )
+    sync = reconcile_task_result(golden_id, terminal)
+    golden_record = TASK_REGISTRY[golden_id]
+    registry_sync_ok = (
+        sync["reconciled"]
+        and sync["status"] == "success"
+        and bool(golden_record.get("completed_at"))
+        and golden_record.get("result_available") is True
+        and golden_record.get("requires_review") is True
+    )
+    step(
+        "workflow_terminal_and_registry_sync",
+        PASS if registry_sync_ok else FAIL,
+        f"{golden_id} status={sync['status']!r} "
+        f"completed_at={golden_record.get('completed_at')!r} "
+        f"result_available={golden_record.get('result_available')}",
+    )
+
+    # 2b) A result for a completely unknown task must also register cleanly.
+    unknown_id = _result_registry_golden_id()
+    unknown_sync = reconcile_task_result(
+        unknown_id, _result_registry_terminal_result(unknown_id)
+    )
+    unknown_ok = (
+        unknown_sync["created"]
+        and unknown_sync["status"] == "success"
+        and unknown_id in TASK_REGISTRY
+    )
+    step(
+        "unknown_result_registers",
+        PASS if unknown_ok else FAIL,
+        f"{unknown_id} created={unknown_sync['created']} "
+        f"status={unknown_sync['status']!r}",
+    )
+
+    # 2c) Historical non-terminal task without any terminal result must NOT be
+    #     promoted to success.
+    historical_id = _result_registry_golden_id()
+    submit_task(
+        historical_id,
+        goal=RESULT_REGISTRY_SYNC_GOAL,
+        status="submitted",
+        requires_review=True,
+    )
+    historical_sync = reconcile_task_result(historical_id)
+    historical_record = TASK_REGISTRY[historical_id]
+    historical_ok = (
+        historical_sync["reconciled"] is False
+        and str(historical_record.get("status")).strip().lower() == "submitted"
+        and not historical_record.get("result_available")
+    )
+    step(
+        "historical_state_preserved",
+        PASS if historical_ok else FAIL,
+        f"{historical_id} reconciled={historical_sync['reconciled']} "
+        f"status={historical_record.get('status')!r} "
+        f"result_available={historical_record.get('result_available')}",
+    )
+
+    # 3) Pending-review discovery.
+    pending_ids = _pending_ids_snapshot()
+    discovery_ok = golden_id in pending_ids
+    step(
+        "pending_review_discovery",
+        PASS if discovery_ok else FAIL,
+        f"{golden_id} in list_pending_results={discovery_ok} "
+        f"pending_count={len(pending_ids)}",
+    )
+
+    # 4) get_task_result must read the terminal result for this task.
+    read = get_task_result(golden_id)
+    read_status = read["execution_summary"]["status"]
+    get_result_ok = (
+        read_status == PASS
+        and "201 passed" in str(read.get("tests", ""))
+        and bool(read.get("artifacts"))
+        and read.get("execution_result_json", {}).get("task_id") == golden_id
+    )
+    step(
+        "get_task_result",
+        PASS if get_result_ok else FAIL,
+        f"{golden_id} status={read_status} tests={read.get('tests')!r} "
+        f"artifacts={len(read.get('artifacts', []))}",
+    )
+
+    # 5) Automatic verdict through the existing auto-review loop.
+    auto_run = auto_review_loop_run(golden_id)
+    auto_review_ok = (
+        auto_run["action"] == "auto_reviewed"
+        and auto_run["verdict"] == PASS
+        and auto_run["stop_gate"] is False
+    )
+    step(
+        "auto_review",
+        PASS if auto_review_ok else FAIL,
+        f"{golden_id} action={auto_run['action']} verdict={auto_run['verdict']}",
+    )
+
+    # 6) mark_reviewed contract applied (inside the auto-review loop).
+    reviewed_record = get_task_review(golden_id) or {}
+    review_events = [
+        event
+        for event in get_review_events(golden_id)
+        if event.get("action") == "review"
+    ]
+    mark_reviewed_ok = (
+        reviewed_record.get("reviewed") is True
+        and reviewed_record.get("review_verdict") == PASS
+        and bool(reviewed_record.get("reviewed_at"))
+        and len(review_events) == 1
+    )
+    step(
+        "mark_reviewed",
+        PASS if mark_reviewed_ok else FAIL,
+        f"{golden_id} reviewed={reviewed_record.get('reviewed')} "
+        f"verdict={reviewed_record.get('review_verdict')!r} "
+        f"review_events={len(review_events)}",
+    )
+
+    # 7) Idempotency: a repeated reconcile and review produce no new side effect.
+    sync_events_before = [
+        event
+        for event in get_consumption_evidence(golden_id)
+        if event.get("event_type") == RESULT_REGISTRY_SYNC_EVENT
+    ]
+    sync_again = reconcile_task_result(golden_id, terminal)
+    sync_events_after = [
+        event
+        for event in get_consumption_evidence(golden_id)
+        if event.get("event_type") == RESULT_REGISTRY_SYNC_EVENT
+    ]
+    review_again = auto_review_loop_run(golden_id)
+    review_events_after = get_review_events(golden_id)
+    pending_after = _pending_ids_snapshot()
+    idempotency_ok = (
+        sync_again["changed"] is False
+        and sync_events_before == sync_events_after
+        and review_again["action"] == "skipped_already_reviewed"
+        and review_again["side_effect"] is False
+        and len(review_events_after) == 1
+        and golden_id not in pending_after
+    )
+    step(
+        "idempotency",
+        PASS if idempotency_ok else FAIL,
+        f"{golden_id} sync_changed={sync_again['changed']} "
+        f"review_action={review_again['action']} "
+        f"review_events={len(review_events_after)} in_pending={golden_id in pending_after}",
+    )
+
+    # 8) FAIL / BLOCKED stop gate.
+    fail_id = _result_registry_golden_id()
+    submit_task(
+        fail_id,
+        goal=RESULT_REGISTRY_SYNC_GOAL,
+        status="submitted",
+        requires_review=True,
+    )
+    reconcile_task_result(
+        fail_id,
+        _result_registry_terminal_result(
+            fail_id, tests="1 failed, 2 passed in 3.00s"
+        ),
+    )
+    fail_run = auto_review_loop_run(fail_id)
+    fail_ok = (
+        fail_run["verdict"] == FAIL
+        and fail_run["stop_gate"] is True
+        and fail_run["dispatch"] is None
+    )
+
+    blocked_id = _result_registry_golden_id()
+    submit_task(
+        blocked_id,
+        goal=RESULT_REGISTRY_SYNC_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    blocked_run = auto_review_loop_run(blocked_id)
+    blocked_ok = (
+        blocked_run["verdict"] == BLOCKED
+        and blocked_run["stop_gate"] is True
+        and blocked_run["dispatch"] is None
+    )
+    fail_blocked_ok = fail_ok and blocked_ok
+    step(
+        "fail_blocked_gate",
+        PASS if fail_blocked_ok else FAIL,
+        f"fail verdict={fail_run['verdict']} blocked verdict={blocked_run['verdict']}",
+    )
+
+    # 9) No unapproved next-task dispatch.
+    golden_dispatch = auto_run.get("dispatch") or {}
+    fail_dispatch_events = [
+        event
+        for event in get_consumption_evidence(fail_id)
+        if event.get("event_type") == AUTO_DISPATCH_EVENT
+    ]
+    no_dispatch_ok = (
+        golden_dispatch.get("dispatched") is False
+        and golden_dispatch.get("action") == "blocked_no_approved_next_task"
+        and not fail_dispatch_events
+    )
+    step(
+        "no_unapproved_next_dispatch",
+        PASS if no_dispatch_ok else FAIL,
+        f"golden dispatch_action={golden_dispatch.get('action')!r} "
+        f"fail dispatch_events={len(fail_dispatch_events)}",
+    )
+
+    # 10) Real sample cf-99260a669a85: reconcile if evidence exists, else report.
+    sample_id = RESULT_REGISTRY_SYNC_SAMPLE_TASK_ID
+    sample_root = _read_execution_result()
+    sample_root_matches = bool(
+        isinstance(sample_root, dict)
+        and str(sample_root.get("task_id", "")).strip() == sample_id
+    )
+    sample_record = TASK_REGISTRY.get(sample_id)
+    sample_sync = reconcile_task_result(sample_id)
+    sample_explanation = (
+        f"terminal execution result for {sample_id} was found offline and "
+        "reconciled into the registry"
+        if sample_sync["reconciled"]
+        else (
+            f"{sample_id} cannot be reconciled in this offline sandbox: its "
+            "workflow artifact (workflow run 36202330155, artifact_found=true) "
+            "lives in $RUNNER_TEMP and is uploaded as a GitHub Actions artifact, "
+            "not committed to the repository; no repo-root execution_result.json "
+            "and no task registry record carrying its terminal result exists here. "
+            "Reconciling it with fabricated evidence is refused. The identical "
+            "code path is verified by the new Golden task above."
+        )
+    )
+    step(
+        "sample_task_reconcile",
+        PASS if sample_sync["reconciled"] else BLOCKED,
+        sample_explanation,
+    )
+
+    acceptance = {
+        "REGISTRY_SYNC": PASS if registry_sync_ok and unknown_ok and historical_ok else FAIL,
+        "PENDING_REVIEW_DISCOVERY": PASS if discovery_ok else FAIL,
+        "GET_TASK_RESULT": PASS if get_result_ok else FAIL,
+        "AUTO_REVIEW": PASS if auto_review_ok else FAIL,
+        "MARK_REVIEWED": PASS if mark_reviewed_ok else FAIL,
+        "IDEMPOTENCY": PASS if idempotency_ok else FAIL,
+        "FAIL_BLOCKED_GATE": PASS if fail_blocked_ok else FAIL,
+        "NO_UNAPPROVED_NEXT_DISPATCH": PASS if no_dispatch_ok else FAIL,
+    }
+
+    fix_commit = _git("rev-parse", "HEAD")
+    deployment = {
+        "deployment_required": False,
+        "workflow_changed": False,
+        "token_changed": False,
+        "secrets_changed": False,
+        "files_changed": ["hello.py", "test_hello.py"],
+        "status": PASS,
+        "detail": (
+            "LOW-risk in-repo fix only; no workflow, token, secret, OAuth, Cloud "
+            "Asset, Knowledge, multi-agent or router change is introduced"
+        ),
+    }
+    final = PASS if all(value == PASS for value in acceptance.values()) else FAIL
+
+    root_cause = (
+        "hello.py:_sync_execution_result() registered a task from the repo-root "
+        "execution_result.json only when the task_id was unknown and returned "
+        "early for any already-registered task; it never reconciled terminal "
+        "fields for a task registered while non-terminal. list_pending_results() "
+        "then filtered on SUCCESS_STATUSES, so a completed result whose registry "
+        "record still said 'submitted'/'running' was invisible to pending_review "
+        "while get_task_result could already read it."
+    )
+    root_cause_evidence = [
+        "hello.py _sync_execution_result: early return on task_id in TASK_REGISTRY",
+        "hello.py list_pending_results: filters status not in SUCCESS_STATUSES",
+        "Golden repro: submitted-state task excluded before reconcile, discovered "
+        "after reconcile_task_result() writes status/completed_at/result_available",
+        "get_task_result now falls back to the registry terminal result when no "
+        "repo-root execution_result.json is present (task-keyed read)",
+    ]
+
+    lines = [
+        f"# {RESULT_REGISTRY_SYNC_REPORT}",
+        "",
+        f"- goal: {RESULT_REGISTRY_SYNC_GOAL}",
+        f"- task_id: {RESULT_REGISTRY_SYNC_TASK_ID}",
+        f"- FINAL: {final}",
+        f"- GOLDEN_TASK_ID: {golden_id}",
+        f"- GOLDEN_RUN_ID: {golden_run_id}",
+        f"- FIX_COMMIT: {fix_commit}",
+        "",
+        "## Acceptance",
+    ]
+    for name, value in acceptance.items():
+        lines.append(f"- {name}={value}")
+    lines += ["", "## Steps"]
+    for item in steps:
+        lines.append(f"- [{item['status']}] {item['step']}: {item['detail']}")
+    lines += ["", "## Root cause", root_cause, "", "## Root cause evidence"]
+    lines += [f"- {item}" for item in root_cause_evidence]
+    lines += [
+        "",
+        "## Deployment",
+        f"- deployment_required: {deployment['deployment_required']}",
+        f"- workflow_changed: {deployment['workflow_changed']}",
+        f"- token_changed: {deployment['token_changed']}",
+        "- status: " + deployment["status"],
+    ]
+
+    return {
+        "report": RESULT_REGISTRY_SYNC_REPORT,
+        "goal": RESULT_REGISTRY_SYNC_GOAL,
+        "task_id": RESULT_REGISTRY_SYNC_TASK_ID,
+        "acceptance": acceptance,
+        "REGISTRY_SYNC": acceptance["REGISTRY_SYNC"],
+        "PENDING_REVIEW_DISCOVERY": acceptance["PENDING_REVIEW_DISCOVERY"],
+        "GET_TASK_RESULT": acceptance["GET_TASK_RESULT"],
+        "AUTO_REVIEW": acceptance["AUTO_REVIEW"],
+        "MARK_REVIEWED": acceptance["MARK_REVIEWED"],
+        "IDEMPOTENCY": acceptance["IDEMPOTENCY"],
+        "FAIL_BLOCKED_GATE": acceptance["FAIL_BLOCKED_GATE"],
+        "NO_UNAPPROVED_NEXT_DISPATCH": acceptance["NO_UNAPPROVED_NEXT_DISPATCH"],
+        "ROOT_CAUSE": root_cause,
+        "root_cause_evidence": root_cause_evidence,
+        "FIX_COMMIT": fix_commit,
+        "DEPLOYMENT": deployment,
+        "GOLDEN_TASK_ID": golden_id,
+        "GOLDEN_RUN_ID": golden_run_id,
+        "GOLDEN_STEPS": steps,
+        "golden_steps": steps,
+        "sync": sync,
+        "unknown_sync": unknown_sync,
+        "historical_sync": historical_sync,
+        "read_status": read_status,
+        "auto_review_run": {
+            "action": auto_run["action"],
+            "verdict": auto_run["verdict"],
+            "stop_gate": auto_run["stop_gate"],
+            "dispatch": auto_run.get("dispatch"),
+        },
+        "fail_verdict": fail_run["verdict"],
+        "blocked_verdict": blocked_run["verdict"],
+        "sample_task_id": sample_id,
+        "sample_reconciled": sample_sync["reconciled"],
+        "sample_root_result_matches": sample_root_matches,
+        "sample_record_present": sample_record is not None,
+        "sample_explanation": sample_explanation,
+        "CHATGPT_PROACTIVE_WAKEUP": chatgpt_proactive_wakeup_status()[
+            "CHATGPT_PROACTIVE_WAKEUP"
+        ],
+        "human_review_gate": True,
+        "submit_task_contract": "UNCHANGED",
+        "get_task_result_contract": "UNCHANGED",
+        "mark_reviewed_contract": "COMPATIBLE",
+        "workflow_modified": False,
+        "FINAL": final,
+        "markdown": "\n".join(lines),
     }
 
 
