@@ -1,1 +1,1 @@
-TASK_SCOPED_ALLOWLIST_PROBE=BASELINE
+expected_files=agent_scope_probe.txt
