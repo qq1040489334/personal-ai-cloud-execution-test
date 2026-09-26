@@ -847,13 +847,14 @@ function newTaskId() {
 }
 __name(newTaskId, "newTaskId");
 __name2(newTaskId, "newTaskId");
-function buildContract(goal, instructions, acceptance) {
+function buildContract(goal, instructions, acceptance, expectedFiles) {
+  const expected_files = expectedFiles === void 0 ? [...ALLOWLIST] : Array.isArray(expectedFiles) ? expectedFiles.map(String) : [];
   return {
     task_id: newTaskId(),
     goal: String(goal ?? ""),
     instructions: Array.isArray(instructions) ? instructions.map(String) : [],
     risk_level: "LOW",
-    expected_files: [...ALLOWLIST],
+    expected_files,
     acceptance: Array.isArray(acceptance) ? acceptance.map(String) : []
   };
 }
@@ -865,11 +866,18 @@ function validateContract(contract) {
   if (!contract.instructions.length) errors.push("instructions must be a non-empty list");
   if (!contract.acceptance.length) errors.push("acceptance must be a non-empty list");
   for (const path of contract.expected_files) {
+    if (typeof path !== "string" || !path.trim()) {
+      errors.push(`expected_file must be a non-empty string: ${path}`);
+      continue;
+    }
+    const normalized = path.replace(/\\/g, "/");
     const low = String(path).toLowerCase();
-    if (FORBIDDEN_PREFIXES.some((p) => low.startsWith(p)) || FORBIDDEN_SUBSTRINGS.some((s) => low.includes(s))) {
+    const absolute = normalized.startsWith("/") || normalized.startsWith("//") || /^[A-Za-z]:\//.test(normalized);
+    const parent = normalized.split("/").includes("..");
+    if (absolute || parent) {
+      errors.push(`unsafe expected_file path: ${path}`);
+    } else if (FORBIDDEN_PREFIXES.some((p) => low.startsWith(p)) || FORBIDDEN_SUBSTRINGS.some((s) => low.includes(s))) {
       errors.push(`forbidden expected_file: ${path}`);
-    } else if (!ALLOWLIST.includes(path)) {
-      errors.push(`expected_file outside allowlist: ${path}`);
     }
   }
   return errors;
@@ -1140,7 +1148,7 @@ async function toolMarkReviewed(env, args) {
 __name(toolMarkReviewed, "toolMarkReviewed");
 __name2(toolMarkReviewed, "toolMarkReviewed");
 async function toolSubmitTask(env, args) {
-  const contract = buildContract(args.goal, args.instructions, args.acceptance);
+  const contract = buildContract(args.goal, args.instructions, args.acceptance, args.expected_files);
   const errors = validateContract(contract);
   if (errors.length) return { isError: true, text: `INVALID_TASK: ${errors.join("; ")}` };
   let dispatch;
@@ -1363,7 +1371,8 @@ var TOOLS = [
       properties: {
         goal: { type: "string" },
         instructions: { type: "array", items: { type: "string" } },
-        acceptance: { type: "array", items: { type: "string" } }
+        acceptance: { type: "array", items: { type: "string" } },
+        expected_files: { type: "array", items: { type: "string" } }
       },
       required: ["goal", "instructions", "acceptance"]
     }
