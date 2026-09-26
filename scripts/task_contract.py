@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import sys
 
-ALLOWLIST = {"hello.py", "test_hello.py"}
 ALLOWED_RISK = {"LOW", "MEDIUM"}
 REQUIRED = ("task_id", "goal", "instructions", "risk_level", "expected_files", "acceptance")
 FORBIDDEN_PREFIXES = (".github/workflows/",)
@@ -43,8 +42,10 @@ def evaluate(data) -> list[str]:
             low = str(path).lower()
             if low.startswith(FORBIDDEN_PREFIXES) or any(s in low for s in FORBIDDEN_SUBSTRINGS):
                 errors.append(f"forbidden expected_file: {path}")
-            elif path not in ALLOWLIST:
-                errors.append(f"expected_file outside allowlist: {path}")
+            elif not isinstance(path, str) or not path.strip():
+                errors.append("expected_file must be a non-empty string")
+            elif path.startswith("/") or path.startswith("\\") or ".." in path.replace("\\", "/").split("/"):
+                errors.append(f"unsafe expected_file path: {path}")
 
     for field in ("instructions", "acceptance"):
         value = data.get(field)
