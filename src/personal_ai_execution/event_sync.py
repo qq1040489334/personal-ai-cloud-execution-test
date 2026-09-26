@@ -22,6 +22,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
+from . import reconciliation as _reconciliation
 from . import result_normalization as _normalization
 
 REVIEW_ACTION = "review"
@@ -29,6 +30,7 @@ REVIEW_VERDICTS = ("PASS", "FAIL", "BLOCKED")
 PENDING_REVIEW = "pending_review"
 REVIEWED_STATE = "reviewed"
 SYNC_EVENT = "event_sync"
+RECONCILE_ACTION = "reconcile"
 
 #: Fixed task id used by the golden EVENT_SYNC discovery path.
 GOLDEN_TASK_ID = "cf-0564e6c347b8"
@@ -50,6 +52,7 @@ class EventSyncRegistry:
         self._tasks: dict[str, dict[str, Any]] = {}
         self._review_events: list[dict[str, Any]] = []
         self._sync_events: list[dict[str, Any]] = []
+        self._reconciliation_events: list[dict[str, Any]] = []
 
     # -- contract-preserved surface -------------------------------------
     def submit_task(
@@ -80,10 +83,13 @@ class EventSyncRegistry:
             raise ValueError("submit_task requires a task_id")
         record = self._tasks.get(str(task_id))
         if record is None:
+            timestamp = _utc_now()
             record = {
                 "task_id": str(task_id),
                 "goal": goal,
                 "status": status,
+                "created_at": timestamp,
+                "updated_at": timestamp,
                 "requires_review": bool(requires_review),
                 "reviewed": False,
                 "review_verdict": None,
@@ -96,9 +102,16 @@ class EventSyncRegistry:
                 "review_state": None,
                 "synced": False,
                 "sync_fingerprint": None,
+                "legacy": False,
+                "reconciled": False,
+                "reconciliation_class": None,
+                "reconciliation_fingerprint": None,
+                "reconciled_at": None,
+                "legacy_original_status": None,
                 "execution_result_json": None,
                 "evidence": {},
                 "review_events": [],
+                "reconciliation_events": [],
             }
             self._tasks[str(task_id)] = record
         else:
@@ -106,7 +119,10 @@ class EventSyncRegistry:
             record["status"] = status or record["status"]
             record["requires_review"] = bool(requires_review)
         for key, value in extra.items():
-            record.setdefault(key, value)
+            if key in ("created_at", "updated_at") and value is not None:
+                record[key] = value
+            else:
+                record.setdefault(key, value)
         return dict(record)
 
     def get_task_result(self, task_id: str) -> dict[str, Any]:
@@ -206,6 +222,186 @@ class EventSyncRegistry:
             for event in self._sync_events
             if event.get("task_id") == str(task_id)
         ]
+
+    def get_reconciliation_events(
+        self, task_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return the append-only reconciliation audit trail."""
+        if task_id is None:
+            return [dict(event) for event in self._reconciliation_events]
+        return [
+            dict(event)
+            for event in self._reconciliation_events
+            if event.get("task_id") == str(task_id)
+        ]
+
+    # -- TASK_REGISTRY_CLEANUP_V0.1 --------------------------------------
+    def audit_historical_tasks(
+        self,
+        *,
+        discovered_results: Mapping[str, Mapping[str, Any]] | None = None,
+        conclusions: Mapping[str, str] | None = None,
+        now: datetime | None = None,
+        orphan_after_seconds: int = _reconciliation.DEFAULT_ORPHAN_AFTER_SECONDS,
+    ) -> dict[str, Any]:
+        """Classify every historical record without mutating the registry."""
+        return self.reconcile_historical_tasks(
+            discovered_results=discovered_results,
+            conclusions=conclusions,
+            now=now,
+            orphan_after_seconds=orphan_after_seconds,
+            dry_run=True,
+        )
+
+    def reconcile_historical_tasks(
+        self,
+        *,
+        discovered_results: Mapping[str, Mapping[str, Any]] | None = None,
+        conclusions: Mapping[str, str] | None = None,
+        now: datetime | None = None,
+        orphan_after_seconds: int = _reconciliation.DEFAULT_ORPHAN_AFTER_SECONDS,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Reconcile pre-EVENT_SYNC task states without deleting any history.
+
+        Only records that predate EVENT_SYNC are touched. Already-synced records
+        keep using the EVENT_SYNC path and are reported as ``already_synced``.
+        The operation is idempotent: re-running it never duplicates pending-review
+        entries or reconciliation events, and it never deletes evidence, review
+        events, or commits.
+        """
+        discovered = dict(discovered_results or {})
+        discovered_conclusions = dict(conclusions or {})
+        report: dict[str, Any] = {
+            "dry_run": bool(dry_run),
+            "idempotent": True,
+            "total": len(self._tasks),
+            "reconciled": [],
+            "skipped": [],
+            "counts": {name: 0 for name in _reconciliation.ALL_CLASSES},
+        }
+        for record in list(self._tasks.values()):
+            task_id = str(record["task_id"])
+            assessment = _reconciliation.classify_record(
+                record,
+                execution_result=discovered.get(task_id),
+                conclusion=discovered_conclusions.get(task_id),
+                now=now,
+                orphan_after_seconds=orphan_after_seconds,
+            )
+            classification = assessment["classification"]
+            report["counts"][classification] += 1
+            if classification in (
+                _reconciliation.ALREADY_SYNCED,
+                _reconciliation.REVIEWED,
+                _reconciliation.IN_PROGRESS,
+            ):
+                report["skipped"].append(
+                    {
+                        "task_id": task_id,
+                        "classification": classification,
+                        "reason": "event-sync owned / reviewed / still in flight",
+                    }
+                )
+                continue
+            entry = {
+                "task_id": task_id,
+                "classification": classification,
+                "previous_status": (
+                    record.get("legacy_original_status") or record.get("status")
+                ),
+                "status": assessment.get("status"),
+                "has_result": bool(assessment.get("has_result")),
+            }
+            if not dry_run:
+                changed = self._apply_reconciliation(
+                    record, assessment, task_id, now=now
+                )
+                entry["changed"] = changed
+                if changed:
+                    report["idempotent"] = False
+            report["reconciled"].append(entry)
+        report["counts"]["total"] = len(self._tasks)
+        return report
+
+    def _apply_reconciliation(
+        self,
+        record: dict[str, Any],
+        assessment: Mapping[str, Any],
+        task_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        classification = str(assessment["classification"])
+        timestamp = (now or _reconciliation.utc_now()).isoformat()
+        record["legacy"] = True
+        if record.get("legacy_original_status") is None:
+            record["legacy_original_status"] = record.get("status")
+        if record.get("reconciled_at") is None:
+            record["reconciled_at"] = timestamp
+
+        task_result = assessment.get("task_result")
+        if task_result is not None:
+            record["status"] = task_result["status"]
+            record["normalized_status"] = task_result["status"]
+            record["workflow_conclusion"] = task_result["workflow_conclusion"]
+            evidence = dict(record.get("evidence") or {})
+            evidence.setdefault("task_result", dict(task_result))
+            evidence["reconciliation_class"] = classification
+            evidence["conclusion_authoritative"] = task_result[
+                "conclusion_authoritative"
+            ]
+            evidence["conclusion_result_mismatch"] = task_result[
+                "conclusion_result_mismatch"
+            ]
+            record["evidence"] = evidence
+            execution_result = assessment.get("execution_result")
+            if isinstance(execution_result, Mapping) and record.get(
+                "execution_result_json"
+            ) is None:
+                record["execution_result_json"] = dict(execution_result)
+
+        if assessment.get("has_result"):
+            record["terminal"] = True
+            record["result_available"] = True
+            record["requires_review"] = True
+            if not record.get("reviewed"):
+                record["review_state"] = PENDING_REVIEW
+        elif classification == _reconciliation.BLOCKED_AWAITING_INSPECTION:
+            record["requires_inspection"] = True
+            record["review_state"] = _reconciliation.BLOCKED_AWAITING_INSPECTION
+        elif classification == _reconciliation.LEGACY_ORPHAN:
+            record["requires_inspection"] = True
+            record["orphaned"] = True
+            record["review_state"] = _reconciliation.LEGACY_ORPHAN
+
+        fingerprint = "|".join(
+            (
+                classification,
+                str(assessment.get("status")),
+                str(assessment.get("workflow_conclusion")),
+            )
+        )
+        already = bool(
+            record.get("reconciled")
+            and record.get("reconciliation_fingerprint") == fingerprint
+        )
+        record["reconciled"] = True
+        record["reconciliation_class"] = classification
+        record["reconciliation_fingerprint"] = fingerprint
+        if already:
+            return False
+        event = {
+            "task_id": task_id,
+            "action": RECONCILE_ACTION,
+            "classification": classification,
+            "from_status": record.get("legacy_original_status"),
+            "to_status": record.get("normalized_status") or record.get("status"),
+            "timestamp": timestamp,
+        }
+        record.setdefault("reconciliation_events", []).append(event)
+        self._reconciliation_events.append(event)
+        return True
 
     # -- EVENT_SYNC ------------------------------------------------------
     def sync_terminal_result(
@@ -374,6 +570,18 @@ def get_review_events(task_id: str | None = None) -> list[dict[str, Any]]:
 
 def get_sync_events(task_id: str | None = None) -> list[dict[str, Any]]:
     return _DEFAULT_REGISTRY.get_sync_events(task_id)
+
+
+def get_reconciliation_events(task_id: str | None = None) -> list[dict[str, Any]]:
+    return _DEFAULT_REGISTRY.get_reconciliation_events(task_id)
+
+
+def audit_historical_tasks(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    return _DEFAULT_REGISTRY.audit_historical_tasks(*args, **kwargs)
+
+
+def reconcile_historical_tasks(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    return _DEFAULT_REGISTRY.reconcile_historical_tasks(*args, **kwargs)
 
 
 def sync_terminal_result(*args: Any, **kwargs: Any) -> dict[str, Any]:

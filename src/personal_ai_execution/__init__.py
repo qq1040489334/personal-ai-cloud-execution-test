@@ -2,20 +2,35 @@
 
 from __future__ import annotations
 
-from . import event_sync
+from . import event_sync, reconciliation
 from .event_sync import (
     GOLDEN_TASK_ID,
     PENDING_REVIEW,
+    RECONCILE_ACTION,
     REVIEWED_STATE,
     EventSyncRegistry,
+    audit_historical_tasks,
     default_registry,
+    get_reconciliation_events,
     get_review_events,
     get_sync_events,
     list_pending_results,
     mark_reviewed,
+    reconcile_historical_tasks,
     reset_default_registry,
     submit_task,
     sync_terminal_result,
+)
+from .reconciliation import (
+    ALREADY_SYNCED,
+    BLOCKED_AWAITING_INSPECTION,
+    COMPLETED_WITH_RESULT,
+    FAILED_WITH_RESULT,
+    IN_PROGRESS,
+    LEGACY_ORPHAN,
+    RECONCILABLE_CLASSES,
+    REVIEWED,
+    classify_record,
 )
 from .result_normalization import (
     BLOCKED,
@@ -32,18 +47,30 @@ from .result_normalization import (
 )
 
 __all__ = [
+    "ALREADY_SYNCED",
     "BLOCKED",
+    "BLOCKED_AWAITING_INSPECTION",
+    "COMPLETED_WITH_RESULT",
     "FAIL",
+    "FAILED_WITH_RESULT",
     "GOLDEN_TASK_ID",
+    "IN_PROGRESS",
+    "LEGACY_ORPHAN",
     "PASS",
     "PENDING",
     "PENDING_REVIEW",
+    "RECONCILABLE_CLASSES",
+    "RECONCILE_ACTION",
+    "REVIEWED",
     "REVIEWED_STATE",
     "TERMINAL_STATUSES",
     "EventSyncRegistry",
+    "audit_historical_tasks",
+    "classify_record",
     "default_registry",
     "event_sync",
     "event_sync_retry_allowed",
+    "get_reconciliation_events",
     "get_review_events",
     "get_sync_events",
     "get_task_result",
@@ -52,6 +79,8 @@ __all__ = [
     "normalize_conclusion",
     "normalize_result",
     "normalize_self_reported_status",
+    "reconcile_historical_tasks",
+    "reconciliation",
     "reset_default_registry",
     "submit_task",
     "sync_terminal_result",
