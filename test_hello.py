@@ -3762,3 +3762,99 @@ def test_runtime_provenance_v0_1_markdown_tokens() -> None:
     assert f"RELATIONSHIP_VERIFIED={report['relationship_verified']}" in markdown
     assert f"RUNTIME_VERIFIED={report['runtime_verified']}" in markdown
     assert "PRODUCTION_MUTATED=False" in markdown
+
+
+POST_CANONICAL_DEPLOY_GOLDEN_TASK_ID = "cf-e4a3dd8b4989"
+
+
+def _import_personal_ai_execution():
+    import sys
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    import personal_ai_execution
+
+    return personal_ai_execution
+
+
+def test_post_canonical_deploy_live_golden_success_path() -> None:
+    """Bounded no-mutation check of submit -> result -> discovery -> review gate."""
+    pkg = _import_personal_ai_execution()
+    PASS = pkg.PASS
+    EventSyncRegistry = pkg.EventSyncRegistry
+    from personal_ai_execution import status_contract as sc
+
+    registry = EventSyncRegistry()
+    task_id = POST_CANONICAL_DEPLOY_GOLDEN_TASK_ID
+    registry.submit_task(task_id, goal="no-change production execution golden")
+
+    fresh = registry.get_task_result(task_id)
+    assert fresh["status"] == sc.PENDING
+    assert fresh["terminal"] is False
+    assert registry.list_pending_results() == []
+
+    with pytest.raises(ValueError):
+        registry.mark_reviewed(task_id, "PASS", note="too early")
+
+    sync = registry.sync_terminal_result(
+        task_id,
+        execution_result={"task_id": task_id, "status": "success"},
+        workflow_conclusion_value="success",
+    )
+    assert sync["status"] == PASS
+    assert sync["terminal"] is True
+
+    result = registry.get_task_result(task_id)
+    assert result["task_id"] == task_id
+    assert result["status"] == PASS
+    assert result["workflow_conclusion"] == "success"
+    assert result["terminal"] is True
+
+    pending = registry.list_pending_results()
+    assert [record["task_id"] for record in pending] == [task_id]
+    assert pending[0]["normalized_status"] == PASS
+    assert pending[0]["review_state"] == "pending_review"
+
+    reviewed = registry.mark_reviewed(task_id, "PASS", note="golden verified")
+    assert reviewed["review_verdict"] == PASS
+    assert reviewed["status"] == PASS
+    assert reviewed["normalized_status"] == PASS
+    assert registry.list_pending_results() == []
+
+
+def test_post_canonical_deploy_live_golden_failure_bucket() -> None:
+    """A non-success conclusion lands in the failure bucket, never upgraded."""
+    pkg = _import_personal_ai_execution()
+    BLOCKED = pkg.BLOCKED
+    FAIL = pkg.FAIL
+    PASS = pkg.PASS
+    EventSyncRegistry = pkg.EventSyncRegistry
+
+    registry = EventSyncRegistry()
+    task_id = f"{POST_CANONICAL_DEPLOY_GOLDEN_TASK_ID}-failure"
+    registry.submit_task(task_id, goal="no-change production execution golden")
+
+    sync = registry.sync_terminal_result(
+        task_id,
+        execution_result={"task_id": task_id, "status": "success"},
+        workflow_conclusion_value="failure",
+    )
+    assert sync["status"] == FAIL
+
+    result = registry.get_task_result(task_id)
+    assert result["status"] == FAIL
+    assert result["execution_result_status"] == PASS
+    assert result["conclusion_result_mismatch"] is True
+
+    pending = registry.list_pending_results()
+    assert [record["task_id"] for record in pending] == [task_id]
+
+    blocked = registry.sync_terminal_result(
+        task_id,
+        execution_result={"task_id": task_id, "status": "success"},
+        workflow_conclusion_value="cancelled",
+    )
+    assert blocked["status"] == BLOCKED
+    assert registry.get_task_result(task_id)["status"] == BLOCKED
