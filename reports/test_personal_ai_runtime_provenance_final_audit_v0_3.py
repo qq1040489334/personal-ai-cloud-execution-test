@@ -21,7 +21,6 @@ evidence artifacts. They assert the fail-closed contract:
 
 from __future__ import annotations
 
-import copy
 import json
 import sys
 from pathlib import Path
@@ -35,33 +34,16 @@ import personal_ai_runtime_provenance_final_audit_v0_3 as audit  # noqa: E402
 
 VALID_OVERALL = {"PASS", "FAIL", "BLOCKED"}
 
-#: Fields that legitimately move when the audit artifact itself is committed or
-#: when it is re-run in a different environment (HEAD and environment values).
-VOLATILE_KEYS = {"generated_at", "markdown", "audit_context", "report_only_commits"}
-VOLATILE_IDENTITY_KEYS = {
-    "env_commit",
-    "env_commit_names",
-    "env_version",
-    "env_version_names",
-}
-VOLATILE_EVIDENCE_KEYS = {
-    "authoritative",
-    "authoritative_sources",
-    "cloudflare_deploy_credential_names_present",
-}
 
-
-def _normalized(report: dict) -> dict:
-    """Return a HEAD/environment-stable view of a report for comparison."""
-    view = copy.deepcopy(report)
-    for key in VOLATILE_KEYS:
-        view.pop(key, None)
-    view["canonical_source"].pop("head_commit", None)
-    for key in VOLATILE_IDENTITY_KEYS:
-        view["deployment_identity"].pop(key, None)
-    for key in VOLATILE_EVIDENCE_KEYS:
-        view["deployment_identity_evidence"].pop(key, None)
-    return view
+def _assert_historical_candidate(candidate: dict) -> None:
+    """Validate a recorded candidate source commit against its own git blob."""
+    blob = audit._blob_at(candidate["commit"], audit.CANONICAL_SOURCE)
+    assert blob is not None, f"missing canonical source at {candidate['commit']}"
+    assert candidate["source_sha256"] == audit._sha256_bytes(blob)
+    assert candidate["source_bytes"] == len(blob)
+    assert candidate["source_lines"] == len(
+        blob.decode("utf-8", "replace").splitlines()
+    )
 
 
 # --- shape / evidence -------------------------------------------------------
@@ -371,12 +353,32 @@ def test_committed_json_artifact_is_consistent() -> None:
     json_path = REPO_ROOT / audit.JSON_ARTIFACT
     assert json_path.is_file(), f"missing committed artifact {audit.JSON_ARTIFACT}"
     committed = json.loads(json_path.read_text(encoding="utf-8"))
-    fresh = audit.build_report()
 
     # The markdown must be exactly reproducible from the committed JSON.
     assert committed["markdown"] == audit.render_markdown(committed)
+    assert committed["report"] == audit.REPORT_NAME
+    assert committed["goal"] == "PERSONAL_AI_RUNTIME_PROVENANCE_FINAL_AUDIT_V0.3"
+    assert committed["task_id"] == "cf-619649c43aa2"
+    assert committed["overall"] in VALID_OVERALL
 
-    assert _normalized(committed) == _normalized(fresh)
+    # The committed artifact is an immutable historical snapshot. Its recorded
+    # canonical-source identity must agree with the blob at the recorded
+    # historical HEAD -- not with the current canonical worker file, which is
+    # checked separately by test_canonical_commit_and_exact_source_hash_verified.
+    canonical = committed["canonical_source"]
+    assert canonical["file"] == audit.CANONICAL_SOURCE
+    blob = audit._blob_at(canonical["head_commit"], canonical["file"])
+    assert blob is not None, "missing canonical source at recorded historical HEAD"
+    assert canonical["head_sha256"] == audit._sha256_bytes(blob)
+    assert canonical["head_bytes"] == len(blob)
+    assert canonical["head_lines"] == len(
+        blob.decode("utf-8", "replace").splitlines()
+    )
+    assert canonical["last_source_commit"]
+
+    # Each recorded candidate source commit must hash to its own recorded blob.
+    for candidate in committed["candidate_source_commits"]:
+        _assert_historical_candidate(candidate)
 
 
 def test_committed_markdown_artifact_present() -> None:

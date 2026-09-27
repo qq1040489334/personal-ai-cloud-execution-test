@@ -16,7 +16,6 @@ committed evidence artifacts. They assert the fail-closed contract:
 
 from __future__ import annotations
 
-import copy
 import json
 import os
 import sys
@@ -30,26 +29,14 @@ if str(REPORTS_DIR) not in sys.path:
 import production_deploy_v0_1 as deploy  # noqa: E402
 
 VALID_VERDICTS = {"PASS", "FAIL", "BLOCKED"}
-HEAD_VOLATILE = (
-    ("canonical_head_commit",),
-    ("preflight", "canonical_head_commit"),
-    ("preflight", "canonical_head_date"),
-    ("preflight", "origin_main_commit"),
-    ("provenance_chain", "git_commit"),
-    ("provenance_chain", "git_commit_date"),
-)
 
 
-def _normalized(report: dict) -> dict:
-    data = copy.deepcopy(report)
-    data.pop("generated_at", None)
-    data.pop("markdown", None)
-    for path in HEAD_VOLATILE:
-        cursor = data
-        for key in path[:-1]:
-            cursor = cursor.get(key, {})
-        cursor.pop(path[-1], None)
-    return data
+def _git_blob(commit: str, path: str) -> bytes:
+    """Return the raw bytes of ``path`` at a historical ``commit``."""
+    assert commit, "historical artifact must record a source commit"
+    result = deploy._run_git("show", f"{commit}:{path}")
+    assert result.returncode == 0, f"cannot read {path} at historical commit {commit}"
+    return result.stdout
 
 
 # --- report shape and fail-closed verdict ----------------------------------
@@ -192,11 +179,31 @@ def test_committed_json_artifact_is_consistent() -> None:
     json_path = REPO_ROOT / deploy.JSON_ARTIFACT
     assert json_path.is_file(), f"missing committed artifact {deploy.JSON_ARTIFACT}"
     committed = json.loads(json_path.read_text(encoding="utf-8"))
-    fresh = deploy.build_report()
 
     # The markdown must be exactly reproducible from the committed JSON.
     assert committed["markdown"] == deploy.render_markdown(committed)
-    assert _normalized(committed) == _normalized(fresh)
+    assert committed["report"] == deploy.REPORT_NAME
+    assert committed["goal"] == deploy.GOAL
+    assert committed["task_id"] == deploy.TASK_ID
+    assert committed["overall"] in VALID_VERDICTS
+    assert committed["verdict"] == committed["overall"]
+
+    # The committed artifact is an immutable historical snapshot. Its recorded
+    # source identity must agree with the blob at the recorded historical HEAD
+    # -- not with the current canonical worker file, which is checked
+    # separately by test_canonical_source_hash_matches_repository_file.
+    source = committed["preflight"]["canonical_source"]
+    assert source["file"] == deploy.CANONICAL_SOURCE
+    blob = _git_blob(committed["canonical_head_commit"], source["file"])
+    assert source["sha256"] == deploy._sha256_bytes(blob)
+    assert source["bytes"] == len(blob)
+    assert source["lines"] == len(blob.decode("utf-8", "replace").splitlines())
+
+    # The historical snapshot is internally consistent across sections.
+    chain = committed["provenance_chain"]
+    assert chain["source_file"] == source["file"]
+    assert chain["source_sha256"] == source["sha256"]
+    assert chain["source_bytes"] == source["bytes"]
 
 
 def test_committed_markdown_artifact_present() -> None:
@@ -227,7 +234,22 @@ def test_baseline_records_blocked_deploy_without_changing_production_identity() 
     assert record["cloudflare_deployment_id"] is None
     assert record["cloudflare_version"] is None
     assert record["evidence_artifact"] == deploy.JSON_ARTIFACT
-    assert record["canonical_source_sha256"] == deploy.build_report()["preflight"]["canonical_source"]["sha256"]
+    # The baseline records the historical snapshot identity. Validate it against
+    # the source blob at the recorded historical commit, never against the
+    # current canonical worker file (that current-canonical check lives in
+    # test_canonical_source_hash_matches_repository_file).
+    historical_commit = record["canonical_head_commit"]
+    blob = _git_blob(historical_commit, deploy.CANONICAL_SOURCE)
+    assert record["canonical_source_sha256"] == deploy._sha256_bytes(blob)
+    # The baseline record and the committed deploy artifact are the same
+    # historical snapshot, so they must agree with each other.
+    artifact = json.loads(
+        (REPO_ROOT / deploy.JSON_ARTIFACT).read_text(encoding="utf-8")
+    )
+    assert (
+        record["canonical_source_sha256"]
+        == artifact["preflight"]["canonical_source"]["sha256"]
+    )
 
 
 def test_engine_does_not_mutate_repository_or_remote() -> None:

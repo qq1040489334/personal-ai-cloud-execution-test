@@ -232,26 +232,38 @@ def test_committed_json_artifact_is_consistent() -> None:
     json_path = rp.REPO_ROOT / rp.JSON_ARTIFACT
     assert json_path.is_file(), f"missing committed artifact {rp.JSON_ARTIFACT}"
     committed = json.loads(json_path.read_text(encoding="utf-8"))
-    fresh = rp.build_report()
 
     # The markdown must be exactly reproducible from the committed JSON.
     assert committed["markdown"] == rp.render_markdown(committed)
+    assert committed["report"] == rp.REPORT_NAME
+    assert committed["goal"] == "PERSONAL_AI_RUNTIME_PROVENANCE_V0.2"
+    assert committed["task_id"] == "cf-883c3502ff24"
+    assert committed["overall"] in VALID_OVERALL
 
-    # generated_at and the rendered markdown embed the generation timestamp;
-    # the markdown is checked for self-consistency via render_markdown above.
-    volatile = {"generated_at", "markdown"}
-    for key in rp.REPORT_FIELDS:
-        if key in volatile:
-            continue
-        if key == "canonical_source":
-            committed_canonical = dict(committed[key])
-            fresh_canonical = dict(fresh[key])
-            # HEAD moves when this report is committed; the source blob does not.
-            committed_canonical.pop("head_commit", None)
-            fresh_canonical.pop("head_commit", None)
-            assert committed_canonical == fresh_canonical
-            continue
-        assert committed[key] == fresh[key], f"stale artifact field: {key}"
+    # The committed artifact is an immutable historical snapshot. Its recorded
+    # canonical-source identity must agree with the blob at the recorded
+    # historical HEAD -- not with the current canonical worker file, which is
+    # checked separately by test_deployed_runtime_not_traceable_to_commit_in_this_repo.
+    canonical = committed["canonical_source"]
+    assert canonical["file"] == rp.CANONICAL_SOURCE
+    blob = rp._blob_at(canonical["head_commit"], canonical["file"])
+    assert blob is not None, "missing canonical source at recorded historical HEAD"
+    assert canonical["head_sha256"] == rp._sha256_bytes(blob)
+    assert canonical["head_bytes"] == len(blob)
+    assert canonical["head_lines"] == len(
+        blob.decode("utf-8", "replace").splitlines()
+    )
+    assert canonical["last_source_commit"]
+
+    # Each recorded candidate source commit must hash to its own recorded blob.
+    for candidate in committed["candidate_source_commits"]:
+        cblob = rp._blob_at(candidate["commit"], rp.CANONICAL_SOURCE)
+        assert cblob is not None, f"missing canonical source at {candidate['commit']}"
+        assert candidate["source_sha256"] == rp._sha256_bytes(cblob)
+        assert candidate["source_bytes"] == len(cblob)
+        assert candidate["source_lines"] == len(
+            cblob.decode("utf-8", "replace").splitlines()
+        )
 
 
 def test_committed_markdown_artifact_present() -> None:

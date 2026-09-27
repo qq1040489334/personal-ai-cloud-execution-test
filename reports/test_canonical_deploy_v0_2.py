@@ -17,7 +17,6 @@ evidence artifacts. They assert the acceptance contract:
 
 from __future__ import annotations
 
-import copy
 import json
 import os
 import sys
@@ -31,25 +30,27 @@ if str(REPORTS_DIR) not in sys.path:
 import canonical_deploy_v0_2 as deploy  # noqa: E402
 
 VALID_STATUS = {"PASS", "FAIL", "BLOCKED"}
-HEAD_VOLATILE = (
-    ("canonical", "git_commit"),
-    ("preflight", "canonical_head_commit"),
-    ("preflight", "canonical_head_date"),
-    ("provenance", "git_commit"),
-    ("provenance", "git_commit_date"),
-)
 
 
-def _normalized(report: dict) -> dict:
-    data = copy.deepcopy(report)
-    data.pop("generated_at", None)
-    data.pop("markdown", None)
-    for path in HEAD_VOLATILE:
-        cursor = data
-        for key in path[:-1]:
-            cursor = cursor.get(key, {})
-        cursor.pop(path[-1], None)
-    return data
+def _git_blob(commit: str, path: str) -> bytes:
+    """Return the raw bytes of ``path`` at a historical ``commit``."""
+    assert commit, "historical artifact must record a source commit"
+    result = deploy._run_git("show", f"{commit}:{path}")
+    assert result.returncode == 0, f"cannot read {path} at historical commit {commit}"
+    return result.stdout
+
+
+def _assert_historical_source_identity(record: dict) -> None:
+    """Validate a recorded source identity against its own historical commit.
+
+    Historical evidence is immutable: it must be checked against the git blob
+    recorded at the time, never against the current canonical worker file
+    (which is validated separately by the current-canonical tests).
+    """
+    blob = _git_blob(record["git_commit"], record["source_file"])
+    assert record["source_sha256"] == deploy._sha256_bytes(blob)
+    assert record["source_bytes"] == len(blob)
+    assert record["source_lines"] == len(blob.decode("utf-8", "replace").splitlines())
 
 
 # --- report shape and fail-closed status -----------------------------------
@@ -215,9 +216,35 @@ def test_committed_json_artifact_is_consistent() -> None:
     json_path = REPO_ROOT / deploy.JSON_ARTIFACT
     assert json_path.is_file(), f"missing committed artifact {deploy.JSON_ARTIFACT}"
     committed = json.loads(json_path.read_text(encoding="utf-8"))
-    fresh = deploy.build_report()
+
+    # The markdown must be exactly reproducible from the committed JSON.
     assert committed["markdown"] == deploy.render_markdown(committed)
-    assert _normalized(committed) == _normalized(fresh)
+    assert committed["report"] == deploy.REPORT_NAME
+    assert committed["goal"] == deploy.GOAL
+    assert committed["task_id"] == deploy.TASK_ID
+    assert committed["deploy_status"] in VALID_STATUS
+    assert committed["deploy_status"] == committed["verdict"] == committed["overall"]
+
+    # The committed artifact is an immutable historical snapshot. Its recorded
+    # source identity must agree with the blob at the recorded historical
+    # commit -- not with the current canonical worker file, which is checked
+    # separately by test_canonical_source_hash_matches_repository_file.
+    canonical = committed["canonical"]
+    assert canonical["source_file"] == deploy.CANONICAL_SOURCE
+    _assert_historical_source_identity(canonical)
+
+    preflight_source = committed["preflight"]["canonical_source"]
+    assert preflight_source["file"] == canonical["source_file"]
+    assert preflight_source["sha256"] == canonical["source_sha256"]
+    assert preflight_source["bytes"] == canonical["source_bytes"]
+    assert preflight_source["lines"] == canonical["source_lines"]
+
+    # The historical snapshot is internally consistent across sections.
+    provenance = committed["provenance"]
+    assert provenance["source_file"] == canonical["source_file"]
+    assert provenance["source_sha256"] == canonical["source_sha256"]
+    assert provenance["source_bytes"] == canonical["source_bytes"]
+    assert provenance["git_commit"] == canonical["git_commit"]
 
 
 def test_committed_markdown_artifact_present() -> None:
