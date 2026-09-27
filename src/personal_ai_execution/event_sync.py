@@ -14,14 +14,21 @@ so a terminal workflow conclusion always wins over the advisory
 Synchronisation is idempotent and side-effect free with respect to review:
 reprocessing the same terminal task never creates a duplicate pending-review
 record and never records a duplicate review event. EVENT_SYNC never calls
-``mark_reviewed`` automatically and never submits a follow-up task.
+``mark_reviewed`` automatically and never invents a follow-up task.
+
+Since PERSONAL_AI_AUTONOMOUS_ADVANCEMENT_V0.2 an *explicit* pre-authorized
+``approved_next_task`` may be dispatched exactly once after an authoritative
+terminal ``PASS`` review (see :mod:`personal_ai_execution.advancement`). With no
+``approved_next_task`` review closure behaves exactly as before and nothing is
+dispatched.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
+from . import advancement as _advancement
 from . import reconciliation as _reconciliation
 from . import result_normalization as _normalization
 from . import review_assistant as _review_assistant
@@ -162,7 +169,9 @@ class EventSyncRegistry:
 
     The registry preserves the ``submit_task`` / ``get_task_result`` /
     ``list_pending_results`` / ``mark_reviewed`` contracts: it never infers a
-    verdict, never auto-reviews and never auto-submits a next task.
+    verdict and never auto-reviews. It never invents a next task; it only
+    dispatches an explicit pre-authorized ``approved_next_task`` exactly once
+    after an authoritative terminal ``PASS`` review.
     """
 
     def __init__(self) -> None:
@@ -231,6 +240,8 @@ class EventSyncRegistry:
                 "evidence": {},
                 "review_events": [],
                 "reconciliation_events": [],
+                "review_dispatch": None,
+                "review_dispatches": [],
             }
             self._tasks[str(task_id)] = record
         else:
@@ -366,7 +377,12 @@ class EventSyncRegistry:
         return pending
 
     def mark_reviewed(
-        self, task_id: Any = None, verdict: str | None = None, note: str | None = None
+        self,
+        task_id: Any = None,
+        verdict: str | None = None,
+        note: str | None = None,
+        approved_next_task: Any = None,
+        dispatcher: Callable[[Mapping[str, Any]], Any] | None = None,
     ) -> dict[str, Any]:
         """Record an explicit human review verdict for an eligible task.
 
@@ -375,12 +391,21 @@ class EventSyncRegistry:
         ``task_id`` matches. Eligible completed tasks accept ``PASS`` / ``FAIL``
         / ``BLOCKED``. An identical repeated verdict is idempotent; a conflicting
         second verdict is rejected.
+
+        When an explicit ``approved_next_task`` is supplied and ``verdict`` is
+        ``PASS``, it is dispatched as a child through ``dispatcher`` exactly once
+        (guarded by a persisted review/dispatch marker). With no
+        ``approved_next_task`` nothing is dispatched and the review is unchanged.
         """
         if isinstance(task_id, Mapping):
             payload = dict(task_id)
             task_id = payload.get("task_id", task_id)
             verdict = payload.get("verdict", verdict)
             note = payload.get("note", note)
+            if approved_next_task is None:
+                approved_next_task = payload.get(_advancement.APPROVED_NEXT_TASK_FIELD)
+            if dispatcher is None:
+                dispatcher = payload.get("dispatcher")
         if not task_id:
             raise ValueError("mark_reviewed requires a task_id")
         normalized = str(verdict).strip().upper() if verdict is not None else ""
@@ -393,8 +418,18 @@ class EventSyncRegistry:
             raise KeyError(f"unknown task_id: {task_id}")
         if record.get("reviewed"):
             if record.get("review_verdict") == normalized:
+                dispatch = _advancement.dispatch_approved_child(
+                    record,
+                    str(task_id),
+                    normalized,
+                    approved_next_task,
+                    dispatcher,
+                    review_timestamp=record.get("reviewed_at"),
+                    review_note=record.get("review_note"),
+                )
                 result = dict(record)
                 result["idempotent"] = True
+                result["child_dispatch"] = dispatch
                 return result
             raise ValueError(
                 f"review already recorded: {record.get('review_verdict')}; "
@@ -427,8 +462,18 @@ class EventSyncRegistry:
         record["review_state"] = REVIEWED_STATE
         record.setdefault("review_events", []).append(event)
         self._review_events.append(event)
+        dispatch = _advancement.dispatch_approved_child(
+            record,
+            str(task_id),
+            normalized,
+            approved_next_task,
+            dispatcher,
+            review_timestamp=timestamp,
+            review_note=note,
+        )
         result = dict(record)
         result["review_event"] = event
+        result["child_dispatch"] = dispatch
         result["idempotent"] = False
         return result
 

@@ -968,6 +968,221 @@ async function dispatchTask(env, contract) {
 }
 __name(dispatchTask, "dispatchTask");
 __name2(dispatchTask, "dispatchTask");
+var DISPATCH_MARKER_PREFIX = "dispatch:";
+var DISPATCH_STATE_PENDING = "PENDING";
+var DISPATCH_STATE_DISPATCHED = "DISPATCHED";
+var DISPATCH_STATE_FAILED = "FAILED";
+var DISPATCH_REASON_DISPATCHED = "DISPATCHED";
+var DISPATCH_REASON_ALREADY = "ALREADY_DISPATCHED";
+var DISPATCH_REASON_VERDICT = "VERDICT_NOT_PASS";
+var DISPATCH_REASON_NO_CHILD = "NO_APPROVED_NEXT_TASK";
+var DISPATCH_REASON_INVALID = "INVALID_APPROVED_NEXT_TASK";
+var DISPATCH_REASON_UNAVAILABLE = "DISPATCH_MARKER_UNAVAILABLE";
+var DISPATCH_REASON_FAILED = "DISPATCH_FAILED";
+function dispatchMarkerKey(parentTaskId) {
+  return `${DISPATCH_MARKER_PREFIX}${parentTaskId}`;
+}
+__name(dispatchMarkerKey, "dispatchMarkerKey");
+__name2(dispatchMarkerKey, "dispatchMarkerKey");
+async function readDispatchMarker(env, parentTaskId) {
+  if (!env.ASSET_DB) return null;
+  try {
+    return await env.ASSET_DB.prepare(
+      "SELECT dispatch_key, parent_task_id, review_verdict, review_timestamp, child_task_id, dispatch_state, dispatch_status, github_http_status, github_request_id, dispatched_at FROM task_dispatch_markers WHERE dispatch_key = ?"
+    ).bind(dispatchMarkerKey(parentTaskId)).first();
+  } catch {
+    return null;
+  }
+}
+__name(readDispatchMarker, "readDispatchMarker");
+__name2(readDispatchMarker, "readDispatchMarker");
+async function claimDispatchMarker(env, parentTaskId, childTaskId, verdict, reviewTimestamp, reviewNote) {
+  if (!env.ASSET_DB) return { status: "unavailable", claimed: false };
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  try {
+    const res = await env.ASSET_DB.prepare(
+      "INSERT OR IGNORE INTO task_dispatch_markers (dispatch_key, parent_task_id, review_verdict, review_timestamp, review_note, child_task_id, dispatch_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).bind(
+      dispatchMarkerKey(parentTaskId),
+      parentTaskId,
+      verdict,
+      reviewTimestamp ?? null,
+      reviewNote ?? null,
+      childTaskId,
+      DISPATCH_STATE_PENDING,
+      nowIso,
+      nowIso
+    ).run();
+    const changes = res && res.meta ? Number(res.meta.changes) || 0 : 0;
+    return changes > 0 ? { status: "claimed", claimed: true } : { status: "duplicate", claimed: false };
+  } catch {
+    return { status: "unavailable", claimed: false };
+  }
+}
+__name(claimDispatchMarker, "claimDispatchMarker");
+__name2(claimDispatchMarker, "claimDispatchMarker");
+async function finalizeDispatchMarker(env, parentTaskId, patch) {
+  if (!env.ASSET_DB) return;
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  try {
+    await env.ASSET_DB.prepare(
+      "UPDATE task_dispatch_markers SET dispatch_state = ?, dispatch_status = ?, github_http_status = ?, github_request_id = ?, dispatched_at = ?, updated_at = ? WHERE dispatch_key = ?"
+    ).bind(
+      patch.state,
+      patch.dispatchStatus ?? null,
+      patch.httpStatus ?? null,
+      patch.requestId ?? null,
+      patch.dispatchedAt ?? null,
+      nowIso,
+      dispatchMarkerKey(parentTaskId)
+    ).run();
+  } catch {
+  }
+}
+__name(finalizeDispatchMarker, "finalizeDispatchMarker");
+__name2(finalizeDispatchMarker, "finalizeDispatchMarker");
+function buildApprovedChildContract(approvedNextTask) {
+  const contract = buildContract(
+    approvedNextTask.goal,
+    approvedNextTask.instructions,
+    approvedNextTask.acceptance,
+    approvedNextTask.expected_files
+  );
+  return { contract, errors: validateContract(contract) };
+}
+__name(buildApprovedChildContract, "buildApprovedChildContract");
+__name2(buildApprovedChildContract, "buildApprovedChildContract");
+async function dispatchApprovedChild(env, parentTaskId, verdict, approvedNextTask, reviewTimestamp, reviewNote) {
+  const base = {
+    parent_task_id: String(parentTaskId),
+    attempted: false,
+    dispatched: false,
+    idempotent: false,
+    child_task_id: null,
+    dispatch_state: null,
+    reason: null
+  };
+  if (verdict !== EXECUTION_STATUS_PASS) return { ...base, reason: DISPATCH_REASON_VERDICT };
+  if (approvedNextTask == null) return { ...base, reason: DISPATCH_REASON_NO_CHILD };
+  if (typeof approvedNextTask !== "object" || Array.isArray(approvedNextTask)) {
+    return {
+      ...base,
+      attempted: true,
+      reason: DISPATCH_REASON_INVALID,
+      errors: ["approved_next_task must be an object"]
+    };
+  }
+  const existing = await readDispatchMarker(env, parentTaskId);
+  if (existing && existing.child_task_id) {
+    return {
+      ...base,
+      idempotent: true,
+      child_task_id: existing.child_task_id,
+      dispatch_state: existing.dispatch_state ?? null,
+      reason: DISPATCH_REASON_ALREADY
+    };
+  }
+  const { contract, errors } = buildApprovedChildContract(approvedNextTask);
+  if (errors.length) {
+    return { ...base, attempted: true, reason: DISPATCH_REASON_INVALID, errors };
+  }
+  const claim = await claimDispatchMarker(
+    env,
+    parentTaskId,
+    contract.task_id,
+    verdict,
+    reviewTimestamp,
+    reviewNote
+  );
+  if (claim.status === "unavailable") {
+    return { ...base, attempted: true, reason: DISPATCH_REASON_UNAVAILABLE };
+  }
+  if (!claim.claimed) {
+    const marker2 = await readDispatchMarker(env, parentTaskId);
+    return {
+      ...base,
+      idempotent: true,
+      child_task_id: marker2 && marker2.child_task_id ? marker2.child_task_id : null,
+      dispatch_state: marker2 && marker2.dispatch_state ? marker2.dispatch_state : null,
+      reason: DISPATCH_REASON_ALREADY
+    };
+  }
+  let dispatch;
+  try {
+    dispatch = await dispatchTask(env, contract);
+  } catch (err2) {
+    await finalizeDispatchMarker(env, parentTaskId, {
+      state: DISPATCH_STATE_FAILED,
+      dispatchStatus: "network_error"
+    });
+    return {
+      ...base,
+      attempted: true,
+      child_task_id: contract.task_id,
+      dispatch_state: DISPATCH_STATE_FAILED,
+      reason: DISPATCH_REASON_FAILED,
+      error: safeGithubResponseBody(err2?.message || "request failed")
+    };
+  }
+  if (!dispatch.ok) {
+    await finalizeDispatchMarker(env, parentTaskId, {
+      state: DISPATCH_STATE_FAILED,
+      dispatchStatus: "github_rejected",
+      httpStatus: dispatch.status,
+      requestId: dispatch.requestId
+    });
+    return {
+      ...base,
+      attempted: true,
+      child_task_id: contract.task_id,
+      dispatch_state: DISPATCH_STATE_FAILED,
+      reason: DISPATCH_REASON_FAILED,
+      dispatch_status: "github_rejected",
+      github_http_status: dispatch.status,
+      github_request_id: dispatch.requestId
+    };
+  }
+  const dispatchedAt = (/* @__PURE__ */ new Date()).toISOString();
+  await finalizeDispatchMarker(env, parentTaskId, {
+    state: DISPATCH_STATE_DISPATCHED,
+    dispatchStatus: "accepted",
+    httpStatus: dispatch.status,
+    requestId: dispatch.requestId,
+    dispatchedAt
+  });
+  try {
+    await recordTask(env, contract);
+  } catch {
+  }
+  return {
+    ...base,
+    attempted: true,
+    dispatched: true,
+    child_task_id: contract.task_id,
+    dispatch_state: DISPATCH_STATE_DISPATCHED,
+    reason: DISPATCH_REASON_DISPATCHED,
+    dispatch_status: "accepted",
+    github_http_status: dispatch.status,
+    github_request_id: dispatch.requestId,
+    dispatched_at: dispatchedAt
+  };
+}
+__name(dispatchApprovedChild, "dispatchApprovedChild");
+__name2(dispatchApprovedChild, "dispatchApprovedChild");
+function reviewDispatchAudit(taskId, verdict, timestamp, dispatch) {
+  return {
+    parent_task_id: String(taskId),
+    child_task_id: dispatch.child_task_id ?? null,
+    dispatch_state: dispatch.dispatch_state ?? null,
+    dispatch_status: dispatch.dispatch_status ?? null,
+    dispatched_at: dispatch.dispatched_at ?? null,
+    review_verdict: verdict,
+    review_timestamp: timestamp ?? null,
+    reason: dispatch.reason ?? null
+  };
+}
+__name(reviewDispatchAudit, "reviewDispatchAudit");
+__name2(reviewDispatchAudit, "reviewDispatchAudit");
 async function findArtifact(env, name) {
   const res = await fetch(
     `${API}/repos/${env.GITHUB_REPO}/actions/artifacts?name=${encodeURIComponent(name)}`,
@@ -1201,6 +1416,7 @@ async function toolMarkReviewed(env, args) {
   const taskId = String(args.task_id ?? "").trim();
   const verdict = String(args.verdict ?? "").trim().toUpperCase();
   const note = args.note == null ? null : String(args.note);
+  const approvedNextTask = args.approved_next_task == null ? null : args.approved_next_task;
   if (!taskId) return { isError: true, text: "INVALID_INPUT: task_id required" };
   if (!REVIEW_VERDICTS.includes(verdict)) {
     return { isError: true, text: `INVALID_INPUT: verdict must be one of ${REVIEW_VERDICTS.join(", ")}` };
@@ -1210,6 +1426,19 @@ async function toolMarkReviewed(env, args) {
   if (task.reviewed === true) {
     const recorded = task.review_verdict ?? task.verdict;
     if (recorded === verdict) {
+      const replayDispatch = await dispatchApprovedChild(
+        env,
+        taskId,
+        verdict,
+        approvedNextTask,
+        task.reviewed_at ?? null,
+        task.review_note ?? null
+      );
+      if (replayDispatch.child_task_id && !task.review_dispatch) {
+        task.review_dispatch = reviewDispatchAudit(taskId, verdict, task.reviewed_at ?? null, replayDispatch);
+        task.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+        await saveTask(env, task);
+      }
       const result2 = {
         task_id: taskId,
         reviewed: true,
@@ -1217,6 +1446,7 @@ async function toolMarkReviewed(env, args) {
         review_verdict: verdict,
         execution_status: task.normalized_status ?? task.execution_status ?? task.status,
         review_event: task.review_event ?? null,
+        child_dispatch: replayDispatch,
         idempotent: true
       };
       return { isError: false, text: JSON.stringify(result2), structuredContent: result2 };
@@ -1253,6 +1483,19 @@ async function toolMarkReviewed(env, args) {
     updated_at: timestamp
   };
   await saveTask(env, updated);
+  const childDispatch = await dispatchApprovedChild(
+    env,
+    taskId,
+    verdict,
+    approvedNextTask,
+    timestamp,
+    note
+  );
+  if (childDispatch.child_task_id) {
+    updated.review_dispatch = reviewDispatchAudit(taskId, verdict, timestamp, childDispatch);
+    updated.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+    await saveTask(env, updated);
+  }
   const result = {
     task_id: taskId,
     reviewed: true,
@@ -1261,6 +1504,7 @@ async function toolMarkReviewed(env, args) {
     execution_status: executionStatus,
     reviewed_at: timestamp,
     review_event: reviewEvent,
+    child_dispatch: childDispatch,
     idempotent: false
   };
   return { isError: false, text: JSON.stringify(result), structuredContent: result };
@@ -1788,13 +2032,23 @@ var TOOLS = [
   },
   {
     name: "mark_reviewed",
-    description: "Record a review verdict for a completed task and close its pending review state.",
+    description: "Record a review verdict for a completed task and close its pending review state. On an authoritative terminal PASS, an explicit pre-authorized approved_next_task may be dispatched exactly once as a child gpt_task; the worker never invents next work.",
     inputSchema: {
       type: "object",
       properties: {
         task_id: { type: "string" },
         verdict: { type: "string", enum: REVIEW_VERDICTS },
-        note: { type: ["string", "null"] }
+        note: { type: ["string", "null"] },
+        approved_next_task: {
+          type: ["object", "null"],
+          properties: {
+            goal: { type: "string" },
+            instructions: { type: "array", items: { type: "string" } },
+            acceptance: { type: "array", items: { type: "string" } },
+            expected_files: { type: "array", items: { type: "string" } }
+          },
+          required: ["goal", "instructions", "acceptance"]
+        }
       },
       required: ["task_id", "verdict"]
     },
@@ -1806,6 +2060,7 @@ var TOOLS = [
         verdict: { type: "string", enum: REVIEW_VERDICTS },
         reviewed_at: { type: "string" },
         review_event: { type: ["object", "null"] },
+        child_dispatch: { type: ["object", "null"] },
         idempotent: { type: "boolean" }
       },
       additionalProperties: true
