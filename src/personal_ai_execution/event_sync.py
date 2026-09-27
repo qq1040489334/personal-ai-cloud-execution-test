@@ -25,6 +25,7 @@ from typing import Any, Mapping
 from . import reconciliation as _reconciliation
 from . import result_normalization as _normalization
 from . import review_assistant as _review_assistant
+from . import status_contract as _status_contract
 
 REVIEW_ACTION = "review"
 REVIEW_VERDICTS = ("PASS", "FAIL", "BLOCKED")
@@ -243,18 +244,105 @@ class EventSyncRegistry:
                 record.setdefault(key, value)
         return dict(record)
 
+    def _result_payload(
+        self, record: Mapping[str, Any], payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Return a payload that keeps execution status and review separate.
+
+        ``status`` / ``normalized_status`` / ``execution_status`` always carry
+        the execution state; ``review_verdict`` carries the human verdict (or
+        ``None``). The two are never merged.
+        """
+        result = dict(payload)
+        result.setdefault("normalized_status", result.get("status"))
+        result["execution_status"] = result.get("status")
+        result["task_id"] = record.get("task_id")
+        result["review_verdict"] = record.get("review_verdict")
+        result["review_state"] = record.get("review_state")
+        return result
+
+    def _store_canonical_result(
+        self, record: dict[str, Any], canonical: Mapping[str, Any]
+    ) -> None:
+        """Write an authoritative terminal execution state back to ``record``.
+
+        This is the single write-back used by EVENT_SYNC and by result discovery
+        so the Task Registry can never stay stale as ``submitted`` after a
+        terminal workflow result is known. It never touches review state other
+        than to keep an already-recorded verdict.
+        """
+        record["status"] = canonical["status"]
+        record["normalized_status"] = canonical["status"]
+        record["workflow_conclusion"] = canonical["workflow_conclusion"]
+        record["terminal"] = bool(canonical["terminal"])
+        record["result_available"] = True
+        record["requires_review"] = True
+        record["synced"] = True
+        record["sync_fingerprint"] = "|".join(
+            (str(canonical["status"]), str(canonical["workflow_conclusion"]))
+        )
+        if record.get("reviewed"):
+            record["review_state"] = REVIEWED_STATE
+        else:
+            record["review_state"] = PENDING_REVIEW
+        evidence = dict(record.get("evidence") or {})
+        evidence.update(
+            {
+                "workflow_conclusion": canonical["workflow_conclusion"],
+                "normalized_status": canonical["status"],
+                "conclusion_authoritative": canonical["conclusion_authoritative"],
+                "conclusion_result_mismatch": canonical["conclusion_result_mismatch"],
+                "task_result": dict(canonical),
+                "reason": canonical["reason"],
+            }
+        )
+        record["evidence"] = evidence
+
     def get_task_result(self, task_id: str) -> dict[str, Any]:
-        """Return the stored workflow-authoritative task result payload."""
+        """Return the stored workflow-authoritative task result payload.
+
+        Reading a task whose workflow conclusion is known also writes the
+        synchronized terminal execution state back onto the registry record, so
+        discovery through :meth:`get_task_result` cannot leave the registry stale
+        as ``submitted``. A task with no authoritative conclusion yet is reported
+        as the non-terminal ``PENDING`` execution status.
+        """
         record = self._tasks.get(str(task_id))
         if record is None:
             raise KeyError(f"unknown task_id: {task_id}")
+        execution_result = record.get("execution_result_json")
+        conclusion = record.get("workflow_conclusion")
+        if conclusion is None:
+            conclusion = _normalization.workflow_conclusion(execution_result)
+        if conclusion is not None:
+            # Re-derive from the authoritative conclusion so the overall status
+            # can never disagree with a (possibly updated) workflow conclusion.
+            canonical = _normalization.get_task_result(
+                str(task_id), execution_result, conclusion
+            )
+            self._store_canonical_result(record, canonical)
+            return self._result_payload(record, canonical)
         payload = (record.get("evidence") or {}).get("task_result")
         if isinstance(payload, Mapping):
-            return dict(payload)
-        return _normalization.get_task_result(
-            str(task_id),
-            record.get("execution_result_json"),
-            record.get("workflow_conclusion"),
+            # Discovered / reconciled result that carries no workflow
+            # conclusion of its own.
+            return self._result_payload(record, payload)
+        lifecycle = _status_contract.normalize_lifecycle_status(record.get("status"))
+        return self._result_payload(
+            record,
+            {
+                "task_id": str(task_id),
+                "status": lifecycle,
+                "workflow_conclusion": None,
+                "conclusion_authoritative": False,
+                "conclusion_result_mismatch": False,
+                "missing_expected_files": [],
+                "terminal": False,
+                "reason": (
+                    "no authoritative workflow conclusion recorded; task is "
+                    "not terminal"
+                ),
+            },
         )
 
     def list_pending_results(self) -> list[dict[str, Any]]:
@@ -527,6 +615,13 @@ class EventSyncRegistry:
         elif classification == _reconciliation.BLOCKED_AWAITING_INSPECTION:
             record["requires_inspection"] = True
             record["review_state"] = _reconciliation.BLOCKED_AWAITING_INSPECTION
+            if assessment.get("ambiguous"):
+                record["ambiguous"] = True
+                ambiguous_result = assessment.get("execution_result")
+                if isinstance(ambiguous_result, Mapping) and record.get(
+                    "execution_result_json"
+                ) is None:
+                    record["execution_result_json"] = dict(ambiguous_result)
         elif classification == _reconciliation.LEGACY_ORPHAN:
             record["requires_inspection"] = True
             record["orphaned"] = True
@@ -626,34 +721,17 @@ class EventSyncRegistry:
             record.get("synced") and record.get("sync_fingerprint") == fingerprint
         )
 
-        record["status"] = canonical["status"]
-        record["normalized_status"] = canonical["status"]
-        record["workflow_conclusion"] = canonical["workflow_conclusion"]
-        record["terminal"] = True
-        record["result_available"] = True
-        record["requires_review"] = True
-        record["synced"] = True
-        record["sync_fingerprint"] = fingerprint
+        self._store_canonical_result(record, canonical)
         if isinstance(execution_result, Mapping) and record.get(
             "execution_result_json"
         ) is None:
             record["execution_result_json"] = dict(execution_result)
-        if record.get("reviewed"):
-            record["review_state"] = REVIEWED_STATE
-        else:
-            record["review_state"] = PENDING_REVIEW
 
         stored_evidence = dict(record.get("evidence") or {})
         stored_evidence.update(
             {
                 "artifact_present": bool(artifact_present),
                 "commit_present": bool(commit_present),
-                "workflow_conclusion": canonical["workflow_conclusion"],
-                "normalized_status": canonical["status"],
-                "conclusion_authoritative": canonical["conclusion_authoritative"],
-                "conclusion_result_mismatch": canonical["conclusion_result_mismatch"],
-                "task_result": canonical,
-                "reason": canonical["reason"],
             }
         )
         if isinstance(evidence, Mapping):
@@ -679,11 +757,13 @@ class EventSyncRegistry:
             "duplicate": already,
             "status": canonical["status"],
             "normalized_status": canonical["status"],
+            "execution_status": canonical["status"],
             "workflow_conclusion": canonical["workflow_conclusion"],
             "terminal": True,
             "review_state": record["review_state"],
             "requires_review": record["requires_review"],
             "reviewed": record["reviewed"],
+            "review_verdict": record.get("review_verdict"),
             "sync_event": event,
             "task_result": canonical,
             "reason": canonical["reason"],

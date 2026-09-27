@@ -24,6 +24,12 @@ Four legacy destinations are distinguished:
 
 Records that are already EVENT_SYNC owned (``synced``), already reviewed, or too
 recent to judge are reported but left untouched.
+
+Fail-closed ambiguity rule: a legacy record whose only evidence is a *stored*
+self-reported ``execution_result.json`` with no authoritative workflow
+conclusion is ambiguous. Being artifact content, that self-report can never
+upgrade the record to a terminal success; the record is surfaced as
+``blocked_awaiting_inspection`` (``ambiguous = True``) for a human instead.
 """
 
 from __future__ import annotations
@@ -152,16 +158,18 @@ def classify_record(
             "terminal": bool(record.get("terminal")),
         }
 
-    result = execution_result
-    if result is None:
-        result = record.get("execution_result_json")
+    discovered_result = execution_result
+    stored_result = record.get("execution_result_json")
     resolved_conclusion = conclusion
     if resolved_conclusion is None:
         resolved_conclusion = record.get("workflow_conclusion")
 
-    if result is not None or resolved_conclusion is not None:
+    if resolved_conclusion is not None:
+        evidence = discovered_result
+        if evidence is None:
+            evidence = stored_result
         task_result = _normalization.get_task_result(
-            str(record.get("task_id")), result, resolved_conclusion
+            str(record.get("task_id")), evidence, resolved_conclusion
         )
         classification = _class_for_status(task_result["status"])
         return {
@@ -171,7 +179,22 @@ def classify_record(
             "status": task_result["status"],
             "workflow_conclusion": task_result["workflow_conclusion"],
             "task_result": task_result,
-            "execution_result": result,
+            "execution_result": evidence,
+        }
+
+    if discovered_result is not None:
+        task_result = _normalization.get_task_result(
+            str(record.get("task_id")), discovered_result, None
+        )
+        classification = _class_for_status(task_result["status"])
+        return {
+            "classification": classification,
+            "has_result": True,
+            "terminal": True,
+            "status": task_result["status"],
+            "workflow_conclusion": task_result["workflow_conclusion"],
+            "task_result": task_result,
+            "execution_result": discovered_result,
         }
 
     if record.get("normalized_status"):
@@ -181,6 +204,19 @@ def classify_record(
             "has_result": bool(record.get("result_available")),
             "terminal": bool(record.get("terminal")),
             "status": record.get("normalized_status"),
+        }
+
+    if stored_result is not None:
+        # Fail-closed: a stored legacy self-report without an authoritative
+        # workflow conclusion is ambiguous. It is surfaced for inspection and is
+        # never upgraded to a terminal success.
+        return {
+            "classification": BLOCKED_AWAITING_INSPECTION,
+            "has_result": False,
+            "terminal": False,
+            "status": _normalization.BLOCKED,
+            "ambiguous": True,
+            "execution_result": stored_result,
         }
 
     advisory = str(record.get("status") or "").strip().lower()

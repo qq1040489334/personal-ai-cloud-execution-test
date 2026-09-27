@@ -249,6 +249,9 @@ def test_reconciliation_preserves_original_evidence_and_commits() -> None:
         "status": "passed",
         "commit": "deadbeef",
     }
+    # An authoritative workflow conclusion is required before a legacy record
+    # can be promoted to a terminal execution status.
+    registry._tasks["cf-evidence"]["workflow_conclusion"] = "success"
 
     registry.reconcile_historical_tasks()
 
@@ -257,6 +260,26 @@ def test_reconciliation_preserves_original_evidence_and_commits() -> None:
     assert record["execution_result_json"]["commit"] == "deadbeef"
     assert record["evidence"]["task_result"]["status"] == PASS
     assert record["reconciled"] is True
+
+
+def test_reconciliation_does_not_upgrade_ambiguous_stored_self_report() -> None:
+    registry = EventSyncRegistry()
+    legacy_task(registry, "cf-ambiguous")
+    registry._tasks["cf-ambiguous"]["execution_result_json"] = {
+        "status": "passed",
+        "tests": "3 passed",
+    }
+
+    report = registry.reconcile_historical_tasks()
+
+    assert report["counts"][BLOCKED_AWAITING_INSPECTION] == 1
+    assert registry.list_pending_results() == []
+    record = registry._tasks["cf-ambiguous"]
+    assert record["terminal"] is False
+    assert record["result_available"] is False
+    assert record["ambiguous"] is True
+    assert record["review_state"] == BLOCKED_AWAITING_INSPECTION
+    assert "task_result" not in record["evidence"]
 
 
 def test_reconciled_record_keeps_contract_operations() -> None:

@@ -485,6 +485,56 @@ __name2(unzipSync, "unzipSync");
 var API = "https://api.github.com";
 var EVENT_TYPE = "gpt_task";
 var RESULT_FILENAME = "execution_result.json";
+var EXECUTION_STATUS_PENDING = "PENDING";
+var EXECUTION_STATUS_PASS = "PASS";
+var EXECUTION_STATUS_FAIL = "FAIL";
+var EXECUTION_STATUS_BLOCKED = "BLOCKED";
+var EXECUTION_STATUSES = [
+  EXECUTION_STATUS_PENDING,
+  EXECUTION_STATUS_PASS,
+  EXECUTION_STATUS_FAIL,
+  EXECUTION_STATUS_BLOCKED
+];
+var TERMINAL_EXECUTION_STATUSES = [
+  EXECUTION_STATUS_PASS,
+  EXECUTION_STATUS_FAIL,
+  EXECUTION_STATUS_BLOCKED
+];
+var REVIEW_VERDICTS_CANONICAL = [
+  EXECUTION_STATUS_PASS,
+  EXECUTION_STATUS_FAIL,
+  EXECUTION_STATUS_BLOCKED
+];
+var WORKFLOW_CONCLUSION_STATUS = {
+  success: "PASS",
+  failure: "FAIL",
+  startup_failure: "FAIL",
+  error: "FAIL",
+  cancelled: "BLOCKED",
+  canceled: "BLOCKED",
+  timed_out: "BLOCKED",
+  action_required: "BLOCKED",
+  stale: "BLOCKED",
+  neutral: "BLOCKED",
+  skipped: "BLOCKED"
+};
+var SELF_REPORTED_FAILURE_STATUSES = [
+  "failure",
+  "failed",
+  "fail",
+  "error",
+  "errored",
+  "timed_out"
+];
+var SELF_REPORTED_SUCCESS_STATUSES = [
+  "success",
+  "succeeded",
+  "pass",
+  "passed",
+  "ok",
+  "complete",
+  "completed"
+];
 var PROTOCOL_VERSION = "2025-06-18";
 var ACCESS_TTL = 3600;
 var REFRESH_TTL = 60 * 60 * 24 * 30;
@@ -968,11 +1018,26 @@ async function getArtifactWorkflowRun(env, artifact) {
 }
 __name(getArtifactWorkflowRun, "getArtifactWorkflowRun");
 __name2(getArtifactWorkflowRun, "getArtifactWorkflowRun");
+function canonicalWorkflowStatus(conclusion) {
+  const key = String(conclusion == null ? "" : conclusion).trim().toLowerCase();
+  return WORKFLOW_CONCLUSION_STATUS[key] || EXECUTION_STATUS_BLOCKED;
+}
+__name(canonicalWorkflowStatus, "canonicalWorkflowStatus");
+__name2(canonicalWorkflowStatus, "canonicalWorkflowStatus");
+function normalizeSelfReportedStatus(rawStatus) {
+  const text = String(rawStatus == null ? "" : rawStatus).trim().toLowerCase();
+  if (SELF_REPORTED_FAILURE_STATUSES.includes(text)) return EXECUTION_STATUS_FAIL;
+  if (SELF_REPORTED_SUCCESS_STATUSES.includes(text)) return EXECUTION_STATUS_PASS;
+  return EXECUTION_STATUS_BLOCKED;
+}
+__name(normalizeSelfReportedStatus, "normalizeSelfReportedStatus");
+__name2(normalizeSelfReportedStatus, "normalizeSelfReportedStatus");
 function verifiedResultStatus(rawStatus, run) {
-  if (run.status !== "completed") return "pending";
-  if (run.conclusion === "cancelled") return "cancelled";
-  if (run.conclusion !== "success") return "failure";
-  return rawStatus || "unknown";
+  if (!run || run.status !== "completed") return EXECUTION_STATUS_PENDING;
+  const canonical = canonicalWorkflowStatus(run.conclusion);
+  if (canonical !== EXECUTION_STATUS_PASS) return canonical;
+  const self = normalizeSelfReportedStatus(rawStatus);
+  return self === EXECUTION_STATUS_FAIL ? EXECUTION_STATUS_FAIL : EXECUTION_STATUS_PASS;
 }
 __name(verifiedResultStatus, "verifiedResultStatus");
 __name2(verifiedResultStatus, "verifiedResultStatus");
@@ -987,12 +1052,17 @@ async function recordTask(env, contract) {
   if (!env.TASK_REGISTRY) return;
   const nowIso = (/* @__PURE__ */ new Date()).toISOString();
   const meta = {
-    status: "submitted",
+    status: EXECUTION_STATUS_PENDING,
+    normalized_status: null,
+    execution_status: EXECUTION_STATUS_PENDING,
+    terminal: false,
+    workflow_conclusion: null,
     title: String(contract.goal || "").slice(0, 120),
     created_at: nowIso,
     updated_at: nowIso,
     result_available: false,
-    reviewed: false
+    reviewed: false,
+    review_verdict: null
   };
   await env.TASK_REGISTRY.put(regKey(contract.task_id), JSON.stringify({ task_id: contract.task_id, ...meta }), {
     metadata: meta
@@ -1020,6 +1090,17 @@ async function readTask(env, taskId) {
 }
 __name(readTask, "readTask");
 __name2(readTask, "readTask");
+async function persistTerminalExecution(env, taskId, patch) {
+  if (!env.TASK_REGISTRY) return;
+  try {
+    const current = await readTask(env, taskId) || { task_id: taskId };
+    const updated = { ...current, ...patch, task_id: taskId };
+    await saveTask(env, updated);
+  } catch {
+  }
+}
+__name(persistTerminalExecution, "persistTerminalExecution");
+__name2(persistTerminalExecution, "persistTerminalExecution");
 async function listPendingResults(env) {
   const tasks = await listTasks(env);
   const now = Date.now();
@@ -1028,10 +1109,11 @@ async function listPendingResults(env) {
   const failed = [];
   const blocked = [];
   for (const task of tasks) {
-    let status = task.status || "submitted";
+    let status = task.normalized_status || task.status || EXECUTION_STATUS_PENDING;
     let resultAvailable = Boolean(task.result_available);
     let updatedAt = task.updated_at || task.created_at || "";
     let completedAt = task.completed_at || "";
+    let workflowConclusion = task.workflow_conclusion || null;
     if (!resultAvailable || !task.workflow_verified) {
       try {
         const artifact = await findArtifact(env, `execution_result-${task.task_id}`);
@@ -1039,33 +1121,40 @@ async function listPendingResults(env) {
           const data = await downloadArtifactJson(env, artifact.id);
           const run = await getArtifactWorkflowRun(env, artifact);
           status = verifiedResultStatus(data.status, run);
+          workflowConclusion = run.conclusion ?? null;
           resultAvailable = run.status === "completed";
           updatedAt = run.updated_at || updatedAt;
           completedAt = run.completed_at || (resultAvailable ? updatedAt : "");
         } else if (task.result_available) {
-          status = "unknown";
+          status = EXECUTION_STATUS_PENDING;
           resultAvailable = false;
         }
       } catch {
-        status = task.result_available ? "unknown" : "submitted";
+        status = task.result_available ? EXECUTION_STATUS_PENDING : task.status || EXECUTION_STATUS_PENDING;
         resultAvailable = false;
       }
     }
+    const terminal = resultAvailable && TERMINAL_EXECUTION_STATUSES.includes(status);
     const entry = {
       task_id: task.task_id,
       status,
+      normalized_status: status,
+      execution_status: status,
+      workflow_conclusion: workflowConclusion,
+      terminal,
       title: task.title || "",
       updated_at: updatedAt,
       completed_at: completedAt,
       result_available: resultAvailable,
       reviewed: task.reviewed === true,
+      review_verdict: task.review_verdict ?? null,
       requires_review: resultAvailable && task.reviewed !== true,
       recommended_action: resultAvailable ? "review" : "wait"
     };
     if (resultAvailable && task.reviewed !== true) {
       pending.push(entry);
       pending_review.push(entry);
-      if (status === "failure") failed.push(entry);
+      if (status === EXECUTION_STATUS_FAIL) failed.push(entry);
     } else {
       if (!resultAvailable) {
         const created = Date.parse(task.created_at || "") || now;
@@ -1074,6 +1163,20 @@ async function listPendingResults(env) {
           blocked.push(entry);
         }
       }
+    }
+    if (terminal) {
+      await persistTerminalExecution(env, task.task_id, {
+        status,
+        normalized_status: status,
+        execution_status: status,
+        terminal: true,
+        result_available: true,
+        workflow_conclusion: workflowConclusion,
+        workflow_verified: true,
+        completed_at: completedAt || updatedAt || (/* @__PURE__ */ new Date()).toISOString(),
+        synced: true,
+        updated_at: updatedAt || (/* @__PURE__ */ new Date()).toISOString()
+      });
     }
   }
   return {
@@ -1105,17 +1208,30 @@ async function toolMarkReviewed(env, args) {
   const task = await readTask(env, taskId);
   if (!task) return { isError: true, text: `UNKNOWN_TASK: ${taskId}` };
   if (task.reviewed === true) {
-    if (task.verdict === verdict) {
+    const recorded = task.review_verdict ?? task.verdict;
+    if (recorded === verdict) {
       const result2 = {
         task_id: taskId,
         reviewed: true,
         verdict,
+        review_verdict: verdict,
+        execution_status: task.normalized_status ?? task.execution_status ?? task.status,
         review_event: task.review_event ?? null,
         idempotent: true
       };
       return { isError: false, text: JSON.stringify(result2), structuredContent: result2 };
     }
-    return { isError: true, text: `REVIEW_ALREADY_RECORDED: ${task.verdict || "UNKNOWN"}` };
+    return { isError: true, text: `REVIEW_ALREADY_RECORDED: ${recorded || "UNKNOWN"}` };
+  }
+  const executionStatus = String(
+    task.normalized_status ?? task.execution_status ?? task.status ?? ""
+  ).trim().toUpperCase();
+  const terminal = task.terminal === true || (task.result_available === true && TERMINAL_EXECUTION_STATUSES.includes(executionStatus));
+  if (!terminal || !TERMINAL_EXECUTION_STATUSES.includes(executionStatus)) {
+    return { isError: true, text: `NOT_REVIEWABLE: NON_TERMINAL (${executionStatus || "UNKNOWN"})` };
+  }
+  if (task.result_available !== true) {
+    return { isError: true, text: "NOT_REVIEWABLE: RESULT_UNAVAILABLE" };
   }
   const timestamp = (/* @__PURE__ */ new Date()).toISOString();
   const reviewEvent = {
@@ -1123,12 +1239,14 @@ async function toolMarkReviewed(env, args) {
     action: "review",
     verdict,
     timestamp,
-    note
+    note,
+    execution_status: executionStatus
   };
   const updated = {
     ...task,
     reviewed: true,
     verdict,
+    review_verdict: verdict,
     reviewed_at: timestamp,
     review_note: note,
     review_event: reviewEvent,
@@ -1139,6 +1257,8 @@ async function toolMarkReviewed(env, args) {
     task_id: taskId,
     reviewed: true,
     verdict,
+    review_verdict: verdict,
+    execution_status: executionStatus,
     reviewed_at: timestamp,
     review_event: reviewEvent,
     idempotent: false
@@ -1189,7 +1309,8 @@ async function toolSubmitTask(env, args) {
     isError: false,
     text: JSON.stringify({
       task_id: contract.task_id,
-      status: "submitted",
+      status: EXECUTION_STATUS_PENDING,
+      submitted: true,
       round: 1,
       dispatch_status: "accepted",
       github_http_status: dispatch.status,
@@ -1211,9 +1332,15 @@ __name(toolListPendingResults, "toolListPendingResults");
 __name2(toolListPendingResults, "toolListPendingResults");
 function buildTaskResult(taskId, data, artifact, run) {
   const raw = data && typeof data === "object" && !Array.isArray(data) ? data : {};
+  const executionStatus = data ? verifiedResultStatus(raw.status, run) : EXECUTION_STATUS_PENDING;
   const result = {
     task_id: taskId,
-    status: data ? verifiedResultStatus(raw.status, run) : "pending",
+    status: executionStatus,
+    normalized_status: executionStatus,
+    execution_status: executionStatus,
+    terminal: TERMINAL_EXECUTION_STATUSES.includes(executionStatus),
+    workflow_conclusion: run ? run.conclusion ?? null : null,
+    review_verdict: null,
     round: raw.round ?? 1,
     execution_summary: raw.execution_summary ?? raw.summary ?? "",
     commit: raw.commit ?? "",
@@ -1241,6 +1368,36 @@ function buildTaskResult(taskId, data, artifact, run) {
 }
 __name(buildTaskResult, "buildTaskResult");
 __name2(buildTaskResult, "buildTaskResult");
+async function finalizeTaskResult(env, taskId, result) {
+  let registry = null;
+  if (env.TASK_REGISTRY) {
+    try {
+      registry = await readTask(env, taskId);
+    } catch {
+      registry = null;
+    }
+  }
+  if (registry) {
+    result.review_verdict = registry.review_verdict ?? registry.verdict ?? null;
+    result.review_state = registry.review_state ?? (registry.reviewed === true ? "reviewed" : null);
+  }
+  if (result.terminal && TERMINAL_EXECUTION_STATUSES.includes(result.status)) {
+    await persistTerminalExecution(env, taskId, {
+      status: result.status,
+      normalized_status: result.status,
+      execution_status: result.status,
+      terminal: true,
+      result_available: true,
+      workflow_conclusion: result.workflow_conclusion ?? null,
+      workflow_verified: true,
+      synced: true,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    });
+  }
+  return result;
+}
+__name(finalizeTaskResult, "finalizeTaskResult");
+__name2(finalizeTaskResult, "finalizeTaskResult");
 async function toolGetTaskResult(env, args) {
   const taskId = String(args.task_id ?? "");
   if (!taskId) return { isError: true, text: "INVALID_INPUT: task_id required" };
@@ -1251,7 +1408,7 @@ async function toolGetTaskResult(env, args) {
     return { isError: true, text: `GITHUB_READ_FAILED: ${err2.message}` };
   }
   if (!artifact) {
-    const result2 = buildTaskResult(taskId, null, null);
+    const result2 = await finalizeTaskResult(env, taskId, buildTaskResult(taskId, null, null));
     return { isError: false, text: JSON.stringify(result2), structuredContent: result2 };
   }
   let data;
@@ -1267,7 +1424,7 @@ async function toolGetTaskResult(env, args) {
   } catch (err2) {
     return { isError: true, text: `GITHUB_READ_FAILED: ${err2.message}` };
   }
-  const result = buildTaskResult(taskId, data, artifact, run);
+  const result = await finalizeTaskResult(env, taskId, buildTaskResult(taskId, data, artifact, run));
   return { isError: false, text: JSON.stringify(result), structuredContent: result };
 }
 __name(toolGetTaskResult, "toolGetTaskResult");
