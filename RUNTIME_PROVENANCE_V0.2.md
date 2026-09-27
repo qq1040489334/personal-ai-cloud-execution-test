@@ -2,7 +2,7 @@
 
 - goal: PERSONAL_AI_RUNTIME_PROVENANCE_V0.2
 - task_id: cf-883c3502ff24
-- generated_at: 2026-09-27T01:32:31.517542+00:00
+- generated_at: 2026-09-27T01:47:04.735443+00:00
 - read_only: True
 - production_mutated: False
 - live_endpoint_checked: False
@@ -40,6 +40,7 @@
 - 6a0c740858a8 after_baseline=False | chore: recover production execution worker baseline: repository presence alone is not deployment evidence; no deployment record ties this source commit to the declared production version 3e2fed43
 
 ## Execution-relevant commits not proven deployed
+- dbbbbd13ada2 worker=False workflow=False tracked_task_commit=False | cloud agent: gpt task
 - 592e7c29af4a worker=True workflow=False tracked_task_commit=True | cloud agent: gpt task
 - 824bd4c41555 worker=False workflow=False tracked_task_commit=True | cloud agent: gpt task
 - 0c3ac20392bf worker=True workflow=False tracked_task_commit=True | cloud agent: gpt task
@@ -60,7 +61,7 @@
 - [PASS] canonical source present: canonical source present: worker/index.js (sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480, bytes=69392, lines=1931)
 - [BLOCKED] declared production source hash matches a canonical commit: declared production source hash 8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1 matches no canonical worker/index.js commit (4 candidate commits checked); current HEAD source hash is 6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480
 - [BLOCKED] canonical source -> deployed runtime relationship: [UNVERIFIED] declared production source hash 8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1 matches no canonical commit of worker/index.js in the repository history; current HEAD source hash is 6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480; the deployed runtime is not traceable to a canonical source commit
-- [BLOCKED] execution-relevant commits proven deployed: 13 execution-relevant commit(s) after the recovered baseline are not proven deployed (source presence != deployment)
+- [BLOCKED] execution-relevant commits proven deployed: 14 execution-relevant commit(s) after the recovered baseline are not proven deployed (source presence != deployment)
 - [PASS] no production mutation: read-only audit: no deploy, upload, secret change, D1/KV mutation, workflow mutation or asset mutation performed
 
 ## Verdict

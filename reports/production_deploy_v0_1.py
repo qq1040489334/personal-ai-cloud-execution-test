@@ -311,9 +311,10 @@ def build_report() -> dict[str, Any]:
         _gate(
             "canonical source identified and hashed",
             PASS if ev["source_present"] else FAIL,
-            f"HEAD={ev['head']} source_sha256={ev['source_hash']} "
+            f"source_sha256={ev['source_hash']} "
             f"bytes={ev['source_bytes']} lines={ev['source_lines']} "
-            f"last_source_commit={ev['source_commit']}",
+            f"last_source_commit={ev['source_commit']} "
+            "(preflight HEAD recorded in preflight.canonical_head_commit)",
         ),
         _gate(
             "canonical source matches declared production baseline",
