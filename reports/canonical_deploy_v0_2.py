@@ -383,9 +383,10 @@ def build_report() -> dict[str, Any]:
         _gate(
             "canonical git commit and source hash recorded",
             PASS if ev["source_present"] else FAIL,
-            f"git_commit={ev['head']} source_sha256={ev['source_hash']} "
+            f"source_sha256={ev['source_hash']} "
             f"bytes={ev['source_bytes']} lines={ev['source_lines']} "
-            f"last_source_commit={ev['source_commit']}",
+            f"last_source_commit={ev['source_commit']} "
+            "(canonical HEAD commit recorded in canonical.git_commit)",
         ),
         _gate(
             "module worker syntax (export default fetch)",

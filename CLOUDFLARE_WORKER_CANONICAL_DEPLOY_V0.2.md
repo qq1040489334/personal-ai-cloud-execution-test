@@ -2,14 +2,14 @@
 
 - goal: CLOUDFLARE_WORKER_CANONICAL_DEPLOY_V0.2
 - task_id: cf-0fe692a1235b
-- generated_at: 2026-09-27T06:30:33.926852+00:00
+- generated_at: 2026-09-27T06:35:19.360164+00:00
 - deploy_status: BLOCKED
 - deployment_attempted: False
 - production_mutated: False
 - secrets_exposed: False
 
 ## Canonical source
-- git_commit: cbcdbe306e0aa300d2c36a99bd0cefe4d6631ef6
+- git_commit: 69c08e9d92aa484e420dc259bf6e0ee69d3b4cf9
 - source_file: worker/index.js
 - source_sha256: 6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480
 - source_bytes: 69392 lines: 1931
@@ -42,7 +42,7 @@
 - deployment_timestamp: None
 
 ## Runtime provenance relationship
-- git_commit: cbcdbe306e0aa300d2c36a99bd0cefe4d6631ef6
+- git_commit: 69c08e9d92aa484e420dc259bf6e0ee69d3b4cf9
 - source_sha256: 6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480
 - cloudflare_version_id: None
 - cloudflare_deployment_id: None
@@ -51,7 +51,7 @@
 
 ## Gates
 - [PASS] canonical source present: canonical worker source present: worker/index.js
-- [PASS] canonical git commit and source hash recorded: git_commit=cbcdbe306e0aa300d2c36a99bd0cefe4d6631ef6 source_sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480 bytes=69392 lines=1931 last_source_commit=592e7c29af4a5e72e3ec12bb458538629011896b
+- [PASS] canonical git commit and source hash recorded: source_sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480 bytes=69392 lines=1931 last_source_commit=592e7c29af4a5e72e3ec12bb458538629011896b (canonical HEAD commit recorded in canonical.git_commit)
 - [PASS] module worker syntax (export default fetch): worker/index.js is a Module Worker exporting a default fetch handler; upload uses main_module=index.js
 - [PASS] module upload metadata uses main_module=index.js: metadata.main_module=index.js content_type for the module part is application/javascript+module (multipart/form-data)
 - [PASS] union of preserved binding/secret names matches production set: preserved: ASSET_DB, GITHUB_REPO, GITHUB_TOKEN, MCP_AUTH_TOKEN, OAUTH_SIGNING_KEY, OWNER_PASSWORD, TASK_REGISTRY; secret bindings preserved via keep_bindings=['secret_text']; values never read
