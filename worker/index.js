@@ -1465,8 +1465,214 @@ function parseAssetJson(value) {
 }
 __name(parseAssetJson, "parseAssetJson");
 __name2(parseAssetJson, "parseAssetJson");
+var ASSET_PROVENANCE_CONTRACT = "PERSONAL_AI_ASSET_PROVENANCE_V0.2";
+var PROVENANCE_STATUS_VERIFIED = "VERIFIED";
+var PROVENANCE_STATUS_INCOMPLETE = "INCOMPLETE";
+var PROVENANCE_STATUS_HASH_MISMATCH = "HASH_MISMATCH";
+var PROVENANCE_FIELDS = [
+  "source_identity",
+  "source_location",
+  "source_version",
+  "content_version",
+  "canonical_version",
+  "content_hash",
+  "source_content_hash",
+  "verification_evidence",
+  "promotion_decision",
+  "promotion_event",
+  "captured_at",
+  "promoted_at",
+  "supersedes",
+  "superseded_by"
+];
+var REQUIRED_PROVENANCE_FIELDS = [
+  "source_identity",
+  "source_location",
+  "source_version",
+  "content_version",
+  "canonical_version",
+  "content_hash",
+  "verification_evidence",
+  "promotion_decision",
+  "promotion_event",
+  "captured_at",
+  "promoted_at"
+];
+var PROVENANCE_FIELD_ALIASES = {
+  source_identity: ["source.identity", "source_identity", "source_id", "source.id"],
+  source_location: ["source.location", "source_location", "source_uri", "source.url"],
+  source_version: ["source_version", "source.version", "source_revision"],
+  content_version: ["content_version", "source.content_version", "content_revision"],
+  canonical_version: ["canonical_version", "target_version", "version"],
+  content_hash: ["content_hash", "canonical_content_hash", "hash"],
+  source_content_hash: ["source_content_hash", "source.hash", "source_hash"],
+  verification_evidence: ["verification.evidence", "verification_evidence", "evidence"],
+  promotion_decision: ["promotion.decision", "promotion_decision", "decision"],
+  promotion_event: ["promotion.event_id", "promotion_event", "promotion_event_id", "promotion.id"],
+  captured_at: ["captured_at", "source.captured_at", "source_timestamp"],
+  promoted_at: ["promoted_at", "promotion.decided_at", "promotion.timestamp"],
+  supersedes: ["supersedes", "supersession", "lineage.supersedes"],
+  superseded_by: ["superseded_by", "lineage.superseded_by"]
+};
+var PROVENANCE_VERIFICATION_HASH_KEYS = [
+  "content_hash_matches",
+  "expected_content_hash",
+  "content_hash"
+];
+var PROVENANCE_HASH_PREFIXES = ["sha256:", "sha-256:", "sha256-", "sha-512:", "0x"];
+function provLookup(mapping, path) {
+  let current = mapping;
+  for (const part of path.split(".")) {
+    if (!current || typeof current !== "object" || Array.isArray(current) || !(part in current)) return null;
+    current = current[part];
+  }
+  return current;
+}
+__name(provLookup, "provLookup");
+__name2(provLookup, "provLookup");
+function provMeaningful(value) {
+  if (value === null || value === void 0) return false;
+  if (typeof value === "string") return value.trim().length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
+}
+__name(provMeaningful, "provMeaningful");
+__name2(provMeaningful, "provMeaningful");
+function provResolve(provenance, field) {
+  const aliases = PROVENANCE_FIELD_ALIASES[field] || [];
+  for (const alias of aliases) {
+    const value = provLookup(provenance, alias);
+    if (provMeaningful(value)) return value;
+  }
+  return null;
+}
+__name(provResolve, "provResolve");
+__name2(provResolve, "provResolve");
+function normalizeProvenanceHash(value) {
+  let text = String(value).trim().toLowerCase();
+  for (const prefix of PROVENANCE_HASH_PREFIXES) {
+    if (text.startsWith(prefix)) {
+      text = text.slice(prefix.length);
+      break;
+    }
+  }
+  return text.replace(/\s+/g, "");
+}
+__name(normalizeProvenanceHash, "normalizeProvenanceHash");
+__name2(normalizeProvenanceHash, "normalizeProvenanceHash");
+function provenanceExpectedHashes(provenance, verification) {
+  const expected = [];
+  for (const source of [provLookup(provenance, "verification"), verification]) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) continue;
+    for (const key of ["expected_content_hash", "content_hash"]) {
+      if (provMeaningful(source[key])) expected.push(source[key]);
+    }
+  }
+  return expected;
+}
+__name(provenanceExpectedHashes, "provenanceExpectedHashes");
+__name2(provenanceExpectedHashes, "provenanceExpectedHashes");
+function provenanceExplicitMatch(provenance, verification) {
+  for (const source of [provLookup(provenance, "verification"), verification]) {
+    if (source && typeof source === "object" && !Array.isArray(source) && "content_hash_matches" in source) {
+      return Boolean(source.content_hash_matches);
+    }
+  }
+  return null;
+}
+__name(provenanceExplicitMatch, "provenanceExplicitMatch");
+__name2(provenanceExplicitMatch, "provenanceExplicitMatch");
+function evaluateAssetProvenance(provenance, options) {
+  const opts = options || {};
+  const source = provenance && typeof provenance === "object" && !Array.isArray(provenance) ? provenance : {};
+  const verification = opts.verification;
+  const fields = {};
+  for (const field of PROVENANCE_FIELDS) {
+    fields[field] = provResolve(source, field);
+  }
+  if (fields.canonical_version === null && provMeaningful(opts.canonical_version)) {
+    fields.canonical_version = opts.canonical_version;
+  }
+  if (fields.verification_evidence === null && verification && typeof verification === "object" && !Array.isArray(verification)) {
+    let candidate = verification.evidence;
+    if (!provMeaningful(candidate)) candidate = verification.method;
+    if (provMeaningful(candidate)) {
+      fields.verification_evidence = candidate;
+    } else {
+      const extra = {};
+      for (const [key, value] of Object.entries(verification)) {
+        if (!PROVENANCE_VERIFICATION_HASH_KEYS.includes(key) && provMeaningful(value)) extra[key] = value;
+      }
+      if (Object.keys(extra).length) fields.verification_evidence = extra;
+    }
+  }
+  const missing = REQUIRED_PROVENANCE_FIELDS.filter((field) => fields[field] === null);
+  const declared = fields.content_hash;
+  const expected = provenanceExpectedHashes(source, verification);
+  const stored = provMeaningful(opts.content_hash) ? opts.content_hash : null;
+  const pairs = [];
+  if (declared !== null && stored !== null) pairs.push([declared, stored]);
+  if (declared !== null && expected.length) pairs.push([declared, expected[0]]);
+  if (stored !== null && expected.length) pairs.push([stored, expected[0]]);
+  let hashChecked = false;
+  let hashMatch = null;
+  for (const [left, right] of pairs) {
+    hashChecked = true;
+    if (normalizeProvenanceHash(left) !== normalizeProvenanceHash(right)) {
+      hashMatch = false;
+      break;
+    }
+    if (hashMatch === null) hashMatch = true;
+  }
+  const explicit = provenanceExplicitMatch(source, verification);
+  if (explicit !== null) {
+    hashChecked = true;
+    if (explicit === false) hashMatch = false;
+    else if (hashMatch === null) hashMatch = explicit;
+  }
+  const complete = missing.length === 0;
+  const verified = complete && hashMatch !== false;
+  let supersedes = fields.supersedes;
+  if (Array.isArray(supersedes)) supersedes = supersedes.slice();
+  else if (supersedes === null) supersedes = [];
+  else supersedes = [supersedes];
+  let status;
+  let reason;
+  if (hashMatch === false) {
+    status = PROVENANCE_STATUS_HASH_MISMATCH;
+    reason = "provenance hash mismatch: content_hash does not agree with the recorded verification evidence";
+  } else if (verified) {
+    status = PROVENANCE_STATUS_VERIFIED;
+    reason = "provenance complete: source/version/hash/verification/promotion evidence linked";
+  } else {
+    status = PROVENANCE_STATUS_INCOMPLETE;
+    reason = "provenance incomplete: missing " + missing.join(", ");
+  }
+  return {
+    contract: ASSET_PROVENANCE_CONTRACT,
+    status,
+    complete,
+    verified,
+    missing,
+    fields,
+    hash_checked: hashChecked,
+    hash_match: hashMatch,
+    lineage: { supersedes, superseded_by: fields.superseded_by ?? null },
+    reason
+  };
+}
+__name(evaluateAssetProvenance, "evaluateAssetProvenance");
+__name2(evaluateAssetProvenance, "evaluateAssetProvenance");
 function readAssetMetadata(row) {
   const parsed = parseAssetJson(row.content);
+  const provenance = safeAssetRead(parseAssetJson(row.provenance));
+  const verification = safeAssetRead(parseAssetJson(row.verification));
+  const completeness = evaluateAssetProvenance(provenance, {
+    content_hash: row.content_hash,
+    canonical_version: row.current_version,
+    verification
+  });
   return {
     asset_id: row.asset_id,
     asset_type: row.asset_type,
@@ -1474,7 +1680,13 @@ function readAssetMetadata(row) {
     title: row.title,
     current_version: row.current_version,
     content_hash: row.content_hash,
-    updated_at: row.updated_at
+    updated_at: row.updated_at,
+    provenance_status: completeness.status,
+    provenance_complete: completeness.complete,
+    provenance_verified: completeness.verified,
+    provenance_missing: completeness.missing,
+    provenance: completeness.fields,
+    provenance_lineage: completeness.lineage
   };
 }
 __name(readAssetMetadata, "readAssetMetadata");
@@ -1488,7 +1700,7 @@ async function toolSearchAssets(env, args) {
   const limit = Math.min(Math.max(Number(args.limit) || 20, 1), 100);
   const like = query ? `%${query.replace(/[\\%_]/g, "\\$&")}%` : "%";
   const result = await env.ASSET_DB.prepare(
-    "SELECT asset_id,asset_type,schema_version,title,status,current_version,content_hash,updated_at, (SELECT content FROM asset_versions av WHERE av.asset_id=assets.asset_id AND av.version=assets.current_version) AS content FROM assets WHERE (? = '' OR asset_type = ?) AND (? = '%' OR title LIKE ? ESCAPE '\\' OR asset_id LIKE ? ESCAPE '\\') ORDER BY updated_at DESC LIMIT ?"
+    "SELECT asset_id,asset_type,schema_version,title,status,current_version,content_hash,updated_at, (SELECT content FROM asset_versions av WHERE av.asset_id=assets.asset_id AND av.version=assets.current_version) AS content, (SELECT provenance FROM asset_versions av WHERE av.asset_id=assets.asset_id AND av.version=assets.current_version) AS provenance, (SELECT verification FROM asset_versions av WHERE av.asset_id=assets.asset_id AND av.version=assets.current_version) AS verification FROM assets WHERE (? = '' OR asset_type = ?) AND (? = '%' OR title LIKE ? ESCAPE '\\' OR asset_id LIKE ? ESCAPE '\\') ORDER BY updated_at DESC LIMIT ?"
   ).bind(typeInput, typeInput, query ? query : "%", like, like, limit).all();
   const assets = (result.results || []).map(readAssetMetadata).filter((asset) => !subtype || asset.subtype === subtype).slice(0, limit);
   return { isError: false, text: JSON.stringify({ assets }), structuredContent: { assets } };
@@ -1506,6 +1718,12 @@ async function toolGetAsset(env, args) {
   const rawContent = parseAssetJson(row.content);
   const content = safeAssetRead(rawContent);
   const provenance = safeAssetRead(parseAssetJson(row.provenance));
+  const verification = safeAssetRead(parseAssetJson(row.verification));
+  const completeness = evaluateAssetProvenance(provenance, {
+    content_hash: row.content_hash,
+    canonical_version: row.current_version,
+    verification
+  });
   const result = {
     asset_id: row.asset_id,
     asset_type: row.asset_type,
@@ -1513,6 +1731,11 @@ async function toolGetAsset(env, args) {
     version: row.current_version,
     content_hash: row.content_hash,
     provenance,
+    verification,
+    provenance_status: completeness.status,
+    provenance_verified: completeness.verified,
+    historical_provenance_incomplete: completeness.status === PROVENANCE_STATUS_INCOMPLETE,
+    provenance_completeness: completeness,
     content
   };
   return { isError: false, text: JSON.stringify(result), structuredContent: result };
