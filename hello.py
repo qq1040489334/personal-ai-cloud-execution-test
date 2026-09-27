@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import uuid
@@ -10010,6 +10011,596 @@ def runtime_provenance_v0_1_report() -> dict:
     }
 
 
+PRODUCTION_GOLDEN_RUNTIME_VERIFY_GOAL = (
+    "PERSONAL_AI_AUTONOMOUS_ADVANCEMENT_GOLDEN_RUNTIME_VERIFY_V0.1"
+)
+PRODUCTION_GOLDEN_RUNTIME_VERIFY_TASK_ID = "cf-d6e78d9da88b"
+PRODUCTION_GOLDEN_RUNTIME_REPORT = "PRODUCTION_GOLDEN_RUNTIME_VERIFY_REPORT"
+PRODUCTION_GOLDEN_RUNTIME_PARENT_TASK_ID = "cf-golden-runtime-parent"
+PRODUCTION_GOLDEN_RUNTIME_DUPLICATE_CALLS = 2
+
+PRODUCTION_GOLDEN_DISPATCH_ALREADY = "ALREADY_DISPATCHED"
+PRODUCTION_GOLDEN_DISPATCH_DISPATCHED = "DISPATCHED"
+PRODUCTION_GOLDEN_NO_CHILD = "NO_APPROVED_NEXT_TASK"
+PRODUCTION_GOLDEN_VERDICT = "VERDICT_NOT_PASS"
+PRODUCTION_GOLDEN_INVALID = "INVALID_APPROVED_NEXT_TASK"
+PRODUCTION_GOLDEN_UNAVAILABLE = "DISPATCH_MARKER_UNAVAILABLE"
+PRODUCTION_GOLDEN_FAILED = "DISPATCH_FAILED"
+
+
+def _production_worker_source_path() -> Path:
+    return REPO_ROOT / "worker" / "index.js"
+
+
+def _node_executable() -> str | None:
+    return shutil.which("node")
+
+
+_PRODUCTION_GOLDEN_RUNTIME_JS = r"""
+const GOLDEN_PARENT = "__GOLDEN_PARENT__";
+const markerRowsHolder = { rows: new Map() };
+const kv = new Map();
+const dispatchCalls = [];
+
+function resetScenario() {
+  markerRowsHolder.rows = new Map();
+  kv.clear();
+  dispatchCalls.length = 0;
+}
+
+function makeD1() {
+  return {
+    prepare: function(sql) {
+      return {
+        bind: function(...args) {
+          return {
+            run: async function() {
+              if (sql.indexOf("INSERT OR IGNORE INTO task_dispatch_markers") === 0) {
+                const key = args[0];
+                if (markerRowsHolder.rows.has(key)) return { success: true, meta: { changes: 0 } };
+                markerRowsHolder.rows.set(key, {
+                  dispatch_key: args[0], parent_task_id: args[1], review_verdict: args[2],
+                  review_timestamp: args[3], review_note: args[4], child_task_id: args[5],
+                  dispatch_state: args[6], dispatch_status: null, github_http_status: null,
+                  github_request_id: null, dispatched_at: null, created_at: args[7], updated_at: args[8]
+                });
+                return { success: true, meta: { changes: 1 } };
+              }
+              if (sql.indexOf("UPDATE task_dispatch_markers") === 0) {
+                const row = markerRowsHolder.rows.get(args[6]);
+                if (row) {
+                  row.dispatch_state = args[0]; row.dispatch_status = args[1];
+                  row.github_http_status = args[2]; row.github_request_id = args[3];
+                  row.dispatched_at = args[4]; row.updated_at = args[5];
+                  return { success: true, meta: { changes: 1 } };
+                }
+                return { success: true, meta: { changes: 0 } };
+              }
+              return { success: true, meta: { changes: 0 } };
+            },
+            first: async function() {
+              if (sql.indexOf("FROM task_dispatch_markers") !== -1) {
+                return markerRowsHolder.rows.get(args[0]) || null;
+              }
+              return null;
+            },
+            all: async function() { return { results: [] }; }
+          };
+        }
+      };
+    }
+  };
+}
+
+function makeEnv(useDb, fetchOk, fetchStatus) {
+  const env = {
+    GITHUB_REPO: "owner/repo",
+    GITHUB_TOKEN: "test-token",
+    TASK_REGISTRY: {
+      get: async function(key, type) {
+        const raw = kv.has(key) ? kv.get(key) : null;
+        if (raw == null) return null;
+        return type === "json" ? JSON.parse(raw) : raw;
+      },
+      put: async function(key, value) { kv.set(key, value); },
+      list: async function() { return { keys: [] }; }
+    }
+  };
+  if (useDb) env.ASSET_DB = makeD1();
+  globalThis.fetch = async function(url, options) {
+    let parsed = null;
+    try { parsed = options && options.body ? JSON.parse(options.body) : null; } catch (e) { parsed = null; }
+    dispatchCalls.push({ url: String(url), body: parsed });
+    return {
+      ok: fetchOk,
+      status: fetchStatus,
+      headers: { get: function() { return "req-1"; } },
+      text: async function() { return ""; }
+    };
+  };
+  return env;
+}
+
+function seedTask(reviewed) {
+  kv.set("task:" + GOLDEN_PARENT, JSON.stringify({
+    task_id: GOLDEN_PARENT,
+    normalized_status: "PASS",
+    status: "PASS",
+    execution_status: "PASS",
+    terminal: true,
+    result_available: true,
+    reviewed: !!reviewed,
+    review_verdict: null,
+    updated_at: "2026-09-27T00:00:00.000Z"
+  }));
+}
+
+async function runScenario(name, options) {
+  resetScenario();
+  const useDb = options.db !== false;
+  const fetchOk = options.fetchOk !== false;
+  const fetchStatus = options.fetchStatus === undefined ? 204 : options.fetchStatus;
+  const env = makeEnv(useDb, fetchOk, fetchStatus);
+  seedTask(false);
+  const args = { task_id: GOLDEN_PARENT, verdict: options.verdict || "PASS", note: "n" };
+  if (Object.prototype.hasOwnProperty.call(options, "approved")) {
+    args.approved_next_task = options.approved;
+  }
+  const results = [];
+  const times = options.times || 1;
+  for (let i = 0; i < times; i++) {
+    const entry = await toolMarkReviewed(env, args);
+    let result = null;
+    try { result = entry.structuredContent || JSON.parse(entry.text); } catch (e) { result = null; }
+    results.push({ isError: !!entry.isError, text: entry.text, result: result });
+  }
+  return {
+    name: name,
+    results: results,
+    dispatchCalls: dispatchCalls.slice(),
+    markerRows: Array.from(markerRowsHolder.rows.values())
+  };
+}
+
+const validChild = {
+  goal: "golden child task",
+  instructions: ["advance"],
+  acceptance: ["advanced"],
+  expected_files: ["hello.py"]
+};
+const invalidChild = { goal: "", instructions: [], acceptance: [] };
+
+const scenarios = [];
+scenarios.push(await runScenario("pass_approved", { approved: validChild, times: 2 }));
+scenarios.push(await runScenario("pass_missing_child", { times: 2 }));
+scenarios.push(await runScenario("fail_with_child", { verdict: "FAIL", approved: validChild, times: 1 }));
+scenarios.push(await runScenario("blocked_with_child", { verdict: "BLOCKED", approved: validChild, times: 1 }));
+scenarios.push(await runScenario("invalid_child", { approved: invalidChild, times: 1 }));
+scenarios.push(await runScenario("no_marker_store", { approved: validChild, times: 1, db: false }));
+scenarios.push(await runScenario("github_rejected", { approved: validChild, times: 2, fetchOk: false, fetchStatus: 422 }));
+
+console.log(JSON.stringify({ ok: true, parent_task_id: GOLDEN_PARENT, scenarios: scenarios }));
+"""
+
+
+def _run_production_golden_runtime_probe() -> dict:
+    """Execute the canonical production Worker ``toolMarkReviewed`` under node.
+
+    Read-only: the Worker runs against an in-memory D1/KV/fetch double, so no
+    production secret, binding or audit row is read or written. Returns
+    ``{"available": False, "reason": ...}`` when the runtime cannot be exercised
+    (fail-closed) instead of inventing a result.
+    """
+    node = _node_executable()
+    if node is None:
+        return {"available": False, "reason": "node runtime not available"}
+    source_path = _production_worker_source_path()
+    if not source_path.is_file():
+        return {
+            "available": False,
+            "reason": f"canonical production worker source missing: {source_path}",
+        }
+    source = source_path.read_text(encoding="utf-8", errors="ignore")
+    harness = _PRODUCTION_GOLDEN_RUNTIME_JS.replace(
+        "__GOLDEN_PARENT__", PRODUCTION_GOLDEN_RUNTIME_PARENT_TASK_ID
+    )
+    probe = source + "\n" + harness
+    try:
+        completed = subprocess.run(
+            [node, "--input-type=module", "-e", probe],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"available": False, "reason": f"node probe failed: {exc}"}
+    if completed.returncode != 0:
+        return {
+            "available": False,
+            "reason": "node probe exited non-zero",
+            "stderr": completed.stderr[-2000:],
+        }
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        return {"available": False, "reason": "node probe produced no output"}
+    try:
+        payload = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        return {"available": False, "reason": f"node probe output not JSON: {exc}"}
+    payload["available"] = True
+    payload["worker_source_path"] = str(source_path)
+    payload["worker_source_sha256"] = hashlib.sha256(
+        source.encode("utf-8")
+    ).hexdigest()
+    return payload
+
+
+def _golden_scenario(probe: dict, name: str) -> dict | None:
+    for scenario in probe.get("scenarios", []):
+        if scenario.get("name") == name:
+            return scenario
+    return None
+
+
+def _golden_result(scenario: dict | None, index: int = 0) -> dict:
+    if not scenario:
+        return {}
+    try:
+        return scenario["results"][index].get("result") or {}
+    except (KeyError, IndexError, TypeError):
+        return {}
+
+
+def _golden_child_dispatch(scenario: dict | None, index: int = 0) -> dict:
+    return _golden_result(scenario, index).get("child_dispatch") or {}
+
+
+def _golden_no_dispatch(scenario: dict | None, reason: str) -> bool:
+    if not scenario:
+        return False
+    for entry in scenario.get("results", []):
+        result = entry.get("result") or {}
+        dispatch = result.get("child_dispatch") or {}
+        if dispatch.get("dispatched") is not False:
+            return False
+        if dispatch.get("reason") != reason:
+            return False
+    return not scenario.get("dispatchCalls") and not scenario.get("markerRows")
+
+
+def production_golden_runtime_verification() -> dict:
+    """Run the PERSONAL_AI_AUTONOMOUS_ADVANCEMENT_GOLDEN_RUNTIME_VERIFY_V0.1.
+
+    Verifies the real ``mark_reviewed(verdict, approved_next_task)`` behaviour of
+    the canonical deployed production Worker source:
+
+    * ``PASS`` + explicit ``approved_next_task`` dispatches exactly one child and
+      records the ``parent_task_id`` -> ``child_task_id`` relation;
+    * a repeated identical review request is exactly-once and creates no second
+      child;
+    * ``FAIL`` / ``BLOCKED`` / missing ``approved_next_task`` / invalid child /
+      missing dispatch-marker store / GitHub rejection all fail closed.
+    """
+    source_path = _production_worker_source_path()
+    worker_present = source_path.is_file()
+    node_available = _node_executable() is not None
+    probe = _run_production_golden_runtime_probe()
+    probe_available = bool(probe.get("available"))
+
+    checks: list[dict] = [
+        {
+            "check": "canonical production worker source present",
+            "status": PASS if worker_present else BLOCKED,
+            "detail": (
+                f"{source_path} sha256={probe.get('worker_source_sha256', 'unavailable')}"
+                if worker_present
+                else f"missing: {source_path}"
+            ),
+        },
+        {
+            "check": "node runtime executes production source",
+            "status": PASS if node_available else BLOCKED,
+            "detail": (
+                f"node={_node_executable()}"
+                if node_available
+                else "node runtime not available"
+            ),
+        },
+    ]
+
+    parent_task_id: str | None = None
+    child_task_id: str | None = None
+    exactly_once: dict = {
+        "verified": False,
+        "duplicate_calls": PRODUCTION_GOLDEN_RUNTIME_DUPLICATE_CALLS,
+        "dispatch_calls": 0,
+        "child_task_ids": [],
+        "reason": None,
+    }
+    fail_closed: dict = {"verified": False, "scenarios": {}}
+
+    if not probe_available:
+        checks.append(
+            {
+                "check": "production source executed under node",
+                "status": BLOCKED,
+                "detail": probe.get("reason", "probe unavailable"),
+            }
+        )
+        overall = BLOCKED
+    else:
+        pass_scenario = _golden_scenario(probe, "pass_approved")
+        first_dispatch = _golden_child_dispatch(pass_scenario, 0)
+        second_dispatch = _golden_child_dispatch(pass_scenario, 1)
+        second_result = _golden_result(pass_scenario, 1)
+        parent_task_id = first_dispatch.get("parent_task_id")
+        child_task_id = first_dispatch.get("child_task_id")
+
+        dispatch_ok = bool(
+            first_dispatch.get("dispatched") is True
+            and child_task_id
+            and parent_task_id
+            and first_dispatch.get("reason") == PRODUCTION_GOLDEN_DISPATCH_DISPATCHED
+        )
+        checks.append(
+            {
+                "check": "PASS + approved_next_task dispatches exactly one child",
+                "status": PASS if dispatch_ok else FAIL,
+                "detail": (
+                    f"parent_task_id={parent_task_id} child_task_id={child_task_id}"
+                    if dispatch_ok
+                    else f"child_dispatch={first_dispatch}"
+                ),
+            }
+        )
+
+        exactly_once_ok = bool(
+            dispatch_ok
+            and second_result.get("idempotent") is True
+            and second_dispatch.get("idempotent") is True
+            and second_dispatch.get("reason") == PRODUCTION_GOLDEN_DISPATCH_ALREADY
+            and second_dispatch.get("child_task_id") == child_task_id
+            and len(pass_scenario.get("dispatchCalls", [])) == 1
+            and len(pass_scenario.get("markerRows", [])) == 1
+        )
+        exactly_once = {
+            "verified": exactly_once_ok,
+            "duplicate_calls": PRODUCTION_GOLDEN_RUNTIME_DUPLICATE_CALLS,
+            "dispatch_calls": len(pass_scenario.get("dispatchCalls", [])) if pass_scenario else 0,
+            "child_task_ids": sorted(
+                {
+                    first_dispatch.get("child_task_id"),
+                    second_dispatch.get("child_task_id"),
+                }
+                - {None}
+            ),
+            "reason": second_dispatch.get("reason"),
+            "parent_task_id": parent_task_id,
+            "child_task_id": child_task_id,
+        }
+        checks.append(
+            {
+                "check": "duplicate review request is exactly-once (no second child)",
+                "status": PASS if exactly_once_ok else FAIL,
+                "detail": (
+                    f"2 identical calls -> {exactly_once['dispatch_calls']} dispatch, "
+                    f"replay reason={exactly_once['reason']}"
+                    if exactly_once_ok
+                    else f"exactly_once={exactly_once}"
+                ),
+            }
+        )
+
+        fail_scenario = _golden_scenario(probe, "fail_with_child")
+        blocked_scenario = _golden_scenario(probe, "blocked_with_child")
+        missing_scenario = _golden_scenario(probe, "pass_missing_child")
+        invalid_scenario = _golden_scenario(probe, "invalid_child")
+        missing_store = _golden_scenario(probe, "no_marker_store")
+        rejected = _golden_scenario(probe, "github_rejected")
+
+        fail_ok = _golden_no_dispatch(fail_scenario, PRODUCTION_GOLDEN_VERDICT)
+        blocked_ok = _golden_no_dispatch(blocked_scenario, PRODUCTION_GOLDEN_VERDICT)
+        missing_ok = _golden_no_dispatch(missing_scenario, PRODUCTION_GOLDEN_NO_CHILD)
+        invalid_ok = _golden_no_dispatch(invalid_scenario, PRODUCTION_GOLDEN_INVALID)
+        store_ok = _golden_no_dispatch(missing_store, PRODUCTION_GOLDEN_UNAVAILABLE)
+        rejected_first = _golden_child_dispatch(rejected, 0)
+        rejected_second = _golden_child_dispatch(rejected, 1)
+        rejected_ok = bool(
+            rejected
+            and rejected_first.get("dispatched") is False
+            and rejected_first.get("dispatch_state") == "FAILED"
+            and rejected_second.get("idempotent") is True
+            and rejected_second.get("reason") == PRODUCTION_GOLDEN_DISPATCH_ALREADY
+            and len(rejected.get("dispatchCalls", [])) == 1
+        )
+
+        fail_closed["scenarios"] = {
+            "FAIL": {
+                "reason": _golden_child_dispatch(fail_scenario).get("reason"),
+                "dispatched": _golden_child_dispatch(fail_scenario).get("dispatched"),
+                "dispatch_calls": len(fail_scenario.get("dispatchCalls", [])) if fail_scenario else 0,
+                "status": PASS if fail_ok else FAIL,
+            },
+            "BLOCKED": {
+                "reason": _golden_child_dispatch(blocked_scenario).get("reason"),
+                "dispatched": _golden_child_dispatch(blocked_scenario).get("dispatched"),
+                "dispatch_calls": len(blocked_scenario.get("dispatchCalls", [])) if blocked_scenario else 0,
+                "status": PASS if blocked_ok else FAIL,
+            },
+            "missing_approved_next_task": {
+                "reason": _golden_child_dispatch(missing_scenario).get("reason"),
+                "dispatched": _golden_child_dispatch(missing_scenario).get("dispatched"),
+                "dispatch_calls": len(missing_scenario.get("dispatchCalls", [])) if missing_scenario else 0,
+                "status": PASS if missing_ok else FAIL,
+            },
+            "invalid_approved_next_task": {
+                "reason": _golden_child_dispatch(invalid_scenario).get("reason"),
+                "dispatched": _golden_child_dispatch(invalid_scenario).get("dispatched"),
+                "dispatch_calls": len(invalid_scenario.get("dispatchCalls", [])) if invalid_scenario else 0,
+                "status": PASS if invalid_ok else FAIL,
+            },
+            "dispatch_marker_unavailable": {
+                "reason": _golden_child_dispatch(missing_store).get("reason"),
+                "dispatched": _golden_child_dispatch(missing_store).get("dispatched"),
+                "dispatch_calls": len(missing_store.get("dispatchCalls", [])) if missing_store else 0,
+                "status": PASS if store_ok else FAIL,
+            },
+            "github_rejected": {
+                "first_state": rejected_first.get("dispatch_state"),
+                "replay_reason": rejected_second.get("reason"),
+                "dispatch_calls": len(rejected.get("dispatchCalls", [])) if rejected else 0,
+                "status": PASS if rejected_ok else FAIL,
+            },
+        }
+        fail_closed["verified"] = all(
+            item["status"] == PASS for item in fail_closed["scenarios"].values()
+        )
+
+        checks.extend(
+            [
+                {
+                    "check": "FAIL verdict dispatches nothing",
+                    "status": PASS if fail_ok else FAIL,
+                    "detail": f"reason={_golden_child_dispatch(fail_scenario).get('reason')}",
+                },
+                {
+                    "check": "BLOCKED verdict dispatches nothing",
+                    "status": PASS if blocked_ok else FAIL,
+                    "detail": f"reason={_golden_child_dispatch(blocked_scenario).get('reason')}",
+                },
+                {
+                    "check": "missing approved_next_task dispatches nothing",
+                    "status": PASS if missing_ok else FAIL,
+                    "detail": f"reason={_golden_child_dispatch(missing_scenario).get('reason')}",
+                },
+                {
+                    "check": "invalid approved_next_task fails closed",
+                    "status": PASS if invalid_ok else FAIL,
+                    "detail": f"reason={_golden_child_dispatch(invalid_scenario).get('reason')}",
+                },
+                {
+                    "check": "missing dispatch-marker store fails closed",
+                    "status": PASS if store_ok else FAIL,
+                    "detail": f"reason={_golden_child_dispatch(missing_store).get('reason')}",
+                },
+                {
+                    "check": "GitHub rejection is at-most-once on replay",
+                    "status": PASS if rejected_ok else FAIL,
+                    "detail": (
+                        f"rejected state={rejected_first.get('dispatch_state')} "
+                        f"replay={rejected_second.get('reason')}"
+                    ),
+                },
+                {
+                    "check": "no production mutation",
+                    "status": PASS,
+                    "detail": (
+                        "read-only: worker source executed against in-memory "
+                        "D1/KV/fetch double; no secret, binding or audit row touched"
+                    ),
+                },
+            ]
+        )
+
+        if any(check["status"] == FAIL for check in checks):
+            overall = FAIL
+        elif any(check["status"] == BLOCKED for check in checks):
+            overall = BLOCKED
+        else:
+            overall = PASS
+
+    lines = [
+        "# PRODUCTION_GOLDEN_RUNTIME_VERIFY_REPORT",
+        "",
+        f"- goal: {PRODUCTION_GOLDEN_RUNTIME_VERIFY_GOAL}",
+        f"- task_id: {PRODUCTION_GOLDEN_RUNTIME_VERIFY_TASK_ID}",
+        f"- production_source: {source_path}",
+        f"- production_source_sha256: {probe.get('worker_source_sha256', 'unavailable')}",
+        f"- production_mutated: False",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += [
+        "",
+        "## Golden dispatch evidence",
+        f"parent_task_id={parent_task_id or 'UNAVAILABLE'}",
+        f"child_task_id={child_task_id or 'UNAVAILABLE'}",
+        f"exactly_once_verified={exactly_once['verified']}",
+        f"duplicate_calls={exactly_once['duplicate_calls']}",
+        f"dispatch_calls={exactly_once['dispatch_calls']}",
+        f"replay_reason={exactly_once['reason'] or 'UNAVAILABLE'}",
+        f"fail_closed_verified={fail_closed['verified']}",
+        "",
+        f"PRODUCTION_GOLDEN_RUNTIME_STATUS={overall}",
+    ]
+
+    return {
+        "report": PRODUCTION_GOLDEN_RUNTIME_REPORT,
+        "goal": PRODUCTION_GOLDEN_RUNTIME_VERIFY_GOAL,
+        "task_id": PRODUCTION_GOLDEN_RUNTIME_VERIFY_TASK_ID,
+        "PRODUCTION_GOLDEN_RUNTIME_STATUS": overall,
+        "status": overall,
+        "production_source_path": str(source_path),
+        "production_source_sha256": probe.get("worker_source_sha256"),
+        "probe_available": probe_available,
+        "parent_task_id": parent_task_id,
+        "child_task_id": child_task_id,
+        "exactly_once": exactly_once,
+        "fail_closed": fail_closed,
+        "checks": checks,
+        "production_mutated": False,
+        "read_only": True,
+        "markdown": "\n".join(lines),
+    }
+
+
+def write_production_golden_runtime_execution_result(
+    report: dict | None = None, output_path: str | Path | None = None
+) -> dict:
+    """Generate ``execution_result.json`` for the golden runtime verification.
+
+    Never writes into the repository working tree by default: the target is
+    ``PERSONAL_AI_EXECUTION_RESULT_PATH``, else ``$RUNNER_TEMP/execution_result.json``,
+    else ``<tempdir>/execution_result.json``. Returns the path and the payload.
+    """
+    report = report or production_golden_runtime_verification()
+    status = report["PRODUCTION_GOLDEN_RUNTIME_STATUS"]
+    if output_path is None:
+        env_path = os.environ.get("PERSONAL_AI_EXECUTION_RESULT_PATH")
+        runner_temp = os.environ.get("RUNNER_TEMP")
+        if env_path:
+            target = Path(env_path)
+        elif runner_temp:
+            target = Path(runner_temp) / "execution_result.json"
+        else:
+            target = Path(tempfile.gettempdir()) / "execution_result.json"
+    else:
+        target = Path(output_path)
+
+    payload = {
+        "status": "success" if status == PASS else "failure",
+        "task_id": report["task_id"],
+        "goal": report["goal"],
+        "PRODUCTION_GOLDEN_RUNTIME_STATUS": status,
+        "parent_task_id": report.get("parent_task_id"),
+        "child_task_id": report.get("child_task_id"),
+        "exactly_once_verified": report["exactly_once"]["verified"],
+        "fail_closed_verified": report["fail_closed"]["verified"],
+        "production_source_sha256": report.get("production_source_sha256"),
+        "production_mutated": False,
+        "tests": os.environ.get("PYTEST_SUMMARY", ""),
+        "changed_files": ["hello.py", "test_hello.py"],
+        "summary": report["goal"],
+        "checks": report["checks"],
+    }
+    target.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return {"path": str(target), "payload": payload}
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(runtime_provenance_v0_1_report()["markdown"])
     print(cloudflare_runtime_audit_report()["markdown"])
@@ -10028,3 +10619,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(personal_ai_execution_dispatch_live_failure_audit()["markdown"])
     print(knowledge_ground_truth_audit_v0_1()["markdown"])
     print(auto_review_loop_report()["markdown"])
+    print(production_golden_runtime_verification()["markdown"])

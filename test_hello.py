@@ -2,6 +2,7 @@
 
 import inspect
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -132,6 +133,12 @@ from hello import (
     personal_ai_execution_dispatch_live_failure_audit,
     personal_ai_execution_result_exposure_audit_detail_export,
     personal_ai_task_runtime_audit,
+    PRODUCTION_GOLDEN_RUNTIME_DUPLICATE_CALLS,
+    PRODUCTION_GOLDEN_RUNTIME_PARENT_TASK_ID,
+    PRODUCTION_GOLDEN_RUNTIME_REPORT,
+    PRODUCTION_GOLDEN_RUNTIME_VERIFY_GOAL,
+    PRODUCTION_GOLDEN_RUNTIME_VERIFY_TASK_ID,
+    production_golden_runtime_verification,
     record_consumer_evidence,
     result_consumer_test,
     result_consumer_test2,
@@ -148,6 +155,7 @@ from hello import (
     task_result_auto_consumer_report,
     task_review_action_report,
     trigger_bridge_test,
+    write_production_golden_runtime_execution_result,
 )
 
 VALID_STATUSES = {"PASS", "FAIL", "BLOCKED"}
@@ -3858,3 +3866,147 @@ def test_post_canonical_deploy_live_golden_failure_bucket() -> None:
     )
     assert blocked["status"] == BLOCKED
     assert registry.get_task_result(task_id)["status"] == BLOCKED
+
+
+# -- PERSONAL_AI_AUTONOMOUS_ADVANCEMENT_GOLDEN_RUNTIME_VERIFY_V0.1 ----------
+#
+# Golden runtime verification of the canonical production Worker
+# ``mark_reviewed(verdict, approved_next_task)`` behaviour. The production
+# source runs read-only under node against an in-memory D1/KV/fetch double.
+
+NODE_AVAILABLE = shutil.which("node") is not None
+requires_node = pytest.mark.skipif(
+    not NODE_AVAILABLE, reason="node runtime is required to execute the worker source"
+)
+
+
+@pytest.fixture(scope="module")
+def golden_runtime_report() -> dict:
+    return production_golden_runtime_verification()
+
+
+@requires_node
+def test_production_golden_runtime_verify_goal_and_task_id(
+    golden_runtime_report: dict,
+) -> None:
+    assert golden_runtime_report["goal"] == PRODUCTION_GOLDEN_RUNTIME_VERIFY_GOAL
+    assert (
+        golden_runtime_report["task_id"] == PRODUCTION_GOLDEN_RUNTIME_VERIFY_TASK_ID
+    )
+    assert golden_runtime_report["report"] == PRODUCTION_GOLDEN_RUNTIME_REPORT
+
+
+@requires_node
+def test_production_golden_runtime_status_is_pass(golden_runtime_report: dict) -> None:
+    assert (
+        golden_runtime_report["PRODUCTION_GOLDEN_RUNTIME_STATUS"] == "PASS"
+    )
+    assert golden_runtime_report["production_mutated"] is False
+    assert golden_runtime_report["read_only"] is True
+    assert all(check["status"] == "PASS" for check in golden_runtime_report["checks"])
+
+
+@requires_node
+def test_production_golden_runtime_parent_child_dispatch_evidence(
+    golden_runtime_report: dict,
+) -> None:
+    parent_task_id = golden_runtime_report["parent_task_id"]
+    child_task_id = golden_runtime_report["child_task_id"]
+    assert parent_task_id == PRODUCTION_GOLDEN_RUNTIME_PARENT_TASK_ID
+    assert parent_task_id
+    assert child_task_id
+    assert child_task_id.startswith("cf-")
+    assert child_task_id != parent_task_id
+    assert (
+        golden_runtime_report["exactly_once"]["parent_task_id"] == parent_task_id
+    )
+    assert golden_runtime_report["exactly_once"]["child_task_id"] == child_task_id
+
+
+@requires_node
+def test_production_golden_runtime_exactly_once(golden_runtime_report: dict) -> None:
+    exactly_once = golden_runtime_report["exactly_once"]
+    assert exactly_once["verified"] is True
+    assert exactly_once["duplicate_calls"] == PRODUCTION_GOLDEN_RUNTIME_DUPLICATE_CALLS
+    assert exactly_once["dispatch_calls"] == 1
+    assert exactly_once["reason"] == "ALREADY_DISPATCHED"
+    assert exactly_once["child_task_ids"] == [golden_runtime_report["child_task_id"]]
+
+
+@requires_node
+def test_production_golden_runtime_fail_closed(golden_runtime_report: dict) -> None:
+    fail_closed = golden_runtime_report["fail_closed"]
+    assert fail_closed["verified"] is True
+    scenarios = fail_closed["scenarios"]
+    for name in (
+        "FAIL",
+        "BLOCKED",
+        "missing_approved_next_task",
+        "invalid_approved_next_task",
+        "dispatch_marker_unavailable",
+        "github_rejected",
+    ):
+        assert scenarios[name]["status"] == "PASS", name
+    assert scenarios["FAIL"]["reason"] == "VERDICT_NOT_PASS"
+    assert scenarios["FAIL"]["dispatch_calls"] == 0
+    assert scenarios["BLOCKED"]["reason"] == "VERDICT_NOT_PASS"
+    assert scenarios["BLOCKED"]["dispatch_calls"] == 0
+    assert scenarios["missing_approved_next_task"]["reason"] == "NO_APPROVED_NEXT_TASK"
+    assert scenarios["missing_approved_next_task"]["dispatch_calls"] == 0
+    assert scenarios["invalid_approved_next_task"]["reason"] == (
+        "INVALID_APPROVED_NEXT_TASK"
+    )
+    assert scenarios["github_rejected"]["dispatch_calls"] == 1
+
+
+@requires_node
+def test_production_golden_runtime_markdown_tokens(golden_runtime_report: dict) -> None:
+    markdown = golden_runtime_report["markdown"]
+    assert f"PRODUCTION_GOLDEN_RUNTIME_STATUS={golden_runtime_report['PRODUCTION_GOLDEN_RUNTIME_STATUS']}" in markdown
+    assert (
+        f"parent_task_id={golden_runtime_report['parent_task_id']}" in markdown
+    )
+    assert f"child_task_id={golden_runtime_report['child_task_id']}" in markdown
+    assert "exactly_once_verified=True" in markdown
+    assert "fail_closed_verified=True" in markdown
+
+
+@requires_node
+def test_write_production_golden_runtime_execution_result(tmp_path) -> None:
+    target = tmp_path / "execution_result.json"
+    written = write_production_golden_runtime_execution_result(output_path=target)
+    assert written["path"] == str(target)
+    assert target.is_file()
+
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    assert payload["status"] == "success"
+    assert payload["task_id"] == PRODUCTION_GOLDEN_RUNTIME_VERIFY_TASK_ID
+    assert payload["goal"] == PRODUCTION_GOLDEN_RUNTIME_VERIFY_GOAL
+    assert payload["PRODUCTION_GOLDEN_RUNTIME_STATUS"] == "PASS"
+    assert payload["parent_task_id"] == PRODUCTION_GOLDEN_RUNTIME_PARENT_TASK_ID
+    assert payload["child_task_id"]
+    assert payload["exactly_once_verified"] is True
+    assert payload["fail_closed_verified"] is True
+    assert payload["production_mutated"] is False
+
+
+def test_production_golden_runtime_missing_node_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hello_module, "_node_executable", lambda: None)
+    report = production_golden_runtime_verification()
+    assert report["PRODUCTION_GOLDEN_RUNTIME_STATUS"] == "BLOCKED"
+    assert report["probe_available"] is False
+    assert report["parent_task_id"] is None
+    assert report["child_task_id"] is None
+
+
+def test_production_golden_runtime_missing_source_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        hello_module, "_production_worker_source_path", lambda: tmp_path / "missing.js"
+    )
+    report = production_golden_runtime_verification()
+    assert report["PRODUCTION_GOLDEN_RUNTIME_STATUS"] == "BLOCKED"
+    assert report["probe_available"] is False
