@@ -15,5 +15,20 @@
   },
   "secrets": "not captured; preserve existing production secrets",
   "provenance": "Cloudflare Quick Edit active production version, copied through the editor without truncation",
-  "rollback_reference": "Restore Cloudflare version 3e2fed43 if a later deployment fails a pre-Golden gate"
+  "rollback_reference": "Restore Cloudflare version 3e2fed43 if a later deployment fails a pre-Golden gate",
+  "controlled_deploy_v0_1": {
+    "task_id": "cf-7afde7d95cdb",
+    "goal": "PERSONAL_AI_CANONICAL_WORKER_CONTROLLED_PRODUCTION_DEPLOY_V0.1",
+    "result": "BLOCKED",
+    "deployment_attempted": false,
+    "production_mutated": false,
+    "secrets_exposed": false,
+    "reason": "No Cloudflare production deploy credential is available in the execution environment (checked CLOUDFLARE_API_TOKEN, CF_API_TOKEN, CLOUDFLARE_API_KEY; `npx wrangler whoami` reports not authenticated). Fail closed before any deploy.",
+    "canonical_head_commit": "ddf5ca385dff459e941d9e201862d2610c413bfc",
+    "canonical_source_sha256": "6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480",
+    "cloudflare_deployment_id": null,
+    "cloudflare_version": null,
+    "evidence_artifact": "reports/production_deploy_v0.1.json",
+    "manual_gate": "inject a Cloudflare deploy token, then run the sequence in reports/production_deploy_v0.1.json (manual_gate.sequence) and backfill cloudflare_deployment_id/cloudflare_version/deployment_timestamp"
+  }
 }
