@@ -1,0 +1,640 @@
+{
+  "report": "PERSONAL_AI_RUNTIME_PROVENANCE_FINAL_AUDIT_V0.3_REPORT",
+  "goal": "PERSONAL_AI_RUNTIME_PROVENANCE_FINAL_AUDIT_V0.3",
+  "task_id": "cf-619649c43aa2",
+  "generated_at": "2026-09-27T01:57:28.378234+00:00",
+  "read_only": true,
+  "production_mutated": false,
+  "secrets_exposed": false,
+  "live_endpoint_checked": false,
+  "repository_presence_is_not_deployment_evidence": true,
+  "audit_context": {
+    "repository_head": "42a47d9e9d2612ca388177e45e47286479428e0e",
+    "origin_main": "42a47d9e9d2612ca388177e45e47286479428e0e",
+    "github_sha": "42a47d9e9d2612ca388177e45e47286479428e0e",
+    "recovery_baseline_commit": "6a0c740858a8e28f8132af88a373b9291b6cdd89"
+  },
+  "deployment_identity": {
+    "service": "personal-ai-execution-mcp",
+    "environment": "production",
+    "production_version": "3e2fed43",
+    "metadata_path": "worker/PRODUCTION-BASELINE.json",
+    "declared_source": "in-repo deployment baseline worker/PRODUCTION-BASELINE.json (self-declared; Cloudflare Quick Edit provenance)",
+    "cloudflare_deployment_id": null,
+    "cloudflare_version": null,
+    "deployment_timestamp": null,
+    "env_version": null,
+    "env_version_names": [],
+    "env_commit": "42a47d9e9d2612ca388177e45e47286479428e0e",
+    "env_commit_names": [
+      "GITHUB_SHA"
+    ],
+    "deploy_attempted": false,
+    "deploy_link_status": "INCOMPLETE_BLOCKED"
+  },
+  "deployment_identity_status": "PARTIAL",
+  "deployment_identity_evidence": {
+    "authoritative": false,
+    "authoritative_sources": [],
+    "self_declared_sources": [
+      "worker/PRODUCTION-BASELINE.json"
+    ],
+    "cloudflare_deploy_credential_names_present": [],
+    "cloudflare_deploy_credential_names_checked": [
+      "CLOUDFLARE_API_TOKEN",
+      "CF_API_TOKEN",
+      "CLOUDFLARE_API_KEY"
+    ],
+    "secrets_exposed": false
+  },
+  "declared_source": {
+    "file": "worker/index.js",
+    "sha256": "8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1",
+    "bytes": 55278,
+    "lines": 1543
+  },
+  "canonical_source": {
+    "file": "worker/index.js",
+    "present": true,
+    "head_commit": "42a47d9e9d2612ca388177e45e47286479428e0e",
+    "head_sha256": "6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480",
+    "head_bytes": 69392,
+    "head_lines": 1931,
+    "last_source_commit": "592e7c29af4a5e72e3ec12bb458538629011896b",
+    "matches_declared_hash": false
+  },
+  "candidate_source_commits": [
+    {
+      "commit": "592e7c29af4a5e72e3ec12bb458538629011896b",
+      "short": "592e7c29af4a",
+      "date": "2026-09-27T01:10:20Z",
+      "subject": "cloud agent: gpt task",
+      "author": "cloud-agent",
+      "tags": [],
+      "touches_canonical_source": true,
+      "source_sha256": "6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480",
+      "source_bytes": 69392,
+      "source_lines": 1931,
+      "on_current_history": true,
+      "matches_declared_hash": false
+    },
+    {
+      "commit": "0c3ac20392bf86bfecb68cbaadd77a7a2a398665",
+      "short": "0c3ac20392bf",
+      "date": "2026-09-27T00:52:12Z",
+      "subject": "cloud agent: gpt task",
+      "author": "cloud-agent",
+      "tags": [],
+      "touches_canonical_source": true,
+      "source_sha256": "1fc165aea2b988ff524c95035f4fdb1fe4ede5219958d04a3cccda239b0adcba",
+      "source_bytes": 60178,
+      "source_lines": 1708,
+      "on_current_history": true,
+      "matches_declared_hash": false
+    },
+    {
+      "commit": "9d60c7bfedca3d4e97b5edd847bfa46796830474",
+      "short": "9d60c7bfedca",
+      "date": "2026-09-26T10:52:36+08:00",
+      "subject": "feat: support task-scoped expected files",
+      "author": "qq1040489334",
+      "tags": [
+        "expected-files-v1-20260926"
+      ],
+      "touches_canonical_source": true,
+      "source_sha256": "b001caebf1193b9bab47d519bc516da92df0c1ce1d83ea3db63b1b21fcebf6c9",
+      "source_bytes": 54312,
+      "source_lines": 1551,
+      "on_current_history": true,
+      "matches_declared_hash": false
+    },
+    {
+      "commit": "6a0c740858a8e28f8132af88a373b9291b6cdd89",
+      "short": "6a0c740858a8",
+      "date": "2026-09-26T10:19:56+08:00",
+      "subject": "chore: recover production execution worker baseline",
+      "author": "qq1040489334",
+      "tags": [
+        "production-recovered-3e2fed43-20260926"
+      ],
+      "touches_canonical_source": true,
+      "source_sha256": "ea298b2eebfb0445086aac85ef5c4988e6d508d2df6bfa0ddfc772429b7aca7c",
+      "source_bytes": 53736,
+      "source_lines": 1542,
+      "on_current_history": true,
+      "matches_declared_hash": false
+    }
+  ],
+  "matching_source_commits": [],
+  "relationship_status": "UNVERIFIED",
+  "relationship_reason": "declared production source hash 8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1 matches no canonical commit of worker/index.js in the repository history; current HEAD source hash is 6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480; no Cloudflare deployment/version record exists to link source to the live runtime; the deployed runtime is not traceable to a canonical source commit",
+  "runtime_changes": {
+    "status_contract": {
+      "label": "status-contract",
+      "required_tokens": [
+        "EXECUTION_STATUS_PENDING",
+        "EXECUTION_STATUS_PASS",
+        "EXECUTION_STATUS_FAIL",
+        "EXECUTION_STATUS_BLOCKED",
+        "WORKFLOW_CONCLUSION_STATUS",
+        "TERMINAL_EXECUTION_STATUSES",
+        "normalized_status",
+        "execution_status",
+        "review_verdict",
+        "persistTerminalExecution"
+      ],
+      "missing_tokens": [],
+      "canonical_source_includes_change": true,
+      "canonical_source_sha256": "6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480",
+      "source_commits": [
+        "0c3ac20392bf86bfecb68cbaadd77a7a2a398665"
+      ],
+      "source_commits_on_history": true,
+      "deployed_inclusion_proven": false,
+      "status": "BLOCKED",
+      "detail": "status-contract tokens are present in canonical source (sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480) but the deployed production source hash cannot be tied to a canonical commit, so inclusion in the live runtime is not proven"
+    },
+    "asset_provenance": {
+      "label": "asset-provenance",
+      "required_tokens": [
+        "ASSET_PROVENANCE_CONTRACT",
+        "evaluateAssetProvenance",
+        "provenance_status",
+        "provenance_missing",
+        "search_assets"
+      ],
+      "missing_tokens": [],
+      "canonical_source_includes_change": true,
+      "canonical_source_sha256": "6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480",
+      "source_commits": [
+        "592e7c29af4a5e72e3ec12bb458538629011896b"
+      ],
+      "source_commits_on_history": true,
+      "deployed_inclusion_proven": false,
+      "status": "BLOCKED",
+      "detail": "asset-provenance tokens are present in canonical source (sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480) but the deployed production source hash cannot be tied to a canonical commit, so inclusion in the live runtime is not proven"
+    }
+  },
+  "undeployed_source_commits": [
+    {
+      "commit": "592e7c29af4a5e72e3ec12bb458538629011896b",
+      "short": "592e7c29af4a",
+      "date": "2026-09-27T01:10:20Z",
+      "subject": "cloud agent: gpt task",
+      "tags": [],
+      "on_current_history": true,
+      "after_recovery_baseline": true,
+      "reason": "repository presence alone is not deployment evidence; no deployment record ties this source commit to the declared production version 3e2fed43"
+    },
+    {
+      "commit": "0c3ac20392bf86bfecb68cbaadd77a7a2a398665",
+      "short": "0c3ac20392bf",
+      "date": "2026-09-27T00:52:12Z",
+      "subject": "cloud agent: gpt task",
+      "tags": [],
+      "on_current_history": true,
+      "after_recovery_baseline": true,
+      "reason": "repository presence alone is not deployment evidence; no deployment record ties this source commit to the declared production version 3e2fed43"
+    },
+    {
+      "commit": "9d60c7bfedca3d4e97b5edd847bfa46796830474",
+      "short": "9d60c7bfedca",
+      "date": "2026-09-26T10:52:36+08:00",
+      "subject": "feat: support task-scoped expected files",
+      "tags": [
+        "expected-files-v1-20260926"
+      ],
+      "on_current_history": true,
+      "after_recovery_baseline": true,
+      "reason": "repository presence alone is not deployment evidence; no deployment record ties this source commit to the declared production version 3e2fed43"
+    },
+    {
+      "commit": "6a0c740858a8e28f8132af88a373b9291b6cdd89",
+      "short": "6a0c740858a8",
+      "date": "2026-09-26T10:19:56+08:00",
+      "subject": "chore: recover production execution worker baseline",
+      "tags": [
+        "production-recovered-3e2fed43-20260926"
+      ],
+      "on_current_history": true,
+      "after_recovery_baseline": false,
+      "reason": "repository presence alone is not deployment evidence; no deployment record ties this source commit to the declared production version 3e2fed43"
+    }
+  ],
+  "execution_relevant_undeployed_commits": [
+    {
+      "commit": "dbbbbd13ada2e257a028aee4f9bdffee14a1ad5a",
+      "short": "dbbbbd13ada2",
+      "date": "2026-09-27T01:44:28Z",
+      "subject": "cloud agent: gpt task",
+      "execution_paths": [
+        "worker/PRODUCTION-BASELINE.json"
+      ],
+      "touches_worker_source": false,
+      "touches_workflow": false,
+      "changed_paths": [
+        "PRODUCTION_DEPLOY_V0.1.md",
+        "reports/production_deploy_v0.1.json",
+        "reports/production_deploy_v0_1.py",
+        "reports/test_production_deploy_v0_1.py",
+        "worker/PRODUCTION-BASELINE.json"
+      ],
+      "proven_deployed": false,
+      "reason": "no deployment record ties this execution-infrastructure commit to the declared production runtime; repository presence alone is not deployment evidence"
+    },
+    {
+      "commit": "592e7c29af4a5e72e3ec12bb458538629011896b",
+      "short": "592e7c29af4a",
+      "date": "2026-09-27T01:10:20Z",
+      "subject": "cloud agent: gpt task",
+      "execution_paths": [
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/provenance_contract.py",
+        "worker/index.js",
+        "worker/migrations/0001_asset_provenance_v0_2.sql"
+      ],
+      "touches_worker_source": true,
+      "touches_workflow": false,
+      "changed_paths": [
+        "ASSET_PROVENANCE_CONTRACT_V0.2.md",
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/provenance_contract.py",
+        "tests/test_asset_provenance_v0_2.py",
+        "worker/index.js",
+        "worker/migrations/0001_asset_provenance_v0_2.sql"
+      ],
+      "proven_deployed": false,
+      "reason": "no deployment record ties this execution-infrastructure commit to the declared production runtime; repository presence alone is not deployment evidence"
+    },
+    {
+      "commit": "0c3ac20392bf86bfecb68cbaadd77a7a2a398665",
+      "short": "0c3ac20392bf",
+      "date": "2026-09-27T00:52:12Z",
+      "subject": "cloud agent: gpt task",
+      "execution_paths": [
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/event_sync.py",
+        "src/personal_ai_execution/reconciliation.py",
+        "src/personal_ai_execution/status_contract.py",
+        "worker/index.js"
+      ],
+      "touches_worker_source": true,
+      "touches_workflow": false,
+      "changed_paths": [
+        "STATUS_CONTRACT_V0.2.md",
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/event_sync.py",
+        "src/personal_ai_execution/reconciliation.py",
+        "src/personal_ai_execution/status_contract.py",
+        "tests/test_status_contract_v0_2.py",
+        "tests/test_task_registry_reconciliation.py",
+        "worker/index.js"
+      ],
+      "proven_deployed": false,
+      "reason": "no deployment record ties this execution-infrastructure commit to the declared production runtime; repository presence alone is not deployment evidence"
+    },
+    {
+      "commit": "698ac2998c6712b9aa5152aed8f53e8db7f3345f",
+      "short": "698ac2998c67",
+      "date": "2026-09-27T00:31:55Z",
+      "subject": "cloud agent: gpt task",
+      "execution_paths": [
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/event_sync.py"
+      ],
+      "touches_worker_source": false,
+      "touches_workflow": false,
+      "changed_paths": [
+        "MARK_REVIEWED_GATE_V0.2.md",
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/event_sync.py",
+        "tests/test_mark_reviewed_gate.py"
+      ],
+      "proven_deployed": false,
+      "reason": "no deployment record ties this execution-infrastructure commit to the declared production runtime; repository presence alone is not deployment evidence"
+    },
+    {
+      "commit": "ed3ca64977a1d1a6e562ba3640820730b71a8447",
+      "short": "ed3ca64977a1",
+      "date": "2026-09-27T07:59:09+08:00",
+      "subject": "fix: extend agent budget and make cancelled results truthful",
+      "execution_paths": [
+        ".github/workflows/agent-dispatch.yml"
+      ],
+      "touches_worker_source": false,
+      "touches_workflow": true,
+      "changed_paths": [
+        ".github/workflows/agent-dispatch.yml"
+      ],
+      "proven_deployed": false,
+      "reason": "no deployment record ties this execution-infrastructure commit to the declared production runtime; repository presence alone is not deployment evidence"
+    },
+    {
+      "commit": "3263e7d47a60a1c7e67d55c3118ef9450ddcb55f",
+      "short": "3263e7d47a60",
+      "date": "2026-09-26T14:03:57Z",
+      "subject": "cloud agent: gpt task",
+      "execution_paths": [
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/review_validation.py"
+      ],
+      "touches_worker_source": false,
+      "touches_workflow": false,
+      "changed_paths": [
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/review_validation.py",
+        "tests/test_review_assistant_golden.py"
+      ],
+      "proven_deployed": false,
+      "reason": "no deployment record ties this execution-infrastructure commit to the declared production runtime; repository presence alone is not deployment evidence"
+    },
+    {
+      "commit": "1427442526d4f1333ddb8008c54435d92e0a2bd6",
+      "short": "1427442526d4",
+      "date": "2026-09-26T13:38:54Z",
+      "subject": "cloud agent: gpt task",
+      "execution_paths": [
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/event_sync.py",
+        "src/personal_ai_execution/review_assistant.py"
+      ],
+      "touches_worker_source": false,
+      "touches_workflow": false,
+      "changed_paths": [
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/event_sync.py",
+        "src/personal_ai_execution/review_assistant.py",
+        "tests/test_review_assistant.py"
+      ],
+      "proven_deployed": false,
+      "reason": "no deployment record ties this execution-infrastructure commit to the declared production runtime; repository presence alone is not deployment evidence"
+    },
+    {
+      "commit": "f7218cee68983874bfedd628991dd07b66195205",
+      "short": "f7218cee6898",
+      "date": "2026-09-26T13:26:48Z",
+      "subject": "cloud agent: gpt task",
+      "execution_paths": [
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/event_sync.py",
+        "src/personal_ai_execution/reconciliation.py"
+      ],
+      "touches_worker_source": false,
+      "touches_workflow": false,
+      "changed_paths": [
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/event_sync.py",
+        "src/personal_ai_execution/reconciliation.py",
+        "tests/test_task_registry_reconciliation.py"
+      ],
+      "proven_deployed": false,
+      "reason": "no deployment record ties this execution-infrastructure commit to the declared production runtime; repository presence alone is not deployment evidence"
+    },
+    {
+      "commit": "d506fd5058e072f668e1e3aa9655c37c275057ae",
+      "short": "d506fd5058e0",
+      "date": "2026-09-26T12:55:44Z",
+      "subject": "cloud agent: gpt task",
+      "execution_paths": [
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/event_sync.py"
+      ],
+      "touches_worker_source": false,
+      "touches_workflow": false,
+      "changed_paths": [
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/event_sync.py",
+        "tests/test_event_sync.py"
+      ],
+      "proven_deployed": false,
+      "reason": "no deployment record ties this execution-infrastructure commit to the declared production runtime; repository presence alone is not deployment evidence"
+    },
+    {
+      "commit": "548170eb05dfa1c0e407cae4f11689a9639dd45b",
+      "short": "548170eb05df",
+      "date": "2026-09-26T12:23:25Z",
+      "subject": "cloud agent: gpt task",
+      "execution_paths": [
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/result_normalization.py"
+      ],
+      "touches_worker_source": false,
+      "touches_workflow": false,
+      "changed_paths": [
+        "src/personal_ai_execution/__init__.py",
+        "src/personal_ai_execution/result_normalization.py",
+        "tests/conftest.py",
+        "tests/test_result_normalization.py"
+      ],
+      "proven_deployed": false,
+      "reason": "no deployment record ties this execution-infrastructure commit to the declared production runtime; repository presence alone is not deployment evidence"
+    },
+    {
+      "commit": "e0f2f2c55b046d14a9f38130fd2b254553c5f794",
+      "short": "e0f2f2c55b04",
+      "date": "2026-09-26T18:32:00+08:00",
+      "subject": "bootstrap: support safe task-scoped new files and globs",
+      "execution_paths": [
+        "scripts/scope_guard.py"
+      ],
+      "touches_worker_source": false,
+      "touches_workflow": false,
+      "changed_paths": [
+        "scripts/scope_guard.py"
+      ],
+      "proven_deployed": false,
+      "reason": "no deployment record ties this execution-infrastructure commit to the declared production runtime; repository presence alone is not deployment evidence"
+    },
+    {
+      "commit": "9d60c7bfedca3d4e97b5edd847bfa46796830474",
+      "short": "9d60c7bfedca",
+      "date": "2026-09-26T10:52:36+08:00",
+      "subject": "feat: support task-scoped expected files",
+      "execution_paths": [
+        "worker/index.js"
+      ],
+      "touches_worker_source": true,
+      "touches_workflow": false,
+      "changed_paths": [
+        "worker/index.js"
+      ],
+      "proven_deployed": false,
+      "reason": "no deployment record ties this execution-infrastructure commit to the declared production runtime; repository presence alone is not deployment evidence"
+    }
+  ],
+  "report_only_commits": [
+    {
+      "commit": "42a47d9e9d2612ca388177e45e47286479428e0e",
+      "short": "42a47d9e9d26",
+      "date": "2026-09-27T01:47:19Z",
+      "subject": "cloud agent: gpt task",
+      "changed_paths": [
+        "PRODUCTION_DEPLOY_V0.1.md",
+        "RUNTIME_PROVENANCE_V0.2.md",
+        "reports/production_deploy_v0.1.json",
+        "reports/production_deploy_v0_1.py",
+        "reports/runtime_provenance_v0.2.json"
+      ],
+      "reason": "does not touch execution-relevant paths; documentation/report-only commit, not a required-but-undeployed runtime change"
+    },
+    {
+      "commit": "ddf5ca385dff459e941d9e201862d2610c413bfc",
+      "short": "ddf5ca385dff",
+      "date": "2026-09-27T01:34:01Z",
+      "subject": "cloud agent: gpt task",
+      "changed_paths": [
+        "RUNTIME_PROVENANCE_V0.2.md",
+        "reports/runtime_provenance_v0.2.json",
+        "tests/runtime_provenance_v0_2.py",
+        "tests/test_runtime_provenance_v0_2.py"
+      ],
+      "reason": "does not touch execution-relevant paths; documentation/report-only commit, not a required-but-undeployed runtime change"
+    },
+    {
+      "commit": "824bd4c415554e111787d3fc1b1632e28863179b",
+      "short": "824bd4c41555",
+      "date": "2026-09-27T00:53:40Z",
+      "subject": "cloud agent: gpt task",
+      "changed_paths": [
+        "STATUS_CONTRACT_V0.2.md"
+      ],
+      "reason": "does not touch execution-relevant paths; documentation/report-only commit, not a required-but-undeployed runtime change"
+    },
+    {
+      "commit": "39949a75ce5d0e2df78a2c255d68169d2ab00be5",
+      "short": "39949a75ce5d",
+      "date": "2026-09-27T00:03:51Z",
+      "subject": "cloud agent: gpt task",
+      "changed_paths": [
+        "POST_TIMEOUT_FIX_GOLDEN_V0.1.md",
+        "tests/test_post_timeout_fix_golden.py"
+      ],
+      "reason": "does not touch execution-relevant paths; documentation/report-only commit, not a required-but-undeployed runtime change"
+    },
+    {
+      "commit": "2058dce16e86abad5f4771735f978853bb1f331f",
+      "short": "2058dce16e86",
+      "date": "2026-09-26T15:18:13Z",
+      "subject": "cloud agent: gpt task",
+      "changed_paths": [
+        "hello.py",
+        "test_hello.py"
+      ],
+      "reason": "does not touch execution-relevant paths; documentation/report-only commit, not a required-but-undeployed runtime change"
+    },
+    {
+      "commit": "93e64046bef93a572d2e077300bff33a6946319c",
+      "short": "93e64046bef9",
+      "date": "2026-09-26T10:38:39Z",
+      "subject": "cloud agent: gpt task",
+      "changed_paths": [
+        "src/gate2_glob_golden.py"
+      ],
+      "reason": "does not touch execution-relevant paths; documentation/report-only commit, not a required-but-undeployed runtime change"
+    },
+    {
+      "commit": "c7075cb75d656ac161fb85a9afe93171658d501e",
+      "short": "c7075cb75d65",
+      "date": "2026-09-26T07:47:18Z",
+      "subject": "cloud agent: gpt task",
+      "changed_paths": [
+        "hello.py",
+        "test_hello.py"
+      ],
+      "reason": "does not touch execution-relevant paths; documentation/report-only commit, not a required-but-undeployed runtime change"
+    },
+    {
+      "commit": "70a208efca3005afb431e1f5ffb4df50fbd905a0",
+      "short": "70a208efca30",
+      "date": "2026-09-26T04:32:05Z",
+      "subject": "cloud agent: gpt task",
+      "changed_paths": [
+        "agent_scope_probe.txt"
+      ],
+      "reason": "does not touch execution-relevant paths; documentation/report-only commit, not a required-but-undeployed runtime change"
+    }
+  ],
+  "remaining_gap": [
+    "production deployment/version identity is only self-declared (worker/PRODUCTION-BASELINE.json version=3e2fed43); no authoritative live-runtime or Cloudflare deployment/version interface confirmed it",
+    "no Cloudflare production deploy credential is available (checked names: CLOUDFLARE_API_TOKEN, CF_API_TOKEN, CLOUDFLARE_API_KEY); the controlled deploy cf-7afde7d95cdb was BLOCKED before any deployment was attempted",
+    "reports/production_deploy_v0.1.json records cloudflare_deployment_id=None, cloudflare_version=None, deployment_timestamp=None, link_status='INCOMPLETE_BLOCKED'",
+    "declared production source sha256 8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1 matches no canonical worker/index.js commit; current HEAD source hash is 6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480 (last source commit 592e7c29af4a5e72e3ec12bb458538629011896b)",
+    "to reach VERIFIED: deploy the canonical worker source with a Cloudflare credential, record cloudflare_deployment_id/version and deployment_timestamp, and write the deployed worker/index.js sha256 into the production baseline so the commit -> hash -> version -> runtime chain closes",
+    "status-contract and asset-provenance Worker changes are present in canonical source but not proven included in the live runtime because the deployed source hash cannot be tied to a canonical commit"
+  ],
+  "live_endpoint_checks": {
+    "performed": false,
+    "reason": "no Cloudflare credential or live interface available in the audit environment; a bounded read-only health probe was not possible, so live runtime evidence is not fabricated",
+    "planned_read_only_checks": [
+      {
+        "check": "health endpoint",
+        "request": "GET /healthz",
+        "expect": "200 JSON containing {\"status\":\"ok\",\"name\":\"personal-ai-execution-mcp\"}"
+      },
+      {
+        "check": "auth boundary",
+        "request": "POST /mcp without Authorization",
+        "expect": "401 unauthorized"
+      },
+      {
+        "check": "MCP tools/list schema",
+        "request": "POST /mcp (authorized) method=tools/list",
+        "expect": "tool schema includes submit_task, get_task_result, search_assets"
+      }
+    ]
+  },
+  "checks": [
+    {
+      "check": "deployment metadata present",
+      "status": "PASS",
+      "detail": "deployment baseline present: worker/PRODUCTION-BASELINE.json"
+    },
+    {
+      "check": "production deployment/version identity independently verified",
+      "status": "BLOCKED",
+      "detail": "identity only self-declared: service=personal-ai-execution-mcp environment=production version=3e2fed43 (source: worker/PRODUCTION-BASELINE.json); no authoritative live/deployment confirmation available"
+    },
+    {
+      "check": "canonical source present",
+      "status": "PASS",
+      "detail": "canonical source present: worker/index.js (sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480, bytes=69392, lines=1931)"
+    },
+    {
+      "check": "canonical commit and exact worker source hash verified",
+      "status": "PASS",
+      "detail": "HEAD source worker/index.js sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480 (69392 bytes / 1931 lines); last source commit 592e7c29af4a5e72e3ec12bb458538629011896b"
+    },
+    {
+      "check": "declared production source hash matches a canonical commit",
+      "status": "BLOCKED",
+      "detail": "declared production source hash 8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1 matches no canonical worker/index.js commit (4 candidate commits checked); current HEAD source hash is 6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480"
+    },
+    {
+      "check": "source hash -> Cloudflare deployment/version link",
+      "status": "BLOCKED",
+      "detail": "no Cloudflare deployment id/version recorded; the link from the canonical source hash to a live deployment is absent"
+    },
+    {
+      "check": "canonical source -> live runtime relationship",
+      "status": "BLOCKED",
+      "detail": "[UNVERIFIED] declared production source hash 8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1 matches no canonical commit of worker/index.js in the repository history; current HEAD source hash is 6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480; no Cloudflare deployment/version record exists to link source to the live runtime; the deployed runtime is not traceable to a canonical source commit"
+    },
+    {
+      "check": "status-contract and asset-provenance runtime changes proven included",
+      "status": "BLOCKED",
+      "detail": "status-contract=BLOCKED: status-contract tokens are present in canonical source (sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480) but the deployed production source hash cannot be tied to a canonical commit, so inclusion in the live runtime is not proven; asset-provenance=BLOCKED: asset-provenance tokens are present in canonical source (sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480) but the deployed production source hash cannot be tied to a canonical commit, so inclusion in the live runtime is not proven"
+    },
+    {
+      "check": "execution-relevant commits proven deployed",
+      "status": "BLOCKED",
+      "detail": "12 execution-relevant commit(s) after the recovered baseline are not proven deployed (source presence != deployment)"
+    },
+    {
+      "check": "no production mutation",
+      "status": "PASS",
+      "detail": "read-only audit: no deploy, upload, secret change, D1/KV mutation, workflow mutation or asset mutation performed"
+    }
+  ],
+  "overall": "BLOCKED",
+  "markdown": "# PERSONAL_AI_RUNTIME_PROVENANCE_FINAL_AUDIT_V0.3_REPORT\n\n- goal: PERSONAL_AI_RUNTIME_PROVENANCE_FINAL_AUDIT_V0.3\n- task_id: cf-619649c43aa2\n- generated_at: 2026-09-27T01:57:28.378234+00:00\n- read_only: True\n- production_mutated: False\n- secrets_exposed: False\n- live_endpoint_checked: False\n\n## Production deployment / version identity\n- service: personal-ai-execution-mcp\n- environment: production\n- production_version: 3e2fed43\n- metadata: worker/PRODUCTION-BASELINE.json\n- cloudflare_deployment_id: None\n- cloudflare_version: None\n- deployment_timestamp: None\n- deploy_attempted: False\n- deploy_link_status: 'INCOMPLETE_BLOCKED'\n- identity_status: PARTIAL\n\n## Canonical source vs declared production source\n- canonical source: worker/index.js\n- canonical HEAD commit: 42a47d9e9d2612ca388177e45e47286479428e0e\n- canonical HEAD sha256: 6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480 (69392 bytes / 1931 lines)\n- declared production sha256: 8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1 (55278 bytes / 1543 lines)\n- canonical HEAD matches declared: False\n- canonical source last commit: 592e7c29af4a5e72e3ec12bb458538629011896b\n\n## Source-to-live-runtime relationship\n- relationship_status: UNVERIFIED\n- reason: declared production source hash 8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1 matches no canonical commit of worker/index.js in the repository history; current HEAD source hash is 6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480; no Cloudflare deployment/version record exists to link source to the live runtime; the deployed runtime is not traceable to a canonical source commit\n\n## Recent runtime changes (inclusion in deployed runtime)\n- status-contract: status=BLOCKED canonical_source_includes=True deployed_inclusion_proven=False source_commits=['0c3ac20392bf']\n  - status-contract tokens are present in canonical source (sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480) but the deployed production source hash cannot be tied to a canonical commit, so inclusion in the live runtime is not proven\n- asset-provenance: status=BLOCKED canonical_source_includes=True deployed_inclusion_proven=False source_commits=['592e7c29af4a']\n  - asset-provenance tokens are present in canonical source (sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480) but the deployed production source hash cannot be tied to a canonical commit, so inclusion in the live runtime is not proven\n\n## Candidate source commits\n- 592e7c29af4a 2026-09-27T01:10:20Z sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480 bytes=69392 lines=1931 on_history=True matches_declared=False tags=[] | cloud agent: gpt task\n- 0c3ac20392bf 2026-09-27T00:52:12Z sha256=1fc165aea2b988ff524c95035f4fdb1fe4ede5219958d04a3cccda239b0adcba bytes=60178 lines=1708 on_history=True matches_declared=False tags=[] | cloud agent: gpt task\n- 9d60c7bfedca 2026-09-26T10:52:36+08:00 sha256=b001caebf1193b9bab47d519bc516da92df0c1ce1d83ea3db63b1b21fcebf6c9 bytes=54312 lines=1551 on_history=True matches_declared=False tags=['expected-files-v1-20260926'] | feat: support task-scoped expected files\n- 6a0c740858a8 2026-09-26T10:19:56+08:00 sha256=ea298b2eebfb0445086aac85ef5c4988e6d508d2df6bfa0ddfc772429b7aca7c bytes=53736 lines=1542 on_history=True matches_declared=False tags=['production-recovered-3e2fed43-20260926'] | chore: recover production execution worker baseline\n\n## Execution-relevant commits not proven deployed\n- dbbbbd13ada2 worker=False workflow=False proven_deployed=False | cloud agent: gpt task\n- 592e7c29af4a worker=True workflow=False proven_deployed=False | cloud agent: gpt task\n- 0c3ac20392bf worker=True workflow=False proven_deployed=False | cloud agent: gpt task\n- 698ac2998c67 worker=False workflow=False proven_deployed=False | cloud agent: gpt task\n- ed3ca64977a1 worker=False workflow=True proven_deployed=False | fix: extend agent budget and make cancelled results truthful\n- 3263e7d47a60 worker=False workflow=False proven_deployed=False | cloud agent: gpt task\n- 1427442526d4 worker=False workflow=False proven_deployed=False | cloud agent: gpt task\n- f7218cee6898 worker=False workflow=False proven_deployed=False | cloud agent: gpt task\n- d506fd5058e0 worker=False workflow=False proven_deployed=False | cloud agent: gpt task\n- 548170eb05df worker=False workflow=False proven_deployed=False | cloud agent: gpt task\n- e0f2f2c55b04 worker=False workflow=False proven_deployed=False | bootstrap: support safe task-scoped new files and globs\n- 9d60c7bfedca worker=True workflow=False proven_deployed=False | feat: support task-scoped expected files\n\n## Report-only (non-runtime) commits\n- 42a47d9e9d26 | cloud agent: gpt task (5 path(s))\n- ddf5ca385dff | cloud agent: gpt task (4 path(s))\n- 824bd4c41555 | cloud agent: gpt task (1 path(s))\n- 39949a75ce5d | cloud agent: gpt task (2 path(s))\n- 2058dce16e86 | cloud agent: gpt task (2 path(s))\n- 93e64046bef9 | cloud agent: gpt task (1 path(s))\n- c7075cb75d65 | cloud agent: gpt task (2 path(s))\n- 70a208efca30 | cloud agent: gpt task (1 path(s))\n\n## Live endpoint checks\n- performed: False\n- reason: no Cloudflare credential or live interface available in the audit environment; a bounded read-only health probe was not possible, so live runtime evidence is not fabricated\n- planned: health endpoint (GET /healthz)\n- planned: auth boundary (POST /mcp without Authorization)\n- planned: MCP tools/list schema (POST /mcp (authorized) method=tools/list)\n\n## Checks\n- [PASS] deployment metadata present: deployment baseline present: worker/PRODUCTION-BASELINE.json\n- [BLOCKED] production deployment/version identity independently verified: identity only self-declared: service=personal-ai-execution-mcp environment=production version=3e2fed43 (source: worker/PRODUCTION-BASELINE.json); no authoritative live/deployment confirmation available\n- [PASS] canonical source present: canonical source present: worker/index.js (sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480, bytes=69392, lines=1931)\n- [PASS] canonical commit and exact worker source hash verified: HEAD source worker/index.js sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480 (69392 bytes / 1931 lines); last source commit 592e7c29af4a5e72e3ec12bb458538629011896b\n- [BLOCKED] declared production source hash matches a canonical commit: declared production source hash 8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1 matches no canonical worker/index.js commit (4 candidate commits checked); current HEAD source hash is 6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480\n- [BLOCKED] source hash -> Cloudflare deployment/version link: no Cloudflare deployment id/version recorded; the link from the canonical source hash to a live deployment is absent\n- [BLOCKED] canonical source -> live runtime relationship: [UNVERIFIED] declared production source hash 8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1 matches no canonical commit of worker/index.js in the repository history; current HEAD source hash is 6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480; no Cloudflare deployment/version record exists to link source to the live runtime; the deployed runtime is not traceable to a canonical source commit\n- [BLOCKED] status-contract and asset-provenance runtime changes proven included: status-contract=BLOCKED: status-contract tokens are present in canonical source (sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480) but the deployed production source hash cannot be tied to a canonical commit, so inclusion in the live runtime is not proven; asset-provenance=BLOCKED: asset-provenance tokens are present in canonical source (sha256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480) but the deployed production source hash cannot be tied to a canonical commit, so inclusion in the live runtime is not proven\n- [BLOCKED] execution-relevant commits proven deployed: 12 execution-relevant commit(s) after the recovered baseline are not proven deployed (source presence != deployment)\n- [PASS] no production mutation: read-only audit: no deploy, upload, secret change, D1/KV mutation, workflow mutation or asset mutation performed\n\n## Remaining gap to VERIFIED\n- production deployment/version identity is only self-declared (worker/PRODUCTION-BASELINE.json version=3e2fed43); no authoritative live-runtime or Cloudflare deployment/version interface confirmed it\n- no Cloudflare production deploy credential is available (checked names: CLOUDFLARE_API_TOKEN, CF_API_TOKEN, CLOUDFLARE_API_KEY); the controlled deploy cf-7afde7d95cdb was BLOCKED before any deployment was attempted\n- reports/production_deploy_v0.1.json records cloudflare_deployment_id=None, cloudflare_version=None, deployment_timestamp=None, link_status='INCOMPLETE_BLOCKED'\n- declared production source sha256 8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1 matches no canonical worker/index.js commit; current HEAD source hash is 6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480 (last source commit 592e7c29af4a5e72e3ec12bb458538629011896b)\n- to reach VERIFIED: deploy the canonical worker source with a Cloudflare credential, record cloudflare_deployment_id/version and deployment_timestamp, and write the deployed worker/index.js sha256 into the production baseline so the commit -> hash -> version -> runtime chain closes\n- status-contract and asset-provenance Worker changes are present in canonical source but not proven included in the live runtime because the deployed source hash cannot be tied to a canonical commit\n\n## Verdict\nDEPLOYED_VERSION=3e2fed43\nCLOUDFLARE_DEPLOYMENT_ID=UNAVAILABLE\nCLOUDFLARE_VERSION=UNAVAILABLE\nDEPLOYMENT_IDENTITY_STATUS=PARTIAL\nRELATIONSHIP_STATUS=UNVERIFIED\nCANONICAL_SOURCE_SHA256=6a2efaa81d6df0d1e5ffd11931d600bba83e4eb1a3c9e06045d35a133b3ae480\nPRODUCTION_MUTATED=False\nSECRETS_EXPOSED=False\nOVERALL=BLOCKED"
+}
