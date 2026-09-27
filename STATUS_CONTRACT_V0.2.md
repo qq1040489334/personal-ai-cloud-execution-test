@@ -149,7 +149,7 @@ Command: `python -m pytest -q`
 
 ## 11. Commit / evidence
 
-- Implementation commit: `__COMMIT__`
+- Implementation commit: `0c3ac20392bf86bfecb68cbaadd77a7a2a398665`
 - Verification: `python -m pytest -q` -> `404 passed`
 - Status matrix: sections 3 and 7 above.
 
