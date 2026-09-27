@@ -33,12 +33,127 @@ REVIEWED_STATE = "reviewed"
 SYNC_EVENT = "event_sync"
 RECONCILE_ACTION = "reconcile"
 
+#: Reason code returned by :func:`review_eligibility` for a reviewable task.
+ELIGIBLE_REASON_CODE = "ELIGIBLE"
+
 #: Fixed task id used by the golden EVENT_SYNC discovery path.
 GOLDEN_TASK_ID = "cf-0564e6c347b8"
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalized_status(value: Any) -> str:
+    return str(value).strip().upper() if value is not None else ""
+
+
+def validated_review_result(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the validated, task-id-matching result for ``record``.
+
+    A result qualifies for review only when it is a stored ``task_result``
+    mapping that (a) carries a ``task_id`` equal to the record's ``task_id`` and
+    (b) has a terminal status. Anything missing, malformed, non-terminal or
+    mismatched returns ``None`` so the caller fails closed.
+    """
+    task_id = str(record.get("task_id") or "")
+    if not task_id:
+        return None
+    evidence = record.get("evidence")
+    result = evidence.get("task_result") if isinstance(evidence, Mapping) else None
+    if not isinstance(result, Mapping):
+        return None
+    result_task_id = result.get("task_id")
+    if result_task_id is None or str(result_task_id) != task_id:
+        return None
+    if _normalized_status(result.get("status")) not in _normalization.TERMINAL_STATUSES:
+        return None
+    if result.get("terminal") is False:
+        return None
+    return dict(result)
+
+
+def review_eligibility(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Assess, fail-closed, whether a task record may be marked reviewed.
+
+    Review closure requires an *authoritative terminal execution state* plus a
+    *validated result whose ``task_id`` matches* the task. Every rejection is
+    returned as a structured ``reason_code`` + human ``reason`` so the mark
+    reviewed audit event can preserve why the gate opened or closed.
+    """
+    task_id = str(record.get("task_id") or "")
+    assessment: dict[str, Any] = {
+        "task_id": task_id or None,
+        "eligible": False,
+        "reason_code": None,
+        "reason": None,
+        "status": None,
+        "result_task_id": None,
+    }
+
+    def reject(code: str, reason: str) -> dict[str, Any]:
+        assessment["reason_code"] = code
+        assessment["reason"] = reason
+        return assessment
+
+    if not task_id:
+        return reject("MISSING_TASK_ID", "task record has no task_id")
+
+    normalized_status = _normalized_status(record.get("normalized_status"))
+    if not record.get("terminal"):
+        return reject(
+            "NON_TERMINAL",
+            "task has no authoritative terminal execution state",
+        )
+    if normalized_status not in _normalization.TERMINAL_STATUSES:
+        return reject(
+            "NON_TERMINAL_STATUS",
+            f"normalized status {normalized_status or None!r} is not terminal; "
+            f"allowed: {', '.join(sorted(_normalization.TERMINAL_STATUSES))}",
+        )
+    if not record.get("result_available"):
+        return reject(
+            "RESULT_UNAVAILABLE",
+            "task has no validated result available for review",
+        )
+
+    evidence = record.get("evidence")
+    stored = evidence.get("task_result") if isinstance(evidence, Mapping) else None
+    if not isinstance(stored, Mapping):
+        return reject("MISSING_RESULT", "task has no stored task_result to validate")
+    stored_task_id = stored.get("task_id")
+    if stored_task_id is None or str(stored_task_id) != task_id:
+        return reject(
+            "RESULT_TASK_ID_MISMATCH",
+            f"result task_id {stored_task_id!r} does not match task {task_id}",
+        )
+    stored_status = _normalized_status(stored.get("status"))
+    if stored_status not in _normalization.TERMINAL_STATUSES:
+        return reject(
+            "NON_TERMINAL_RESULT",
+            f"validated result status {stored_status or None!r} is not terminal",
+        )
+    if stored.get("terminal") is False:
+        return reject(
+            "NON_TERMINAL_RESULT",
+            "validated result reports terminal=False",
+        )
+    if stored_status != normalized_status:
+        return reject(
+            "RESULT_STATUS_MISMATCH",
+            f"result status {stored_status} disagrees with registry status "
+            f"{normalized_status}",
+        )
+
+    assessment["eligible"] = True
+    assessment["reason_code"] = ELIGIBLE_REASON_CODE
+    assessment["status"] = normalized_status
+    assessment["result_task_id"] = str(stored_task_id)
+    assessment["reason"] = (
+        f"task {task_id} has terminal status {normalized_status} and a "
+        f"validated result whose task_id matches"
+    )
+    return assessment
 
 
 class EventSyncRegistry:
@@ -96,6 +211,8 @@ class EventSyncRegistry:
                 "review_verdict": None,
                 "reviewed_at": None,
                 "review_note": None,
+                "review_reason": None,
+                "review_reason_code": None,
                 "result_available": False,
                 "terminal": False,
                 "normalized_status": None,
@@ -163,7 +280,14 @@ class EventSyncRegistry:
     def mark_reviewed(
         self, task_id: Any = None, verdict: str | None = None, note: str | None = None
     ) -> dict[str, Any]:
-        """Record an explicit human review verdict; idempotent per verdict."""
+        """Record an explicit human review verdict for an eligible task.
+
+        Fail-closed: review closure is allowed only when the task has an
+        authoritative terminal execution state and a validated result whose
+        ``task_id`` matches. Eligible completed tasks accept ``PASS`` / ``FAIL``
+        / ``BLOCKED``. An identical repeated verdict is idempotent; a conflicting
+        second verdict is rejected.
+        """
         if isinstance(task_id, Mapping):
             payload = dict(task_id)
             task_id = payload.get("task_id", task_id)
@@ -185,7 +309,14 @@ class EventSyncRegistry:
                 result["idempotent"] = True
                 return result
             raise ValueError(
-                f"review already recorded: {record.get('review_verdict')}"
+                f"review already recorded: {record.get('review_verdict')}; "
+                f"conflicting verdict {normalized} rejected"
+            )
+        eligibility = review_eligibility(record)
+        if not eligibility["eligible"]:
+            raise ValueError(
+                f"task {task_id} is not reviewable "
+                f"({eligibility['reason_code']}): {eligibility['reason']}"
             )
         timestamp = _utc_now()
         event = {
@@ -194,15 +325,22 @@ class EventSyncRegistry:
             "verdict": normalized,
             "timestamp": timestamp,
             "note": note,
+            "reason": eligibility["reason"],
+            "reason_code": eligibility["reason_code"],
+            "reviewed_status": eligibility["status"],
+            "result_task_id": eligibility["result_task_id"],
         }
         record["reviewed"] = True
         record["review_verdict"] = normalized
         record["reviewed_at"] = timestamp
         record["review_note"] = note
+        record["review_reason"] = eligibility["reason"]
+        record["review_reason_code"] = eligibility["reason_code"]
         record["review_state"] = REVIEWED_STATE
         record.setdefault("review_events", []).append(event)
         self._review_events.append(event)
         result = dict(record)
+        result["review_event"] = event
         result["idempotent"] = False
         return result
 

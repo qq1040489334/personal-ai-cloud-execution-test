@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from . import event_sync, reconciliation, review_assistant, review_validation
 from .event_sync import (
+    ELIGIBLE_REASON_CODE,
     GOLDEN_TASK_ID,
     PENDING_REVIEW,
     RECONCILE_ACTION,
@@ -20,8 +21,10 @@ from .event_sync import (
     recommend_review,
     reconcile_historical_tasks,
     reset_default_registry,
+    review_eligibility,
     submit_task,
     sync_terminal_result,
+    validated_review_result,
 )
 from .reconciliation import (
     ALREADY_SYNCED,
@@ -68,6 +71,7 @@ __all__ = [
     "BLOCKED",
     "BLOCKED_AWAITING_INSPECTION",
     "COMPLETED_WITH_RESULT",
+    "ELIGIBLE_REASON_CODE",
     "FAIL",
     "FAILED_WITH_RESULT",
     "GOLDEN_GOAL",
@@ -112,9 +116,11 @@ __all__ = [
     "reconciliation",
     "reset_default_registry",
     "review_assistant",
+    "review_eligibility",
     "review_validation",
     "run_review_assistant_golden",
     "submit_task",
     "sync_terminal_result",
+    "validated_review_result",
     "workflow_conclusion",
 ]
