@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -10601,6 +10602,554 @@ def write_production_golden_runtime_execution_result(
     return {"path": str(target), "payload": payload}
 
 
+# -- PERSONAL_AI_AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_V0.1 ------
+#
+# Final, strictly read-only evidence audit of the production autonomous
+# advancement edge (PASS review -> pre-authorized child dispatch). It never
+# deploys, never mutates D1/KV, never writes secrets and never fabricates a
+# production record. Authoritative production evidence can only come from a
+# real Cloudflare D1 / Task Registry / review-dispatch read; when it is not
+# captured every required section is reported BLOCKED_EVIDENCE_MISSING and the
+# final status can never be GOLDEN_PASS.
+
+AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_GOAL = (
+    "PERSONAL_AI_AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_V0.1"
+)
+AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_TASK_ID = "cf-f31219ae9854"
+AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_REPORT = (
+    "AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_REPORT"
+)
+
+AUTONOMOUS_ADVANCEMENT_FINAL_GOLDEN_PASS = "GOLDEN_PASS"
+AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE = "BLOCKED_EVIDENCE_MISSING"
+AUTONOMOUS_ADVANCEMENT_FINAL_FAIL = "FAIL"
+
+AUTONOMOUS_ADVANCEMENT_EVIDENCE_ENV = "AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE"
+AUTONOMOUS_ADVANCEMENT_EVIDENCE_PATH_ENV = (
+    "AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_PATH"
+)
+
+_AUTONOMOUS_ADVANCEMENT_D1_MIGRATION = (
+    "worker/migrations/0002_dispatch_idempotency.sql"
+)
+_AUTONOMOUS_ADVANCEMENT_BASELINE = "worker/PRODUCTION-BASELINE.json"
+
+_REQUIRED_D1_INDEXES = {
+    "idx_task_dispatch_markers_parent": ("parent_task_id", True),
+    "idx_task_dispatch_markers_child": ("child_task_id", False),
+    "idx_task_dispatch_markers_state": ("dispatch_state", False),
+}
+
+_FAIL_CLOSED_SCENARIOS = ("FAIL", "BLOCKED", "missing_approved_next_task")
+
+
+def _read_text_if_file(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _autonomous_advancement_d1_schema_evidence() -> dict:
+    """Verify the D1 dispatch-marker table + the three required indexes in-repo.
+
+    This confirms the *declared schema* only. ``production_authoritative`` stays
+    ``False`` until a real remote D1 read confirms it.
+    """
+    path = REPO_ROOT / _AUTONOMOUS_ADVANCEMENT_D1_MIGRATION
+    sql = _read_text_if_file(path)
+    table_present = "CREATE TABLE IF NOT EXISTS task_dispatch_markers" in sql
+    indexes: dict[str, dict] = {}
+    for name, (column, required_unique) in _REQUIRED_D1_INDEXES.items():
+        pattern = re.compile(
+            r"CREATE\s+(UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+"
+            + re.escape(name)
+            + r"\s+ON\s+task_dispatch_markers\s*\(\s*"
+            + re.escape(column)
+            + r"\s*\)",
+            re.IGNORECASE,
+        )
+        match = pattern.search(sql)
+        present = match is not None
+        unique = bool(match and match.group(1))
+        indexes[name] = {
+            "column": column,
+            "required_unique": required_unique,
+            "present": present,
+            "unique": unique,
+            "satisfied": present and unique == required_unique,
+        }
+    remote_applied = "APPLIED_REMOTE" in sql and "NOT_APPLIED_REMOTE" not in sql
+    return {
+        "source": str(path),
+        "table": "task_dispatch_markers",
+        "table_present": table_present,
+        "indexes": indexes,
+        "indexes_satisfied": table_present
+        and all(item["satisfied"] for item in indexes.values()),
+        "remote_applied": remote_applied,
+        "production_authoritative": False,
+    }
+
+
+def _declared_production_version() -> str | None:
+    baseline = REPO_ROOT / _AUTONOMOUS_ADVANCEMENT_BASELINE
+    data = {}
+    text = _read_text_if_file(baseline)
+    if text:
+        try:
+            loaded = json.loads(text)
+            if isinstance(loaded, dict):
+                data = loaded
+        except json.JSONDecodeError:
+            data = {}
+    return _metadata_str(data, "production_version", "version", "version_id")
+
+
+def _capture_production_evidence() -> dict:
+    """Attempt an authoritative production evidence capture (read-only).
+
+    Evidence may be supplied as JSON via ``AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE``
+    or as a file via ``AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_PATH``. In this
+    execution environment neither a Cloudflare read/write credential nor a
+    Cloudflare MCP interface is exposed, so the capture is unavailable and the
+    audit fails closed instead of inventing records.
+    """
+    raw = os.environ.get(AUTONOMOUS_ADVANCEMENT_EVIDENCE_ENV)
+    source = "env:" + AUTONOMOUS_ADVANCEMENT_EVIDENCE_ENV
+    if not raw:
+        path_value = os.environ.get(AUTONOMOUS_ADVANCEMENT_EVIDENCE_PATH_ENV)
+        if path_value:
+            raw = _read_text_if_file(Path(path_value))
+            source = path_value
+    if not raw:
+        return {
+            "available": False,
+            "reason": (
+                "no authoritative Cloudflare D1 / Task Registry / review-dispatch "
+                "read interface or credential is present, and no production "
+                "evidence JSON/path was supplied"
+            ),
+            "source": "unavailable",
+        }
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return {
+            "available": False,
+            "reason": f"supplied production evidence is not valid JSON: {exc}",
+            "source": source,
+        }
+    if not isinstance(loaded, dict):
+        return {
+            "available": False,
+            "reason": "supplied production evidence is not a JSON object",
+            "source": source,
+        }
+    loaded.setdefault("source", source)
+    loaded.setdefault("available", True)
+    return loaded
+
+
+def _autonomous_advancement_golden_reference() -> dict:
+    report = production_golden_runtime_verification()
+    exactly_once = report.get("exactly_once", {}) or {}
+    return {
+        "probe_available": report.get("probe_available", False),
+        "status": report.get("PRODUCTION_GOLDEN_RUNTIME_STATUS"),
+        "parent_task_id": report.get("parent_task_id"),
+        "child_task_id": report.get("child_task_id"),
+        "exactly_once_verified": exactly_once.get("verified"),
+        "exactly_once_dispatch_calls": exactly_once.get("dispatch_calls"),
+        "fail_closed_verified": (report.get("fail_closed", {}) or {}).get("verified"),
+        "non_authoritative": True,
+        "reason": (
+            "in-memory execution of the canonical worker source against a "
+            "D1/KV/fetch double with a synthetic parent id; not production records"
+        ),
+    }
+
+
+def autonomous_advancement_production_evidence_audit(
+    production_evidence: dict | None = None,
+) -> dict:
+    """Read-only audit of the production autonomous-advancement edge.
+
+    Verifies the ``task_dispatch_markers`` table and the three required indexes,
+    the golden PASS ``parent_task_id`` -> ``child_task_id`` dispatch, exactly-once
+    replay (child dispatch count == 1), and fail-closed behaviour for
+    ``FAIL`` / ``BLOCKED`` / missing ``approved_next_task`` (each child dispatch
+    count == 0). Also reports the Cloudflare current version/deployment id.
+
+    Authoritative evidence is used *only* when it is genuinely captured. When it
+    is missing, every section is ``BLOCKED_EVIDENCE_MISSING`` and the final
+    status is never ``GOLDEN_PASS``. No remote mutation, deployment or D1 write
+    is ever performed.
+    """
+    capture = (
+        production_evidence
+        if isinstance(production_evidence, dict)
+        else _capture_production_evidence()
+    )
+    authoritative = bool(capture.get("available"))
+    source = capture.get("source", "unavailable")
+    golden_reference = _autonomous_advancement_golden_reference()
+
+    # -- D1 schema evidence -------------------------------------------------
+    local_d1 = _autonomous_advancement_d1_schema_evidence()
+    captured_d1 = capture.get("d1") if authoritative else None
+    if isinstance(captured_d1, dict):
+        d1 = dict(captured_d1)
+        d1.setdefault("table", "task_dispatch_markers")
+        d1.setdefault("source", source)
+        d1["production_authoritative"] = True
+    else:
+        d1 = dict(local_d1)
+    d1_authoritative = bool(d1.get("production_authoritative"))
+    d1_ok = bool(
+        d1_authoritative
+        and d1.get("table_present")
+        and d1.get("indexes_satisfied")
+    )
+    d1["status"] = PASS if d1_ok else AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+    if not d1_authoritative:
+        d1["missing_reason"] = (
+            "table + three indexes are verified in the in-repo migration, but no "
+            "authoritative remote D1 read confirms the schema is applied in production"
+        )
+
+    # -- PASS dispatch evidence --------------------------------------------
+    captured_pass = capture.get("pass_dispatch") if authoritative else None
+    pass_dispatch = {
+        "parent_task_id": None,
+        "child_task_id": None,
+        "dispatch_state": None,
+        "created_at": None,
+        "source": source,
+        "production_authoritative": authoritative,
+        "non_authoritative_reference": golden_reference,
+        "status": AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE,
+        "missing_reason": None,
+    }
+    if isinstance(captured_pass, dict):
+        pass_dispatch.update(
+            {
+                "parent_task_id": captured_pass.get("parent_task_id"),
+                "child_task_id": captured_pass.get("child_task_id"),
+                "dispatch_state": captured_pass.get("dispatch_state"),
+                "created_at": captured_pass.get("created_at"),
+            }
+        )
+        parent = pass_dispatch["parent_task_id"]
+        child = pass_dispatch["child_task_id"]
+        if parent and child:
+            pass_dispatch["status"] = (
+                PASS
+                if str(pass_dispatch["dispatch_state"]).upper() == "DISPATCHED"
+                else FAIL
+            )
+        else:
+            pass_dispatch["missing_reason"] = "captured PASS dispatch lacks parent/child ids"
+    else:
+        pass_dispatch["missing_reason"] = (
+            "no authoritative production PASS review/dispatch record with a real "
+            "parent_task_id and child_task_id"
+        )
+
+    # -- Exactly once evidence ---------------------------------------------
+    captured_once = capture.get("exactly_once") if authoritative else None
+    exactly_once = {
+        "parent_task_id": None,
+        "child_task_id": None,
+        "child_dispatch_count": None,
+        "replay_reason": None,
+        "source": source,
+        "production_authoritative": authoritative,
+        "non_authoritative_reference": golden_reference,
+        "status": AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE,
+        "missing_reason": None,
+    }
+    if isinstance(captured_once, dict):
+        exactly_once.update(
+            {
+                "parent_task_id": captured_once.get("parent_task_id"),
+                "child_task_id": captured_once.get("child_task_id"),
+                "child_dispatch_count": captured_once.get("child_dispatch_count"),
+                "replay_reason": captured_once.get("replay_reason"),
+            }
+        )
+        if isinstance(exactly_once["child_dispatch_count"], int):
+            exactly_once["status"] = (
+                PASS if exactly_once["child_dispatch_count"] == 1 else FAIL
+            )
+        else:
+            exactly_once["missing_reason"] = "captured exactly-once section lacks a count"
+    else:
+        exactly_once["missing_reason"] = (
+            "no authoritative production dispatch-count evidence for the reviewed parent"
+        )
+
+    # -- Fail closed evidence ----------------------------------------------
+    captured_closed = capture.get("fail_closed") if authoritative else None
+    closed_source = captured_closed if isinstance(captured_closed, dict) else {}
+    scenarios: dict[str, dict] = {}
+    closed_complete = True
+    closed_leak = False
+    for name in _FAIL_CLOSED_SCENARIOS:
+        entry = closed_source.get(name)
+        count = entry.get("child_dispatch_count") if isinstance(entry, dict) else None
+        if not isinstance(count, int):
+            closed_complete = False
+        if isinstance(count, int) and count != 0:
+            closed_leak = True
+        scenarios[name] = {
+            "child_dispatch_count": count,
+            "status": (
+                FAIL
+                if isinstance(count, int) and count != 0
+                else (PASS if count == 0 else AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE)
+            ),
+        }
+    if not authoritative:
+        fail_closed_status = AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+    elif closed_leak:
+        fail_closed_status = FAIL
+    elif not closed_complete:
+        fail_closed_status = AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+    else:
+        fail_closed_status = PASS
+    fail_closed = {
+        "scenarios": scenarios,
+        "source": source,
+        "production_authoritative": authoritative,
+        "non_authoritative_reference": golden_reference,
+        "status": fail_closed_status,
+        "missing_reason": (
+            None
+            if fail_closed_status == PASS
+            else "no authoritative production records for the FAIL / BLOCKED / "
+            "missing approved_next_task paths (child dispatch count must be 0)"
+        ),
+    }
+
+    # -- Cloudflare version / deployment evidence --------------------------
+    captured_cf = capture.get("cloudflare") if authoritative else None
+    version_id = None
+    deployment_id = None
+    cf_reason = None
+    if isinstance(captured_cf, dict):
+        version_id = captured_cf.get("version_id") or None
+        deployment_id = captured_cf.get("deployment_id") or None
+    if not authoritative:
+        cf_reason = (
+            "authoritative Cloudflare read unavailable: no Cloudflare read "
+            "credential / MCP interface is exposed; the production deploy is "
+            "recorded BLOCKED, so no current version id or deployment id can be read"
+        )
+    elif not (version_id and deployment_id):
+        cf_reason = "captured production evidence lacks Cloudflare version/deployment id"
+    cloudflare = {
+        "declared_production_version": _declared_production_version(),
+        "version_id": version_id,
+        "deployment_id": deployment_id,
+        "source": source,
+        "production_authoritative": authoritative,
+        "status": (
+            PASS
+            if (authoritative and version_id and deployment_id)
+            else AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+        ),
+        "missing_reason": cf_reason,
+    }
+
+    section_statuses = {
+        "d1_schema": d1["status"],
+        "pass_dispatch": pass_dispatch["status"],
+        "exactly_once": exactly_once["status"],
+        "fail_closed": fail_closed["status"],
+        "cloudflare": cloudflare["status"],
+    }
+    if any(status == FAIL for status in section_statuses.values()):
+        final_status = AUTONOMOUS_ADVANCEMENT_FINAL_FAIL
+    elif all(status == PASS for status in section_statuses.values()):
+        final_status = AUTONOMOUS_ADVANCEMENT_FINAL_GOLDEN_PASS
+    else:
+        final_status = AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+
+    checks = [
+        {
+            "check": "D1 task_dispatch_markers table present",
+            "status": PASS if d1.get("table_present") else FAIL,
+            "detail": f"table=task_dispatch_markers present={d1.get('table_present')}",
+        }
+    ]
+    for name, item in d1.get("indexes", {}).items():
+        checks.append(
+            {
+                "check": f"D1 required index {name}",
+                "status": PASS if item.get("satisfied") else FAIL,
+                "detail": (
+                    f"column={item.get('column')} unique={item.get('unique')} "
+                    f"required_unique={item.get('required_unique')}"
+                ),
+            }
+        )
+    checks.extend(
+        [
+            {
+                "check": "authoritative production D1 schema read",
+                "status": PASS if d1_authoritative else AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE,
+                "detail": d1.get("missing_reason") or d1.get("source"),
+            },
+            {
+                "check": "PASS review dispatches one real child",
+                "status": pass_dispatch["status"],
+                "detail": (
+                    f"parent_task_id={pass_dispatch['parent_task_id']} "
+                    f"child_task_id={pass_dispatch['child_task_id']}"
+                    if pass_dispatch["status"] == PASS
+                    else pass_dispatch.get("missing_reason")
+                ),
+            },
+            {
+                "check": "exactly-once child dispatch count == 1",
+                "status": exactly_once["status"],
+                "detail": (
+                    f"child_dispatch_count={exactly_once['child_dispatch_count']}"
+                    if exactly_once["status"] in (PASS, FAIL)
+                    else exactly_once.get("missing_reason")
+                ),
+            },
+            {
+                "check": "fail-closed FAIL/BLOCKED/missing approved_next_task count == 0",
+                "status": fail_closed["status"],
+                "detail": (
+                    "all three scenarios child_dispatch_count=0"
+                    if fail_closed["status"] == PASS
+                    else fail_closed.get("missing_reason")
+                ),
+            },
+            {
+                "check": "Cloudflare version/deployment id",
+                "status": cloudflare["status"],
+                "detail": (
+                    f"version_id={cloudflare['version_id']} "
+                    f"deployment_id={cloudflare['deployment_id']}"
+                    if cloudflare["status"] == PASS
+                    else cloudflare.get("missing_reason")
+                ),
+            },
+            {
+                "check": "read-only (no remote mutation)",
+                "status": PASS,
+                "detail": (
+                    "remote_mutations=0 deployments=0 d1_mutations=0; no deploy, "
+                    "secret, binding, KV or D1 write performed"
+                ),
+            },
+        ]
+    )
+
+    lines = [
+        "# AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_REPORT",
+        "",
+        f"- goal: {AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_GOAL}",
+        f"- task_id: {AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_TASK_ID}",
+        "- read_only: True",
+        f"- production_authoritative_evidence: {authoritative}",
+        f"- evidence_source: {source}",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += [
+        "",
+        "## D1_SCHEMA_EVIDENCE",
+        f"D1_TABLE=task_dispatch_markers present={d1.get('table_present')}",
+    ]
+    for name, item in d1.get("indexes", {}).items():
+        lines.append(
+            f"D1_INDEX={name} column={item.get('column')} "
+            f"unique={item.get('unique')} present={item.get('present')} "
+            f"satisfied={item.get('satisfied')}"
+        )
+    lines += [
+        f"D1_REMOTE_APPLIED={d1.get('remote_applied')}",
+        f"D1_PRODUCTION_AUTHORITATIVE={d1_authoritative}",
+        "",
+        "## PASS_DISPATCH_EVIDENCE",
+        f"parent_task_id={pass_dispatch['parent_task_id'] or 'UNAVAILABLE'}",
+        f"child_task_id={pass_dispatch['child_task_id'] or 'UNAVAILABLE'}",
+        f"dispatch_state={pass_dispatch['dispatch_state'] or 'UNAVAILABLE'}",
+        f"created_at={pass_dispatch['created_at'] or 'UNAVAILABLE'}",
+        f"PASS_DISPATCH_STATUS={pass_dispatch['status']}",
+        "",
+        "## EXACTLY_ONCE_EVIDENCE",
+        f"parent_task_id={exactly_once['parent_task_id'] or 'UNAVAILABLE'}",
+        f"child_task_id={exactly_once['child_task_id'] or 'UNAVAILABLE'}",
+        f"child_dispatch_count={exactly_once['child_dispatch_count']}",
+        f"replay_reason={exactly_once['replay_reason'] or 'UNAVAILABLE'}",
+        f"EXACTLY_ONCE_STATUS={exactly_once['status']}",
+        "",
+        "## FAIL_CLOSED_EVIDENCE",
+    ]
+    for name in _FAIL_CLOSED_SCENARIOS:
+        item = scenarios[name]
+        lines.append(
+            f"FAIL_CLOSED={name} child_dispatch_count={item['child_dispatch_count']} "
+            f"status={item['status']}"
+        )
+    lines += [
+        f"FAIL_CLOSED_STATUS={fail_closed['status']}",
+        "",
+        "## CLOUDFLARE_VERSION_EVIDENCE",
+        f"declared_production_version={cloudflare['declared_production_version'] or 'UNAVAILABLE'}",
+        f"cloudflare_version_id={cloudflare['version_id'] or 'UNAVAILABLE'}",
+        f"cloudflare_deployment_id={cloudflare['deployment_id'] or 'UNAVAILABLE'}",
+        f"cloudflare_missing_reason={cloudflare['missing_reason'] or 'NOT_APPLICABLE'}",
+        "",
+        "## Mutation counters",
+        "remote_mutations=0",
+        "deployments=0",
+        "d1_mutations=0",
+        "",
+        f"FINAL_STATUS={final_status}",
+    ]
+
+    return {
+        "report": AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_REPORT,
+        "goal": AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_GOAL,
+        "task_id": AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_TASK_ID,
+        "FINAL_STATUS": final_status,
+        "status": final_status,
+        "authoritative_evidence": authoritative,
+        "evidence_source": source,
+        "d1_schema": d1,
+        "pass_dispatch": pass_dispatch,
+        "exactly_once": exactly_once,
+        "fail_closed": fail_closed,
+        "cloudflare": cloudflare,
+        "section_statuses": section_statuses,
+        "remote_mutations": 0,
+        "deployments": 0,
+        "d1_mutations": 0,
+        "production_mutated": False,
+        "read_only": True,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
+def personal_ai_autonomous_advancement_production_evidence_audit_v0_1(
+    production_evidence: dict | None = None,
+) -> dict:
+    """Alias for the V0.1 production evidence audit entrypoint."""
+    return autonomous_advancement_production_evidence_audit(production_evidence)
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(runtime_provenance_v0_1_report()["markdown"])
     print(cloudflare_runtime_audit_report()["markdown"])
@@ -10620,3 +11169,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(knowledge_ground_truth_audit_v0_1()["markdown"])
     print(auto_review_loop_report()["markdown"])
     print(production_golden_runtime_verification()["markdown"])
+    print(autonomous_advancement_production_evidence_audit()["markdown"])

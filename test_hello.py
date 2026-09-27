@@ -93,9 +93,18 @@ from hello import (
     RESULT_DETAIL_FIELDS,
     STATUS_MODEL_EXPECTED_FIELDS,
     TASK_REVIEW_GOAL,
+    AUTONOMOUS_ADVANCEMENT_EVIDENCE_ENV,
+    AUTONOMOUS_ADVANCEMENT_EVIDENCE_PATH_ENV,
+    AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE,
+    AUTONOMOUS_ADVANCEMENT_FINAL_FAIL,
+    AUTONOMOUS_ADVANCEMENT_FINAL_GOLDEN_PASS,
+    AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_GOAL,
+    AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_REPORT,
+    AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_TASK_ID,
     auto_consume_completed_results,
     auto_result_close_loop_golden_verify,
     auto_result_golden_test_verify,
+    autonomous_advancement_production_evidence_audit,
     classify_pending_task,
     cloud_agent_test,
     cloud_agent_test_2,
@@ -130,6 +139,7 @@ from hello import (
     oauth_mcp_test,
     opencode_go_provider_golden_e2e_marker,
     pending_acceptance_notice,
+    personal_ai_autonomous_advancement_production_evidence_audit_v0_1,
     personal_ai_execution_dispatch_live_failure_audit,
     personal_ai_execution_result_exposure_audit_detail_export,
     personal_ai_task_runtime_audit,
@@ -4010,3 +4020,262 @@ def test_production_golden_runtime_missing_source_fails_closed(
     report = production_golden_runtime_verification()
     assert report["PRODUCTION_GOLDEN_RUNTIME_STATUS"] == "BLOCKED"
     assert report["probe_available"] is False
+
+
+# -- PERSONAL_AI_AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_V0.1 ------
+#
+# Final read-only production evidence audit of the PASS-review -> child-dispatch
+# edge. The default environment has no authoritative Cloudflare D1 read, so the
+# audit must fail closed (BLOCKED_EVIDENCE_MISSING), never invent GOLDEN_PASS.
+
+
+def captured_production_evidence() -> dict:
+    """A syntactically complete authoritative capture, used to exercise the
+    GOLDEN_PASS / FAIL evaluation branches without touching production."""
+    return {
+        "available": True,
+        "source": "test-capture:cloudflare-d1-readonly",
+        "captured_at": "2026-09-27T00:00:00Z",
+        "d1": {
+            "table_present": True,
+            "indexes_satisfied": True,
+            "remote_applied": True,
+        },
+        "pass_dispatch": {
+            "parent_task_id": "cf-golden-parent-1",
+            "child_task_id": "cf-golden-child-1",
+            "dispatch_state": "DISPATCHED",
+            "created_at": "2026-09-27T00:00:01Z",
+        },
+        "exactly_once": {
+            "parent_task_id": "cf-golden-parent-1",
+            "child_task_id": "cf-golden-child-1",
+            "child_dispatch_count": 1,
+            "replay_reason": "ALREADY_DISPATCHED",
+        },
+        "fail_closed": {
+            "FAIL": {"child_dispatch_count": 0},
+            "BLOCKED": {"child_dispatch_count": 0},
+            "missing_approved_next_task": {"child_dispatch_count": 0},
+        },
+        "cloudflare": {
+            "version_id": "ver-golden-1",
+            "deployment_id": "dep-golden-1",
+        },
+    }
+
+
+@pytest.fixture(scope="module")
+def production_evidence_audit_report() -> dict:
+    return autonomous_advancement_production_evidence_audit()
+
+
+def test_production_evidence_audit_goal_and_task_id(
+    production_evidence_audit_report: dict,
+) -> None:
+    assert (
+        production_evidence_audit_report["goal"]
+        == AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_GOAL
+    )
+    assert (
+        production_evidence_audit_report["task_id"]
+        == AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_TASK_ID
+    )
+    assert (
+        production_evidence_audit_report["report"]
+        == AUTONOMOUS_ADVANCEMENT_PRODUCTION_EVIDENCE_AUDIT_REPORT
+    )
+
+
+def test_production_evidence_audit_default_is_blocked(
+    production_evidence_audit_report: dict,
+) -> None:
+    report = production_evidence_audit_report
+    assert report["FINAL_STATUS"] == AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+    assert report["authoritative_evidence"] is False
+    assert report["read_only"] is True
+    assert report["production_mutated"] is False
+    assert report["remote_mutations"] == 0
+    assert report["deployments"] == 0
+    assert report["d1_mutations"] == 0
+
+
+def test_production_evidence_audit_d1_schema_table_and_three_indexes(
+    production_evidence_audit_report: dict,
+) -> None:
+    d1 = production_evidence_audit_report["d1_schema"]
+    assert d1["table"] == "task_dispatch_markers"
+    assert d1["table_present"] is True
+    indexes = d1["indexes"]
+    assert set(indexes) == {
+        "idx_task_dispatch_markers_parent",
+        "idx_task_dispatch_markers_child",
+        "idx_task_dispatch_markers_state",
+    }
+    assert indexes["idx_task_dispatch_markers_parent"]["column"] == "parent_task_id"
+    assert indexes["idx_task_dispatch_markers_parent"]["required_unique"] is True
+    assert indexes["idx_task_dispatch_markers_parent"]["unique"] is True
+    assert indexes["idx_task_dispatch_markers_child"]["column"] == "child_task_id"
+    assert indexes["idx_task_dispatch_markers_child"]["required_unique"] is False
+    assert indexes["idx_task_dispatch_markers_state"]["column"] == "dispatch_state"
+    assert indexes["idx_task_dispatch_markers_state"]["required_unique"] is False
+    assert all(item["satisfied"] for item in indexes.values())
+    assert d1["indexes_satisfied"] is True
+    # In-repo schema only: production D1 remains non-authoritative/blocked.
+    assert d1["production_authoritative"] is False
+    assert d1["status"] == AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+    assert d1["remote_applied"] is False
+
+
+def test_production_evidence_audit_default_pass_dispatch_is_missing(
+    production_evidence_audit_report: dict,
+) -> None:
+    dispatch = production_evidence_audit_report["pass_dispatch"]
+    assert dispatch["parent_task_id"] is None
+    assert dispatch["child_task_id"] is None
+    assert dispatch["status"] == AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+    assert dispatch["missing_reason"]
+
+
+def test_production_evidence_audit_default_exactly_once_is_missing(
+    production_evidence_audit_report: dict,
+) -> None:
+    exactly_once = production_evidence_audit_report["exactly_once"]
+    assert exactly_once["child_dispatch_count"] is None
+    assert exactly_once["status"] == AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+
+
+def test_production_evidence_audit_default_fail_closed_is_missing(
+    production_evidence_audit_report: dict,
+) -> None:
+    fail_closed = production_evidence_audit_report["fail_closed"]
+    assert fail_closed["status"] == AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+    for name in ("FAIL", "BLOCKED", "missing_approved_next_task"):
+        assert fail_closed["scenarios"][name]["child_dispatch_count"] is None
+        assert (
+            fail_closed["scenarios"][name]["status"]
+            == AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+        )
+
+
+def test_production_evidence_audit_cloudflare_version_missing_reason(
+    production_evidence_audit_report: dict,
+) -> None:
+    cloudflare = production_evidence_audit_report["cloudflare"]
+    assert cloudflare["version_id"] is None
+    assert cloudflare["deployment_id"] is None
+    assert cloudflare["status"] == AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+    assert cloudflare["missing_reason"]
+    assert cloudflare["declared_production_version"]
+
+
+def test_production_evidence_audit_golden_pass_with_captured_evidence() -> None:
+    report = autonomous_advancement_production_evidence_audit(
+        captured_production_evidence()
+    )
+    assert report["FINAL_STATUS"] == AUTONOMOUS_ADVANCEMENT_FINAL_GOLDEN_PASS
+    assert all(status == "PASS" for status in report["section_statuses"].values())
+    assert report["pass_dispatch"]["parent_task_id"] == "cf-golden-parent-1"
+    assert report["pass_dispatch"]["child_task_id"] == "cf-golden-child-1"
+    assert report["cloudflare"]["version_id"] == "ver-golden-1"
+    assert report["cloudflare"]["deployment_id"] == "dep-golden-1"
+    assert report["remote_mutations"] == 0
+    assert report["deployments"] == 0
+    assert report["d1_mutations"] == 0
+
+
+def test_production_evidence_audit_exactly_once_count_is_one() -> None:
+    report = autonomous_advancement_production_evidence_audit(
+        captured_production_evidence()
+    )
+    exactly_once = report["exactly_once"]
+    assert exactly_once["child_dispatch_count"] == 1
+    assert exactly_once["replay_reason"] == "ALREADY_DISPATCHED"
+    assert exactly_once["status"] == "PASS"
+
+
+def test_production_evidence_audit_fail_closed_all_zero() -> None:
+    report = autonomous_advancement_production_evidence_audit(
+        captured_production_evidence()
+    )
+    assert report["fail_closed"]["status"] == "PASS"
+    for name in ("FAIL", "BLOCKED", "missing_approved_next_task"):
+        assert report["fail_closed"]["scenarios"][name]["child_dispatch_count"] == 0
+
+
+def test_production_evidence_audit_fails_on_second_child() -> None:
+    evidence = captured_production_evidence()
+    evidence["exactly_once"]["child_dispatch_count"] = 2
+    report = autonomous_advancement_production_evidence_audit(evidence)
+    assert report["exactly_once"]["status"] == "FAIL"
+    assert report["FINAL_STATUS"] == AUTONOMOUS_ADVANCEMENT_FINAL_FAIL
+
+
+def test_production_evidence_audit_fails_on_fail_closed_leak() -> None:
+    evidence = captured_production_evidence()
+    evidence["fail_closed"]["BLOCKED"]["child_dispatch_count"] = 1
+    report = autonomous_advancement_production_evidence_audit(evidence)
+    assert report["fail_closed"]["scenarios"]["BLOCKED"]["status"] == "FAIL"
+    assert report["FINAL_STATUS"] == AUTONOMOUS_ADVANCEMENT_FINAL_FAIL
+
+
+def test_production_evidence_audit_missing_parent_child_is_blocked() -> None:
+    evidence = captured_production_evidence()
+    evidence["pass_dispatch"] = {}
+    report = autonomous_advancement_production_evidence_audit(evidence)
+    assert report["pass_dispatch"]["status"] == (
+        AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+    )
+    assert report["FINAL_STATUS"] == AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+
+
+def test_production_evidence_audit_capture_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        AUTONOMOUS_ADVANCEMENT_EVIDENCE_ENV,
+        json.dumps(captured_production_evidence()),
+    )
+    report = autonomous_advancement_production_evidence_audit()
+    assert report["authoritative_evidence"] is True
+    assert report["FINAL_STATUS"] == AUTONOMOUS_ADVANCEMENT_FINAL_GOLDEN_PASS
+
+
+def test_production_evidence_audit_invalid_env_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(AUTONOMOUS_ADVANCEMENT_EVIDENCE_ENV, "not-json")
+    report = autonomous_advancement_production_evidence_audit()
+    assert report["authoritative_evidence"] is False
+    assert report["FINAL_STATUS"] == AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE
+
+
+def test_production_evidence_audit_markdown_tokens() -> None:
+    report = autonomous_advancement_production_evidence_audit(
+        captured_production_evidence()
+    )
+    markdown = report["markdown"]
+    for token in (
+        "D1_SCHEMA_EVIDENCE",
+        "PASS_DISPATCH_EVIDENCE",
+        "EXACTLY_ONCE_EVIDENCE",
+        "FAIL_CLOSED_EVIDENCE",
+        "remote_mutations=0",
+        "deployments=0",
+        "d1_mutations=0",
+    ):
+        assert token in markdown
+    assert f"FINAL_STATUS={report['FINAL_STATUS']}" in markdown
+    assert "parent_task_id=cf-golden-parent-1" in markdown
+    assert "child_task_id=cf-golden-child-1" in markdown
+    assert "child_dispatch_count=1" in markdown
+
+    blocked = autonomous_advancement_production_evidence_audit()
+    assert "FINAL_STATUS=BLOCKED_EVIDENCE_MISSING" in blocked["markdown"]
+
+
+def test_personal_ai_autonomous_advancement_alias() -> None:
+    report = personal_ai_autonomous_advancement_production_evidence_audit_v0_1(
+        captured_production_evidence()
+    )
+    assert report["FINAL_STATUS"] == AUTONOMOUS_ADVANCEMENT_FINAL_GOLDEN_PASS
