@@ -4382,3 +4382,245 @@ def test_result_schema_preservation_missing_unknown_field_fails() -> None:
         for item in report["checks"]
     )
 
+
+
+# -- PERSONAL_AI_AUTO_REVIEW_GATE_V0.1 -------------------------------------
+# Minimal closed loop: read a completed get_task_result payload -> decide
+# PASS/FAIL/BLOCKED -> apply (or simulate) mark_reviewed. No Router, no
+# multi-agent scheduling, no workflow/token change.
+
+AUTO_REVIEW_GATE_ACCEPTANCE_FIELDS = (
+    "auto decision logic exposed",
+    "PASS/FAIL/BLOCKED mapping",
+    "mark_reviewed applied",
+    "dry-run has no side effect",
+    "execution_result return structure preserved",
+    "contracts unchanged",
+)
+
+
+def _auto_review_gate_test_id(kind: str) -> str:
+    return f"auto-review-gate-test-{kind}-{hello_module.uuid.uuid4().hex[:10]}"
+
+
+def _auto_review_gate_test_evidence(probe_id: str) -> dict:
+    return {
+        "tests": "5 passed in 0.20s",
+        "artifacts": [
+            {
+                "name": "hello.py",
+                "path": "hello.py",
+                "sha256": "f" * 64,
+                "bytes": 42,
+            }
+        ],
+        "evidence": {"validation": {"pytest": "5 passed"}},
+        "execution_result_json": {
+            "task_id": probe_id,
+            "status": "success",
+            "tests": "5 passed",
+        },
+    }
+
+
+@pytest.fixture(scope="module")
+def auto_review_gate_report() -> dict:
+    return hello_module.personal_ai_auto_review_gate_v0_1()
+
+
+def test_auto_review_gate_report_contract(auto_review_gate_report: dict) -> None:
+    report = auto_review_gate_report
+    assert report["report"] == "PERSONAL_AI_AUTO_REVIEW_GATE_REPORT"
+    assert report["goal"] == "PERSONAL_AI_AUTO_REVIEW_GATE_V0.1"
+    assert report["task_id"] == "cf-cdcf9d65ec42"
+    assert report["status"] == "PASS"
+    assert report["final_status"] == "PASS"
+    assert report["decision_logic"]
+    assert report["markdown"].startswith("# PERSONAL_AI_AUTO_REVIEW_GATE_REPORT")
+    assert "FINAL_STATUS=PASS" in report["markdown"]
+
+
+def test_auto_review_gate_checks_all_pass(auto_review_gate_report: dict) -> None:
+    report = auto_review_gate_report
+    checks = {check["check"]: check for check in report["checks"]}
+    assert set(checks) == set(AUTO_REVIEW_GATE_ACCEPTANCE_FIELDS)
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] == "PASS"
+        assert check["detail"]
+
+
+def test_auto_review_gate_state_mapping_exposes_three_states(
+    auto_review_gate_report: dict,
+) -> None:
+    report = auto_review_gate_report
+    assert set(report["states"]) == {"PASS", "FAIL", "BLOCKED"}
+    assert set(report["state_mapping"]) == {"PASS", "FAIL", "BLOCKED"}
+    for state, rule in report["state_mapping"].items():
+        assert rule
+    assert report["state_mapping_ok"] is True
+
+    actuals = {scenario["scenario"]: scenario["actual"] for scenario in report["scenarios"]}
+    assert actuals["success_maps_to_pass"] == "PASS"
+    assert actuals["failing_tests_map_to_fail"] == "FAIL"
+    assert actuals["insufficient_evidence_maps_to_blocked"] == "BLOCKED"
+    assert set(actuals.values()) >= {"PASS", "FAIL", "BLOCKED"}
+
+
+def test_auto_review_gate_scenarios_are_auditable(
+    auto_review_gate_report: dict,
+) -> None:
+    for scenario in auto_review_gate_report["scenarios"]:
+        assert set(scenario) >= {
+            "scenario",
+            "expected",
+            "actual",
+            "status",
+            "applied",
+            "evidence",
+        }
+        assert scenario["status"] == "PASS"
+        assert scenario["expected"] == scenario["actual"]
+        assert scenario["evidence"]
+
+
+def test_auto_review_gate_applies_mark_reviewed() -> None:
+    probe = _auto_review_gate_test_id("apply")
+    hello_module.submit_task(
+        probe,
+        goal="PERSONAL_AI_AUTO_REVIEW_GATE_V0.1",
+        status="success",
+        requires_review=True,
+        **_auto_review_gate_test_evidence(probe),
+    )
+    run = hello_module.auto_review_gate(probe, apply=True)
+    assert run["verdict"] == "PASS"
+    assert run["mark_reviewed_applied"] is True
+    assert run["mode"] == "apply"
+    assert run["mark_reviewed_call"] == {
+        "task_id": probe,
+        "verdict": "PASS",
+        "note": run["reason"],
+    }
+    record = hello_module.get_task_review(probe)
+    assert record["reviewed"] is True
+    assert record["review_verdict"] == "PASS"
+    assert record["reviewed_at"]
+    events = hello_module.get_review_events(probe)
+    assert len(events) == 1
+    assert events[0]["verdict"] == "PASS"
+    assert events[0]["action"] == "review"
+
+
+def test_auto_review_gate_dry_run_has_no_side_effect() -> None:
+    probe = _auto_review_gate_test_id("dry")
+    hello_module.submit_task(
+        probe,
+        goal="PERSONAL_AI_AUTO_REVIEW_GATE_V0.1",
+        status="success",
+        requires_review=True,
+        **_auto_review_gate_test_evidence(probe),
+    )
+    run = hello_module.auto_review_gate(probe, apply=False)
+    assert run["verdict"] == "PASS"
+    assert run["mode"] == "dry_run"
+    assert run["mark_reviewed_applied"] is False
+    assert run["review_record"] is None
+    record = hello_module.get_task_review(probe)
+    assert record["reviewed"] is False
+    assert record["review_verdict"] is None
+    assert hello_module.get_review_events(probe) == []
+
+
+def test_auto_review_gate_fail_and_blocked_stop_gate() -> None:
+    fail_probe = _auto_review_gate_test_id("fail")
+    fail_evidence = _auto_review_gate_test_evidence(fail_probe)
+    hello_module.submit_task(
+        fail_probe,
+        goal="PERSONAL_AI_AUTO_REVIEW_GATE_V0.1",
+        status="success",
+        requires_review=True,
+        tests="1 failed, 4 passed",
+        artifacts=fail_evidence["artifacts"],
+        evidence=fail_evidence["evidence"],
+        execution_result_json=fail_evidence["execution_result_json"],
+    )
+    fail_run = hello_module.auto_review_gate(fail_probe, apply=True)
+    assert fail_run["verdict"] == "FAIL"
+    assert fail_run["stop_gate"] is True
+    assert fail_run["blockers"]
+    assert hello_module.get_task_review(fail_probe)["review_verdict"] == "FAIL"
+
+    blocked_probe = _auto_review_gate_test_id("blocked")
+    hello_module.submit_task(
+        blocked_probe,
+        goal="PERSONAL_AI_AUTO_REVIEW_GATE_V0.1",
+        status="success",
+        requires_review=True,
+    )
+    blocked_run = hello_module.auto_review_gate(blocked_probe, apply=True)
+    assert blocked_run["verdict"] == "BLOCKED"
+    assert blocked_run["stop_gate"] is True
+    assert blocked_run["blockers"]
+    assert (
+        hello_module.get_task_review(blocked_probe)["review_verdict"] == "BLOCKED"
+    )
+
+
+def test_auto_review_gate_rejects_empty_task_id() -> None:
+    with pytest.raises(ValueError):
+        hello_module.auto_review_gate("")
+
+
+def test_auto_review_gate_preserves_execution_result_structure(
+    auto_review_gate_report: dict,
+) -> None:
+    report = auto_review_gate_report
+    assert report["execution_result_contract_preserved"] is True
+    assert report["execution_result_evidence_preserved"] is True
+    assert report["execution_result_json_preserved"] is True
+    assert set(report["execution_result_contract_fields"]) == {
+        "execution_summary",
+        "commit",
+        "tests",
+        "artifacts",
+        "execution_result_json",
+        "evidence",
+    }
+    probe_id = report["scenario_ids"]["pass"]
+    result = hello_module.get_task_result(probe_id)
+    assert set(result) == set(report["execution_result_contract_fields"])
+    assert set(result["evidence"]) >= {
+        "acceptance",
+        "logs",
+        "validation",
+        "decision",
+    }
+    assert isinstance(result["execution_result_json"], dict)
+    assert isinstance(result["artifacts"], list)
+
+
+def test_auto_review_gate_contracts_unchanged(
+    auto_review_gate_report: dict,
+) -> None:
+    report = auto_review_gate_report
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert report["mark_reviewed_contract"] == "COMPATIBLE"
+    assert report["workflow_modified"] is False
+    assert report["read_only_execution_result"] is True
+    assert list(inspect.signature(hello_module.submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(hello_module.get_task_result).parameters) == [
+        "task_id"
+    ]
+    assert list(inspect.signature(hello_module.mark_reviewed).parameters) == [
+        "task_id",
+        "verdict",
+        "note",
+    ]

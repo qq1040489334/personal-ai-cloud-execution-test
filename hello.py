@@ -11415,6 +11415,440 @@ def result_schema_preservation_golden_verify(
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_AUTO_REVIEW_GATE_V0.1
+#
+# Minimal closed loop for the automatic acceptance gate. It builds directly on
+# the existing ``get_task_result`` return structure and reuses the audited
+# decision logic (``auto_review_decide``): read the completed task result, map it
+# to exactly one of PASS / FAIL / BLOCKED, then apply (or simulate) the stable
+# ``mark_reviewed`` action. No Router, no multi-agent scheduling, no complex
+# orchestration, and no workflow / token / secret change. The
+# ``execution_result`` contract is preserved verbatim.
+# ---------------------------------------------------------------------------
+AUTO_REVIEW_GATE_GOAL = "PERSONAL_AI_AUTO_REVIEW_GATE_V0.1"
+AUTO_REVIEW_GATE_TASK_ID = "cf-cdcf9d65ec42"
+AUTO_REVIEW_GATE_REPORT = "PERSONAL_AI_AUTO_REVIEW_GATE_REPORT"
+AUTO_REVIEW_GATE_STATES = (PASS, FAIL, BLOCKED)
+AUTO_REVIEW_GATE_STATE_MAPPING = {
+    PASS: (
+        "execution status is success AND tests pass AND >=1 readable artifact "
+        "AND evidence is readable"
+    ),
+    FAIL: (
+        "execution status is a terminal failure OR test evidence indicates a "
+        "failure/error"
+    ),
+    BLOCKED: (
+        "execution status is not a success status OR tests/artifacts/evidence "
+        "are missing or unreadable; PASS is never guessed"
+    ),
+}
+AUTO_REVIEW_GATE_CONTRACT_FIELDS = (
+    "execution_summary",
+    "commit",
+    "tests",
+    "artifacts",
+    "execution_result_json",
+    "evidence",
+)
+
+
+def auto_review_gate(task_id: str, apply: bool = False) -> dict:
+    """Run the minimal auto-acceptance gate for one completed task.
+
+    Steps: read the full ``get_task_result`` payload -> decide exactly one of
+    PASS / FAIL / BLOCKED -> apply (or simulate) ``mark_reviewed``. The decision
+    is never guessed: a task that is not clearly PASS becomes FAIL or BLOCKED.
+    ``apply=False`` is a dry run that returns the exact ``mark_reviewed`` call
+    that would be made without producing any side effect.
+    """
+    if not task_id:
+        raise ValueError("auto_review_gate requires a task_id")
+    read = auto_review_loop_read_result(task_id)
+    decision = auto_review_decide(task_id, read)
+    mark_reviewed_call = {
+        "task_id": task_id,
+        "verdict": decision["verdict"],
+        "note": decision["reason"],
+    }
+    review_record = None
+    if apply:
+        review_record = mark_reviewed(
+            mark_reviewed_call["task_id"],
+            mark_reviewed_call["verdict"],
+            mark_reviewed_call["note"],
+        )
+    return {
+        "task_id": task_id,
+        "mode": "apply" if apply else "dry_run",
+        "verdict": decision["verdict"],
+        "reason": decision["reason"],
+        "blockers": decision["blockers"],
+        "stop_gate": decision["stop_gate"],
+        "decision": decision,
+        "mark_reviewed_call": mark_reviewed_call,
+        "mark_reviewed_applied": review_record is not None,
+        "review_record": review_record,
+        "execution_status": read["execution_status"],
+        "result_status": read["result_status"],
+        "artifact_count": len(read["artifacts"]),
+        "evidence_readable": decision["evidence_readable"],
+        "result_contract_complete": read["result_contract_complete"],
+        "execution_result": read["result"],
+    }
+
+
+def _auto_review_gate_probe_id(kind: str) -> str:
+    return f"auto-review-gate-{kind}-{uuid.uuid4().hex[:10]}"
+
+
+def _auto_review_gate_evidence(probe_id: str) -> dict:
+    return {
+        "tests": "3 passed in 0.05s",
+        "artifacts": [
+            {
+                "name": "hello.py",
+                "path": "hello.py",
+                "sha256": "e" * 64,
+                "bytes": 42,
+            }
+        ],
+        "evidence": {
+            "validation": {"pytest": "3 passed"},
+            "decision": {"status": PASS, "reason": "gate golden"},
+        },
+        "execution_result_json": {
+            "task_id": probe_id,
+            "status": "success",
+            "tests": "3 passed",
+        },
+    }
+
+
+def _auto_review_gate_scenarios() -> dict:
+    """Execute the auditable PASS/FAIL/BLOCKED mapping scenarios."""
+    scenarios: list[dict] = []
+    ids: dict = {}
+
+    # Scenario 1: success + passing tests + artifact + evidence -> PASS.
+    pass_id = _auto_review_gate_probe_id("pass")
+    ids["pass"] = pass_id
+    submit_task(
+        pass_id,
+        goal=AUTO_REVIEW_GATE_GOAL,
+        status="success",
+        requires_review=True,
+        **_auto_review_gate_evidence(pass_id),
+    )
+    pass_run = auto_review_gate(pass_id, apply=True)
+    pass_record = get_task_review(pass_id) or {}
+    pass_events = get_review_events(pass_id)
+    pass_ok = (
+        pass_run["verdict"] == PASS
+        and pass_record.get("reviewed") is True
+        and pass_record.get("review_verdict") == PASS
+        and len(pass_events) == 1
+        and pass_events[0]["action"] == REVIEW_ACTION
+        and pass_events[0]["verdict"] == PASS
+    )
+    scenarios.append(
+        {
+            "scenario": "success_maps_to_pass",
+            "expected": PASS,
+            "actual": pass_run["verdict"],
+            "status": PASS if pass_ok else FAIL,
+            "applied": pass_run["mark_reviewed_applied"],
+            "evidence": (
+                f"{pass_id} verdict={pass_run['verdict']} "
+                f"reviewed={pass_record.get('reviewed')} "
+                f"review_verdict={pass_record.get('review_verdict')} "
+                f"review_events={len(pass_events)}"
+            ),
+        }
+    )
+
+    # Scenario 2: success status but failing tests -> FAIL and stop gate.
+    fail_id = _auto_review_gate_probe_id("fail")
+    ids["fail"] = fail_id
+    fail_evidence = _auto_review_gate_evidence(fail_id)
+    submit_task(
+        fail_id,
+        goal=AUTO_REVIEW_GATE_GOAL,
+        status="success",
+        requires_review=True,
+        tests="2 failed, 1 passed",
+        artifacts=fail_evidence["artifacts"],
+        evidence=fail_evidence["evidence"],
+        execution_result_json={
+            "task_id": fail_id,
+            "status": "success",
+            "tests": "2 failed",
+        },
+    )
+    fail_run = auto_review_gate(fail_id, apply=True)
+    fail_record = get_task_review(fail_id) or {}
+    fail_ok = (
+        fail_run["verdict"] == FAIL
+        and fail_run["stop_gate"] is True
+        and fail_record.get("review_verdict") == FAIL
+        and fail_run["blockers"]
+    )
+    scenarios.append(
+        {
+            "scenario": "failing_tests_map_to_fail",
+            "expected": FAIL,
+            "actual": fail_run["verdict"],
+            "status": PASS if fail_ok else FAIL,
+            "applied": fail_run["mark_reviewed_applied"],
+            "evidence": (
+                f"{fail_id} verdict={fail_run['verdict']} "
+                f"stop_gate={fail_run['stop_gate']} "
+                f"review_verdict={fail_record.get('review_verdict')} "
+                f"blockers={fail_run['blockers']}"
+            ),
+        }
+    )
+
+    # Scenario 3: success status but insufficient evidence -> BLOCKED.
+    blocked_id = _auto_review_gate_probe_id("blocked")
+    ids["blocked"] = blocked_id
+    submit_task(
+        blocked_id,
+        goal=AUTO_REVIEW_GATE_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    blocked_run = auto_review_gate(blocked_id, apply=True)
+    blocked_record = get_task_review(blocked_id) or {}
+    blocked_ok = (
+        blocked_run["verdict"] == BLOCKED
+        and blocked_run["stop_gate"] is True
+        and blocked_record.get("review_verdict") == BLOCKED
+        and blocked_run["blockers"]
+    )
+    scenarios.append(
+        {
+            "scenario": "insufficient_evidence_maps_to_blocked",
+            "expected": BLOCKED,
+            "actual": blocked_run["verdict"],
+            "status": PASS if blocked_ok else FAIL,
+            "applied": blocked_run["mark_reviewed_applied"],
+            "evidence": (
+                f"{blocked_id} verdict={blocked_run['verdict']} "
+                f"stop_gate={blocked_run['stop_gate']} "
+                f"review_verdict={blocked_record.get('review_verdict')} "
+                f"blockers={blocked_run['blockers']}"
+            ),
+        }
+    )
+
+    # Scenario 4: a dry run decides but produces no review side effect.
+    dry_id = _auto_review_gate_probe_id("dry-run")
+    ids["dry_run"] = dry_id
+    submit_task(
+        dry_id,
+        goal=AUTO_REVIEW_GATE_GOAL,
+        status="success",
+        requires_review=True,
+        **_auto_review_gate_evidence(dry_id),
+    )
+    dry_run = auto_review_gate(dry_id, apply=False)
+    dry_record = get_task_review(dry_id) or {}
+    dry_ok = (
+        dry_run["verdict"] == PASS
+        and dry_run["mark_reviewed_applied"] is False
+        and dry_run["mode"] == "dry_run"
+        and dry_record.get("reviewed") is False
+        and not get_review_events(dry_id)
+        and dry_run["mark_reviewed_call"]["verdict"] == PASS
+    )
+    scenarios.append(
+        {
+            "scenario": "dry_run_simulates_without_side_effect",
+            "expected": PASS,
+            "actual": dry_run["verdict"],
+            "status": PASS if dry_ok else FAIL,
+            "applied": dry_run["mark_reviewed_applied"],
+            "evidence": (
+                f"{dry_id} mode={dry_run['mode']} "
+                f"applied={dry_run['mark_reviewed_applied']} "
+                f"reviewed={dry_record.get('reviewed')} "
+                f"review_events={len(get_review_events(dry_id))}"
+            ),
+        }
+    )
+
+    return {"scenarios": scenarios, "ids": ids}
+
+
+def personal_ai_auto_review_gate_v0_1() -> dict:
+    """Build the PERSONAL_AI_AUTO_REVIEW_GATE_V0.1 acceptance report.
+
+    Verifies the automatic acceptance decision logic, the PASS/FAIL/BLOCKED
+    state mapping, the ``mark_reviewed`` application, and that the existing
+    ``get_task_result`` / ``execution_result`` return structure is preserved.
+    """
+    golden = _auto_review_gate_scenarios()
+    scenarios = golden["scenarios"]
+    scenario_map = {item["scenario"]: item for item in scenarios}
+
+    # Existing execution_result return structure must be preserved verbatim.
+    probe_id = golden["ids"]["pass"]
+    probe_result = get_task_result(probe_id)
+    contract_fields = tuple(probe_result)
+    structure_preserved = set(contract_fields) == set(
+        AUTO_REVIEW_GATE_CONTRACT_FIELDS
+    )
+    evidence = probe_result.get("evidence")
+    evidence_preserved = (
+        isinstance(evidence, dict)
+        and {"acceptance", "logs", "validation", "decision"} <= set(evidence)
+    )
+    raw = probe_result.get("execution_result_json")
+    raw_preserved = isinstance(raw, dict)
+
+    state_mapping_ok = all(
+        scenario_map[name]["status"] == PASS
+        for name in (
+            "success_maps_to_pass",
+            "failing_tests_map_to_fail",
+            "insufficient_evidence_maps_to_blocked",
+        )
+    )
+    distinct_states = {
+        scenario_map["success_maps_to_pass"]["actual"],
+        scenario_map["failing_tests_map_to_fail"]["actual"],
+        scenario_map["insufficient_evidence_maps_to_blocked"]["actual"],
+    } == set(AUTO_REVIEW_GATE_STATES)
+    dry_run_ok = (
+        scenario_map["dry_run_simulates_without_side_effect"]["status"] == PASS
+    )
+    mark_reviewed_ok = (
+        scenario_map["success_maps_to_pass"]["applied"] is True
+        and scenario_map["failing_tests_map_to_fail"]["applied"] is True
+        and scenario_map["insufficient_evidence_maps_to_blocked"]["applied"] is True
+    )
+
+    checks = [
+        {
+            "check": "auto decision logic exposed",
+            "status": PASS if all(scenario["status"] == PASS for scenario in scenarios) else FAIL,
+            "detail": (
+                "auto_review_gate reads get_task_result -> auto_review_decide -> "
+                "mark_reviewed; every scenario carries expected/actual/reason"
+            ),
+        },
+        {
+            "check": "PASS/FAIL/BLOCKED mapping",
+            "status": PASS if state_mapping_ok and distinct_states else FAIL,
+            "detail": (
+                "three distinct inputs map to "
+                + ", ".join(
+                    f"{name}={scenario_map[name]['actual']}"
+                    for name in (
+                        "success_maps_to_pass",
+                        "failing_tests_map_to_fail",
+                        "insufficient_evidence_maps_to_blocked",
+                    )
+                )
+            ),
+        },
+        {
+            "check": "mark_reviewed applied",
+            "status": PASS if mark_reviewed_ok else FAIL,
+            "detail": "each applied scenario wrote reviewed/review_verdict/reviewed_at",
+        },
+        {
+            "check": "dry-run has no side effect",
+            "status": PASS if dry_run_ok else FAIL,
+            "detail": scenario_map["dry_run_simulates_without_side_effect"]["evidence"],
+        },
+        {
+            "check": "execution_result return structure preserved",
+            "status": PASS if structure_preserved and evidence_preserved and raw_preserved else FAIL,
+            "detail": "get_task_result fields: " + ", ".join(contract_fields),
+        },
+        {
+            "check": "contracts unchanged",
+            "status": PASS
+            if (
+                list(inspect.signature(submit_task).parameters)
+                == SUBMIT_TASK_PARAMS
+                and list(inspect.signature(get_task_result).parameters) == ["task_id"]
+            )
+            else FAIL,
+            "detail": "submit_task and get_task_result signatures unchanged",
+        },
+    ]
+
+    final = (
+        PASS
+        if all(check["status"] == PASS for check in checks)
+        else FAIL
+    )
+
+    decision_logic = (
+        "auto_review_gate(task_id, apply): read get_task_result -> "
+        "auto_review_loop_read_result -> auto_review_decide -> mark_reviewed. "
+        "PASS requires success status + passing tests + >=1 readable artifact + "
+        "readable evidence. FAIL is a terminal failure status or failing tests. "
+        "Everything else is BLOCKED; PASS is never guessed."
+    )
+    markdown_lines = [
+        f"# {AUTO_REVIEW_GATE_REPORT}",
+        "",
+        f"- goal: {AUTO_REVIEW_GATE_GOAL}",
+        f"- task_id: {AUTO_REVIEW_GATE_TASK_ID}",
+        f"- FINAL: {final}",
+        "",
+        "## Decision logic",
+        decision_logic,
+        "",
+        "## State mapping",
+    ]
+    for state in AUTO_REVIEW_GATE_STATES:
+        markdown_lines.append(f"- {state}: {AUTO_REVIEW_GATE_STATE_MAPPING[state]}")
+    markdown_lines += ["", "## Scenarios"]
+    for scenario in scenarios:
+        markdown_lines.append(
+            f"- [{scenario['status']}] {scenario['scenario']}: "
+            f"expected={scenario['expected']} actual={scenario['actual']} "
+            f"applied={scenario['applied']}"
+        )
+    markdown_lines += ["", "## Checks"]
+    for check in checks:
+        markdown_lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    markdown_lines += ["", f"FINAL_STATUS={final}"]
+
+    return {
+        "report": AUTO_REVIEW_GATE_REPORT,
+        "goal": AUTO_REVIEW_GATE_GOAL,
+        "task_id": AUTO_REVIEW_GATE_TASK_ID,
+        "status": final,
+        "final_status": final,
+        "decision_logic": decision_logic,
+        "state_mapping": dict(AUTO_REVIEW_GATE_STATE_MAPPING),
+        "states": list(AUTO_REVIEW_GATE_STATES),
+        "scenarios": scenarios,
+        "scenario_ids": golden["ids"],
+        "checks": checks,
+        "state_mapping_ok": state_mapping_ok,
+        "dry_run_ok": dry_run_ok,
+        "mark_reviewed_ok": mark_reviewed_ok,
+        "execution_result_contract_fields": list(AUTO_REVIEW_GATE_CONTRACT_FIELDS),
+        "execution_result_contract_preserved": structure_preserved,
+        "execution_result_evidence_preserved": evidence_preserved,
+        "execution_result_json_preserved": raw_preserved,
+        "submit_task_contract": "UNCHANGED",
+        "get_task_result_contract": "UNCHANGED",
+        "mark_reviewed_contract": "COMPATIBLE",
+        "workflow_modified": False,
+        "read_only_execution_result": True,
+        "markdown": "\n".join(markdown_lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(runtime_provenance_v0_1_report()["markdown"])
     print(cloudflare_runtime_audit_report()["markdown"])
