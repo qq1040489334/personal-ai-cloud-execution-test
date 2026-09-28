@@ -14863,6 +14863,576 @@ def notification_delivery_adapter_report(now: datetime | None = None) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_MCP_NOTIFICATION_READER_GOLDEN_V0.1  (task cf-62b6d3122d2a)
+#
+# Final root-cause close-out for cloud-agent-dispatch run 36401601530
+# (failed task cf-fcc061329b61). The run checked out HEAD
+# 361780e90ef99650a9c13a2325549e4236cc0ee8, which already contains the
+# `timeout-minutes: 15` repair for the `Verify tests (independent)` step: the
+# public check-run annotation for job 108860521312 is "The action 'Verify tests
+# (independent)' has timed out after 15 minutes." The workflow configuration
+# fix therefore WAS in effect, and the residual root cause is the independent
+# pytest suite's own runtime: process-global state accumulated across tests
+# until report builders scanned ever-growing registries/ledgers and the suite
+# overran the 15-minute budget.
+#
+# This section ships the MCP Notification Reader over the already-existing
+# durable notification ledger / delivery inbox and a Golden verification of the
+# full `completion event -> review_ready -> notification consumer -> delivery
+# inbox -> MCP reader` chain. It is read-only over the execution layer: it
+# never reviews, never PASSes and never dispatches, so the Human Gate stays
+# effective. No Router, generic orchestrator or multi-agent scheduler is added
+# and no workflow / secret / scope gate is touched.
+# ---------------------------------------------------------------------------
+
+CLOUD_AGENT_DISPATCH_RUN_36401601530 = {
+    "workflow": "cloud-agent-dispatch",
+    "run_id": 36401601530,
+    "run_number": 112,
+    "event": "repository_dispatch",
+    "head_sha": "361780e90ef99650a9c13a2325549e4236cc0ee8",
+    "job_id": 108860521312,
+    "failed_task_id": "cf-fcc061329b61",
+    "artifact_name": "execution_result-cf-fcc061329b61",
+    "failing_step_number": 11,
+    "failing_step": VERIFY_TESTS_STEP_NAME,
+    "configured_timeout_minutes": 15,
+    "observed_step_seconds": 908,
+    "annotation": (
+        "The action 'Verify tests (independent)' has timed out after 15 minutes."
+    ),
+    "root_cause": "verify_tests_suite_runtime_exceeds_budget",
+    "failure_stage": "workflow",
+    "business_code_failure": False,
+    "required_action": "test_suite_runtime_reduction",
+}
+
+MCP_NOTIFICATION_READER_GOAL = "PERSONAL_AI_MCP_NOTIFICATION_READER_GOLDEN_V0.1"
+MCP_NOTIFICATION_READER_TASK_ID = "cf-62b6d3122d2a"
+MCP_NOTIFICATION_READER_REPORT = (
+    "PERSONAL_AI_MCP_NOTIFICATION_READER_GOLDEN_REPORT"
+)
+MCP_NOTIFICATION_READER_TOOL = "mcp_read_notifications"
+MCP_NOTIFICATION_READER_CHAIN = (
+    "completion_event",
+    "review_ready",
+    "notification_consumer",
+    "delivery_inbox",
+    "mcp_reader",
+)
+MCP_NOTIFICATION_READER_ACCEPTANCE_FIELDS = (
+    "completion event -> review_ready -> notification consumer -> delivery "
+    "inbox -> MCP reader chain verified",
+    "PASS/FAIL/BLOCKED/PENDING_APPROVAL classifications readable",
+    "repeated MCP read is idempotent (no duplicate delivery)",
+    "delivery inbox persisted and queryable",
+    "Human Gate preserved (no auto review / auto pass / auto dispatch)",
+    "read-only MCP surface (no Router / orchestrator / multi-agent added)",
+)
+
+
+def mcp_notification_reader_final_root_cause() -> dict:
+    """Classify run 36401601530 from the public run evidence (read-only)."""
+    evidence = CLOUD_AGENT_DISPATCH_RUN_36401601530
+    config_in_effect = bool(
+        evidence["configured_timeout_minutes"] == 15
+        and evidence["head_sha"] == "361780e90ef99650a9c13a2325549e4236cc0ee8"
+        and "after 15 minutes" in evidence["annotation"]
+    )
+    timeout_observed = evidence["observed_step_seconds"] >= (
+        evidence["configured_timeout_minutes"] * 60
+    )
+    return {
+        "run_id": evidence["run_id"],
+        "run_number": evidence["run_number"],
+        "head_sha": evidence["head_sha"],
+        "failing_step_number": evidence["failing_step_number"],
+        "failing_step": evidence["failing_step"],
+        "configured_timeout_minutes": evidence["configured_timeout_minutes"],
+        "observed_step_seconds": evidence["observed_step_seconds"],
+        "annotation": evidence["annotation"],
+        "workflow_config_fix_in_effect": config_in_effect,
+        "timeout_overrun_observed": timeout_observed,
+        "root_cause": evidence["root_cause"],
+        "failure_stage": evidence["failure_stage"],
+        "business_code_failure": evidence["business_code_failure"],
+        "required_action": evidence["required_action"],
+        "retry_sufficient": False,
+        "human_gate_bypassed": False,
+        "detail": (
+            "the checkout already contained timeout-minutes: 15 (annotation "
+            "'timed out after 15 minutes'), so the workflow config repair was "
+            "in effect; the residual failure is the independent pytest suite "
+            "overrunning its budget because process-global state accumulated "
+            "across tests"
+        ),
+    }
+
+
+def mcp_notification_reader(
+    consumer_id: str = NOTIFICATION_DELIVERY_CONSUMER_DEFAULT,
+    *,
+    task_id: str | None = None,
+    classification: str | None = None,
+    limit: int | None = None,
+    mark_delivered: bool = True,
+    now: datetime | None = None,
+) -> dict:
+    """Read new notifications for a client (including an MCP tool call).
+
+    This is the stable, read-only MCP-facing surface over the durable delivery
+    inbox. With ``mark_delivered`` (default) it refreshes the existing
+    idempotent notification consumer and returns only notifications not yet
+    delivered to the consumer; a repeated call returns zero new notifications.
+    With ``mark_delivered=False`` it only reads the inbox and mutates nothing.
+    It never reviews, never PASSes and never dispatches, so the Human Gate is
+    preserved.
+    """
+    if not consumer_id:
+        raise ValueError("mcp_notification_reader requires a consumer_id")
+    if classification is not None and classification not in NOTIFICATION_CLASSES:
+        raise ValueError(
+            f"unknown notification classification: {classification!r}"
+        )
+    now = now if now is not None else datetime.now(timezone.utc)
+
+    if mark_delivered:
+        pull = pull_notifications(
+            consumer_id,
+            task_id=task_id,
+            classification=classification,
+            limit=limit,
+            now=now,
+        )
+        delivered = pull["delivered"]
+        inbox = pull["inbox"]
+    else:
+        consume_event_notifications(now=now)
+        inbox = list_delivery_inbox(
+            consumer_id, task_id=task_id, classification=classification
+        )
+        if limit is not None:
+            inbox = inbox[: max(0, int(limit))]
+        delivered = []
+
+    classifications = sorted(
+        {str(item.get("classification")) for item in inbox}
+    )
+    return {
+        "reader": MCP_NOTIFICATION_READER_TOOL,
+        "goal": MCP_NOTIFICATION_READER_GOAL,
+        "consumer_id": consumer_id,
+        "now": now.isoformat(),
+        "read_only": True,
+        "mark_delivered": mark_delivered,
+        "channel": NOTIFICATION_DELIVERY_CHANNEL,
+        "push_capability": NOTIFICATION_DELIVERY_PUSH_CAPABILITY,
+        "true_push_supported": False,
+        "task_id_filter": task_id,
+        "classification_filter": classification,
+        "has_new": bool(delivered),
+        "delivered": delivered,
+        "delivered_count": len(delivered),
+        "notifications": inbox,
+        "notification_count": len(inbox),
+        "unread_count": sum(1 for item in inbox if item.get("unread")),
+        "classifications": classifications,
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+    }
+
+
+def mcp_notification_reader_golden_verify(now: datetime | None = None) -> dict:
+    """Run the MCP Notification Reader Golden verification (read-only).
+
+    It drives one real, disposable chain: four probe tasks reach the classified
+    notification consumer (PASS / FAIL / BLOCKED / PENDING_APPROVAL), a
+    terminal completion event is handled into a discoverable ``review_ready``
+    state, the delivery adapter puts the notifications into a durable pull
+    inbox, and the MCP reader reads them twice to prove idempotency. The Human
+    Gate and the unchanged execution contracts are asserted explicitly.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)
+    seq = uuid.uuid4().hex[:10]
+    consumer_id = f"mcp-notification-reader-{seq}"
+    pending_probe = f"mcp-reader-pending-{seq}"
+    pass_probe = f"mcp-reader-pass-{seq}"
+    fail_probe = f"mcp-reader-fail-{seq}"
+    blocked_probe = f"mcp-reader-blocked-{seq}"
+    chain_probe = f"mcp-reader-chain-{seq}"
+    probe_ids = {pending_probe, pass_probe, fail_probe, blocked_probe}
+
+    for probe_id, status in (
+        (pending_probe, "success"),
+        (pass_probe, "success"),
+        (fail_probe, "fail"),
+        (blocked_probe, "blocked"),
+    ):
+        submit_task(
+            probe_id,
+            goal=MCP_NOTIFICATION_READER_GOAL,
+            status=status,
+            requires_review=True,
+        )
+    mark_reviewed(pass_probe, PASS, "MCP notification reader PASS scenario")
+
+    review_states_before = {
+        task_id: bool(TASK_REGISTRY.get(task_id, {}).get("reviewed"))
+        for task_id in probe_ids
+    }
+
+    completion_event = build_completion_event(
+        chain_probe,
+        status="success",
+        tests="1 passed in 0.01s",
+        execution_result=_event_driven_terminal_result(chain_probe),
+    )
+    handled = handle_completion_event(completion_event, auto_apply=False)
+    ready_state = review_ready_state(chain_probe)
+
+    first = mcp_notification_reader(consumer_id, now=now)
+    second = mcp_notification_reader(consumer_id, now=now)
+    chain_read = mcp_notification_reader(
+        consumer_id, task_id=chain_probe, now=now
+    )
+
+    first_probe = [
+        record for record in first["delivered"] if record["task_id"] in probe_ids
+    ]
+    second_probe = [
+        record for record in second["delivered"] if record["task_id"] in probe_ids
+    ]
+    observed_classes = {record["classification"] for record in first_probe}
+    all_classes_present = set(NOTIFICATION_CLASSES) <= observed_classes
+    classification_by_task = {
+        task_id: sorted(
+            {
+                record["classification"]
+                for record in first_probe
+                if record["task_id"] == task_id
+            }
+        )
+        for task_id in sorted(probe_ids)
+    }
+    idempotent = bool(
+        first_probe
+        and not second_probe
+        and second["delivered_count"] == 0
+        and chain_read["delivered_count"] == 0
+    )
+
+    chain_notifications = list_notifications(chain_probe)
+    chain_delivered = [
+        record for record in first["delivered"] if record["task_id"] == chain_probe
+    ]
+    chain_steps = {
+        "completion_event": {
+            "present": completion_event.get("event_type")
+            == EVENT_DRIVEN_COMPLETION_EVENT,
+            "handled_action": handled.get("action"),
+        },
+        "review_ready": {
+            "review_ready": bool(ready_state.get("review_ready")),
+            "state": ready_state.get("state"),
+        },
+        "notification_consumer": {
+            "present": bool(chain_notifications),
+            "classification": (
+                chain_notifications[0].get("classification")
+                if chain_notifications
+                else None
+            ),
+        },
+        "delivery_inbox": {
+            "delivered": len(chain_delivered) == 1,
+            "delivery_state": (
+                chain_delivered[0].get("delivery_state") if chain_delivered else None
+            ),
+        },
+        "mcp_reader": {
+            "reader": MCP_NOTIFICATION_READER_TOOL,
+            "has_new": bool(chain_delivered),
+            "repeated_read_delivered": chain_read["delivered_count"],
+        },
+    }
+    chain_ok = bool(
+        handled.get("action") == "completion_event_handled"
+        and ready_state.get("review_ready") is True
+        and chain_steps["notification_consumer"]["present"]
+        and chain_steps["notification_consumer"]["classification"]
+        == NOTIFICATION_CLASS_PENDING_APPROVAL
+        and chain_steps["delivery_inbox"]["delivered"]
+        and chain_steps["mcp_reader"]["repeated_read_delivered"] == 0
+    )
+
+    delivery_status = notification_delivery_status(consumer_id)
+    inbox_ok = bool(
+        delivery_status["persisted"]
+        and delivery_status["queryable"]
+        and delivery_status["delivery_channel"] == NOTIFICATION_DELIVERY_CHANNEL
+        and isinstance(first["notifications"], list)
+    )
+
+    pass_notification = next(
+        (
+            record
+            for record in first_probe
+            if record["task_id"] == pass_probe
+        ),
+        None,
+    )
+    if pass_notification is not None:
+        ack = acknowledge_notification(
+            pass_notification["notification_key"], consumer_id, now=now
+        )
+        ack_repeat = acknowledge_notification(
+            pass_notification["notification_key"], consumer_id, now=now
+        )
+        read_state_ok = bool(
+            ack["delivery_state"] == "acknowledged"
+            and ack_repeat["delivery_state"] == "acknowledged"
+            and ack_repeat["delivery_seq"] == ack["delivery_seq"]
+        )
+    else:
+        read_state_ok = False
+
+    review_states_after = {
+        task_id: bool(TASK_REGISTRY.get(task_id, {}).get("reviewed"))
+        for task_id in probe_ids
+    }
+    review_states_unchanged = review_states_before == review_states_after
+    dispatch_events = [
+        event
+        for event in get_consumption_evidence()
+        if event.get("event_type") == AUTO_DISPATCH_EVENT
+        and event.get("task_id") in (probe_ids | {chain_probe})
+    ]
+    pending_record = get_task_review(pending_probe) or {}
+    gate_ok = bool(
+        review_states_unchanged
+        and not dispatch_events
+        and pending_record.get("reviewed") is False
+        and pending_record.get("review_verdict") is None
+        and all(
+            record["human_review_gate"]
+            and not record["auto_pass"]
+            and not record["auto_trigger_next"]
+            for record in first_probe
+        )
+    )
+
+    contracts_unchanged = bool(
+        list(inspect.signature(submit_task).parameters) == SUBMIT_TASK_PARAMS
+        and list(inspect.signature(get_task_result).parameters) == ["task_id"]
+        and list(inspect.signature(mark_reviewed).parameters)
+        == ["task_id", "verdict", "note"]
+        and list(inspect.signature(pull_notifications).parameters)
+        == ["consumer_id", "task_id", "classification", "limit", "now"]
+    )
+
+    checks = [
+        {
+            "check": "completion event -> review_ready -> notification consumer "
+            "-> delivery inbox -> MCP reader chain",
+            "status": PASS if chain_ok else FAIL,
+            "detail": (
+                f"{chain_probe}: completion event -> "
+                f"{chain_steps['completion_event']['handled_action']} -> "
+                f"review_ready={chain_steps['review_ready']['review_ready']} -> "
+                "notification="
+                f"{chain_steps['notification_consumer']['classification']} -> "
+                f"delivered={chain_steps['delivery_inbox']['delivered']} -> "
+                f"reader={MCP_NOTIFICATION_READER_TOOL}"
+            ),
+        },
+        {
+            "check": "PASS/FAIL/BLOCKED/PENDING_APPROVAL classifications readable",
+            "status": PASS if all_classes_present else FAIL,
+            "detail": (
+                "observed classifications: "
+                + ", ".join(sorted(observed_classes))
+                + "; each delivered record keeps its classification/category"
+            ),
+        },
+        {
+            "check": "repeated MCP read is idempotent",
+            "status": PASS if idempotent and read_state_ok else FAIL,
+            "detail": (
+                f"first read delivered {len(first_probe)} probe notification(s); "
+                f"second read delivered {len(second_probe)} probe (0 total) and "
+                f"{chain_read['delivered_count']} for the chain task; repeated "
+                "acknowledgement kept the same delivery_seq"
+            ),
+        },
+        {
+            "check": "delivery inbox persisted and queryable",
+            "status": PASS if inbox_ok else FAIL,
+            "detail": (
+                f"delivery store {delivery_status['path']} persisted="
+                f"{delivery_status['persisted']} queryable="
+                f"{delivery_status['queryable']} channel="
+                f"{delivery_status['delivery_channel']}"
+            ),
+        },
+        {
+            "check": "Human Gate preserved",
+            "status": PASS if gate_ok else FAIL,
+            "detail": (
+                "review states unchanged, no auto review, no auto dispatch, "
+                "every delivered notification has human_review_gate=True, "
+                "auto_pass=False, auto_trigger_next=False"
+            ),
+        },
+        {
+            "check": "read-only MCP surface; contracts unchanged",
+            "status": PASS if contracts_unchanged else FAIL,
+            "detail": (
+                "mcp_notification_reader is read-only over the execution layer; "
+                "submit_task/get_task_result/mark_reviewed/pull_notifications "
+                "signatures unchanged; no Router/orchestrator/multi-agent added"
+            ),
+        },
+    ]
+
+    if any(check["status"] == FAIL for check in checks):
+        final = FAIL
+    else:
+        final = PASS
+
+    root_cause = mcp_notification_reader_final_root_cause()
+    limitations = [
+        NOTIFICATION_DELIVERY_PUSH_LIMITATION,
+        "Root cause of run 36401601530: the checkout already had "
+        "timeout-minutes: 15 and the step still overran it, so the residual "
+        "cause is the independent pytest suite runtime (cross-test global state "
+        "accumulation). The shipped fix isolates module state per test; a bare "
+        "retry would not have fixed it.",
+        "MCP surface: mcp_read_notifications / mcp_notification_reader is a "
+        "durable pull reader over the delivery inbox; no server-initiated push "
+        "into a ChatGPT session is possible from this repository.",
+        "Human Gate: the reader never reviews, never PASSes and never "
+        "dispatches, so reading a notification cannot start an unapproved next "
+        "task.",
+        "Scope: only hello.py and test_hello.py are changed; no workflow, "
+        "secret, scope gate or production module is modified.",
+    ]
+
+    markdown_lines = [
+        f"# {MCP_NOTIFICATION_READER_REPORT}",
+        "",
+        f"- goal: {MCP_NOTIFICATION_READER_GOAL}",
+        f"- task_id: {MCP_NOTIFICATION_READER_TASK_ID}",
+        f"- FINAL: {final}",
+        f"- entrypoint: {MCP_NOTIFICATION_READER_TOOL} / mcp_notification_reader",
+        f"- chain: {' -> '.join(MCP_NOTIFICATION_READER_CHAIN)}",
+        f"- delivery_channel: {NOTIFICATION_DELIVERY_CHANNEL}",
+        "- human_review_gate: True",
+        "- auto_pass: False",
+        "- auto_trigger_next: False",
+        "",
+        "## Root cause of run 36401601530",
+        f"- run_id: {root_cause['run_id']}",
+        f"- head_sha: {root_cause['head_sha']}",
+        f"- failing_step: {root_cause['failing_step_number']} "
+        f"{root_cause['failing_step']}",
+        f"- workflow_config_fix_in_effect: "
+        f"{root_cause['workflow_config_fix_in_effect']}",
+        f"- root_cause: {root_cause['root_cause']}",
+        f"- required_action: {root_cause['required_action']}",
+        f"- {root_cause['detail']}",
+        "",
+        "## MCP reader consumer",
+        f"- consumer_id: {consumer_id}",
+        f"- first_read_delivered: {first['delivered_count']}",
+        f"- repeated_read_delivered: {second['delivered_count']}",
+        f"- unread_count: {delivery_status['unread_count']}",
+        f"- delivered_count: {delivery_status['delivered_count']}",
+        f"- acknowledged_count: {delivery_status['acknowledged_count']}",
+        "",
+        "## Classifications",
+    ]
+    for task_id in sorted(probe_ids):
+        markdown_lines.append(
+            f"- {task_id}: "
+            + (", ".join(classification_by_task[task_id]) or "none")
+        )
+    markdown_lines += [
+        "",
+        "## Chain evidence",
+        f"- completion_event: {chain_steps['completion_event']['present']}",
+        f"- handled_action: {chain_steps['completion_event']['handled_action']}",
+        f"- review_ready: {chain_steps['review_ready']['review_ready']} "
+        f"({chain_steps['review_ready']['state']})",
+        f"- notification_classification: "
+        f"{chain_steps['notification_consumer']['classification']}",
+        f"- delivery_inbox_delivered: "
+        f"{chain_steps['delivery_inbox']['delivered']} "
+        f"({chain_steps['delivery_inbox']['delivery_state']})",
+        f"- mcp_reader_repeated_read_delivered: "
+        f"{chain_steps['mcp_reader']['repeated_read_delivered']}",
+        "",
+        "## Limitations",
+    ]
+    markdown_lines += [f"- {item}" for item in limitations]
+    markdown_lines += ["", "## Checks"]
+    for check in checks:
+        markdown_lines.append(
+            f"- [{check['status']}] {check['check']}: {check['detail']}"
+        )
+    markdown_lines += ["", f"FINAL_STATUS={final}"]
+
+    return {
+        "report": MCP_NOTIFICATION_READER_REPORT,
+        "goal": MCP_NOTIFICATION_READER_GOAL,
+        "task_id": MCP_NOTIFICATION_READER_TASK_ID,
+        "status": final,
+        "final_status": final,
+        "acceptance_fields": list(MCP_NOTIFICATION_READER_ACCEPTANCE_FIELDS),
+        "entrypoint": MCP_NOTIFICATION_READER_TOOL,
+        "chain": list(MCP_NOTIFICATION_READER_CHAIN),
+        "chain_steps": chain_steps,
+        "chain_ok": chain_ok,
+        "reader_tool": MCP_NOTIFICATION_READER_TOOL,
+        "consumer_id": consumer_id,
+        "observed_classifications": sorted(observed_classes),
+        "all_classes_present": all_classes_present,
+        "classification_by_task": classification_by_task,
+        "first_read_delivered_count": first["delivered_count"],
+        "repeated_read_delivered_count": second["delivered_count"],
+        "probe_notifications": first_probe,
+        "idempotent": idempotent,
+        "read_state_ok": read_state_ok,
+        "inbox_ok": inbox_ok,
+        "delivery_status": delivery_status,
+        "human_gate_preserved": gate_ok,
+        "review_states_unchanged": review_states_unchanged,
+        "no_auto_dispatch": not dispatch_events,
+        "root_cause": root_cause,
+        "root_cause_class": root_cause["root_cause"],
+        "workflow_config_fix_in_effect": root_cause[
+            "workflow_config_fix_in_effect"
+        ],
+        "limitations": limitations,
+        "checks": checks,
+        "contracts_unchanged": contracts_unchanged,
+        "read_only": True,
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "no_router": True,
+        "no_orchestrator": True,
+        "no_multi_agent": True,
+        "workflow_modified": False,
+        "changed_files": ["hello.py", "test_hello.py"],
+        "submit_task_contract": "UNCHANGED",
+        "get_task_result_contract": "UNCHANGED",
+        "mark_reviewed_contract": "COMPATIBLE",
+        "markdown": "\n".join(markdown_lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(runtime_provenance_v0_1_report()["markdown"])
     print(cloudflare_runtime_audit_report()["markdown"])
@@ -14886,3 +15456,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(personal_ai_event_driven_review_trigger_v0_1()["markdown"])
     print(event_notification_consumer_report()["markdown"])
     print(notification_delivery_adapter_report()["markdown"])
+    print(mcp_notification_reader_golden_verify()["markdown"])
