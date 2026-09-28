@@ -1,0 +1,114 @@
+{
+  "schema": "personal-ai-mobile-cloud-e2e-probe/v1",
+  "task_id": "cf-0f908ee294c4",
+  "goal": "MOBILE_CLOUD_AGENT_INDEPENDENT_E2E_GOLDEN_01",
+  "probe_kind": "mobile_dispatch_to_cloud_agent_to_result_return",
+  "risk_level": "LOW",
+  "overall_status": "PASS",
+  "executed_at_utc": "2026-09-28T10:19:45Z",
+  "environment": {
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "kernel": "Linux 6.17.0-1022-azure #22-Ubuntu SMP Mon Jul 27 17:24:03 UTC 2026 x86_64",
+    "python_version": "3.11.16",
+    "git_version": "2.55.0",
+    "pytest_version": "9.1.1",
+    "repo_commit": "cbd12a9a52ba4f485f842b77ca93475fba1e036a",
+    "network_required": false,
+    "side_effects": "none"
+  },
+  "sha256": {
+    "input_string": "personal-ai-mobile-cloud-e2e",
+    "algorithm": "sha256",
+    "encoding": "utf-8",
+    "digest": "1e1adecec9caf932f005688de87d414c1f9aff58839881c50559f1cf7e3c0a14"
+  },
+  "checks": [
+    {
+      "id": "python_available",
+      "description": "Python interpreter is executable and reports a version.",
+      "command": "python3 --version",
+      "status": "PASS",
+      "evidence": "Python 3.11.16"
+    },
+    {
+      "id": "git_available",
+      "description": "Git executable is available in the cloud runner.",
+      "command": "git --version",
+      "status": "PASS",
+      "evidence": "git version 2.55.0"
+    },
+    {
+      "id": "temp_file_roundtrip",
+      "description": "Create a temporary UTF-8 text file, read it back, verify content and clean it up.",
+      "command": "python3 tempfile roundtrip",
+      "status": "PASS",
+      "evidence": "temp_path=/tmp/tmp_3ua78yh.txt read_back=personal-ai-mobile-cloud-e2e match=True cleaned=True"
+    },
+    {
+      "id": "fixed_string_sha256",
+      "description": "Compute SHA-256 of the fixed string 'personal-ai-mobile-cloud-e2e' and recompute it.",
+      "command": "python3 -c \"import hashlib; hashlib.sha256(b'personal-ai-mobile-cloud-e2e').hexdigest()\"",
+      "status": "PASS",
+      "evidence": "1e1adecec9caf932f005688de87d414c1f9aff58839881c50559f1cf7e3c0a14 (recomputed identically in the probe test)"
+    },
+    {
+      "id": "minimal_pytest",
+      "description": "Run a minimal pytest suite (SHA-256 assertion + temp file roundtrip) and record the result.",
+      "command": "python3 -m pytest -q",
+      "status": "PASS",
+      "evidence": "2 passed in 0.01s"
+    },
+    {
+      "id": "result_chain_readback",
+      "description": "Read the terminal state back through the existing Personal AI Execution V2 result chain.",
+      "command": "PYTHONPATH=src python3 -c \"from personal_ai_execution.result_normalization import get_task_result; ...\"",
+      "status": "PASS",
+      "evidence": "status=PASS terminal=True conclusion_authoritative=True missing_expected_files=[] reason=workflow conclusion 'success' agrees with execution_result.json -> PASS"
+    }
+  ],
+  "test_result": {
+    "framework": "pytest",
+    "command": "python3 -m pytest -q",
+    "location": "/tmp/opencode/e2e_probe/test_minimal_probe.py (temporary, cleaned up after execution)",
+    "passed": 2,
+    "failed": 0,
+    "errors": 0,
+    "duration": "0.01s",
+    "summary": "2 passed in 0.01s",
+    "status": "PASS",
+    "persisted_in_repo": false
+  },
+  "execution_result": {
+    "task_id": "cf-0f908ee294c4",
+    "status": "success",
+    "summary": "MOBILE_CLOUD_AGENT_INDEPENDENT_E2E_GOLDEN_01",
+    "tests": "2 passed in 0.01s",
+    "expected_files": [
+      "PERSONAL_AI_MOBILE_CLOUD_E2E_PROBE.md",
+      "PERSONAL_AI_MOBILE_CLOUD_E2E_PROBE.json"
+    ],
+    "changed_files": [
+      "PERSONAL_AI_MOBILE_CLOUD_E2E_PROBE.md",
+      "PERSONAL_AI_MOBILE_CLOUD_E2E_PROBE.json"
+    ],
+    "final_status": "PASS",
+    "workflow_status": {
+      "separation_note": "business outcome (final_status) is kept separate from workflow status"
+    }
+  },
+  "result_chain": {
+    "reader": "src/personal_ai_execution/result_normalization.py:get_task_result",
+    "workflow_conclusion": "success",
+    "normalized_status": "PASS",
+    "terminal": true,
+    "conclusion_authoritative": true,
+    "conclusion_result_mismatch": false,
+    "missing_expected_files": [],
+    "reason": "workflow conclusion 'success' agrees with execution_result.json -> PASS"
+  },
+  "artifacts": [
+    "PERSONAL_AI_MOBILE_CLOUD_E2E_PROBE.md",
+    "PERSONAL_AI_MOBILE_CLOUD_E2E_PROBE.json"
+  ],
+  "conclusion": "Independent mobile -> cloud agent -> result-return golden probe PASSED. All six no-side-effect checks have real, recomputable evidence; the fixed-string SHA-256 matches the human-readable report; and the terminal status is readable through the existing Personal AI Execution V2 result chain."
+}
