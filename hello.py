@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -11148,6 +11149,270 @@ def personal_ai_autonomous_advancement_production_evidence_audit_v0_1(
 ) -> dict:
     """Alias for the V0.1 production evidence audit entrypoint."""
     return autonomous_advancement_production_evidence_audit(production_evidence)
+
+
+# -- PERSONAL_AI_EXECUTION_RUNTIME_GOLDEN_VERIFY_V0.1 -----------------------
+#
+# Golden verification of RESULT_SCHEMA_PRESERVATION across the real production
+# chain: submit_task -> GitHub Action -> Agent -> agent_result.json -> the
+# production scripts/build_execution_result.py -> execution_result.json
+# artifact -> worker/get_task_result. It proves that an Agent's original
+# unknown fields (for example ``future_unknown_field``), ``evidence``,
+# ``artifacts`` and the nested ``agent_result`` copy survive into the published
+# execution_result.json and stay readable through ``get_task_result``. It only
+# reads/executes the existing generator and never mutates Worker, MCP,
+# Cloudflare, D1/KV, OAuth or any production configuration.
+
+RESULT_SCHEMA_PRESERVATION_GOAL = "PERSONAL_AI_EXECUTION_RUNTIME_GOLDEN_VERIFY_V0.1"
+RESULT_SCHEMA_PRESERVATION_TASK_ID = "cf-15d186c2ee3a"
+RESULT_SCHEMA_PRESERVATION_REPORT = "RESULT_SCHEMA_PRESERVATION_GOLDEN_VERIFY_REPORT"
+RESULT_SCHEMA_PRESERVATION_UNKNOWN_FIELD = "future_unknown_field"
+RESULT_SCHEMA_PRESERVATION_PRESERVED_FIELDS = (
+    RESULT_SCHEMA_PRESERVATION_UNKNOWN_FIELD,
+    "evidence",
+    "artifacts",
+    "agent_result",
+    "final_status",
+)
+
+
+def build_result_schema_preservation_agent_result() -> dict:
+    """Return the structured Agent result fixture for schema preservation.
+
+    It mirrors what a real Agent publishes to ``$RUNNER_TEMP/agent_result.json``:
+    a business ``final_status`` kept separate from the workflow ``status``, the
+    required ``evidence`` / ``artifacts`` / ``agent_result`` sections, and an
+    original unknown field the schema must not drop.
+    """
+    return {
+        "final_status": PASS,
+        "task_id": RESULT_SCHEMA_PRESERVATION_TASK_ID,
+        "goal": RESULT_SCHEMA_PRESERVATION_GOAL,
+        RESULT_SCHEMA_PRESERVATION_UNKNOWN_FIELD: {
+            "preserve": True,
+            "nested": {"numbers": [1, 2, 3], "label": "agent-original"},
+        },
+        "evidence": {
+            "pytest": "python -m pytest -q",
+            "workflow": "agent-dispatch.yml",
+            "schema_preservation": True,
+        },
+        "artifacts": [
+            {"name": "hello.py", "path": "hello.py"},
+            {"name": "test_hello.py", "path": "test_hello.py"},
+        ],
+        "agent_result": {"schema": "result-v1", "preserved": True},
+        "workflow_status": "success",
+    }
+
+
+def _run_result_schema_preservation_generator(
+    agent_result: dict,
+    out_path: str | Path,
+    *,
+    base: str = "HEAD",
+    tests_summary: str = "python -m pytest -q",
+) -> dict:
+    """Run the real production generator exactly as the GitHub Action does."""
+    generator = REPO_ROOT / "scripts" / "build_execution_result.py"
+    workdir = Path(tempfile.mkdtemp(prefix="result-schema-preservation-"))
+    task_path = workdir / "task.json"
+    agent_path = workdir / "agent_result.json"
+    task_path.write_text(
+        json.dumps(
+            {
+                "task_id": RESULT_SCHEMA_PRESERVATION_TASK_ID,
+                "goal": RESULT_SCHEMA_PRESERVATION_GOAL,
+            }
+        ),
+        encoding="utf-8",
+    )
+    agent_path.write_text(json.dumps(agent_result), encoding="utf-8")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(generator),
+            str(task_path),
+            base,
+            tests_summary,
+            str(out_path),
+            str(agent_path),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    return {
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
+
+
+def result_schema_preservation_golden_verify(
+    agent_result: dict | None = None,
+    output_path: str | Path | None = None,
+) -> dict:
+    """Verify a structured Agent result survives into ``execution_result.json``.
+
+    Returns a decidable ``PASS`` / ``FAIL`` / ``BLOCKED`` report with the
+    per-field evidence. ``BLOCKED`` means the production generator could not be
+    executed in this environment; ``FAIL`` means a preserved field was lost.
+    """
+    fixture = (
+        dict(agent_result)
+        if isinstance(agent_result, dict)
+        else build_result_schema_preservation_agent_result()
+    )
+    if output_path is None:
+        workdir = Path(tempfile.mkdtemp(prefix="result-schema-artifact-"))
+        output_path = workdir / "execution_result.json"
+    output_path = Path(output_path)
+
+    checks: list[dict] = []
+    artifact: dict | None = None
+    generator_error: str | None = None
+    try:
+        run = _run_result_schema_preservation_generator(fixture, output_path)
+        if run["returncode"] != 0:
+            raise RuntimeError(
+                run["stderr"].strip() or f"generator exit {run['returncode']}"
+            )
+        loaded = json.loads(output_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("execution_result.json is not a JSON object")
+        artifact = loaded
+    except Exception as exc:  # pragma: no cover - environment dependent
+        generator_error = f"{type(exc).__name__}: {exc}"
+
+    def check(name: str, ok: bool, detail: str) -> None:
+        checks.append({"check": name, "status": PASS if ok else FAIL, "detail": detail})
+
+    def field_expected(container: dict | None, field: str) -> tuple[bool, object]:
+        """Return (present, expected value) for a preserved field.
+
+        The production generator deliberately republishes ``agent_result`` as a
+        full copy of the Agent result, so its expected value is the whole
+        fixture rather than the fixture's own nested ``agent_result`` value.
+        """
+        if not isinstance(container, dict):
+            return (False, None)
+        if field == "agent_result":
+            nested = container.get("agent_result")
+            return (isinstance(nested, dict), container)
+        return (field in container, container.get(field))
+
+    if artifact is None:
+        for field in RESULT_SCHEMA_PRESERVATION_PRESERVED_FIELDS:
+            check(
+                f"{field} preserved in execution_result.json",
+                False,
+                f"execution_result.json unavailable: {generator_error}",
+            )
+    else:
+        for field in RESULT_SCHEMA_PRESERVATION_PRESERVED_FIELDS:
+            present, expected = field_expected(fixture, field)
+            equal = present and artifact.get(field) == expected
+            check(
+                f"{field} preserved in execution_result.json",
+                bool(present and equal),
+                (
+                    f"value={artifact.get(field)!r}"
+                    if artifact.get(field) is not None
+                    else "field missing from execution_result.json"
+                ),
+            )
+        check(
+            "workflow status remains the compatibility field",
+            artifact.get("status") == "success",
+            f"status={artifact.get('status')!r}",
+        )
+        check(
+            "task_id rewritten to the parent contract",
+            artifact.get("task_id") == RESULT_SCHEMA_PRESERVATION_TASK_ID,
+            f"task_id={artifact.get('task_id')!r}",
+        )
+
+    exposed: dict | None = None
+    exposure_error: str | None = None
+    if artifact is not None:
+        original_reader = globals().get("_read_execution_result")
+        globals()["_read_execution_result"] = lambda: artifact
+        try:
+            exposed = get_task_result(RESULT_SCHEMA_PRESERVATION_TASK_ID)
+        except Exception as exc:  # pragma: no cover - defensive
+            exposure_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            if original_reader is not None:
+                globals()["_read_execution_result"] = original_reader
+
+    raw_result = (
+        exposed.get("execution_result_json") if isinstance(exposed, dict) else None
+    )
+    for field in RESULT_SCHEMA_PRESERVATION_PRESERVED_FIELDS:
+        present, expected = field_expected(fixture, field)
+        equal = (
+            isinstance(raw_result, dict)
+            and present
+            and raw_result.get(field) == expected
+        )
+        check(
+            f"get_task_result preserves {field}",
+            bool(equal),
+            (
+                f"execution_result_json.{field}={raw_result.get(field)!r}"
+                if isinstance(raw_result, dict) and raw_result.get(field) is not None
+                else (
+                    f"execution_result_json missing: {exposure_error}"
+                    if exposure_error
+                    else "field missing from get_task_result.execution_result_json"
+                )
+            ),
+        )
+
+    failed = [item for item in checks if item["status"] == FAIL]
+    if generator_error is not None:
+        overall = BLOCKED
+    elif failed:
+        overall = FAIL
+    else:
+        overall = PASS
+
+    lines = [
+        "# RESULT_SCHEMA_PRESERVATION_GOLDEN_VERIFY_REPORT",
+        "",
+        f"- goal: {RESULT_SCHEMA_PRESERVATION_GOAL}",
+        f"- task_id: {RESULT_SCHEMA_PRESERVATION_TASK_ID}",
+        f"- production_generator: scripts/build_execution_result.py",
+        f"- production_mutated: False",
+        "",
+        "## Checks",
+    ]
+    for item in checks:
+        lines.append(f"- [{item['status']}] {item['check']}: {item['detail']}")
+    lines += [
+        "",
+        f"FINAL_STATUS={overall}",
+    ]
+
+    return {
+        "report": RESULT_SCHEMA_PRESERVATION_REPORT,
+        "goal": RESULT_SCHEMA_PRESERVATION_GOAL,
+        "task_id": RESULT_SCHEMA_PRESERVATION_TASK_ID,
+        "status": overall,
+        "final_status": overall,
+        "preserved_fields": list(RESULT_SCHEMA_PRESERVATION_PRESERVED_FIELDS),
+        "agent_result": fixture,
+        "execution_result_json": artifact,
+        "evidence": fixture["evidence"],
+        "artifacts": fixture["artifacts"],
+        "checks": checks,
+        "generator_error": generator_error,
+        "get_task_result_exposed": exposed,
+        "production_mutated": False,
+        "read_only": True,
+        "markdown": "\n".join(lines),
+    }
 
 
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint

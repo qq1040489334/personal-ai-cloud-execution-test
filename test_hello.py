@@ -91,6 +91,10 @@ from hello import (
     RESULT_DETAIL_GOAL,
     RESULT_DETAIL_TASK_ID,
     RESULT_DETAIL_FIELDS,
+    RESULT_SCHEMA_PRESERVATION_GOAL,
+    RESULT_SCHEMA_PRESERVATION_REPORT,
+    RESULT_SCHEMA_PRESERVATION_TASK_ID,
+    RESULT_SCHEMA_PRESERVATION_UNKNOWN_FIELD,
     STATUS_MODEL_EXPECTED_FIELDS,
     TASK_REVIEW_GOAL,
     AUTONOMOUS_ADVANCEMENT_EVIDENCE_ENV,
@@ -105,6 +109,7 @@ from hello import (
     auto_result_close_loop_golden_verify,
     auto_result_golden_test_verify,
     autonomous_advancement_production_evidence_audit,
+    build_result_schema_preservation_agent_result,
     classify_pending_task,
     cloud_agent_test,
     cloud_agent_test_2,
@@ -152,6 +157,7 @@ from hello import (
     record_consumer_evidence,
     result_consumer_test,
     result_consumer_test2,
+    result_schema_preservation_golden_verify,
     runtime_provenance_report,
     security_test,
     submit_task,
@@ -4279,3 +4285,100 @@ def test_personal_ai_autonomous_advancement_alias() -> None:
         captured_production_evidence()
     )
     assert report["FINAL_STATUS"] == AUTONOMOUS_ADVANCEMENT_FINAL_GOLDEN_PASS
+
+
+# -- PERSONAL_AI_EXECUTION_RUNTIME_GOLDEN_VERIFY_V0.1 -----------------------
+# Golden verification that a structured Agent result survives the production
+# chain (agent_result.json -> build_execution_result.py -> execution_result.json
+# -> get_task_result) with RESULT_SCHEMA_PRESERVATION intact.
+
+
+@pytest.fixture(scope="module")
+def result_schema_preservation_golden_report() -> dict:
+    return result_schema_preservation_golden_verify()
+
+
+def test_result_schema_preservation_report_contract(
+    result_schema_preservation_golden_report: dict,
+) -> None:
+    report = result_schema_preservation_golden_report
+    assert report["report"] == RESULT_SCHEMA_PRESERVATION_REPORT
+    assert report["goal"] == RESULT_SCHEMA_PRESERVATION_GOAL
+    assert report["task_id"] == RESULT_SCHEMA_PRESERVATION_TASK_ID
+    assert report["status"] == "PASS"
+    assert report["final_status"] == "PASS"
+    assert report["production_mutated"] is False
+    assert report["read_only"] is True
+    assert report["generator_error"] is None
+
+
+def test_result_schema_preservation_unknown_field_survives_generator(
+    result_schema_preservation_golden_report: dict,
+) -> None:
+    report = result_schema_preservation_golden_report
+    artifact = report["execution_result_json"]
+    fixture = report["agent_result"]
+    unknown = RESULT_SCHEMA_PRESERVATION_UNKNOWN_FIELD
+
+    assert artifact[unknown] == fixture[unknown]
+    assert artifact["evidence"] == fixture["evidence"]
+    assert artifact["artifacts"] == fixture["artifacts"]
+    assert artifact["agent_result"] == fixture
+    assert artifact["final_status"] == fixture["final_status"]
+
+
+def test_result_schema_preservation_keeps_business_and_workflow_status_separate(
+    result_schema_preservation_golden_report: dict,
+) -> None:
+    artifact = result_schema_preservation_golden_report["execution_result_json"]
+    assert artifact["status"] == "success"
+    assert artifact["final_status"] == "PASS"
+    assert artifact["task_id"] == RESULT_SCHEMA_PRESERVATION_TASK_ID
+
+
+def test_result_schema_preservation_get_task_result_exposes_unknown_field(
+    result_schema_preservation_golden_report: dict,
+) -> None:
+    report = result_schema_preservation_golden_report
+    exposed = report["get_task_result_exposed"]
+    raw = exposed["execution_result_json"]
+    fixture = report["agent_result"]
+    unknown = RESULT_SCHEMA_PRESERVATION_UNKNOWN_FIELD
+
+    assert raw[unknown] == fixture[unknown]
+    assert raw["evidence"] == fixture["evidence"]
+    assert raw["artifacts"] == fixture["artifacts"]
+    assert raw["agent_result"] == fixture
+
+
+def test_get_task_result_preserves_agent_unknown_field_via_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = result_schema_preservation_golden_verify()
+    artifact = report["execution_result_json"]
+    monkeypatch.setattr(hello_module, "_read_execution_result", lambda: artifact)
+
+    result = get_task_result(RESULT_SCHEMA_PRESERVATION_TASK_ID)
+    raw = result["execution_result_json"]
+    unknown = RESULT_SCHEMA_PRESERVATION_UNKNOWN_FIELD
+
+    assert raw[unknown] == report["agent_result"][unknown]
+    assert raw["evidence"]
+    assert raw["artifacts"]
+    assert raw["agent_result"]
+    assert result["artifacts"]
+
+
+def test_result_schema_preservation_missing_unknown_field_fails() -> None:
+    fixture = build_result_schema_preservation_agent_result()
+    fixture.pop(RESULT_SCHEMA_PRESERVATION_UNKNOWN_FIELD)
+
+    report = result_schema_preservation_golden_verify(fixture)
+
+    assert report["final_status"] == "FAIL"
+    assert any(
+        item["status"] == "FAIL"
+        and RESULT_SCHEMA_PRESERVATION_UNKNOWN_FIELD in item["check"]
+        for item in report["checks"]
+    )
+
