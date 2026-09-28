@@ -2,6 +2,7 @@
 
 import inspect
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -189,17 +190,30 @@ from hello import (
     REAL_PUSH_BLOCKED_CREDENTIAL,
     REAL_PUSH_FAILED,
     REAL_PUSH_PASS,
+    SERVERCHAN_REAL_PUSH_02_EVENT,
+    SERVERCHAN_REAL_PUSH_02_GOAL,
+    SERVERCHAN_REAL_PUSH_02_MARKER,
+    SERVERCHAN_REAL_PUSH_02_REPORT,
+    SERVERCHAN_REAL_PUSH_02_TASK_ID,
+    SERVERCHAN_REAL_PUSH_02_TITLE,
     SERVERCHAN_REAL_PUSH_EVENT,
     SERVERCHAN_REAL_PUSH_GOAL,
     SERVERCHAN_REAL_PUSH_MARKER,
     SERVERCHAN_REAL_PUSH_REPORT,
     SERVERCHAN_REAL_PUSH_TASK_ID,
     SERVERCHAN_REAL_PUSH_TITLE,
+    build_serverchan_golden_02_payload,
     build_serverchan_golden_payload,
     serverchan_real_push_golden,
+    serverchan_real_push_golden_02,
 )
 
 VALID_STATUSES = {"PASS", "FAIL", "BLOCKED"}
+
+# Snapshot the runner-process SendKey at import time (before the autouse fixture
+# deletes it for test isolation). It is only ever re-injected into the process
+# env for the one real-push Golden 02 test; it is never printed or persisted.
+_RUNNER_SERVERCHAN_SENDKEY = os.environ.get("SERVERCHAN_SENDKEY")
 
 # Residual root cause of cloud-agent-dispatch run 36401601530: the checked-out
 # workflow already declared `timeout-minutes: 15` for `Verify tests
@@ -7279,3 +7293,187 @@ def test_serverchan_workflow_wiring_audit_can_skip_real_push(monkeypatch) -> Non
     assert report["real_push_result"] is None
     assert report["real_push"] == hello_module.REAL_PUSH_BLOCKED_CREDENTIAL
     assert report["final_status"] == "BLOCKED"
+
+
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_B_SERVERCHAN_REAL_PUSH_GOLDEN_02 (task cf-4721483214cc)
+# Re-verifies the unchanged completion/notification/outbox/ServerChan chain for
+# a second task id after the workflow secret wiring fix. Fake transports keep the
+# deterministic tests offline; the single real HTTPS leg runs only when the
+# runner provides SERVERCHAN_SENDKEY, and is skipped (never faked) otherwise.
+# ---------------------------------------------------------------------------
+
+
+def test_serverchan_golden_02_payload_contract() -> None:
+    envelope = {
+        "task_id": SERVERCHAN_REAL_PUSH_02_TASK_ID,
+        "classification": "PASS",
+        "summary": "fixed summary 02",
+        "review_required": False,
+        "dedupe_key": f"push:{SERVERCHAN_REAL_PUSH_02_TASK_ID}:PASS:abc123",
+    }
+    payload = build_serverchan_golden_02_payload(envelope)
+    assert payload["title"] == SERVERCHAN_REAL_PUSH_02_TITLE
+    assert SERVERCHAN_REAL_PUSH_02_TITLE == "Personal AI Golden 02"
+    assert payload["task_id"] == SERVERCHAN_REAL_PUSH_02_TASK_ID == "cf-4721483214cc"
+    assert payload["classification"] == "PASS"
+    assert payload["review_required"] is False
+    assert payload["marker"] == SERVERCHAN_REAL_PUSH_02_MARKER
+    for token in ("task_id", "classification", "summary", "review_required"):
+        assert token in payload["desp"]
+    assert "review_required: false" in payload["desp"]
+    assert "classification: PASS" in payload["desp"]
+    assert f"- task_id: {SERVERCHAN_REAL_PUSH_02_TASK_ID}" in payload["desp"]
+    assert SERVERCHAN_REAL_PUSH_02_MARKER in payload["desp"]
+    assert payload["human_review_gate"] is True
+    assert payload["auto_pass"] is False
+    assert payload["auto_trigger_next"] is False
+    json.dumps(payload, sort_keys=True)
+    with pytest.raises(TypeError):
+        build_serverchan_golden_02_payload("not-a-dict")
+    with pytest.raises(ValueError):
+        build_serverchan_golden_02_payload({"classification": "PASS"})
+    with pytest.raises(ValueError):
+        build_serverchan_golden_02_payload(
+            {"task_id": "t", "classification": "NOT_A_CLASS"}
+        )
+
+
+def test_serverchan_real_push_golden_02_without_credential_is_blocked(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(hello_module.SERVERCHAN_SENDKEY_ENV, raising=False)
+    calls: list = []
+    report = serverchan_real_push_golden_02(transport=_golden_fake_transport(calls))
+    assert report["report"] == SERVERCHAN_REAL_PUSH_02_REPORT
+    assert report["goal"] == SERVERCHAN_REAL_PUSH_02_GOAL
+    assert report["task_id"] == SERVERCHAN_REAL_PUSH_02_TASK_ID
+    assert report["final_status"] == "BLOCKED"
+    assert report["real_push"] == REAL_PUSH_BLOCKED_CREDENTIAL
+    assert report["real_push"] == "REAL_PUSH=BLOCKED_EXTERNAL_CREDENTIAL"
+    assert report["real_push_passed"] is False
+    assert report["external_blocker"] == hello_module.BLOCKED_EXTERNAL_CREDENTIAL
+    assert report["credential_present"] is False
+    # The real network leg must never be entered without a credential.
+    assert calls == []
+    # Exactly one logical notification + one outbox envelope, dedupe normal.
+    assert report["single_logical_notification"] is True
+    assert report["notification_count"] == 1
+    assert report["envelope_count"] == 1
+    assert report["dedupe_ok"] is True
+    assert SERVERCHAN_REAL_PUSH_02_TITLE in report["payload"]["title"]
+    assert "review_required: false" in report["payload"]["desp"]
+    assert "classification: PASS" in report["payload"]["desp"]
+    assert f"- task_id: {SERVERCHAN_REAL_PUSH_02_TASK_ID}" in report["payload"]["desp"]
+    assert SERVERCHAN_REAL_PUSH_02_MARKER in report["payload"]["desp"]
+    assert report["markdown"].startswith(f"# {SERVERCHAN_REAL_PUSH_02_REPORT}")
+    assert "REAL_PUSH=BLOCKED_EXTERNAL_CREDENTIAL" in report["markdown"]
+    assert "FINAL_STATUS=BLOCKED" in report["markdown"]
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    assert report["workflow_modified"] is False
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in VALID_STATUSES
+        assert check["detail"]
+
+
+def test_serverchan_real_push_golden_02_with_fake_credential_passes(
+    monkeypatch,
+) -> None:
+    fake_key = _serverchan_fake_key("SCT")
+    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, fake_key)
+    calls: list = []
+    report = serverchan_real_push_golden_02(
+        transport=_golden_fake_transport(calls, push_id="pid-golden-02")
+    )
+    assert report["final_status"] == "PASS"
+    assert report["real_push"] == REAL_PUSH_PASS == "REAL_PUSH=PASS"
+    assert report["real_push_passed"] is True
+    assert report["credential_present"] is True
+    assert report["external_blocker"] is None
+    assert len(calls) == 1
+    endpoint, payload = calls[0]
+    assert endpoint == f"https://sctapi.ftqq.com/{fake_key}.send"
+    assert SERVERCHAN_REAL_PUSH_02_TITLE in payload["title"]
+    assert payload["task_id"] == SERVERCHAN_REAL_PUSH_02_TASK_ID
+    assert report["http_status_code"] == 200
+    assert report["push_id"] == "pid-golden-02"
+    assert report["server_message"] == "SUCCESS"
+    assert report["sent_at"]
+    # The SendKey must never leak into the report or markdown.
+    assert fake_key not in json.dumps(report, sort_keys=True)
+    assert fake_key not in report["markdown"]
+    assert report["delivery"]["state"] == "delivered"
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    assert report["changed_files"] == ["hello.py", "test_hello.py"]
+    assert list(
+        inspect.signature(serverchan_real_push_golden_02).parameters
+    ) == ["transport", "now"]
+
+
+def test_serverchan_real_push_golden_02_is_idempotent(monkeypatch) -> None:
+    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, _serverchan_fake_key())
+    calls: list = []
+    transport = _golden_fake_transport(calls, push_id="pid-once-02")
+    first = serverchan_real_push_golden_02(transport=transport)
+    second = serverchan_real_push_golden_02(transport=transport)
+    assert first["real_push"] == REAL_PUSH_PASS
+    assert second["real_push"] == REAL_PUSH_PASS
+    # Exactly one logical notification and one send across both runs.
+    assert len(calls) == 1
+    assert second["notification_count"] == 1
+    assert second["envelope_count"] == 1
+    assert second["single_logical_notification"] is True
+    assert second["delivery"]["already_delivered"] is True
+    assert second["push_id"] == "pid-once-02"
+
+
+def test_serverchan_real_push_golden_02_workflow_wiring_confirmed() -> None:
+    workflow = pathlib.Path(
+        hello_module.REPO_ROOT,
+        *hello_module.SERVERCHAN_WORKFLOW_DIR,
+        hello_module.SERVERCHAN_CANONICAL_WORKFLOW,
+    )
+    status = hello_module.serverchan_workflow_wiring_status(
+        workflow.read_text(encoding="utf-8")
+    )
+    assert status["has_agent_step"] is True
+    assert status["secret_wired"] is True
+    assert status["secret_reference_present"] is True
+    assert status["expected_env_line"] == (
+        "SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}"
+    )
+
+
+@pytest.mark.skipif(
+    not _RUNNER_SERVERCHAN_SENDKEY,
+    reason="no runner SERVERCHAN_SENDKEY; real push Golden 02 is skipped, not faked",
+)
+def test_serverchan_real_push_golden_02_real_https_pass(monkeypatch) -> None:
+    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, _RUNNER_SERVERCHAN_SENDKEY)
+    report = serverchan_real_push_golden_02()
+    assert report["credential_present"] is True
+    assert report["real_push"] == REAL_PUSH_PASS == "REAL_PUSH=PASS"
+    assert report["real_push_passed"] is True
+    assert report["final_status"] == "PASS"
+    assert report["external_blocker"] is None
+    assert report["http_status_code"] == 200
+    assert report["delivery"]["state"] == "delivered"
+    assert report["single_logical_notification"] is True
+    assert report["notification_count"] == 1
+    assert report["envelope_count"] == 1
+    assert SERVERCHAN_REAL_PUSH_02_TITLE in report["payload"]["title"]
+    assert "classification: PASS" in report["payload"]["desp"]
+    assert "review_required: false" in report["payload"]["desp"]
+    # Never leak the live SendKey into any surfaced field.
+    live = str(_RUNNER_SERVERCHAN_SENDKEY)
+    assert live not in json.dumps(report, sort_keys=True)
+    assert live not in report["markdown"]
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    assert report["workflow_modified"] is False

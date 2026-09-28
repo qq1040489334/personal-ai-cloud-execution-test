@@ -17341,19 +17341,41 @@ SERVERCHAN_REAL_PUSH_SUMMARY = (
 )
 SERVERCHAN_REAL_PUSH_EVENT = "serverchan_real_push_golden"
 
+# Golden 02 re-runs the SAME unchanged completion/notification/outbox/ServerChan
+# chain for a second task id, after the workflow secret wiring fix, with its own
+# distinct title/marker so the phone reader can tell the two Goldens apart. It
+# never edits the workflow, Cloudflare, Execution A or any orchestrator.
+SERVERCHAN_REAL_PUSH_02_GOAL = "PERSONAL_AI_EXECUTION_B_SERVERCHAN_REAL_PUSH_GOLDEN_02"
+SERVERCHAN_REAL_PUSH_02_TASK_ID = "cf-4721483214cc"
+SERVERCHAN_REAL_PUSH_02_REPORT = "PERSONAL_AI_SERVERCHAN_REAL_PUSH_GOLDEN_02_REPORT"
+SERVERCHAN_REAL_PUSH_02_MARKER = (
+    "PERSONAL_AI_EXECUTION_B_SERVERCHAN_REAL_PUSH_GOLDEN_02"
+)
+SERVERCHAN_REAL_PUSH_02_TITLE = "Personal AI Golden 02"
+SERVERCHAN_REAL_PUSH_02_SUMMARY = (
+    "Fixed golden 02 probe: workflow secret wiring verified, task completed "
+    "successfully and reviewed PASS."
+)
+SERVERCHAN_REAL_PUSH_02_EVENT = "serverchan_real_push_golden_02"
+
 REAL_PUSH_PASS = "REAL_PUSH=PASS"
 REAL_PUSH_BLOCKED_CREDENTIAL = "REAL_PUSH=BLOCKED_EXTERNAL_CREDENTIAL"
 REAL_PUSH_BLOCKED_DELIVERY = "REAL_PUSH=BLOCKED_DELIVERY"
 REAL_PUSH_FAILED = "REAL_PUSH=FAIL"
 
 
-def build_serverchan_golden_payload(envelope: dict) -> dict:
-    """Map the Golden push envelope to ServerChan's title/desp contract.
+def _build_serverchan_golden_payload(
+    envelope: dict,
+    *,
+    title: str,
+    marker: str,
+    fallback_summary: str,
+) -> dict:
+    """Shared mapping from a Golden push envelope to the title/desp contract.
 
-    The title always contains ``SERVERCHAN_REAL_PUSH_TITLE`` ("Personal AI
-    Golden") and the body always carries task_id, classification,
-    summary and review_required so the phone-side reader can recognise the
-    notification as ``SERVERCHAN_REAL_PUSH_MARKER``.
+    The title always contains ``title`` and the body always carries task_id,
+    classification, summary and review_required so the phone-side reader can
+    recognise the notification as ``marker``.
     """
     if not isinstance(envelope, dict):
         raise TypeError("build_serverchan_golden_payload requires an envelope dict")
@@ -17365,20 +17387,18 @@ def build_serverchan_golden_payload(envelope: dict) -> dict:
         raise ValueError(
             f"unknown notification classification: {classification!r}"
         )
-    summary = (
-        str(envelope.get("summary") or "").strip() or SERVERCHAN_REAL_PUSH_SUMMARY
-    )
+    summary = str(envelope.get("summary") or "").strip() or fallback_summary
     review_required = bool(envelope.get("review_required")) or (
         classification == NOTIFICATION_CLASS_PENDING_APPROVAL
     )
-    title = SERVERCHAN_REAL_PUSH_TITLE
-    if len(title) > SERVERCHAN_TITLE_MAX_LENGTH:
-        title = title[: SERVERCHAN_TITLE_MAX_LENGTH - 3] + "..."
+    safe_title = title
+    if len(safe_title) > SERVERCHAN_TITLE_MAX_LENGTH:
+        safe_title = safe_title[: SERVERCHAN_TITLE_MAX_LENGTH - 3] + "..."
     desp = "\n".join(
         [
-            f"### {SERVERCHAN_REAL_PUSH_TITLE}",
+            f"### {title}",
             "",
-            f"- golden: {SERVERCHAN_REAL_PUSH_MARKER}",
+            f"- golden: {marker}",
             f"- task_id: {task_id}",
             f"- classification: {classification}",
             f"- summary: {summary}",
@@ -17389,19 +17409,39 @@ def build_serverchan_golden_payload(envelope: dict) -> dict:
         ]
     )
     return {
-        "title": title,
+        "title": safe_title,
         "desp": desp,
         "task_id": task_id,
         "classification": classification,
         "summary": summary,
         "review_required": review_required,
-        "marker": SERVERCHAN_REAL_PUSH_MARKER,
+        "marker": marker,
         "dedupe_key": envelope.get("dedupe_key"),
         "channel": SERVERCHAN_ADAPTER_CHANNEL,
         "human_review_gate": True,
         "auto_pass": False,
         "auto_trigger_next": False,
     }
+
+
+def build_serverchan_golden_payload(envelope: dict) -> dict:
+    """Map the Golden 01 push envelope to ServerChan's title/desp contract."""
+    return _build_serverchan_golden_payload(
+        envelope,
+        title=SERVERCHAN_REAL_PUSH_TITLE,
+        marker=SERVERCHAN_REAL_PUSH_MARKER,
+        fallback_summary=SERVERCHAN_REAL_PUSH_SUMMARY,
+    )
+
+
+def build_serverchan_golden_02_payload(envelope: dict) -> dict:
+    """Map the Golden 02 push envelope to ServerChan's title/desp contract."""
+    return _build_serverchan_golden_payload(
+        envelope,
+        title=SERVERCHAN_REAL_PUSH_02_TITLE,
+        marker=SERVERCHAN_REAL_PUSH_02_MARKER,
+        fallback_summary=SERVERCHAN_REAL_PUSH_02_SUMMARY,
+    )
 
 
 def serverchan_real_push_golden(
@@ -17422,11 +17462,42 @@ def serverchan_real_push_golden(
     )
 
 
+def serverchan_real_push_golden_02(
+    *,
+    transport=None,
+    now: datetime | None = None,
+) -> dict:
+    """Run the real ServerChan Golden 02 push after the secret wiring fix.
+
+    Identical unchanged chain to :func:`serverchan_real_push_golden` but for the
+    Golden 02 task id and with the distinct ``Personal AI Golden 02`` title so the
+    phone reader can tell the two Goldens apart. ``REAL_PUSH=PASS`` is only
+    returned when a credential is present and the real HTTPS send was confirmed.
+    """
+    return _serverchan_real_push_golden_for(
+        SERVERCHAN_REAL_PUSH_02_TASK_ID,
+        transport=transport,
+        now=now,
+        title=SERVERCHAN_REAL_PUSH_02_TITLE,
+        marker=SERVERCHAN_REAL_PUSH_02_MARKER,
+        goal=SERVERCHAN_REAL_PUSH_02_GOAL,
+        report_name=SERVERCHAN_REAL_PUSH_02_REPORT,
+        event=SERVERCHAN_REAL_PUSH_02_EVENT,
+        summary=SERVERCHAN_REAL_PUSH_02_SUMMARY,
+    )
+
+
 def _serverchan_real_push_golden_for(
     task_id: str,
     *,
     transport=None,
     now: datetime | None = None,
+    title: str = SERVERCHAN_REAL_PUSH_TITLE,
+    marker: str = SERVERCHAN_REAL_PUSH_MARKER,
+    goal: str = SERVERCHAN_REAL_PUSH_GOAL,
+    report_name: str = SERVERCHAN_REAL_PUSH_REPORT,
+    event: str = SERVERCHAN_REAL_PUSH_EVENT,
+    summary: str = SERVERCHAN_REAL_PUSH_SUMMARY,
 ) -> dict:
     """Run the real ServerChan end-to-end push Golden for one ``task_id``.
 
@@ -17458,7 +17529,7 @@ def _serverchan_real_push_golden_for(
     if chain_ran:
         submit_task(
             task_id,
-            goal=SERVERCHAN_REAL_PUSH_GOAL,
+            goal=goal,
             status="success",
             requires_review=True,
         )
@@ -17466,7 +17537,7 @@ def _serverchan_real_push_golden_for(
             task_id,
             status="success",
             tests="python -m pytest -q",
-            evidence={"golden": SERVERCHAN_REAL_PUSH_MARKER},
+            evidence={"golden": marker},
         )
         handled = handle_completion_event(completion_event)
         if not already_reviewed:
@@ -17502,7 +17573,13 @@ def _serverchan_real_push_golden_for(
     )
 
     # 4. ServerChan adapter -> real HTTPS send.
-    payload = build_serverchan_golden_payload(envelope) if envelope else {}
+    payload = (
+        _build_serverchan_golden_payload(
+            envelope, title=title, marker=marker, fallback_summary=summary
+        )
+        if envelope
+        else {}
+    )
     credential_present = serverchan_sendkey_present()
     serverchan_meta = (envelope or {}).get("serverchan") or {}
     if envelope is not None and str(envelope.get("state")) == "delivered":
@@ -17563,7 +17640,7 @@ def _serverchan_real_push_golden_for(
 
     payload_ok = bool(
         payload
-        and SERVERCHAN_REAL_PUSH_TITLE in str(payload.get("title") or "")
+        and title in str(payload.get("title") or "")
         and str(payload.get("task_id")) == task_id
         and payload.get("classification") == NOTIFICATION_CLASS_PASS
         and payload.get("summary")
@@ -17602,7 +17679,7 @@ def _serverchan_real_push_golden_for(
             "status": PASS if payload_ok else FAIL,
             "detail": (
                 f"title={payload.get('title')!r} contains "
-                f"{SERVERCHAN_REAL_PUSH_TITLE!r}; desp carries task_id/"
+                f"{title!r}; desp carries task_id/"
                 "classification=classification/summary/review_required=false"
             ),
         },
@@ -17646,8 +17723,8 @@ def _serverchan_real_push_golden_for(
 
     evidence = {
         "task_id": task_id,
-        "marker": SERVERCHAN_REAL_PUSH_MARKER,
-        "goal": SERVERCHAN_REAL_PUSH_GOAL,
+        "marker": marker,
+        "goal": goal,
         "chain_ran": chain_ran,
         "classification": NOTIFICATION_CLASS_PASS,
         "summary": payload.get("summary"),
@@ -17670,7 +17747,7 @@ def _serverchan_real_push_golden_for(
     }
 
     record_consumer_evidence(
-        SERVERCHAN_REAL_PUSH_EVENT,
+        event,
         task_id,
         detail=(
             f"serverchan real push golden -> {real_push} "
@@ -17680,11 +17757,11 @@ def _serverchan_real_push_golden_for(
     )
 
     lines = [
-        f"# {SERVERCHAN_REAL_PUSH_REPORT}",
+        f"# {report_name}",
         "",
-        f"- goal: {SERVERCHAN_REAL_PUSH_GOAL}",
+        f"- goal: {goal}",
         f"- task_id: {task_id}",
-        f"- marker: {SERVERCHAN_REAL_PUSH_MARKER}",
+        f"- marker: {marker}",
         f"- {real_push}",
         f"- final_status: {final}",
         f"- external_blocker: {blocker or 'none'}",
@@ -17720,10 +17797,10 @@ def _serverchan_real_push_golden_for(
     lines += ["", f"REAL_PUSH={real_push.split('=', 1)[-1]}", f"FINAL_STATUS={final}"]
 
     return {
-        "report": SERVERCHAN_REAL_PUSH_REPORT,
-        "goal": SERVERCHAN_REAL_PUSH_GOAL,
+        "report": report_name,
+        "goal": goal,
         "task_id": task_id,
-        "marker": SERVERCHAN_REAL_PUSH_MARKER,
+        "marker": marker,
         "classification": NOTIFICATION_CLASS_PASS,
         "final_status": final,
         "real_push": real_push,
