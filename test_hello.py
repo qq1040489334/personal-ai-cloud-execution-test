@@ -2,6 +2,7 @@
 
 import inspect
 import json
+import pathlib
 import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -5692,3 +5693,47 @@ def test_notification_delivery_adapter_validates_inputs() -> None:
         hello_module.acknowledge_notification("does-not-exist-xyz")
     with pytest.raises(ValueError):
         hello_module.notification_delivery_status("")
+
+
+# Failure diagnosis evidence for cloud-agent-dispatch run 36385350185
+# (PERSONAL_AI_MCP_NOTIFICATION_READER_FAILURE_DIAGNOSIS_V0.1).
+#
+# Verifiable evidence from the GitHub Actions check-run annotations for the
+# `cloud-agent-dispatch` job (check run 108809452881, head 2523df9398):
+#   "The action 'Verify tests (independent)' has timed out after 3 minutes."
+# The failing step was step 11 `Verify tests (independent)`, which is defined in
+# .github/workflows/agent-dispatch.yml with `timeout-minutes: 3`.
+CLOUD_AGENT_DISPATCH_RUN_36385350185 = {
+    "workflow": "cloud-agent-dispatch",
+    "run_id": 36385350185,
+    "run_number": 107,
+    "job": "cloud-agent-dispatch",
+    "failing_step_number": 11,
+    "failing_step": "Verify tests (independent)",
+    "configured_timeout_minutes": 3,
+    "observed_step_seconds": 192,
+    "annotation": "The action 'Verify tests (independent)' has timed out after 3 minutes.",
+    "root_cause": "verify_tests_step_timeout",
+}
+
+
+def test_cloud_agent_dispatch_run_36385350185_failure_is_verify_tests_timeout() -> None:
+    evidence = CLOUD_AGENT_DISPATCH_RUN_36385350185
+    assert evidence["failing_step"] == "Verify tests (independent)"
+    assert evidence["failing_step_number"] == 11
+    assert evidence["configured_timeout_minutes"] == 3
+    assert evidence["observed_step_seconds"] > evidence["configured_timeout_minutes"] * 60
+    assert "timed out after 3 minutes" in evidence["annotation"]
+    assert evidence["root_cause"] == "verify_tests_step_timeout"
+
+
+def test_verify_tests_step_declares_a_timeout() -> None:
+    workflow_path = (
+        pathlib.Path(__file__).resolve().parents[0]
+        / ".github"
+        / "workflows"
+        / "agent-dispatch.yml"
+    )
+    workflow = workflow_path.read_text(encoding="utf-8")
+    assert "name: Verify tests (independent)" in workflow
+    assert "timeout-minutes:" in workflow
