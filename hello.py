@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import inspect
 import json
@@ -14,6 +15,11 @@ import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+try:  # POSIX cross-process file locking; Linux CI always has it.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -16583,13 +16589,72 @@ def serverchan_endpoint(sendkey: str) -> str:
     return SERVERCHAN_ENDPOINT_TEMPLATES[kind].format(sendkey=key)
 
 
+# ---------------------------------------------------------------------------
+# TEST ISOLATION (task cf-2f2b71c331da)
+#
+# The real ServerChan HTTPS transport must NEVER run during pytest. The Golden
+# 02 regression made three real sends because a pytest test re-injected the
+# runner ``SERVERCHAN_SENDKEY`` and called the Golden with the default transport.
+# The guard below blocks the real network leg whenever the process is a pytest
+# process (env marker, ``PYTEST_CURRENT_TEST`` or the pytest module being
+# imported), so every pytest path is forced through a fake/injected transport.
+# Real sends remain reachable only from the explicit production/golden delivery
+# entrypoints running outside a test process.
+# ---------------------------------------------------------------------------
+SERVERCHAN_TEST_ISOLATION_ENV = "PERSONAL_AI_SERVERCHAN_TEST_ISOLATION"
+SERVERCHAN_TEST_ISOLATION_ERROR = "blocked_under_test_isolation"
+SERVERCHAN_REAL_NETWORK_ATTEMPTS = 0
+SERVERCHAN_TEST_ISOLATION_BLOCKS = 0
+
+
+def serverchan_running_under_pytest() -> bool:
+    """Return True when the current interpreter is a pytest test process."""
+    marker = os.environ.get(SERVERCHAN_TEST_ISOLATION_ENV, "")
+    if marker.strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return True
+    return "pytest" in sys.modules
+
+
+def reset_serverchan_test_isolation_counters() -> None:
+    """Reset the real-network attempt / isolation-block counters (test helper)."""
+    global SERVERCHAN_REAL_NETWORK_ATTEMPTS, SERVERCHAN_TEST_ISOLATION_BLOCKS
+    SERVERCHAN_REAL_NETWORK_ATTEMPTS = 0
+    SERVERCHAN_TEST_ISOLATION_BLOCKS = 0
+
+
+def serverchan_real_network_attempts() -> int:
+    """Return how many real HTTP POSTs were actually attempted this process."""
+    return SERVERCHAN_REAL_NETWORK_ATTEMPTS
+
+
+def serverchan_test_isolation_blocks() -> int:
+    """Return how many real HTTP POSTs were blocked by test isolation."""
+    return SERVERCHAN_TEST_ISOLATION_BLOCKS
+
+
 def serverchan_http_transport(endpoint: str, payload: dict) -> dict:
     """Default transport: bounded stdlib HTTP POST of title/desp to ServerChan.
 
     ServerChan accepts form-encoded ``title`` / ``desp`` and returns JSON with
     ``code == 0`` on success. Error text is reduced to the exception class name so
     the SendKey embedded in ``endpoint`` can never leak through an error message.
+
+    Fail-closed TEST ISOLATION: inside a pytest process this returns a blocked
+    outcome without opening any socket, so a present ``SERVERCHAN_SENDKEY`` can
+    never cause a real ServerChan HTTPS call during tests.
     """
+    global SERVERCHAN_REAL_NETWORK_ATTEMPTS, SERVERCHAN_TEST_ISOLATION_BLOCKS
+    if serverchan_running_under_pytest():
+        SERVERCHAN_TEST_ISOLATION_BLOCKS += 1
+        return {
+            "ok": False,
+            "status_code": None,
+            "error": SERVERCHAN_TEST_ISOLATION_ERROR,
+            "network_attempted": False,
+        }
+    SERVERCHAN_REAL_NETWORK_ATTEMPTS += 1
     import urllib.parse
     import urllib.request
 
@@ -16695,6 +16760,440 @@ def build_serverchan_payload(envelope: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# DURABLE DELIVERY DEDUPE (task cf-2f2b71c331da)
+#
+# The push outbox dedupe was process-local / scratch-file only, so a workflow
+# retry or a second Python process could re-send the same logical notification
+# and consume another ServerChan quota unit. This ledger is the canonical,
+# cross-process, cross-workflow dedupe store. It is persisted inside the
+# repository working tree (committed with the agent's result), NOT in /tmp and
+# NOT in a process global. The claim is atomic (flock) and fail-closed:
+#   * DELIVERED identity -> never call the transport again; already_delivered.
+#   * in-flight from another session/process, or uncertain/exhausted -> blocked.
+#   * bounded retry is allowed only within one same-session unconfirmed send.
+# Identity is the stable task_id + classification dedupe key, so at most one
+# real ServerChan success is ever consumed for a given task+classification.
+# ---------------------------------------------------------------------------
+DELIVERY_LEDGER_STATE_ENV = "PERSONAL_AI_SERVERCHAN_DELIVERY_LEDGER"
+DELIVERY_LEDGER_STATE_DEFAULT = "personal_ai_serverchan_delivery_ledger.json"
+DELIVERY_LEDGER_EVIDENCE_KIND = "personal_ai_serverchan_durable_delivery_ledger"
+DELIVERY_LEDGER_SCHEMA = "personal-ai-serverchan-durable-delivery-ledger/v1"
+
+DELIVERY_STATE_IN_FLIGHT = "in_flight"
+DELIVERY_STATE_DELIVERED = "delivered"
+DELIVERY_STATE_RETRY = "retry"
+DELIVERY_STATE_UNCERTAIN = "uncertain"
+DELIVERY_LEDGER_STATES = (
+    DELIVERY_STATE_IN_FLIGHT,
+    DELIVERY_STATE_DELIVERED,
+    DELIVERY_STATE_RETRY,
+    DELIVERY_STATE_UNCERTAIN,
+)
+BLOCKED_DELIVERY_FAIL_CLOSED = "BLOCKED_DELIVERY_FAIL_CLOSED"
+SERVERCHAN_DELIVERY_SESSION_ID = uuid.uuid4().hex
+
+
+def get_delivery_ledger_path() -> Path:
+    """Return the durable delivery-ledger path (canonical, not /tmp).
+
+    The default is a repository-working-tree file so an agent commit (or a
+    durable checkout) preserves the dedupe state across workflow retry/rerun.
+    Tests override ``PERSONAL_AI_SERVERCHAN_DELIVERY_LEDGER`` so they never touch
+    the canonical file. This is deliberately NOT ``tempfile.gettempdir()`` and
+    NOT a process global.
+    """
+    override = os.environ.get(DELIVERY_LEDGER_STATE_ENV)
+    if override and override.strip():
+        return Path(override).expanduser()
+    return REPO_ROOT / DELIVERY_LEDGER_STATE_DEFAULT
+
+
+def delivery_identity(task_id: str, classification: str) -> str:
+    """Return the stable durable dedupe identity for task_id + classification."""
+    if not task_id:
+        raise ValueError("delivery_identity requires a task_id")
+    if not classification:
+        raise ValueError("delivery_identity requires a classification")
+    return push_envelope_dedupe_key(task_id, classification)
+
+
+def _delivery_session_id() -> str:
+    """Return this process's delivery session id (used for bounded retry scope)."""
+    return SERVERCHAN_DELIVERY_SESSION_ID
+
+
+@contextlib.contextmanager
+def _delivery_ledger_lock():
+    """Serialise ledger read-modify-write across processes (flock)."""
+    path = get_delivery_ledger_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    handle = open(path, "a+", encoding="utf-8")
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _read_delivery_ledger() -> dict[str, dict]:
+    """Return the durable ledger records keyed by delivery identity."""
+    path = get_delivery_ledger_path()
+    if not path.is_file():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if isinstance(loaded, dict) and "deliveries" in loaded:
+        loaded = loaded.get("deliveries")
+    if not isinstance(loaded, dict):
+        return {}
+    return {
+        str(key): dict(value)
+        for key, value in loaded.items()
+        if isinstance(value, dict)
+    }
+
+
+def _delivery_ledger_corrupt() -> bool:
+    """Fail-closed check: a present-but-unreadable ledger is treated as unsafe."""
+    path = get_delivery_ledger_path()
+    if not path.is_file():
+        return False
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return True
+    if not raw.strip():
+        return False  # freshly created / locked empty file, not corrupt
+    try:
+        loaded = json.loads(raw)
+    except (TypeError, ValueError):
+        return True
+    if isinstance(loaded, dict) and "deliveries" in loaded:
+        return not isinstance(loaded.get("deliveries"), dict)
+    return not isinstance(loaded, dict)
+
+
+def _write_delivery_ledger(records: dict[str, dict]) -> bool:
+    path = get_delivery_ledger_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "kind": DELIVERY_LEDGER_EVIDENCE_KIND,
+            "schema": DELIVERY_LEDGER_SCHEMA,
+            "updated_at": _utc_now(),
+            "deliveries": records,
+        }
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except OSError:
+        return False
+    return True
+
+
+def get_delivery_record(identity: str) -> dict | None:
+    """Return one durable delivery record by identity, or ``None``."""
+    if not identity:
+        raise ValueError("get_delivery_record requires an identity")
+    return _read_delivery_ledger().get(str(identity))
+
+
+def list_delivery_records(
+    *,
+    task_id: str | None = None,
+    classification: str | None = None,
+) -> list[dict]:
+    """Return durable delivery records with optional task/classification filters."""
+    records = list(_read_delivery_ledger().values())
+    if task_id is not None:
+        records = [r for r in records if str(r.get("task_id")) == str(task_id)]
+    if classification is not None:
+        records = [
+            r for r in records if str(r.get("classification")) == str(classification)
+        ]
+    return records
+
+
+def delivery_ledger_status() -> dict:
+    """Report durable ledger persistence, state counts and storage boundary."""
+    path = get_delivery_ledger_path()
+    records = list(_read_delivery_ledger().values())
+    by_state = {state: 0 for state in DELIVERY_LEDGER_STATES}
+    for record in records:
+        state = str(record.get("state") or DELIVERY_STATE_IN_FLIGHT)
+        by_state[state] = by_state.get(state, 0) + 1
+    return {
+        "path": str(path),
+        "durable": True,
+        "in_repo": str(path).startswith(str(REPO_ROOT)),
+        "under_tempdir": str(path).startswith(str(Path(tempfile.gettempdir()))),
+        "persisted": path.is_file(),
+        "record_count": len(records),
+        "by_state": by_state,
+        "delivered_count": by_state.get(DELIVERY_STATE_DELIVERED, 0),
+        "uncertain_count": by_state.get(DELIVERY_STATE_UNCERTAIN, 0),
+        "identity_fields": ["task_id", "classification"],
+        "channel": SERVERCHAN_ADAPTER_CHANNEL,
+        "human_review_gate": True,
+    }
+
+
+def _fail_closed_claim(identity: str, record: dict, reason: str) -> dict:
+    return {
+        "identity": str(identity),
+        "claimed": False,
+        "already_delivered": False,
+        "fail_closed": True,
+        "state": str(record.get("state") or DELIVERY_STATE_UNCERTAIN),
+        "attempt_count": int(record.get("attempt_count") or 0),
+        "record": dict(record),
+        "reason": reason,
+    }
+
+
+def claim_delivery(
+    identity: str,
+    *,
+    task_id: str,
+    classification: str,
+    max_attempts: int = SERVERCHAN_MAX_ATTEMPTS,
+    session: str | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Atomically claim the right to send one real ServerChan notification.
+
+    Fail-closed: a DELIVERED identity is never resent (``already_delivered``);
+    an identity that is in-flight from another process/session, corrupt, or
+    uncertain/exhausted is blocked (``fail_closed``). Only same-session retries
+    below ``max_attempts`` are allowed, so bounded retry stays inside a single
+    unconfirmed sending transaction and no quota is blindly re-consumed.
+    """
+    if not identity:
+        raise ValueError("claim_delivery requires an identity")
+    now = now if now is not None else datetime.now(timezone.utc)
+    session = session if session is not None else _delivery_session_id()
+    with _delivery_ledger_lock():
+        if _delivery_ledger_corrupt():
+            return _fail_closed_claim(
+                identity,
+                {"state": DELIVERY_STATE_UNCERTAIN, "attempt_count": 0},
+                "ledger_corrupt",
+            )
+        records = _read_delivery_ledger()
+        record = records.get(str(identity))
+        if record is None:
+            record = {
+                "identity": str(identity),
+                "dedupe_key": str(identity),
+                "task_id": task_id,
+                "classification": classification,
+                "state": DELIVERY_STATE_IN_FLIGHT,
+                "attempt_count": 1,
+                "max_attempts": int(max_attempts),
+                "session": session,
+                "created_at": now.isoformat(),
+                "updated_at": now.isoformat(),
+                "delivered_at": None,
+                "push_id": None,
+                "last_error": None,
+                "server_message": None,
+                "status_code": None,
+                "quota_consumed": False,
+                "human_review_gate": True,
+            }
+            records[str(identity)] = record
+            _write_delivery_ledger(records)
+            return {
+                "identity": str(identity),
+                "claimed": True,
+                "already_delivered": False,
+                "fail_closed": False,
+                "state": record["state"],
+                "attempt_count": 1,
+                "record": dict(record),
+                "reason": "claimed",
+            }
+        state = str(record.get("state"))
+        attempts = int(record.get("attempt_count") or 0)
+        if state == DELIVERY_STATE_DELIVERED:
+            return {
+                "identity": str(identity),
+                "claimed": False,
+                "already_delivered": True,
+                "fail_closed": False,
+                "state": state,
+                "attempt_count": attempts,
+                "record": dict(record),
+                "reason": "already_delivered",
+            }
+        same_session = str(record.get("session")) == session
+        if (
+            same_session
+            and state in (DELIVERY_STATE_IN_FLIGHT, DELIVERY_STATE_RETRY)
+            and attempts < int(max_attempts)
+        ):
+            record = dict(record)
+            record["attempt_count"] = attempts + 1
+            record["state"] = DELIVERY_STATE_IN_FLIGHT
+            record["session"] = session
+            record["updated_at"] = now.isoformat()
+            records[str(identity)] = record
+            _write_delivery_ledger(records)
+            return {
+                "identity": str(identity),
+                "claimed": True,
+                "already_delivered": False,
+                "fail_closed": False,
+                "state": record["state"],
+                "attempt_count": record["attempt_count"],
+                "record": dict(record),
+                "reason": "retry_claimed",
+            }
+        record = dict(record)
+        if state != DELIVERY_STATE_UNCERTAIN:
+            record["state"] = DELIVERY_STATE_UNCERTAIN
+            record["updated_at"] = now.isoformat()
+            record["last_error"] = record.get("last_error") or "fail_closed"
+            records[str(identity)] = record
+            _write_delivery_ledger(records)
+        return _fail_closed_claim(identity, record, "already_in_flight_or_uncertain")
+
+
+def record_delivery_outcome(
+    identity: str,
+    *,
+    success: bool,
+    push_id: str | None = None,
+    server_message: str | None = None,
+    status_code: int | None = None,
+    error: str | None = None,
+    max_attempts: int = SERVERCHAN_MAX_ATTEMPTS,
+    now: datetime | None = None,
+) -> dict | None:
+    """Persist the (non-sensitive) outcome of a claimed delivery.
+
+    On success the record is terminal ``delivered`` with the ServerChan
+    ``push_id`` and timestamp; only non-sensitive values are stored. On failure
+    below ``max_attempts`` the record is ``retry``; once the attempts are
+    exhausted it becomes ``uncertain`` and subsequent claims are fail-closed.
+    """
+    if not identity:
+        raise ValueError("record_delivery_outcome requires an identity")
+    now = now if now is not None else datetime.now(timezone.utc)
+    with _delivery_ledger_lock():
+        records = _read_delivery_ledger()
+        record = records.get(str(identity))
+        if record is None:
+            return None
+        record = dict(record)
+        if success:
+            record["state"] = DELIVERY_STATE_DELIVERED
+            record["delivered_at"] = now.isoformat()
+            record["push_id"] = (
+                str(push_id) if push_id else record.get("push_id")
+            )
+            record["server_message"] = (
+                str(server_message)
+                if server_message
+                else record.get("server_message")
+            )
+            record["status_code"] = status_code
+            record["last_error"] = None
+            record["quota_consumed"] = True
+        else:
+            attempts = int(record.get("attempt_count") or 0)
+            record["last_error"] = str(error or "delivery_failed")
+            record["server_message"] = (
+                str(server_message)
+                if server_message
+                else record.get("server_message")
+            )
+            record["status_code"] = status_code
+            record["state"] = (
+                DELIVERY_STATE_UNCERTAIN
+                if attempts >= int(max_attempts)
+                else DELIVERY_STATE_RETRY
+            )
+        record["updated_at"] = now.isoformat()
+        records[str(identity)] = record
+        _write_delivery_ledger(records)
+        return dict(record)
+
+
+def _already_delivered_result(
+    dedupe_key: str,
+    updated: dict,
+    payload: dict,
+    record: dict,
+) -> dict:
+    """Return the idempotent result for an identity already DELIVERED."""
+    serverchan_meta = updated.get("serverchan") or {}
+    return {
+        "dedupe_key": dedupe_key,
+        "task_id": updated.get("task_id"),
+        "classification": updated.get("classification"),
+        "state": "delivered",
+        "status": PASS,
+        "credential_present": True,
+        "endpoint_kind": serverchan_meta.get("endpoint_kind"),
+        "sendkey_redacted": serverchan_meta.get("sendkey_redacted"),
+        "external_blocker": None,
+        "retryable": False,
+        "attempt_count": int(record.get("attempt_count") or 0),
+        "status_code": record.get("status_code"),
+        "push_id": record.get("push_id"),
+        "server_message": record.get("server_message"),
+        "delivered_at": record.get("delivered_at"),
+        "payload": payload,
+        "envelope": updated,
+        "already_delivered": True,
+    }
+
+
+def _fail_closed_delivery_result(
+    dedupe_key: str,
+    updated: dict,
+    payload: dict,
+    claim: dict,
+) -> dict:
+    """Return the fail-closed blocked result when a claim may not send."""
+    record = claim.get("record") or {}
+    return {
+        "dedupe_key": dedupe_key,
+        "task_id": updated.get("task_id"),
+        "classification": updated.get("classification"),
+        "state": "blocked",
+        "status": BLOCKED,
+        "credential_present": True,
+        "endpoint_kind": (updated.get("serverchan") or {}).get("endpoint_kind"),
+        "sendkey_redacted": (updated.get("serverchan") or {}).get(
+            "sendkey_redacted"
+        ),
+        "external_blocker": BLOCKED_DELIVERY_FAIL_CLOSED,
+        "retryable": False,
+        "attempt_count": int(record.get("attempt_count") or 0),
+        "status_code": record.get("status_code"),
+        "push_id": record.get("push_id"),
+        "server_message": record.get("server_message"),
+        "payload": payload,
+        "envelope": updated,
+        "already_delivered": False,
+        "fail_closed": True,
+        "fail_closed_reason": claim.get("reason"),
+    }
+
+
 def _deliver_serverchan(
     dedupe_key: str,
     envelope: dict,
@@ -16768,6 +17267,91 @@ def _deliver_serverchan(
     sender = transport if transport is not None else serverchan_http_transport
     attempt = int(envelope.get("attempt_count") or 0) + 1
     max_attempts = int(envelope.get("max_attempts") or SERVERCHAN_MAX_ATTEMPTS)
+
+    # DURABLE DEDUPE GATE: claim the task_id + classification identity before any
+    # transport call. A DELIVERED identity is never resent; an in-flight/uncertain
+    # identity from another process/session is fail-closed.
+    updated["serverchan"] = {
+        "credential_present": True,
+        "endpoint_kind": kind,
+        "sendkey_redacted": serverchan_redact(sendkey),
+        "push_id": (updated.get("serverchan") or {}).get("push_id"),
+        "server_message": (updated.get("serverchan") or {}).get("server_message"),
+        "status_code": (updated.get("serverchan") or {}).get("status_code"),
+    }
+    delivery_key = delivery_identity(
+        str(updated.get("task_id") or payload.get("task_id") or ""),
+        str(updated.get("classification") or payload.get("classification") or ""),
+    )
+    claim = claim_delivery(
+        delivery_key,
+        task_id=str(updated.get("task_id") or payload.get("task_id") or ""),
+        classification=str(
+            updated.get("classification") or payload.get("classification") or ""
+        ),
+        max_attempts=max_attempts,
+        now=now,
+    )
+    if claim["already_delivered"]:
+        record = claim.get("record") or {}
+        updated["state"] = "delivered"
+        updated["retryable"] = False
+        updated["external_blocker"] = None
+        updated["last_error"] = None
+        updated["delivered_at"] = (
+            record.get("delivered_at")
+            or updated.get("delivered_at")
+            or now.isoformat()
+        )
+        updated["serverchan"] = {
+            "credential_present": True,
+            "endpoint_kind": kind,
+            "sendkey_redacted": serverchan_redact(sendkey),
+            "push_id": record.get("push_id"),
+            "server_message": record.get("server_message"),
+            "status_code": record.get("status_code"),
+        }
+        result = _update_push_envelope(updated)
+        record_consumer_evidence(
+            SERVERCHAN_DELIVERED_EVENT,
+            result["task_id"],
+            detail=(
+                f"serverchan send suppressed: {delivery_key} already delivered "
+                "(durable ledger); no quota re-consumed"
+            ),
+            extra={
+                "dedupe_key": dedupe_key,
+                "identity": delivery_key,
+                "state": "delivered",
+                "already_delivered": True,
+                "push_id": record.get("push_id"),
+            },
+        )
+        return _already_delivered_result(dedupe_key, updated, payload, record)
+    if claim["fail_closed"]:
+        updated["state"] = "blocked"
+        updated["retryable"] = False
+        updated["external_blocker"] = BLOCKED_DELIVERY_FAIL_CLOSED
+        updated["last_error"] = "delivery_fail_closed_uncertain"
+        updated["last_attempt_at"] = now.isoformat()
+        result = _update_push_envelope(updated)
+        record_consumer_evidence(
+            SERVERCHAN_BLOCKED_EVENT,
+            result["task_id"],
+            detail=(
+                f"serverchan send fail-closed for {delivery_key}: "
+                f"{claim.get('reason')}"
+            ),
+            extra={
+                "dedupe_key": dedupe_key,
+                "identity": delivery_key,
+                "state": "blocked",
+                "external_blocker": BLOCKED_DELIVERY_FAIL_CLOSED,
+                "fail_closed_reason": claim.get("reason"),
+            },
+        )
+        return _fail_closed_delivery_result(dedupe_key, updated, payload, claim)
+
     updated["attempt_count"] = attempt
     updated["last_attempt_at"] = now.isoformat()
 
@@ -16812,6 +17396,19 @@ def _deliver_serverchan(
         "server_message": str(server_message) if server_message else None,
         "status_code": status_code,
     }
+    # Persist the non-sensitive outcome on the durable ledger: success is
+    # terminal delivered (quota consumed); a failure is retry until the bounded
+    # attempts are exhausted, then uncertain and fail-closed for all later calls.
+    record_delivery_outcome(
+        delivery_key,
+        success=ok,
+        push_id=str(push_id) if push_id else None,
+        server_message=str(server_message) if server_message else None,
+        status_code=status_code if isinstance(status_code, int) else None,
+        error=str(error) if error else None,
+        max_attempts=max_attempts,
+        now=now,
+    )
     result = _update_push_envelope(updated)
     record_consumer_evidence(
         SERVERCHAN_DELIVERED_EVENT if ok else SERVERCHAN_ATTEMPT_EVENT,

@@ -6,6 +6,8 @@ import os
 import pathlib
 import re
 import shutil
+import subprocess
+import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -210,10 +212,10 @@ from hello import (
 
 VALID_STATUSES = {"PASS", "FAIL", "BLOCKED"}
 
-# Snapshot the runner-process SendKey at import time (before the autouse fixture
-# deletes it for test isolation). It is only ever re-injected into the process
-# env for the one real-push Golden 02 test; it is never printed or persisted.
-_RUNNER_SERVERCHAN_SENDKEY = os.environ.get("SERVERCHAN_SENDKEY")
+# TEST ISOLATION (task cf-2f2b71c331da): the runner-process SendKey is
+# deliberately NOT snapshotted. Every pytest path must inject a fake transport
+# (or be stopped by hello's in-process test-isolation guard), so a present
+# SERVERCHAN_SENDKEY can never cause a real ServerChan HTTPS call during pytest.
 
 # Residual root cause of cloud-agent-dispatch run 36401601530: the checked-out
 # workflow already declared `timeout-minutes: 15` for `Verify tests
@@ -253,6 +255,15 @@ def isolate_hello_state(monkeypatch, tmp_path):
         hello_module.PUSH_OUTBOX_STATE_ENV,
         str(state_dir / "push_outbox.json"),
     )
+    # Durable ServerChan delivery ledger: always redirected to the test tmp dir so
+    # the canonical repo-root ledger is never written by a test.
+    monkeypatch.setenv(
+        hello_module.DELIVERY_LEDGER_STATE_ENV,
+        str(state_dir / "delivery_ledger.json"),
+    )
+    # Hard test-isolation marker: the real HTTP transport refuses to run while
+    # this is set (and while pytest is imported / PYTEST_CURRENT_TEST is set).
+    monkeypatch.setenv(hello_module.SERVERCHAN_TEST_ISOLATION_ENV, "1")
     monkeypatch.delenv(hello_module.PUSH_EXTERNAL_ENDPOINT_ENV, raising=False)
     monkeypatch.delenv(hello_module.SERVERCHAN_SENDKEY_ENV, raising=False)
     for name in _RESETTABLE_HELLO_STATE:
@@ -261,6 +272,7 @@ def isolate_hello_state(monkeypatch, tmp_path):
             container.clear()
     hello_module._AUTO_CONSUMER_RAN = False
     hello_module._AUTO_CONSUMER_GUARD = False
+    hello_module.reset_serverchan_test_isolation_counters()
     yield
 
 
@@ -7449,31 +7461,233 @@ def test_serverchan_real_push_golden_02_workflow_wiring_confirmed() -> None:
     )
 
 
-@pytest.mark.skipif(
-    not _RUNNER_SERVERCHAN_SENDKEY,
-    reason="no runner SERVERCHAN_SENDKEY; real push Golden 02 is skipped, not faked",
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_B_SERVERCHAN_DURABLE_DEDUPE_AND_TEST_ISOLATION_FIX_01
+# (task cf-2f2b71c331da)
+#
+# The real-HTTPS Golden test was removed: re-injecting the runner SendKey into a
+# pytest process is exactly what produced the extra real ServerChan sends. The
+# tests below instead prove (a) pytest can never reach the real network even when
+# SERVERCHAN_SENDKEY is present, and (b) the durable, cross-process delivery
+# ledger makes a second delivery idempotent and fail-closed.
+# ---------------------------------------------------------------------------
+
+
+def test_pytest_never_performs_real_serverchan_https(monkeypatch) -> None:
+    # Worst case: the runner really does export SERVERCHAN_SENDKEY. The
+    # in-module test-isolation guard must still keep the count at exactly zero.
+    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, _serverchan_fake_key())
+    monkeypatch.setenv(hello_module.SERVERCHAN_TEST_ISOLATION_ENV, "1")
+    hello_module.reset_serverchan_test_isolation_counters()
+
+    calls: list = []
+    report = serverchan_real_push_golden_02(
+        transport=_golden_fake_transport(calls, push_id="pid-isolation")
+    )
+    # Fake transport is always injected in tests and no real attempt is made.
+    assert hello_module.serverchan_real_network_attempts() == 0
+    assert len(calls) == 1
+    assert report["real_push"] == REAL_PUSH_PASS
+
+    # Now with the DEFAULT (real) transport on a fresh identity: the isolation
+    # guard must block the network even though a credential is present.
+    task_id = "serverchan-isolation-default"
+    key = _serverchan_queue(task_id)
+    hello_module.reset_serverchan_test_isolation_counters()
+    blocked = hello_module.deliver_serverchan_envelope(key)
+    assert hello_module.serverchan_real_network_attempts() == 0
+    assert hello_module.serverchan_test_isolation_blocks() == 1
+    assert blocked["state"] == "retry"
+    assert blocked["status"] == "BLOCKED"
+
+
+def test_serverchan_real_transport_refuses_under_pytest(monkeypatch) -> None:
+    monkeypatch.setenv(hello_module.SERVERCHAN_TEST_ISOLATION_ENV, "1")
+    hello_module.reset_serverchan_test_isolation_counters()
+    outcome = hello_module.serverchan_http_transport(
+        "https://sctapi.ftqq.com/FAKE.send", {"title": "t", "desp": "d"}
+    )
+    assert outcome["ok"] is False
+    assert outcome["network_attempted"] is False
+    assert hello_module.serverchan_real_network_attempts() == 0
+    assert hello_module.serverchan_test_isolation_blocks() == 1
+
+
+def test_delivery_ledger_default_path_is_canonical_not_tmp(monkeypatch) -> None:
+    monkeypatch.delenv(hello_module.DELIVERY_LEDGER_STATE_ENV, raising=False)
+    path = hello_module.get_delivery_ledger_path()
+    assert path == hello_module.REPO_ROOT / hello_module.DELIVERY_LEDGER_STATE_DEFAULT
+    assert not str(path).startswith(str(hello_module.tempfile.gettempdir()))
+    status = hello_module.delivery_ledger_status()
+    assert status["durable"] is True
+    assert status["in_repo"] is True
+    assert status["under_tempdir"] is False
+    assert status["identity_fields"] == ["task_id", "classification"]
+
+
+def test_durable_ledger_records_once_and_blocks_resend(monkeypatch) -> None:
+    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, _serverchan_fake_key())
+    task_id = "serverchan-ledger-once"
+    key = _serverchan_queue(task_id)
+    classification = hello_module.get_push_envelope(key)["classification"]
+    calls: list = []
+
+    def fake_transport(endpoint: str, payload: dict) -> dict:
+        calls.append(endpoint)
+        return {
+            "ok": True,
+            "status_code": 200,
+            "push_id": "pid-ledger-once",
+            "server_message": "SUCCESS",
+        }
+
+    first = hello_module.deliver_serverchan_envelope(key, transport=fake_transport)
+    assert first["state"] == "delivered"
+    identity = hello_module.delivery_identity(task_id, classification)
+    record = hello_module.get_delivery_record(identity)
+    assert record is not None
+    assert record["state"] == "delivered"
+    assert record["push_id"] == "pid-ledger-once"
+    assert record["delivered_at"]
+    assert record["quota_consumed"] is True
+
+    second = hello_module.deliver_serverchan_envelope(key, transport=fake_transport)
+    assert second["state"] == "delivered"
+    assert second["already_delivered"] is True
+    assert second["push_id"] == "pid-ledger-once"
+    assert len(calls) == 1  # same task+classification never consumes a 2nd unit
+
+
+def test_durable_ledger_fail_closed_after_uncertain(monkeypatch) -> None:
+    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, _serverchan_fake_key())
+    task_id = "serverchan-ledger-uncertain"
+    key = _serverchan_queue(task_id)
+    calls = {"count": 0}
+
+    def dead_transport(endpoint: str, payload: dict) -> dict:
+        calls["count"] += 1
+        return {"ok": False, "error": "synthetic_permanent"}
+
+    for _ in range(hello_module.SERVERCHAN_MAX_ATTEMPTS):
+        hello_module.deliver_serverchan_envelope(key, transport=dead_transport)
+    assert calls["count"] == hello_module.SERVERCHAN_MAX_ATTEMPTS
+
+    blocked = hello_module.deliver_serverchan_envelope(key, transport=dead_transport)
+    assert blocked["state"] == "blocked"
+    assert blocked["fail_closed"] is True
+    assert blocked["external_blocker"] == hello_module.BLOCKED_DELIVERY_FAIL_CLOSED
+    assert calls["count"] == hello_module.SERVERCHAN_MAX_ATTEMPTS  # no blind resend
+
+
+_XPROC_SERVERCHAN_SCRIPT = r'''
+import json
+import os
+import sys
+
+repo = os.environ["HELLO_REPO"]
+if repo not in sys.path:
+    sys.path.insert(0, repo)
+import hello  # noqa: E402
+
+task_id = os.environ["XPROC_TASK"]
+consumer = os.environ["XPROC_CONSUMER"]
+marker = os.environ["XPROC_MARKER"]
+
+# Rebuild the logical notification from scratch in THIS process, exactly like a
+# fresh workflow rerun. Only the durable delivery ledger is shared.
+hello.submit_task(
+    task_id,
+    goal=hello.SERVERCHAN_ADAPTER_GOAL,
+    status="success",
+    requires_review=True,
 )
-def test_serverchan_real_push_golden_02_real_https_pass(monkeypatch) -> None:
-    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, _RUNNER_SERVERCHAN_SENDKEY)
-    report = serverchan_real_push_golden_02()
-    assert report["credential_present"] is True
-    assert report["real_push"] == REAL_PUSH_PASS == "REAL_PUSH=PASS"
-    assert report["real_push_passed"] is True
-    assert report["final_status"] == "PASS"
-    assert report["external_blocker"] is None
-    assert report["http_status_code"] == 200
-    assert report["delivery"]["state"] == "delivered"
-    assert report["single_logical_notification"] is True
-    assert report["notification_count"] == 1
-    assert report["envelope_count"] == 1
-    assert SERVERCHAN_REAL_PUSH_02_TITLE in report["payload"]["title"]
-    assert "classification: PASS" in report["payload"]["desp"]
-    assert "review_required: false" in report["payload"]["desp"]
-    # Never leak the live SendKey into any surfaced field.
-    live = str(_RUNNER_SERVERCHAN_SENDKEY)
-    assert live not in json.dumps(report, sort_keys=True)
-    assert live not in report["markdown"]
-    assert report["human_review_gate"] is True
-    assert report["auto_pass"] is False
-    assert report["auto_trigger_next"] is False
-    assert report["workflow_modified"] is False
+hello.mark_reviewed(task_id, "PASS", "xproc setup")
+hello.enqueue_push_envelopes(consumer, task_id=task_id)
+key = hello.list_push_envelopes(task_id=task_id)[0]["dedupe_key"]
+
+
+def fake_transport(endpoint, payload):
+    with open(marker, "w", encoding="utf-8") as handle:
+        handle.write("called")
+    return {"ok": True, "status_code": 200, "push_id": "pid-xproc"}
+
+
+result = hello.deliver_serverchan_envelope(key, transport=fake_transport)
+print(json.dumps({
+    "state": result.get("state"),
+    "already_delivered": bool(result.get("already_delivered")),
+    "transport_called": os.path.exists(marker),
+}))
+'''
+
+
+def _xproc_state_env(tmp_path, tag: str, shared_ledger) -> dict:
+    base_env = dict(os.environ)
+    base_env.update(
+        {
+            "HELLO_REPO": str(hello_module.REPO_ROOT),
+            "XPROC_TASK": "serverchan-xproc-task",
+            "XPROC_CONSUMER": f"serverchan-xproc-consumer-{tag}",
+            hello_module.SERVERCHAN_SENDKEY_ENV: _serverchan_fake_key(),
+            hello_module.DELIVERY_LEDGER_STATE_ENV: str(shared_ledger),
+            hello_module.PUSH_OUTBOX_STATE_ENV: str(tmp_path / f"outbox-{tag}.json"),
+            hello_module.EVENT_NOTIFICATION_STATE_ENV: str(
+                tmp_path / f"notif-{tag}.json"
+            ),
+            hello_module.NOTIFICATION_DELIVERY_STATE_ENV: str(
+                tmp_path / f"deliveries-{tag}.json"
+            ),
+            hello_module.CONSUMER_EVIDENCE_ENV: str(
+                tmp_path / f"evidence-{tag}.json"
+            ),
+            "XPROC_MARKER": str(tmp_path / f"marker-{tag}"),
+        }
+    )
+    # A genuinely independent process has neither the pytest marker nor the
+    # in-module isolation env; only the durable ledger can dedupe it.
+    base_env.pop(hello_module.SERVERCHAN_TEST_ISOLATION_ENV, None)
+    base_env.pop("PYTEST_CURRENT_TEST", None)
+    return base_env
+
+
+def test_durable_dedupe_across_independent_processes(tmp_path) -> None:
+    ledger_path = tmp_path / "delivery_ledger.json"
+
+    first = subprocess.run(
+        [sys.executable, "-c", _XPROC_SERVERCHAN_SCRIPT],
+        env=_xproc_state_env(tmp_path, "first", ledger_path),
+        capture_output=True,
+        text=True,
+        cwd=str(hello_module.REPO_ROOT),
+    )
+    assert first.returncode == 0, first.stderr
+    first_result = json.loads(first.stdout.strip().splitlines()[-1])
+    assert first_result["state"] == "delivered"
+    assert first_result["transport_called"] is True
+
+    # Second independent process: fresh outbox / notification / evidence state,
+    # so the ONLY durable signal left is the shared ledger. It must suppress the
+    # send (already_delivered) without calling the transport.
+    second = subprocess.run(
+        [sys.executable, "-c", _XPROC_SERVERCHAN_SCRIPT],
+        env=_xproc_state_env(tmp_path, "second", ledger_path),
+        capture_output=True,
+        text=True,
+        cwd=str(hello_module.REPO_ROOT),
+    )
+    assert second.returncode == 0, second.stderr
+    second_result = json.loads(second.stdout.strip().splitlines()[-1])
+    assert second_result["already_delivered"] is True
+    assert second_result["state"] == "delivered"
+    assert second_result["transport_called"] is False
+    assert not (tmp_path / "marker-second").exists()
+
+    persisted = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert persisted["kind"] == hello_module.DELIVERY_LEDGER_EVIDENCE_KIND
+    delivered = [
+        record
+        for record in persisted["deliveries"].values()
+        if record.get("state") == "delivered"
+    ]
+    assert len(delivered) == 1
+    assert delivered[0]["push_id"] == "pid-xproc"
