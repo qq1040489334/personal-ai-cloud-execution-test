@@ -146,6 +146,31 @@ jobs:
             fi
           fi
 
+      - name: Restore ServerChan delivery ledger
+        if: success()
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/personal_ai_serverchan_delivery_ledger.json
+          key: personal-ai-serverchan-delivery-ledger-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            personal-ai-serverchan-delivery-ledger-v1-
+
+      - name: Dedicated ServerChan push (credential only here)
+        if: success()
+        env:
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          PERSONAL_AI_SERVERCHAN_DELIVERY_LEDGER: ${{ runner.temp }}/personal_ai_serverchan_delivery_ledger.json
+          PERSONAL_AI_PUSH_OUTBOX_STATE: ${{ runner.temp }}/personal_ai_push_outbox.json
+          PERSONAL_AI_EXECUTION_RESULT: ${{ runner.temp }}/execution_result.json
+        run: python hello.py notification-push --result "$RUNNER_TEMP/execution_result.json"
+
+      - name: Save ServerChan delivery ledger
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/personal_ai_serverchan_delivery_ledger.json
+          key: personal-ai-serverchan-delivery-ledger-v1-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: Upload execution_result artifact
         if: always() && steps.taskid.outputs.task_id != ''
         uses: actions/upload-artifact@v4
