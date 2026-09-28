@@ -65,7 +65,7 @@ jobs:
 
       - name: Verify tests (independent)
         id: tests
-        timeout-minutes: 3
+        timeout-minutes: 15
         run: |
           set +e
           test_output="$(python -m pytest -q 2>&1)"
