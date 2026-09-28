@@ -17411,16 +17411,36 @@ def serverchan_real_push_golden(
 ) -> dict:
     """Run the real ServerChan end-to-end push Golden.
 
+    Thin wrapper over :func:`_serverchan_real_push_golden_for` for the canonical
+    Golden ``SERVERCHAN_REAL_PUSH_TASK_ID``. Its public signature is unchanged so
+    existing callers and the frozen Execution B contract keep working.
+    """
+    return _serverchan_real_push_golden_for(
+        SERVERCHAN_REAL_PUSH_TASK_ID,
+        transport=transport,
+        now=now,
+    )
+
+
+def _serverchan_real_push_golden_for(
+    task_id: str,
+    *,
+    transport=None,
+    now: datetime | None = None,
+) -> dict:
+    """Run the real ServerChan end-to-end push Golden for one ``task_id``.
+
     Chain: fixed completion event -> existing event notification consumer -> Push
     Outbox -> ServerChan adapter -> real HTTPS ``transport`` (default
     :func:`serverchan_http_transport`). Exactly one logical notification and one
-    outbox envelope are produced for ``SERVERCHAN_REAL_PUSH_TASK_ID``. The result
-    is ``REAL_PUSH=PASS`` only when a credential is present and the HTTPS call
+    outbox envelope are produced for ``task_id``. The result is
+    ``REAL_PUSH=PASS`` only when a credential is present and the HTTPS call
     returned a ServerChan success; otherwise a concrete blocker is returned and a
-    mocked send is never reported as a real push.
+    mocked send is never reported as a real push. The SendKey is read ONLY from
+    the runner secret env and is never read back, logged, persisted or uploaded.
     """
     now = now if now is not None else datetime.now(timezone.utc)
-    task_id = SERVERCHAN_REAL_PUSH_TASK_ID
+    task_id = str(task_id or "").strip() or SERVERCHAN_REAL_PUSH_TASK_ID
 
     # 1. Fixed test result -> canonical completion event.
     existing = TASK_REGISTRY.get(task_id)
@@ -17732,6 +17752,288 @@ def serverchan_real_push_golden(
             "repeated_enqueue_created": len(second_probe),
             "serverchan_state": delivery_state,
         },
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "workflow_modified": False,
+        "changed_files": ["hello.py", "test_hello.py"],
+        "submit_task_contract": "UNCHANGED",
+        "get_task_result_contract": "UNCHANGED",
+        "mark_reviewed_contract": "COMPATIBLE",
+        "markdown": "\n".join(lines),
+    }
+
+
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_B_SERVERCHAN_WORKFLOW_SECRET_WIRING_FIX_01
+# (task cf-4c0b4b0e81d7)
+#
+# Read-only audit of whether the canonical GitHub Actions workflow injects the
+# repository secret SERVERCHAN_SENDKEY into the process that runs the ServerChan
+# real push Golden. The confirmed single breakpoint is that the canonical
+# .github/workflows/agent-dispatch.yml runs the agent/pytest process with only
+# OPENCODE_API_KEY in its env, so the probe observes credential_present=false and
+# the real WeChat leg stays BLOCKED_EXTERNAL_CREDENTIAL. The minimal fix is one
+# env line on the "Run OpenCode agent" step:
+#     SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+# .github/workflows/ is explicitly OUT OF SCOPE for this task
+# (expected_files=[hello.py, test_hello.py]) and is a hard-forbidden target, so
+# this module only DETECTS and REPORTS the gap. It never edits the workflow, never
+# reads/echoes/persists the SendKey value, never rotates the repository secret,
+# and never reports a mocked send as a real push.
+# ---------------------------------------------------------------------------
+
+SERVERCHAN_WIRING_FIX_GOAL = (
+    "PERSONAL_AI_EXECUTION_B_SERVERCHAN_WORKFLOW_SECRET_WIRING_FIX_01"
+)
+SERVERCHAN_WIRING_FIX_TASK_ID = "cf-4c0b4b0e81d7"
+SERVERCHAN_WIRING_FIX_REPORT = (
+    "PERSONAL_AI_SERVERCHAN_WORKFLOW_SECRET_WIRING_FIX_REPORT"
+)
+SERVERCHAN_WIRING_BLOCKER = "workflow_secret_not_wired"
+SERVERCHAN_CANONICAL_WORKFLOW = "agent-dispatch.yml"
+SERVERCHAN_WORKFLOW_DIR = (".github", "workflows")
+SERVERCHAN_AGENT_RUN_HINT = "opencode run"
+SERVERCHAN_WIRING_ENV_LINE = (
+    SERVERCHAN_SENDKEY_ENV + ": ${{ secrets." + SERVERCHAN_SENDKEY_ENV + " }}"
+)
+
+
+def _workflow_agent_step_block(workflow_text: str) -> str:
+    """Return the YAML step block that runs the agent, or ``""``.
+
+    Read-only text slicing: find the line containing the agent run command, then
+    expand to the enclosing ``- name:`` step. No YAML dependency and no secret is
+    ever evaluated.
+    """
+    lines = str(workflow_text or "").splitlines()
+    run_index = next(
+        (i for i, line in enumerate(lines) if SERVERCHAN_AGENT_RUN_HINT in line),
+        None,
+    )
+    if run_index is None:
+        return ""
+    start = 0
+    for index in range(run_index, -1, -1):
+        if re.match(r"^\s*-\s+name\s*:", lines[index]):
+            start = index
+            break
+    end = len(lines)
+    for index in range(run_index + 1, len(lines)):
+        if re.match(r"^\s*-\s+name\s*:", lines[index]):
+            end = index
+            break
+    return "\n".join(lines[start:end])
+
+
+def serverchan_workflow_wiring_status(workflow_text: str) -> dict:
+    """Report whether one workflow injects SERVERCHAN_SENDKEY into the agent step.
+
+    Value-free and read-only: it only checks for the env wiring marker on the step
+    that runs the agent. It never evaluates, returns or logs the secret value.
+    """
+    block = _workflow_agent_step_block(workflow_text)
+    secret_ref = "secrets." + SERVERCHAN_SENDKEY_ENV
+    wired = bool(
+        block
+        and secret_ref in block
+        and re.search(
+            r"(?m)^\s*" + re.escape(SERVERCHAN_SENDKEY_ENV) + r"\s*:", block
+        )
+    )
+    return {
+        "has_agent_step": bool(block),
+        "secret_wired": wired,
+        "secret_reference_present": secret_ref in str(workflow_text or ""),
+        "expected_env_line": SERVERCHAN_WIRING_ENV_LINE,
+    }
+
+
+def serverchan_workflow_secret_wiring_audit(
+    *,
+    attempt_real_push: bool = True,
+    transport=None,
+    now: datetime | None = None,
+) -> dict:
+    """Audit the SendKey injection and prove the real-push state for this task.
+
+    It reads the canonical workflows (read-only), pinpoints the step that runs the
+    agent and whether it injects ``SERVERCHAN_SENDKEY``, then runs exactly one
+    logical Golden push for the current task id through the unchanged ServerChan
+    chain (the real HTTPS transport by default). Without a credential the chain
+    returns a concrete blocker and no network request is made; a mock transport is
+    never reported as a real push. The single precise blocker is
+    ``workflow_secret_not_wired`` when the workflow does not inject the secret.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)
+    workflow_dir = REPO_ROOT.joinpath(*SERVERCHAN_WORKFLOW_DIR)
+    workflow_details: list[dict] = []
+    for name in _workflow_names():
+        try:
+            text = (workflow_dir / name).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        workflow_details.append(
+            {"workflow": name, **serverchan_workflow_wiring_status(text)}
+        )
+    agent_workflows = [w for w in workflow_details if w["has_agent_step"]]
+    wired = any(w["secret_wired"] for w in agent_workflows)
+    wired_workflow = next(
+        (w["workflow"] for w in agent_workflows if w["secret_wired"]), None
+    )
+
+    credential_present = serverchan_sendkey_present()
+    real_push_result = (
+        _serverchan_real_push_golden_for(
+            SERVERCHAN_WIRING_FIX_TASK_ID, transport=transport, now=now
+        )
+        if attempt_real_push
+        else None
+    )
+    real_push = (
+        real_push_result.get("real_push")
+        if real_push_result is not None
+        else REAL_PUSH_BLOCKED_CREDENTIAL
+    )
+    real_push_ok = bool(real_push == REAL_PUSH_PASS)
+    real_https_attempted = bool(credential_present and real_push_result is not None)
+
+    if real_push_ok:
+        final = PASS
+        blocker = None
+        blocker_detail = None
+    elif not wired:
+        final = BLOCKED
+        blocker = SERVERCHAN_WIRING_BLOCKER
+        blocker_detail = (
+            "the canonical workflow step that runs the agent does not inject "
+            f"{SERVERCHAN_SENDKEY_ENV}; it carries only OPENCODE_API_KEY, so the "
+            f"ServerChan probe runs with credential_present={credential_present}. "
+            "Minimal fix is one env line on that step: "
+            f"{SERVERCHAN_WIRING_ENV_LINE!r}."
+        )
+    elif not credential_present:
+        final = BLOCKED
+        blocker = BLOCKED_EXTERNAL_CREDENTIAL
+        blocker_detail = (
+            f"{SERVERCHAN_SENDKEY_ENV} is wired but not present in this runner "
+            "environment; no real WeChat push is attempted."
+        )
+    else:
+        final = BLOCKED
+        blocker = "delivery_incomplete"
+        blocker_detail = "credential present but the real HTTPS send was not confirmed."
+
+    next_action = (
+        "Human/workflow change only: add "
+        f"`{SERVERCHAN_WIRING_ENV_LINE}` to the "
+        f"`Run OpenCode agent (execute task contract)` step env in "
+        f".github/workflows/{SERVERCHAN_CANONICAL_WORKFLOW}. This file is outside "
+        "this task's allowlist (expected_files=[hello.py, test_hello.py]) and is a "
+        "hard-forbidden target, so the agent must not edit it."
+    )
+
+    checks = [
+        {
+            "check": "canonical workflow present",
+            "status": PASS if workflow_details else BLOCKED,
+            "detail": (
+                "workflows: "
+                + ", ".join(w["workflow"] for w in workflow_details)
+                if workflow_details
+                else "no workflow files found"
+            ),
+        },
+        {
+            "check": "agent run step located",
+            "status": PASS if agent_workflows else BLOCKED,
+            "detail": (
+                "agent step(s): "
+                + ", ".join(w["workflow"] for w in agent_workflows)
+                if agent_workflows
+                else f"no step containing {SERVERCHAN_AGENT_RUN_HINT!r}"
+            ),
+        },
+        {
+            "check": "SERVERCHAN_SENDKEY injected into agent process",
+            "status": PASS if wired else BLOCKED,
+            "detail": (
+                f"wired in {wired_workflow}" if wired else f"missing: {SERVERCHAN_WIRING_ENV_LINE}"
+            ),
+        },
+        {
+            "check": "credential present in runner",
+            "status": PASS if credential_present else BLOCKED,
+            "detail": f"credential_present={credential_present}",
+        },
+        {
+            "check": "real HTTPS push confirmed by ServerChan",
+            "status": PASS if real_push_ok else BLOCKED,
+            "detail": (
+                f"attempted={real_https_attempted}; real_push={real_push}; "
+                "no mock is reported as a real push"
+            ),
+        },
+        {
+            "check": "Human Gate preserved; workflow not modified",
+            "status": PASS,
+            "detail": (
+                "notification only; no auto review / PASS / dispatch; the canonical "
+                "workflow is read-only and left unchanged"
+            ),
+        },
+    ]
+
+    lines = [
+        f"# {SERVERCHAN_WIRING_FIX_REPORT}",
+        "",
+        f"- goal: {SERVERCHAN_WIRING_FIX_GOAL}",
+        f"- task_id: {SERVERCHAN_WIRING_FIX_TASK_ID}",
+        f"- final_status: {final}",
+        f"- blocker: {blocker or 'none'}",
+        f"- credential_present: {credential_present}",
+        f"- workflow_secret_wired: {wired}",
+        f"- real_push: {real_push}",
+        f"- real_https_attempted: {real_https_attempted}",
+        "",
+        "## Workflow SendKey wiring (read-only)",
+    ]
+    for detail in workflow_details:
+        lines.append(
+            f"- {detail['workflow']}: has_agent_step={detail['has_agent_step']} "
+            f"secret_wired={detail['secret_wired']} "
+            f"secret_reference_present={detail['secret_reference_present']}"
+        )
+    lines += ["", "## Next human action", f"- {next_action}", "", "## Checks"]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"REAL_PUSH={real_push.split('=', 1)[-1]}", f"FINAL_STATUS={final}"]
+
+    return {
+        "report": SERVERCHAN_WIRING_FIX_REPORT,
+        "goal": SERVERCHAN_WIRING_FIX_GOAL,
+        "task_id": SERVERCHAN_WIRING_FIX_TASK_ID,
+        "marker": SERVERCHAN_REAL_PUSH_MARKER,
+        "final_status": final,
+        "blocker": blocker,
+        "blocker_detail": blocker_detail,
+        "single_blocker": blocker if final != PASS else None,
+        "credential_present": credential_present,
+        "workflow_secret_wired": wired,
+        "wired_workflow": wired_workflow,
+        "canonical_workflow": SERVERCHAN_CANONICAL_WORKFLOW,
+        "expected_env_line": SERVERCHAN_WIRING_ENV_LINE,
+        "workflows": workflow_details,
+        "real_push": real_push,
+        "real_push_passed": real_push_ok,
+        "real_https_attempted": real_https_attempted,
+        "real_push_result": real_push_result,
+        "payload": (real_push_result or {}).get("payload", {}),
+        "http_status_code": (real_push_result or {}).get("http_status_code"),
+        "push_id": (real_push_result or {}).get("push_id"),
+        "server_message": (real_push_result or {}).get("server_message"),
+        "next_action": next_action,
+        "checks": checks,
         "human_review_gate": True,
         "auto_pass": False,
         "auto_trigger_next": False,

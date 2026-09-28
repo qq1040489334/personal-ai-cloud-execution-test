@@ -7137,3 +7137,145 @@ def test_serverchan_real_push_golden_human_gate_and_contracts(
     assert list(
         inspect.signature(serverchan_real_push_golden).parameters
     ) == ["transport", "now"]
+
+
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_B_SERVERCHAN_WORKFLOW_SECRET_WIRING_FIX_01
+# (task cf-4c0b4b0e81d7). Read-only detection of the missing workflow secret
+# wiring; no real credential and no network are used here.
+# ---------------------------------------------------------------------------
+
+_WIRED_AGENT_STEP = """\
+steps:
+  - name: Setup python
+    uses: actions/setup-python@v5
+  - name: Run OpenCode agent (execute task contract)
+    env:
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+    run: |
+      opencode run --auto -m some/model "task"
+"""
+
+_UNWIRED_AGENT_STEP = """\
+steps:
+  - name: Setup python
+    uses: actions/setup-python@v5
+  - name: Run OpenCode agent (execute task contract)
+    env:
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+    run: |
+      opencode run --auto -m some/model "task"
+"""
+
+
+def test_serverchan_workflow_wiring_detects_missing_secret() -> None:
+    status = hello_module.serverchan_workflow_wiring_status(_UNWIRED_AGENT_STEP)
+    assert status["has_agent_step"] is True
+    assert status["secret_wired"] is False
+    assert status["expected_env_line"] == (
+        "SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}"
+    )
+
+
+def test_serverchan_workflow_wiring_detects_present_secret() -> None:
+    status = hello_module.serverchan_workflow_wiring_status(_WIRED_AGENT_STEP)
+    assert status["has_agent_step"] is True
+    assert status["secret_wired"] is True
+    assert status["secret_reference_present"] is True
+
+
+def test_serverchan_workflow_wiring_ignores_secret_outside_agent_step() -> None:
+    text = """\
+steps:
+  - name: Some other step
+    env:
+      SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+  - name: Run OpenCode agent (execute task contract)
+    env:
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+    run: |
+      opencode run --auto "task"
+"""
+    status = hello_module.serverchan_workflow_wiring_status(text)
+    assert status["secret_reference_present"] is True
+    assert status["secret_wired"] is False
+
+
+def test_serverchan_workflow_wiring_audit_without_credential_reports_blocker(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(hello_module.SERVERCHAN_SENDKEY_ENV, raising=False)
+    report = hello_module.serverchan_workflow_secret_wiring_audit()
+    assert report["report"] == hello_module.SERVERCHAN_WIRING_FIX_REPORT
+    assert report["goal"] == hello_module.SERVERCHAN_WIRING_FIX_GOAL
+    assert report["task_id"] == hello_module.SERVERCHAN_WIRING_FIX_TASK_ID
+    assert report["task_id"] == "cf-4c0b4b0e81d7"
+    assert report["credential_present"] is False
+    assert report["real_push_passed"] is False
+    assert report["real_https_attempted"] is False
+    assert report["final_status"] == "BLOCKED"
+    assert report["real_push"] == hello_module.REAL_PUSH_BLOCKED_CREDENTIAL
+    # The single precise blocker must be the workflow wiring gap, not a mock PASS.
+    if not report["workflow_secret_wired"]:
+        assert report["blocker"] == hello_module.SERVERCHAN_WIRING_BLOCKER
+        assert report["single_blocker"] == hello_module.SERVERCHAN_WIRING_BLOCKER
+    else:
+        assert report["blocker"] == hello_module.BLOCKED_EXTERNAL_CREDENTIAL
+    assert report["workflow_modified"] is False
+    assert report["changed_files"] == ["hello.py", "test_hello.py"]
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    assert report["payload"]["task_id"] == hello_module.SERVERCHAN_WIRING_FIX_TASK_ID
+    assert hello_module.SERVERCHAN_REAL_PUSH_TITLE in report["payload"]["title"]
+    assert "classification: PASS" in report["payload"]["desp"]
+    assert "review_required: false" in report["payload"]["desp"]
+    assert report["markdown"].startswith(f"# {hello_module.SERVERCHAN_WIRING_FIX_REPORT}")
+    assert "FINAL_STATUS=BLOCKED" in report["markdown"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in VALID_STATUSES
+        assert check["detail"]
+    # No credential means no network leg is entered.
+    assert report["real_push_result"]["delivery"]["state"] == "blocked"
+
+
+def test_serverchan_workflow_wiring_audit_with_fake_credential_passes(
+    monkeypatch,
+) -> None:
+    fake_key = _serverchan_fake_key("SCT")
+    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, fake_key)
+    calls: list = []
+    report = hello_module.serverchan_workflow_secret_wiring_audit(
+        transport=_golden_fake_transport(calls, push_id="pid-wiring-1")
+    )
+    assert report["final_status"] == "PASS"
+    assert report["real_push"] == hello_module.REAL_PUSH_PASS
+    assert report["real_push_passed"] is True
+    assert report["blocker"] is None
+    assert report["single_blocker"] is None
+    assert report["credential_present"] is True
+    assert report["real_https_attempted"] is True
+    assert len(calls) == 1
+    endpoint, payload = calls[0]
+    assert endpoint == f"https://sctapi.ftqq.com/{fake_key}.send"
+    assert hello_module.SERVERCHAN_REAL_PUSH_TITLE in payload["title"]
+    assert payload["task_id"] == hello_module.SERVERCHAN_WIRING_FIX_TASK_ID
+    assert report["http_status_code"] == 200
+    assert report["push_id"] == "pid-wiring-1"
+    assert report["server_message"] == "SUCCESS"
+    # The SendKey must never leak into the report or its markdown.
+    assert fake_key not in json.dumps(report, sort_keys=True)
+    assert fake_key not in report["markdown"]
+    assert report["workflow_modified"] is False
+
+
+def test_serverchan_workflow_wiring_audit_can_skip_real_push(monkeypatch) -> None:
+    monkeypatch.delenv(hello_module.SERVERCHAN_SENDKEY_ENV, raising=False)
+    report = hello_module.serverchan_workflow_secret_wiring_audit(
+        attempt_real_push=False
+    )
+    assert report["real_push_result"] is None
+    assert report["real_push"] == hello_module.REAL_PUSH_BLOCKED_CREDENTIAL
+    assert report["final_status"] == "BLOCKED"
