@@ -5415,3 +5415,280 @@ def test_event_notification_consumer_helpers_validate_input() -> None:
     assert set(hello_module.NOTIFICATION_SEVERITY_BY_CLASS) == set(
         hello_module.NOTIFICATION_CLASSES
     )
+
+
+def _isolate_delivery_state(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(
+        hello_module.EVENT_NOTIFICATION_STATE_ENV,
+        str(tmp_path / "event_notifications.json"),
+    )
+    monkeypatch.setenv(
+        hello_module.CONSUMER_EVIDENCE_ENV,
+        str(tmp_path / "consumer_evidence.json"),
+    )
+    monkeypatch.setenv(
+        hello_module.NOTIFICATION_DELIVERY_STATE_ENV,
+        str(tmp_path / "notification_delivery.json"),
+    )
+
+
+def test_notification_delivery_adapter_report_shape(monkeypatch, tmp_path) -> None:
+    _isolate_delivery_state(monkeypatch, tmp_path)
+    report = hello_module.notification_delivery_adapter_report()
+    assert report["report"] == hello_module.NOTIFICATION_DELIVERY_ADAPTER_REPORT
+    assert report["goal"] == hello_module.NOTIFICATION_DELIVERY_ADAPTER_GOAL
+    assert report["task_id"] == hello_module.NOTIFICATION_DELIVERY_ADAPTER_TASK_ID
+    assert report["task_id"] == "cf-699516362570"
+    assert report["status"] in VALID_STATUSES
+    assert report["final_status"] == report["status"]
+    assert report["entrypoint"] == "pull_notifications"
+    assert report["delivery_channel"] == hello_module.NOTIFICATION_DELIVERY_CHANNEL
+    assert report["categories"] == list(hello_module.NOTIFICATION_CLASSES)
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in VALID_STATUSES
+        assert check["detail"]
+    markdown = report["markdown"]
+    assert markdown.startswith(
+        f"# {hello_module.NOTIFICATION_DELIVERY_ADAPTER_REPORT}"
+    )
+    assert (
+        f"- task_id: {hello_module.NOTIFICATION_DELIVERY_ADAPTER_TASK_ID}"
+        in markdown
+    )
+    for token in (
+        "## Consumable inbox",
+        "## Classifications",
+        "## Idempotency & read state",
+        "## Real completion-event chain",
+        "## Limitations",
+        "## Checks",
+    ):
+        assert token in markdown
+    assert "FINAL_STATUS=" in markdown
+
+
+def test_notification_delivery_adapter_classifies_all_four(
+    monkeypatch, tmp_path
+) -> None:
+    _isolate_delivery_state(monkeypatch, tmp_path)
+    report = hello_module.notification_delivery_adapter_report()
+    assert report["all_classes_present"] is True
+    assert set(hello_module.NOTIFICATION_CLASSES) <= set(
+        report["observed_classifications"]
+    )
+    for record in report["probe_notifications"]:
+        assert record["classification"] in hello_module.NOTIFICATION_CLASSES
+        assert record["delivery_state"] == "delivered"
+        assert record["human_review_gate"] is True
+        assert record["auto_pass"] is False
+        assert record["auto_trigger_next"] is False
+
+
+def test_notification_delivery_adapter_pull_discovers_and_idempotent(
+    monkeypatch, tmp_path
+) -> None:
+    _isolate_delivery_state(monkeypatch, tmp_path)
+    consumer_id = f"test-consumer-{uuid.uuid4().hex[:10]}"
+    task_id = _notification_probe("delivery-adapter-pull")
+    hello_module.submit_task(
+        task_id,
+        goal=hello_module.NOTIFICATION_DELIVERY_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    first = hello_module.pull_notifications(consumer_id)
+    first_items = [r for r in first["delivered"] if r["task_id"] == task_id]
+    assert len(first_items) == 1
+    assert first_items[0]["classification"] == (
+        hello_module.NOTIFICATION_CLASS_PENDING_APPROVAL
+    )
+    assert first_items[0]["delivery_state"] == "delivered"
+    second = hello_module.pull_notifications(consumer_id)
+    second_items = [r for r in second["delivered"] if r["task_id"] == task_id]
+    assert second_items == []
+    delivery_events = [
+        event
+        for event in hello_module.get_consumption_evidence(task_id)
+        if event.get("event_type") == hello_module.NOTIFICATION_DELIVERY_EVENT
+    ]
+    assert len(delivery_events) == 1
+    inbox = hello_module.list_delivery_inbox(consumer_id, task_id=task_id)
+    assert len(inbox) == 1
+
+
+def test_notification_delivery_adapter_read_unread_state(
+    monkeypatch, tmp_path
+) -> None:
+    _isolate_delivery_state(monkeypatch, tmp_path)
+    consumer_id = f"test-consumer-{uuid.uuid4().hex[:10]}"
+    task_id = _notification_probe("delivery-adapter-readstate")
+    hello_module.submit_task(
+        task_id,
+        goal=hello_module.NOTIFICATION_DELIVERY_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    hello_module.pull_notifications(consumer_id)
+    inbox = hello_module.list_delivery_inbox(consumer_id, task_id=task_id)
+    assert len(inbox) == 1
+    assert inbox[0]["delivery_state"] == "delivered"
+    assert inbox[0]["read"] is False
+    key = inbox[0]["notification_key"]
+    ack = hello_module.acknowledge_notification(key, consumer_id)
+    assert ack["delivery_state"] == "acknowledged"
+    again = hello_module.acknowledge_notification(key, consumer_id)
+    assert again["delivery_state"] == "acknowledged"
+    assert again["delivery_seq"] == ack["delivery_seq"]
+    inbox_after = hello_module.list_delivery_inbox(consumer_id, task_id=task_id)
+    assert inbox_after[0]["delivery_state"] == "acknowledged"
+    assert inbox_after[0]["read"] is True
+    assert hello_module.list_delivery_inbox(
+        consumer_id, task_id=task_id, unread_only=True
+    ) == []
+
+
+def test_notification_delivery_adapter_preserves_human_gate(
+    monkeypatch, tmp_path
+) -> None:
+    _isolate_delivery_state(monkeypatch, tmp_path)
+    consumer_id = f"test-consumer-{uuid.uuid4().hex[:10]}"
+    task_id = _notification_probe("delivery-adapter-gate")
+    hello_module.submit_task(
+        task_id,
+        goal=hello_module.NOTIFICATION_DELIVERY_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    hello_module.pull_notifications(consumer_id, task_id=task_id)
+    record = hello_module.get_task_review(task_id)
+    assert record["reviewed"] is False
+    assert record["review_verdict"] is None
+    assert record["reviewed_at"] is None
+    dispatched = [
+        event
+        for event in hello_module.get_consumption_evidence(task_id)
+        if event.get("event_type") == hello_module.AUTO_DISPATCH_EVENT
+    ]
+    assert dispatched == []
+    report = hello_module.notification_delivery_adapter_report()
+    assert report["human_gate_preserved"] is True
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    assert report["review_states_unchanged"] is True
+    assert report["no_auto_dispatch"] is True
+
+
+def test_notification_delivery_adapter_push_boundary_stated(
+    monkeypatch, tmp_path
+) -> None:
+    _isolate_delivery_state(monkeypatch, tmp_path)
+    report = hello_module.notification_delivery_adapter_report()
+    assert report["true_push_supported"] is False
+    assert report["push_capability"] == (
+        hello_module.NOTIFICATION_DELIVERY_PUSH_CAPABILITY
+    )
+    status = report["delivery_status"]
+    assert status["true_push_supported"] is False
+    assert status["push_capability"] == (
+        hello_module.NOTIFICATION_DELIVERY_PUSH_CAPABILITY
+    )
+    assert report["push_limitation"]
+    assert any("push" in item.lower() for item in report["limitations"])
+
+
+def test_notification_delivery_adapter_persisted_and_queryable(
+    monkeypatch, tmp_path
+) -> None:
+    state = tmp_path / "delivery.json"
+    monkeypatch.setenv(
+        hello_module.EVENT_NOTIFICATION_STATE_ENV, str(tmp_path / "n.json")
+    )
+    monkeypatch.setenv(
+        hello_module.CONSUMER_EVIDENCE_ENV, str(tmp_path / "c.json")
+    )
+    monkeypatch.setenv(hello_module.NOTIFICATION_DELIVERY_STATE_ENV, str(state))
+    consumer_id = f"test-consumer-{uuid.uuid4().hex[:10]}"
+    task_id = _notification_probe("delivery-adapter-persist")
+    hello_module.submit_task(
+        task_id,
+        goal=hello_module.NOTIFICATION_DELIVERY_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    hello_module.pull_notifications(consumer_id, task_id=task_id)
+    assert state.is_file()
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["kind"] == hello_module.NOTIFICATION_DELIVERY_EVIDENCE_KIND
+    assert any(item["task_id"] == task_id for item in saved["deliveries"])
+    status = hello_module.notification_delivery_status(consumer_id)
+    assert status["persisted"] is True
+    assert status["queryable"] is True
+    assert hello_module.get_notification_delivery_state_path() == state
+    records = hello_module.delivery_records(consumer_id)
+    assert any(item["task_id"] == task_id for item in records)
+
+
+def test_notification_delivery_adapter_real_chain(monkeypatch, tmp_path) -> None:
+    _isolate_delivery_state(monkeypatch, tmp_path)
+    report = hello_module.notification_delivery_adapter_report()
+    assert report["status"] == "PASS"
+    assert report["idempotent"] is True
+    assert report["no_duplicate_events"] is True
+    assert report["read_state_ok"] is True
+    assert report["delivered_state_ok"] is True
+    assert report["real_chain_ok"] is True
+    chain = report["real_chain"]
+    assert chain["completion_event_action"] == "completion_event_handled"
+    assert chain["review_ready"] is True
+    assert chain["auto_applied"] is False
+    assert hello_module.NOTIFICATION_CLASS_PENDING_APPROVAL in (
+        chain["delivered_classifications"]
+    )
+    assert report["limitations"]
+    assert report["acceptance_fields"] == list(
+        hello_module.NOTIFICATION_DELIVERY_ACCEPTANCE_FIELDS
+    )
+
+
+def test_notification_delivery_adapter_contracts_and_scope(
+    monkeypatch, tmp_path
+) -> None:
+    _isolate_delivery_state(monkeypatch, tmp_path)
+    report = hello_module.notification_delivery_adapter_report()
+    assert report["contracts_unchanged"] is True
+    assert report["no_router"] is True
+    assert report["no_orchestrator"] is True
+    assert report["no_multi_agent"] is True
+    assert report["workflow_modified"] is False
+    assert report["changed_files"] == ["hello.py", "test_hello.py"]
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert report["mark_reviewed_contract"] == "COMPATIBLE"
+    assert list(
+        inspect.signature(hello_module.pull_notifications).parameters
+    ) == ["consumer_id", "task_id", "classification", "limit", "now"]
+    assert list(
+        inspect.signature(hello_module.list_delivery_inbox).parameters
+    ) == [
+        "consumer_id",
+        "task_id",
+        "classification",
+        "delivery_state",
+        "unread_only",
+    ]
+
+
+def test_notification_delivery_adapter_validates_inputs() -> None:
+    with pytest.raises(ValueError):
+        hello_module.list_delivery_inbox("")
+    with pytest.raises(ValueError):
+        hello_module.pull_notifications("")
+    with pytest.raises(ValueError):
+        hello_module.acknowledge_notification("")
+    with pytest.raises(KeyError):
+        hello_module.acknowledge_notification("does-not-exist-xyz")
+    with pytest.raises(ValueError):
+        hello_module.notification_delivery_status("")

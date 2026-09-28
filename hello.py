@@ -13938,6 +13938,808 @@ def event_notification_consumer_report(now: datetime | None = None) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_NOTIFICATION_DELIVERY_ADAPTER_V0.1
+#
+# Minimal last-mile Delivery Adapter over the already-existing Event
+# Notification Consumer. It does NOT rebuild the notification system: it reads
+# the existing durable notification ledger / review_ready state through
+# ``list_notifications`` / ``consume_event_notifications`` and exposes one
+# stable, idempotent consumption interface that a client (including a
+# ChatGPT-side MCP tool call) can poll for *new* notifications without asking
+# the user to manually query a task result.
+#
+# The adapter keeps an explicit read/unread (consumption) state per consumer so
+# a repeated read/consumption never produces a duplicate delivery event. It is
+# strictly read-only with respect to the execution layer: it never reviews,
+# never grants PASS and never dispatches a next task, so the Human Gate stays
+# effective. No Router, generic orchestrator or multi-agent scheduling is added
+# and no workflow / secret / scope gate is touched.
+#
+# Real push boundary: there is no server-initiated push channel into a ChatGPT
+# session available from this repository/runner. The adapter therefore ships a
+# durable, pollable pull inbox and marks the limitation explicitly instead of
+# faking a proactive push.
+# ---------------------------------------------------------------------------
+
+NOTIFICATION_DELIVERY_ADAPTER_GOAL = "PERSONAL_AI_NOTIFICATION_DELIVERY_ADAPTER_V0.1"
+NOTIFICATION_DELIVERY_ADAPTER_TASK_ID = "cf-699516362570"
+NOTIFICATION_DELIVERY_ADAPTER_REPORT = (
+    "PERSONAL_AI_NOTIFICATION_DELIVERY_ADAPTER_REPORT"
+)
+NOTIFICATION_DELIVERY_STATE_ENV = "PERSONAL_AI_NOTIFICATION_DELIVERY_STATE"
+NOTIFICATION_DELIVERY_STATE_DEFAULT = "personal_ai_notification_delivery.json"
+NOTIFICATION_DELIVERY_EVIDENCE_KIND = "personal_ai_notification_delivery_state"
+NOTIFICATION_DELIVERY_SOURCE = "notification_delivery_adapter"
+NOTIFICATION_DELIVERY_EVENT = "notification_delivered"
+NOTIFICATION_DELIVERY_ACK_EVENT = "notification_acknowledged"
+NOTIFICATION_DELIVERY_CONSUMER_DEFAULT = "default"
+NOTIFICATION_DELIVERY_STATES = ("unread", "delivered", "acknowledged")
+NOTIFICATION_DELIVERY_CHANNEL = "durable_pull_inbox"
+NOTIFICATION_DELIVERY_PUSH_CAPABILITY = "pull_only_in_repo_ledger"
+NOTIFICATION_DELIVERY_PUSH_LIMITATION = (
+    "No true server-initiated push into a ChatGPT/MCP session is possible from "
+    "this repository or runner: neither the ChatGPT session nor the MCP "
+    "transport is reachable from the sandbox, and no webhook/token may be "
+    "introduced. The adapter therefore exposes a durable, idempotent PULL inbox "
+    "that any client (including a ChatGPT-side MCP tool call) can poll for new "
+    "notifications; it does not fabricate a proactive push."
+)
+NOTIFICATION_DELIVERY_ACCEPTANCE_FIELDS = (
+    "explicit notification consumption entry discoverable by a client",
+    "PASS/FAIL/BLOCKED/PENDING_APPROVAL all readable and classified",
+    "repeated read/consumption is idempotent (no duplicate delivery events)",
+    "read/unread consumption state tracked per consumer",
+    "Human Gate preserved; notification never triggers an unapproved next task",
+    "real push capability boundary stated explicitly (pull-only)",
+    "full test suite passes with a real chain",
+)
+
+NOTIFICATION_DELIVERIES: list[dict] = []
+_NOTIFICATION_DELIVERY_SEQ = 0
+
+
+def get_notification_delivery_state_path() -> Path:
+    """Return the durable notification-delivery state path (env-overridable)."""
+    override = os.environ.get(NOTIFICATION_DELIVERY_STATE_ENV)
+    if override and override.strip():
+        return Path(override).expanduser()
+    return Path(tempfile.gettempdir()) / NOTIFICATION_DELIVERY_STATE_DEFAULT
+
+
+def _load_notification_deliveries() -> list[dict]:
+    path = get_notification_delivery_state_path()
+    if not path.is_file():
+        return []
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(loaded, dict):
+        loaded = loaded.get("deliveries", [])
+    if not isinstance(loaded, list):
+        return []
+    return [dict(item) for item in loaded if isinstance(item, dict)]
+
+
+def _persist_notification_deliveries() -> bool:
+    path = get_notification_delivery_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "kind": NOTIFICATION_DELIVERY_EVIDENCE_KIND,
+            "updated_at": _utc_now(),
+            "deliveries": delivery_records(),
+        }
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except OSError:
+        return False
+    return True
+
+
+def _next_delivery_seq() -> int:
+    global _NOTIFICATION_DELIVERY_SEQ
+    _NOTIFICATION_DELIVERY_SEQ += 1
+    return _NOTIFICATION_DELIVERY_SEQ
+
+
+def delivery_records(consumer_id: str | None = None) -> list[dict]:
+    """Return the durable delivery records, deduplicated per (key, consumer).
+
+    In-memory records are applied after the persisted ones so an in-place state
+    transition (for example ``delivered`` -> ``acknowledged``) is never shadowed
+    by the older persisted copy.
+    """
+    merged: dict[tuple[str, str], dict] = {}
+    for item in _load_notification_deliveries() + NOTIFICATION_DELIVERIES:
+        key = (str(item.get("notification_key")), str(item.get("consumer_id")))
+        merged[key] = dict(item)
+    records = list(merged.values())
+    if consumer_id is not None:
+        records = [item for item in records if item.get("consumer_id") == consumer_id]
+    records.sort(
+        key=lambda item: (
+            str(item.get("task_id")),
+            str(item.get("notification_key")),
+            int(item.get("delivery_seq") or 0),
+        )
+    )
+    return records
+
+
+def _delivery_record_index(consumer_id: str) -> dict[str, dict]:
+    return {
+        str(item.get("notification_key")): item
+        for item in delivery_records(consumer_id)
+    }
+
+
+def _record_delivery(
+    notification: dict,
+    consumer_id: str,
+    *,
+    now: datetime,
+    delivery_state: str = "delivered",
+) -> dict:
+    seq = _next_delivery_seq()
+    record = {
+        "delivery_id": (
+            f"{consumer_id}:{notification.get('notification_key')}:{seq}"
+        ),
+        "notification_key": notification.get("notification_key"),
+        "notification_id": notification.get("notification_id"),
+        "task_id": notification.get("task_id"),
+        "classification": notification.get("classification"),
+        "category": notification.get("category"),
+        "consumer_id": consumer_id,
+        "delivery_state": delivery_state,
+        "delivery_seq": seq,
+        "delivered_at": (
+            now.isoformat() if delivery_state in ("delivered", "acknowledged") else None
+        ),
+        "acknowledged_at": (
+            now.isoformat() if delivery_state == "acknowledged" else None
+        ),
+        "channel": NOTIFICATION_DELIVERY_CHANNEL,
+        "push_capability": NOTIFICATION_DELIVERY_PUSH_CAPABILITY,
+        "source": NOTIFICATION_DELIVERY_SOURCE,
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+    }
+    NOTIFICATION_DELIVERIES.append(record)
+    return record
+
+
+def _set_delivery_state(
+    notification: dict,
+    consumer_id: str,
+    state: str,
+    *,
+    now: datetime,
+) -> tuple[dict, bool]:
+    """Set the consumption state of one notification, returning (record, changed)."""
+    if state not in NOTIFICATION_DELIVERY_STATES:
+        raise ValueError(f"unknown delivery state: {state!r}")
+    key = str(notification.get("notification_key"))
+    existing = _delivery_record_index(consumer_id).get(key)
+    if existing is None:
+        return (
+            _record_delivery(
+                notification, consumer_id, now=now, delivery_state=state
+            ),
+            True,
+        )
+    if str(existing.get("delivery_state")) == state:
+        return dict(existing), False
+    updated = dict(existing)
+    updated["delivery_state"] = state
+    updated["delivery_seq"] = _next_delivery_seq()
+    updated["delivery_id"] = f"{consumer_id}:{key}:{updated['delivery_seq']}"
+    if state == "acknowledged":
+        updated["acknowledged_at"] = now.isoformat()
+    else:
+        updated["delivered_at"] = updated.get("delivered_at") or now.isoformat()
+    NOTIFICATION_DELIVERIES.append(updated)
+    return updated, True
+
+
+def _notification_delivery_state(
+    notification: dict, records: dict[str, dict]
+) -> str:
+    record = records.get(str(notification.get("notification_key")))
+    if record is None:
+        return "unread"
+    state = str(record.get("delivery_state") or "delivered")
+    return state if state in NOTIFICATION_DELIVERY_STATES else "delivered"
+
+
+def list_delivery_inbox(
+    consumer_id: str = NOTIFICATION_DELIVERY_CONSUMER_DEFAULT,
+    *,
+    task_id: str | None = None,
+    classification: str | None = None,
+    delivery_state: str | None = None,
+    unread_only: bool = False,
+) -> list[dict]:
+    """Return the consumable delivery inbox with per-consumer read state.
+
+    This is the stable discovery interface for a client: it reads the existing
+    notification ledger and annotates every record with ``delivery_state`` /
+    ``read`` for the given consumer. It never mutates task or notification
+    state.
+    """
+    if not consumer_id:
+        raise ValueError("list_delivery_inbox requires a consumer_id")
+    records = _delivery_record_index(consumer_id)
+    inbox: list[dict] = []
+    for notification in list_notifications(task_id):
+        if (
+            classification is not None
+            and notification.get("classification") != classification
+        ):
+            continue
+        state = _notification_delivery_state(notification, records)
+        if unread_only and state != "unread":
+            continue
+        if delivery_state is not None and state != delivery_state:
+            continue
+        item = dict(notification)
+        item["delivery_state"] = state
+        item["read"] = state == "acknowledged"
+        item["unread"] = state == "unread"
+        item["consumer_id"] = consumer_id
+        item["delivery_channel"] = NOTIFICATION_DELIVERY_CHANNEL
+        inbox.append(item)
+    inbox.sort(
+        key=lambda item: (
+            str(item.get("task_id")),
+            str(item.get("notification_id")),
+        )
+    )
+    return inbox
+
+
+def pull_notifications(
+    consumer_id: str = NOTIFICATION_DELIVERY_CONSUMER_DEFAULT,
+    *,
+    task_id: str | None = None,
+    classification: str | None = None,
+    limit: int | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Deliver only the *new* (unread) notifications to a consumer.
+
+    The existing idempotent consumer is refreshed first, then every not-yet
+    delivered notification is recorded as ``delivered`` for this consumer and an
+    append-only delivery evidence event is written. A repeated pull for the same
+    consumer returns zero new notifications and writes no duplicate event. The
+    adapter never reviews, PASSes or dispatches, so the Human Gate is preserved.
+    """
+    if not consumer_id:
+        raise ValueError("pull_notifications requires a consumer_id")
+    now = now if now is not None else datetime.now(timezone.utc)
+    consume_event_notifications(now=now)
+    pending = list_delivery_inbox(
+        consumer_id,
+        task_id=task_id,
+        classification=classification,
+        unread_only=True,
+    )
+    if limit is not None:
+        pending = pending[: max(0, int(limit))]
+
+    delivered: list[dict] = []
+    for notification in pending:
+        record = _record_delivery(notification, consumer_id, now=now)
+        delivered.append(record)
+        record_consumer_evidence(
+            NOTIFICATION_DELIVERY_EVENT,
+            str(notification.get("task_id") or ""),
+            detail=(
+                f"notification {notification.get('notification_id')} "
+                f"({notification.get('classification')}) delivered to consumer "
+                f"{consumer_id}"
+            ),
+            extra={
+                "classification": notification.get("classification"),
+                "notification_key": notification.get("notification_key"),
+                "consumer_id": consumer_id,
+                "delivery_state": record["delivery_state"],
+                "channel": NOTIFICATION_DELIVERY_CHANNEL,
+            },
+        )
+    _persist_notification_deliveries()
+
+    inbox = list_delivery_inbox(consumer_id, task_id=task_id)
+    return {
+        "goal": NOTIFICATION_DELIVERY_ADAPTER_GOAL,
+        "consumer_id": consumer_id,
+        "now": now.isoformat(),
+        "channel": NOTIFICATION_DELIVERY_CHANNEL,
+        "push_capability": NOTIFICATION_DELIVERY_PUSH_CAPABILITY,
+        "has_new": bool(delivered),
+        "delivered": delivered,
+        "delivered_count": len(delivered),
+        "inbox": inbox,
+        "pending_count": sum(1 for item in inbox if item["delivery_state"] == "unread"),
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "delivery_status": notification_delivery_status(consumer_id),
+    }
+
+
+def acknowledge_notification(
+    notification_key: str,
+    consumer_id: str = NOTIFICATION_DELIVERY_CONSUMER_DEFAULT,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """Mark one notification read (acknowledged) for a consumer.
+
+    Idempotent: acknowledging an already-read notification changes nothing and
+    writes no duplicate evidence event.
+    """
+    if not notification_key:
+        raise ValueError("acknowledge_notification requires a notification_key")
+    if not consumer_id:
+        raise ValueError("acknowledge_notification requires a consumer_id")
+    now = now if now is not None else datetime.now(timezone.utc)
+    match = next(
+        (
+            item
+            for item in list_notifications()
+            if str(item.get("notification_key")) == str(notification_key)
+        ),
+        None,
+    )
+    if match is None:
+        raise KeyError(notification_key)
+    record, changed = _set_delivery_state(
+        match, consumer_id, "acknowledged", now=now
+    )
+    if changed:
+        _persist_notification_deliveries()
+        record_consumer_evidence(
+            NOTIFICATION_DELIVERY_ACK_EVENT,
+            str(match.get("task_id") or ""),
+            detail=(
+                f"notification {match.get('notification_id')} acknowledged read "
+                f"by consumer {consumer_id}"
+            ),
+            extra={
+                "classification": match.get("classification"),
+                "notification_key": match.get("notification_key"),
+                "consumer_id": consumer_id,
+                "delivery_state": "acknowledged",
+                "channel": NOTIFICATION_DELIVERY_CHANNEL,
+            },
+        )
+    return dict(record)
+
+
+def notification_delivery_status(
+    consumer_id: str = NOTIFICATION_DELIVERY_CONSUMER_DEFAULT,
+) -> dict:
+    """Report persistence, read/unread counts and the real push boundary."""
+    if not consumer_id:
+        raise ValueError("notification_delivery_status requires a consumer_id")
+    path = get_notification_delivery_state_path()
+    records = delivery_records(consumer_id)
+    inbox = list_delivery_inbox(consumer_id)
+    by_state = {state: 0 for state in NOTIFICATION_DELIVERY_STATES}
+    for item in inbox:
+        by_state[item["delivery_state"]] = by_state.get(item["delivery_state"], 0) + 1
+    return {
+        "path": str(path),
+        "persisted": path.is_file(),
+        "consumer_id": consumer_id,
+        "record_count": len(records),
+        "inbox_count": len(inbox),
+        "by_state": by_state,
+        "unread_count": by_state.get("unread", 0),
+        "delivered_count": by_state.get("delivered", 0),
+        "acknowledged_count": by_state.get("acknowledged", 0),
+        "queryable": isinstance(inbox, list),
+        "delivery_channel": NOTIFICATION_DELIVERY_CHANNEL,
+        "push_capability": NOTIFICATION_DELIVERY_PUSH_CAPABILITY,
+        "true_push_supported": False,
+        "push_limitation": NOTIFICATION_DELIVERY_PUSH_LIMITATION,
+        "detail": (
+            f"{len(inbox)} notification(s) in the pull inbox for consumer "
+            f"{consumer_id}; unread={by_state.get('unread', 0)} "
+            f"delivered={by_state.get('delivered', 0)} "
+            f"acknowledged={by_state.get('acknowledged', 0)}"
+        ),
+    }
+
+
+def notification_delivery_adapter_report(now: datetime | None = None) -> dict:
+    """Build the PERSONAL_AI_NOTIFICATION_DELIVERY_ADAPTER_V0.1 report.
+
+    It drives a real, disposable chain: PASS/FAIL/BLOCKED/PENDING_APPROVAL probe
+    tasks are classified by the existing notification consumer, then pulled
+    through the delivery adapter twice to prove idempotency, the read/unread
+    state is exercised, the Human Gate is shown to be untouched, and a real
+    ``completion_event -> handle_completion_event -> pull_notifications`` chain
+    is linked. The inability to truly push into a ChatGPT session is reported
+    explicitly instead of being faked.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)
+    seq = uuid.uuid4().hex[:10]
+    consumer_id = f"delivery-adapter-consumer-{seq}"
+    pending_probe = f"delivery-adapter-pending-{seq}"
+    pass_probe = f"delivery-adapter-pass-{seq}"
+    fail_probe = f"delivery-adapter-fail-{seq}"
+    blocked_probe = f"delivery-adapter-blocked-{seq}"
+    chain_probe = f"delivery-adapter-chain-{seq}"
+    probe_ids = {pending_probe, pass_probe, fail_probe, blocked_probe}
+
+    submit_task(
+        pending_probe,
+        goal=NOTIFICATION_DELIVERY_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    submit_task(
+        pass_probe,
+        goal=NOTIFICATION_DELIVERY_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    mark_reviewed(pass_probe, PASS, "notification delivery adapter PASS scenario")
+    submit_task(
+        fail_probe,
+        goal=NOTIFICATION_DELIVERY_ADAPTER_GOAL,
+        status="fail",
+        requires_review=True,
+    )
+    submit_task(
+        blocked_probe,
+        goal=NOTIFICATION_DELIVERY_ADAPTER_GOAL,
+        status="blocked",
+        requires_review=True,
+    )
+
+    review_states_before = {
+        task_id: bool(TASK_REGISTRY.get(task_id, {}).get("reviewed"))
+        for task_id in probe_ids
+    }
+
+    first = pull_notifications(consumer_id, now=now)
+    second = pull_notifications(consumer_id, now=now)
+
+    first_probe = [record for record in first["delivered"] if record["task_id"] in probe_ids]
+    second_probe = [
+        record for record in second["delivered"] if record["task_id"] in probe_ids
+    ]
+    observed_classes = {record["classification"] for record in first_probe}
+    all_classes_present = set(NOTIFICATION_CLASSES) <= observed_classes
+    classification_by_task = {
+        task_id: sorted(
+            {
+                record["classification"]
+                for record in first_probe
+                if record["task_id"] == task_id
+            }
+        )
+        for task_id in sorted(probe_ids)
+    }
+    idempotent = bool(first_probe) and not second_probe
+
+    inbox_after = list_delivery_inbox(consumer_id)
+    delivered_states = {
+        task_id: next(
+            (
+                item["delivery_state"]
+                for item in inbox_after
+                if item["task_id"] == task_id
+            ),
+            None,
+        )
+        for task_id in sorted(probe_ids)
+    }
+    delivered_ok = all(
+        state == "delivered" for state in delivered_states.values()
+    )
+
+    pass_notification = next(
+        (record for record in first_probe if record["task_id"] == pass_probe), None
+    )
+    ack = acknowledge_notification(
+        pass_notification["notification_key"], consumer_id, now=now
+    )
+    ack_repeat = acknowledge_notification(
+        pass_notification["notification_key"], consumer_id, now=now
+    )
+    inbox_acked = list_delivery_inbox(consumer_id, task_id=pass_probe)
+    pass_state_after = next(
+        (item["delivery_state"] for item in inbox_acked), None
+    )
+    read_state_ok = bool(
+        ack["delivery_state"] == "acknowledged"
+        and ack_repeat["delivery_state"] == "acknowledged"
+        and ack_repeat["delivery_seq"] == ack["delivery_seq"]
+        and pass_state_after == "acknowledged"
+        and all(item["read"] for item in inbox_acked)
+    )
+
+    review_states_after = {
+        task_id: bool(TASK_REGISTRY.get(task_id, {}).get("reviewed"))
+        for task_id in probe_ids
+    }
+    review_states_unchanged = review_states_before == review_states_after
+    dispatch_events = [
+        event
+        for event in get_consumption_evidence()
+        if event.get("event_type") == AUTO_DISPATCH_EVENT
+        and event.get("task_id") in probe_ids
+    ]
+    no_auto_dispatch = not dispatch_events
+    pending_record = get_task_review(pending_probe) or {}
+    gate_ok = bool(
+        review_states_unchanged
+        and no_auto_dispatch
+        and pending_record.get("reviewed") is False
+        and pending_record.get("review_verdict") is None
+        and all(
+            record["human_review_gate"]
+            and not record["auto_pass"]
+            and not record["auto_trigger_next"]
+            for record in first_probe
+        )
+    )
+
+    completion_event = build_completion_event(
+        chain_probe,
+        status="success",
+        tests="1 passed in 0.01s",
+        execution_result=_event_driven_terminal_result(chain_probe),
+    )
+    handled = handle_completion_event(completion_event, auto_apply=False)
+    chain_pull = pull_notifications(consumer_id, task_id=chain_probe, now=now)
+    chain_delivered = chain_pull["delivered"]
+    real_chain = {
+        "task_id": chain_probe,
+        "completion_event_action": handled["action"],
+        "review_ready": handled["review_ready"]["review_ready"],
+        "auto_applied": handled["review"]["auto_applied"],
+        "delivered_classifications": sorted(
+            {record["classification"] for record in chain_delivered}
+        ),
+        "delivery_channel": NOTIFICATION_DELIVERY_CHANNEL,
+    }
+    real_chain_ok = bool(
+        real_chain["completion_event_action"] == "completion_event_handled"
+        and real_chain["review_ready"]
+        and real_chain["auto_applied"] is False
+        and NOTIFICATION_CLASS_PENDING_APPROVAL
+        in real_chain["delivered_classifications"]
+    )
+
+    contracts_unchanged = (
+        list(inspect.signature(submit_task).parameters) == SUBMIT_TASK_PARAMS
+        and list(inspect.signature(get_task_result).parameters) == ["task_id"]
+        and list(inspect.signature(mark_reviewed).parameters)
+        == ["task_id", "verdict", "note"]
+    )
+
+    delivery_status = notification_delivery_status(consumer_id)
+    ledger = notification_ledger_status()
+    no_duplicate_events = idempotent and second["delivered_count"] == 0
+    push_ok = bool(
+        delivery_status["true_push_supported"] is False
+        and delivery_status["push_capability"] == NOTIFICATION_DELIVERY_PUSH_CAPABILITY
+        and NOTIFICATION_DELIVERY_PUSH_LIMITATION
+    )
+
+    limitations = [
+        NOTIFICATION_DELIVERY_PUSH_LIMITATION,
+        "Pull interface (delivered): pull_notifications() / list_delivery_inbox() "
+        "are the stable consumption entrypoints; they are idempotent per "
+        "consumer and persist read/unread state, so a client can discover new "
+        "notifications without manually calling get_task_result.",
+        "Workflow wiring (out of scope, not applied): no .github workflow is "
+        "modified. A runner or an MCP tool call can invoke pull_notifications() "
+        "after a completion event without a workflow change.",
+        "Human Gate: the delivery adapter is read-only over the execution layer; "
+        "it never reviews, never PASSes and never dispatches, so delivering a "
+        "notification cannot start an unapproved next task.",
+        "Scope: only hello.py and test_hello.py are changed; submit_task, "
+        "get_task_result and mark_reviewed contracts are preserved and no "
+        "secret/scope gate is weakened.",
+    ]
+
+    checks = [
+        {
+            "check": "explicit notification consumption entry discoverable",
+            "status": PASS if (callable(pull_notifications) and bool(first_probe))
+            else FAIL,
+            "detail": (
+                "pull_notifications()/list_delivery_inbox() pulled "
+                f"{len(first_probe)} new probe notification(s) for consumer "
+                f"{consumer_id} without any manual get_task_result call"
+            ),
+        },
+        {
+            "check": "PASS/FAIL/BLOCKED/PENDING_APPROVAL all readable and classified",
+            "status": PASS if all_classes_present else FAIL,
+            "detail": (
+                "observed classifications: "
+                + ", ".join(sorted(observed_classes))
+                + "; each delivered record keeps its classification/category"
+            ),
+        },
+        {
+            "check": "repeated read/consumption is idempotent",
+            "status": PASS if no_duplicate_events else FAIL,
+            "detail": (
+                f"first pull delivered {len(first_probe)} probe notification(s); "
+                f"an identical second pull delivered {len(second_probe)} and "
+                f"{second['delivered_count']} total (no duplicate events)"
+            ),
+        },
+        {
+            "check": "read/unread consumption state tracked",
+            "status": PASS if (delivered_ok and read_state_ok) else FAIL,
+            "detail": (
+                "probe records reached delivery_state=delivered; "
+                f"acknowledge_notification() marked {pass_probe} acknowledged "
+                "(read=True) and a repeated acknowledgement was a no-op"
+            ),
+        },
+        {
+            "check": "Human Gate preserved",
+            "status": PASS if gate_ok else FAIL,
+            "detail": (
+                "review states unchanged, no auto review, no auto dispatch, "
+                "every delivered notification has human_review_gate=True, "
+                "auto_pass=False, auto_trigger_next=False"
+            ),
+        },
+        {
+            "check": "real push capability boundary stated",
+            "status": PASS if push_ok else FAIL,
+            "detail": (
+                "true_push_supported=False; channel="
+                f"{NOTIFICATION_DELIVERY_CHANNEL}; limitation recorded explicitly"
+            ),
+        },
+        {
+            "check": "real completion-event chain reaches delivery adapter",
+            "status": PASS if real_chain_ok else FAIL,
+            "detail": (
+                f"{chain_probe}: completion event -> "
+                f"{real_chain['completion_event_action']} -> review_ready="
+                f"{real_chain['review_ready']} -> delivered="
+                + (", ".join(real_chain["delivered_classifications"]) or "none")
+            ),
+        },
+        {
+            "check": "contracts unchanged and no Router/orchestrator/multi-agent",
+            "status": PASS if contracts_unchanged else FAIL,
+            "detail": (
+                "submit_task/get_task_result/mark_reviewed signatures unchanged; "
+                "single idempotent pull adapter, no Router, generic orchestrator "
+                "or multi-agent scheduler added"
+            ),
+        },
+    ]
+
+    if any(check["status"] == FAIL for check in checks):
+        final = FAIL
+    else:
+        final = PASS
+
+    lines = [
+        f"# {NOTIFICATION_DELIVERY_ADAPTER_REPORT}",
+        "",
+        f"- goal: {NOTIFICATION_DELIVERY_ADAPTER_GOAL}",
+        f"- task_id: {NOTIFICATION_DELIVERY_ADAPTER_TASK_ID}",
+        f"- FINAL: {final}",
+        f"- entrypoint: pull_notifications / list_delivery_inbox",
+        f"- delivery_channel: {NOTIFICATION_DELIVERY_CHANNEL}",
+        f"- true_push_supported: False",
+        "- human_review_gate: True",
+        "- auto_pass: False",
+        "- auto_trigger_next: False",
+        "",
+        "## Consumable inbox",
+        f"- consumer_id: {consumer_id}",
+        f"- first_pull_delivered: {first['delivered_count']}",
+        f"- repeated_pull_delivered: {second['delivered_count']}",
+        f"- unread_count: {delivery_status['unread_count']}",
+        f"- delivered_count: {delivery_status['delivered_count']}",
+        f"- acknowledged_count: {delivery_status['acknowledged_count']}",
+        "",
+        "## Classifications",
+    ]
+    for task_id in sorted(probe_ids):
+        lines.append(
+            f"- {task_id}: "
+            + (", ".join(classification_by_task[task_id]) or "none")
+        )
+    lines += [
+        "",
+        "## Idempotency & read state",
+        f"- idempotent: {idempotent}",
+        f"- no_duplicate_events: {no_duplicate_events}",
+        f"- delivered_state_ok: {delivered_ok}",
+        f"- read_state_ok: {read_state_ok}",
+        "",
+        "## Real completion-event chain",
+        f"- task_id: {real_chain['task_id']}",
+        f"- action: {real_chain['completion_event_action']}",
+        f"- review_ready: {real_chain['review_ready']}",
+        f"- auto_applied: {real_chain['auto_applied']}",
+        f"- delivered: "
+        + (", ".join(real_chain["delivered_classifications"]) or "none"),
+        "",
+        "## Notification ledger",
+        f"- ledger_store: {ledger['path']}",
+        f"- delivery_store: {delivery_status['path']}",
+        f"- notification_count: {ledger['notification_count']}",
+        "",
+        "## Limitations",
+    ]
+    lines += [f"- {item}" for item in limitations]
+    lines += ["", "## Checks"]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final}"]
+
+    return {
+        "report": NOTIFICATION_DELIVERY_ADAPTER_REPORT,
+        "goal": NOTIFICATION_DELIVERY_ADAPTER_GOAL,
+        "task_id": NOTIFICATION_DELIVERY_ADAPTER_TASK_ID,
+        "status": final,
+        "final_status": final,
+        "acceptance_fields": list(NOTIFICATION_DELIVERY_ACCEPTANCE_FIELDS),
+        "entrypoint": "pull_notifications",
+        "delivery_channel": NOTIFICATION_DELIVERY_CHANNEL,
+        "push_capability": NOTIFICATION_DELIVERY_PUSH_CAPABILITY,
+        "true_push_supported": False,
+        "push_limitation": NOTIFICATION_DELIVERY_PUSH_LIMITATION,
+        "consumer_id": consumer_id,
+        "categories": list(NOTIFICATION_CLASSES),
+        "observed_classifications": sorted(observed_classes),
+        "all_classes_present": all_classes_present,
+        "classification_by_task": classification_by_task,
+        "first_pull_delivered_count": first["delivered_count"],
+        "repeated_pull_delivered_count": second["delivered_count"],
+        "probe_notifications": first_probe,
+        "idempotent": idempotent,
+        "no_duplicate_events": no_duplicate_events,
+        "delivered_state_ok": delivered_ok,
+        "read_state_ok": read_state_ok,
+        "delivery_status": delivery_status,
+        "notification_ledger": ledger,
+        "human_gate_preserved": gate_ok,
+        "review_states_unchanged": review_states_unchanged,
+        "no_auto_dispatch": no_auto_dispatch,
+        "real_chain": real_chain,
+        "real_chain_ok": real_chain_ok,
+        "limitations": limitations,
+        "checks": checks,
+        "contracts_unchanged": contracts_unchanged,
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "no_router": True,
+        "no_orchestrator": True,
+        "no_multi_agent": True,
+        "workflow_modified": False,
+        "changed_files": ["hello.py", "test_hello.py"],
+        "submit_task_contract": "UNCHANGED",
+        "get_task_result_contract": "UNCHANGED",
+        "mark_reviewed_contract": "COMPATIBLE",
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(runtime_provenance_v0_1_report()["markdown"])
     print(cloudflare_runtime_audit_report()["markdown"])
@@ -13960,3 +14762,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(autonomous_advancement_production_evidence_audit()["markdown"])
     print(personal_ai_event_driven_review_trigger_v0_1()["markdown"])
     print(event_notification_consumer_report()["markdown"])
+    print(notification_delivery_adapter_report()["markdown"])
