@@ -48,6 +48,20 @@ REQUIRED_RESULT_FIELDS = (
 )
 DEPLOY_WORKFLOW_HINTS = ("deploy", "wrangler", "cloudflare", "mcp")
 
+VERIFY_TESTS_TIMEOUT_POLICY_MIN_MINUTES = 10
+VERIFY_TESTS_TIMEOUT_POLICY_MAX_MINUTES = 15
+
+
+def verify_tests_timeout_is_within_policy(minutes: int) -> bool:
+    """Return whether a Verify-tests step timeout satisfies the hardening policy."""
+    if isinstance(minutes, bool) or not isinstance(minutes, int):
+        raise TypeError("minutes must be an int")
+    return (
+        VERIFY_TESTS_TIMEOUT_POLICY_MIN_MINUTES
+        <= minutes
+        <= VERIFY_TESTS_TIMEOUT_POLICY_MAX_MINUTES
+    )
+
 
 def hello() -> str:
     """Return a greeting."""

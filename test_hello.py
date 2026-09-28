@@ -3,6 +3,7 @@
 import inspect
 import json
 import pathlib
+import re
 import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -99,6 +100,8 @@ from hello import (
     RESULT_SCHEMA_PRESERVATION_UNKNOWN_FIELD,
     STATUS_MODEL_EXPECTED_FIELDS,
     TASK_REVIEW_GOAL,
+    VERIFY_TESTS_TIMEOUT_POLICY_MAX_MINUTES,
+    VERIFY_TESTS_TIMEOUT_POLICY_MIN_MINUTES,
     AUTONOMOUS_ADVANCEMENT_EVIDENCE_ENV,
     AUTONOMOUS_ADVANCEMENT_EVIDENCE_PATH_ENV,
     AUTONOMOUS_ADVANCEMENT_FINAL_BLOCKED_EVIDENCE,
@@ -173,6 +176,7 @@ from hello import (
     task_result_auto_consumer_report,
     task_review_action_report,
     trigger_bridge_test,
+    verify_tests_timeout_is_within_policy,
     write_production_golden_runtime_execution_result,
 )
 
@@ -5737,3 +5741,58 @@ def test_verify_tests_step_declares_a_timeout() -> None:
     workflow = workflow_path.read_text(encoding="utf-8")
     assert "name: Verify tests (independent)" in workflow
     assert "timeout-minutes:" in workflow
+
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[0]
+
+
+def test_verify_tests_timeout_policy_band_is_ten_to_fifteen_minutes() -> None:
+    assert VERIFY_TESTS_TIMEOUT_POLICY_MIN_MINUTES == 10
+    assert VERIFY_TESTS_TIMEOUT_POLICY_MAX_MINUTES == 15
+    assert VERIFY_TESTS_TIMEOUT_POLICY_MIN_MINUTES < VERIFY_TESTS_TIMEOUT_POLICY_MAX_MINUTES
+
+
+def test_verify_tests_timeout_policy_accepts_safe_growth_band() -> None:
+    for minutes in range(10, 16):
+        assert verify_tests_timeout_is_within_policy(minutes) is True
+
+
+def test_verify_tests_timeout_policy_rejects_too_short_or_too_long() -> None:
+    for minutes in (0, 1, 2, 3, 9, 16, 25, 30):
+        assert verify_tests_timeout_is_within_policy(minutes) is False
+
+
+def test_verify_tests_timeout_policy_rejects_non_integer_values() -> None:
+    with pytest.raises(TypeError):
+        verify_tests_timeout_is_within_policy("3")
+    with pytest.raises(TypeError):
+        verify_tests_timeout_is_within_policy(True)
+
+
+def test_verify_tests_timeout_policy_flags_current_three_minute_budget() -> None:
+    assert verify_tests_timeout_is_within_policy(3) is False
+
+
+def test_verify_tests_step_declares_numeric_timeout() -> None:
+    workflow = (
+        REPO_ROOT / ".github" / "workflows" / "agent-dispatch.yml"
+    ).read_text(encoding="utf-8")
+    block = workflow.split("name: Verify tests (independent)", 1)[1]
+    block = block.split("- name:", 1)[0]
+    match = re.search(r"timeout-minutes:\s*(\d+)", block)
+    assert match, "Verify tests step must declare a numeric timeout"
+    assert int(match.group(1)) > 0
+
+
+def test_scope_guard_still_forbids_workflow_paths() -> None:
+    source = (REPO_ROOT / "scripts" / "scope_guard.py").read_text(encoding="utf-8")
+    assert 'FORBIDDEN_PREFIXES = (".github/workflows/",)' in source
+    assert "deletion forbidden" in source
+    assert "modification outside task allowlist" in source
+
+
+def test_secret_guard_still_detects_api_keys() -> None:
+    source = (REPO_ROOT / "scripts" / "secret_guard.py").read_text(encoding="utf-8")
+    assert "KEY_PATTERN = re.compile" in source
+    assert r"sk-[A-Za-z0-9]{10,}" in source
+    assert "MODEL_API_KEY" in source
