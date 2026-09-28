@@ -204,6 +204,7 @@ _RESETTABLE_HELLO_STATE = (
     "PRODUCTION_TERMINAL_EVIDENCE",
     "NOTIFICATION_LEDGER",
     "NOTIFICATION_DELIVERIES",
+    "PUSH_OUTBOX",
 )
 
 
@@ -223,6 +224,11 @@ def isolate_hello_state(monkeypatch, tmp_path):
         hello_module.CONSUMER_EVIDENCE_ENV,
         str(state_dir / "consumer_evidence.json"),
     )
+    monkeypatch.setenv(
+        hello_module.PUSH_OUTBOX_STATE_ENV,
+        str(state_dir / "push_outbox.json"),
+    )
+    monkeypatch.delenv(hello_module.PUSH_EXTERNAL_ENDPOINT_ENV, raising=False)
     for name in _RESETTABLE_HELLO_STATE:
         container = getattr(hello_module, name, None)
         if container is not None:
@@ -6315,3 +6321,326 @@ def test_mcp_notification_reader_golden_contracts_and_no_router() -> None:
         "mark_delivered",
         "now",
     ]
+
+
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_B_MINIMAL_TRUE_PUSH_V0.1 (task cf-26c20a48d03c)
+# Minimal Push Adapter / Outbox over the existing notification delivery layer.
+# ---------------------------------------------------------------------------
+
+
+def test_execution_a_golden_cf_0f908ee294c4_baseline_intact() -> None:
+    integrity = hello_module.execution_a_golden_baseline_integrity()
+    assert integrity["task_id"] == "cf-0f908ee294c4"
+    assert integrity["goal"] == "MOBILE_CLOUD_AGENT_INDEPENDENT_E2E_GOLDEN_01"
+    assert integrity["intact"] is True
+    assert integrity["status"] == "PASS"
+    assert integrity["modified"] is False
+    assert integrity["sha256"]["recomputed_digest"] == (
+        hello_module.EXECUTION_A_GOLDEN_SHA256
+    )
+    assert integrity["sha256"]["recorded_digest"] == (
+        hello_module.EXECUTION_A_GOLDEN_SHA256
+    )
+    assert all(integrity["checks"].values())
+
+
+def test_push_envelope_builder_is_machine_readable() -> None:
+    notification = {
+        "task_id": "task-x",
+        "classification": hello_module.NOTIFICATION_CLASS_PENDING_APPROVAL,
+        "notification_key": "task-x|PENDING_APPROVAL|sig",
+        "message": "Task task-x awaits an explicit human approval",
+        "requires_human_approval": True,
+    }
+    envelope = hello_module.build_push_envelope(notification)
+    for field in hello_module.PUSH_ENVELOPE_FIELDS:
+        assert field in envelope
+    assert envelope["schema"] == hello_module.PUSH_ENVELOPE_SCHEMA
+    assert envelope["classification"] == (
+        hello_module.NOTIFICATION_CLASS_PENDING_APPROVAL
+    )
+    assert envelope["review_required"] is True
+    assert envelope["summary"]
+    assert envelope["dedupe_key"] == hello_module.push_envelope_dedupe_key(
+        "task-x",
+        hello_module.NOTIFICATION_CLASS_PENDING_APPROVAL,
+        "task-x|PENDING_APPROVAL|sig",
+    )
+    assert envelope["state"] == "pending"
+    assert envelope["attempt_count"] == 0
+    assert envelope["retryable"] is True
+    assert envelope["human_review_gate"] is True
+    assert envelope["auto_pass"] is False
+    assert envelope["auto_trigger_next"] is False
+    json.dumps(envelope, sort_keys=True)
+
+
+def test_push_envelope_review_required_only_for_pending_approval() -> None:
+    for classification in hello_module.NOTIFICATION_CLASSES:
+        envelope = hello_module.build_push_envelope(
+            {"task_id": f"t-{classification}", "classification": classification}
+        )
+        expected = (
+            classification == hello_module.NOTIFICATION_CLASS_PENDING_APPROVAL
+        )
+        assert envelope["review_required"] is expected
+
+
+def test_push_adapter_enqueue_is_idempotent_on_dedupe_key() -> None:
+    task_id = _notification_probe("push-idempotent")
+    hello_module.submit_task(
+        task_id,
+        goal=hello_module.PUSH_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    consumer_one = f"push-consumer-{uuid.uuid4().hex[:8]}"
+    first = hello_module.enqueue_push_envelopes(consumer_one, task_id=task_id)
+    assert first["created_count"] == 1
+    envelope = first["created"][0]
+    assert envelope["classification"] == (
+        hello_module.NOTIFICATION_CLASS_PENDING_APPROVAL
+    )
+    # Same consumer: the pull adapter is already idempotent.
+    same = hello_module.enqueue_push_envelopes(consumer_one, task_id=task_id)
+    assert same["created_count"] == 0
+    # Different consumer re-delivers the notification, but the outbox dedupe
+    # key still suppresses a duplicate envelope.
+    consumer_two = f"push-consumer-{uuid.uuid4().hex[:8]}"
+    deduped = hello_module.enqueue_push_envelopes(consumer_two, task_id=task_id)
+    assert deduped["created_count"] == 0
+    assert envelope["dedupe_key"] in deduped["skipped_duplicate"]
+    assert len(hello_module.list_push_envelopes(task_id=task_id)) == 1
+
+
+def test_push_adapter_retry_semantics_are_bounded() -> None:
+    task_id = _notification_probe("push-retry")
+    hello_module.submit_task(
+        task_id,
+        goal=hello_module.PUSH_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    consumer = f"push-consumer-{uuid.uuid4().hex[:8]}"
+    queued = hello_module.enqueue_push_envelopes(consumer, task_id=task_id)
+    key = queued["created"][0]["dedupe_key"]
+
+    calls = {"count": 0}
+
+    def flaky_sender(envelope: dict) -> dict:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {"ok": False, "error": "synthetic_transient"}
+        return {"ok": True}
+
+    first = hello_module.deliver_push_envelope(key, sender=flaky_sender)
+    assert first["state"] == "retry"
+    assert first["attempt_count"] == 1
+    assert first["retryable"] is True
+    second = hello_module.deliver_push_envelope(key, sender=flaky_sender)
+    assert second["state"] == "delivered"
+    assert second["attempt_count"] == 2
+    assert second["retryable"] is False
+    assert hello_module.get_push_envelope(key)["state"] == "delivered"
+
+
+def test_push_adapter_retry_exhaustion_blocks() -> None:
+    task_id = _notification_probe("push-exhaust")
+    hello_module.submit_task(
+        task_id,
+        goal=hello_module.PUSH_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    consumer = f"push-consumer-{uuid.uuid4().hex[:8]}"
+    queued = hello_module.enqueue_push_envelopes(consumer, task_id=task_id)
+    key = queued["created"][0]["dedupe_key"]
+
+    def dead_sender(envelope: dict) -> dict:
+        return {"ok": False, "error": "synthetic_permanent"}
+
+    states = [
+        hello_module.deliver_push_envelope(key, sender=dead_sender)["state"]
+        for _ in range(hello_module.PUSH_MAX_ATTEMPTS)
+    ]
+    assert states == ["retry", "retry", "blocked"]
+    final = hello_module.get_push_envelope(key)
+    assert final["state"] == "blocked"
+    assert final["retryable"] is False
+    assert final["last_error"]
+
+
+def test_push_adapter_external_leg_is_blocked_not_faked() -> None:
+    report = hello_module.push_adapter_report()
+    assert report["status"] == "BLOCKED"
+    assert report["final_status"] == "BLOCKED"
+    assert report["external_blocker"] == hello_module.BLOCKED_EXTERNAL_ENDPOINT
+    assert report["external_endpoint_configured"] is False
+    assert report["true_push_supported"] is False
+    assert report["external_blocked_ok"] is True
+    assert report["required_human_actions"]
+    assert any(
+        hello_module.PUSH_EXTERNAL_ENDPOINT_ENV in item
+        for item in report["required_human_actions"]
+    )
+    external_check = next(
+        check
+        for check in report["checks"]
+        if "external true-push" in check["check"]
+    )
+    assert external_check["status"] == "BLOCKED"
+
+
+def test_push_adapter_report_shape() -> None:
+    report = hello_module.push_adapter_report()
+    assert report["report"] == hello_module.PUSH_ADAPTER_REPORT
+    assert report["goal"] == hello_module.PUSH_ADAPTER_GOAL
+    assert report["task_id"] == hello_module.PUSH_ADAPTER_TASK_ID
+    assert report["task_id"] == "cf-26c20a48d03c"
+    assert report["status"] in VALID_STATUSES
+    assert report["final_status"] == report["status"]
+    assert report["entrypoint"] == "enqueue_push_envelopes"
+    assert report["envelope_schema"] == hello_module.PUSH_ENVELOPE_SCHEMA
+    assert report["envelope_fields"] == list(hello_module.PUSH_ENVELOPE_FIELDS)
+    assert report["channel"] == hello_module.PUSH_ENVELOPE_CHANNEL
+    assert report["acceptance_fields"] == list(
+        hello_module.PUSH_ADAPTER_ACCEPTANCE_FIELDS
+    )
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in VALID_STATUSES
+        assert check["detail"]
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {hello_module.PUSH_ADAPTER_REPORT}")
+    for token in (
+        "## Envelope contract",
+        "## Classifications",
+        "## Idempotency & retry",
+        "## Real completion-event chain",
+        "## Execution A Golden baseline",
+        "## Required human actions to close true push",
+        "## Limitations",
+        "## Checks",
+    ):
+        assert token in markdown
+    assert "FINAL_STATUS=BLOCKED" in markdown
+
+
+def test_push_adapter_generates_all_four_classifications() -> None:
+    report = hello_module.push_adapter_report()
+    assert report["all_classes_present"] is True
+    assert set(hello_module.NOTIFICATION_CLASSES) <= set(
+        report["observed_classifications"]
+    )
+    assert report["machine_readable_ok"] is True
+    assert report["dedupe_keys_unique"] is True
+    for envelope in report["probe_envelopes"]:
+        for field in hello_module.PUSH_ENVELOPE_FIELDS:
+            assert field in envelope
+        assert envelope["human_review_gate"] is True
+        assert envelope["auto_pass"] is False
+        assert envelope["auto_trigger_next"] is False
+
+
+def test_push_adapter_report_retry_and_golden_and_chain() -> None:
+    report = hello_module.push_adapter_report()
+    assert report["idempotent"] is True
+    assert report["retry_semantics_ok"] is True
+    assert report["exhaustion_ok"] is True
+    assert report["exhaustion_states"] == ["retry", "retry", "blocked"]
+    assert report["real_chain_ok"] is True
+    assert report["execution_a_golden"]["intact"] is True
+    chain = report["real_chain"]
+    assert chain["completion_event_action"] == "completion_event_handled"
+    assert chain["review_ready"] is True
+    assert chain["auto_applied"] is False
+    assert hello_module.NOTIFICATION_CLASS_PENDING_APPROVAL in (
+        chain["envelope_classifications"]
+    )
+
+
+def test_push_adapter_preserves_human_gate() -> None:
+    report = hello_module.push_adapter_report()
+    assert report["human_gate_preserved"] is True
+    assert report["review_states_unchanged"] is True
+    assert report["no_auto_dispatch"] is True
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+
+
+def test_push_adapter_no_router_or_orchestrator() -> None:
+    report = hello_module.push_adapter_report()
+    assert report["contracts_unchanged"] is True
+    assert report["no_router"] is True
+    assert report["no_orchestrator"] is True
+    assert report["no_multi_agent"] is True
+    assert report["workflow_modified"] is False
+    assert report["changed_files"] == ["hello.py", "test_hello.py"]
+    assert list(
+        inspect.signature(hello_module.enqueue_push_envelopes).parameters
+    ) == ["consumer_id", "task_id", "classification", "now"]
+    assert list(
+        inspect.signature(hello_module.deliver_push_envelope).parameters
+    ) == ["dedupe_key", "sender", "now"]
+
+
+def test_push_adapter_outbox_persisted_and_queryable() -> None:
+    task_id = _notification_probe("push-persist")
+    hello_module.submit_task(
+        task_id,
+        goal=hello_module.PUSH_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    consumer = f"push-consumer-{uuid.uuid4().hex[:8]}"
+    hello_module.enqueue_push_envelopes(consumer, task_id=task_id)
+    path = hello_module.get_push_outbox_path()
+    assert path.is_file()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["kind"] == hello_module.PUSH_OUTBOX_EVIDENCE_KIND
+    assert any(item["task_id"] == task_id for item in saved["envelopes"])
+    status = hello_module.push_outbox_status()
+    assert status["persisted"] is True
+    assert status["queryable"] is True
+    assert status["pending_count"] >= 1
+    assert status["external_endpoint_configured"] is False
+    assert status["external_blocker"] == hello_module.BLOCKED_EXTERNAL_ENDPOINT
+
+
+def test_push_adapter_validates_inputs() -> None:
+    with pytest.raises(ValueError):
+        hello_module.get_push_envelope("")
+    with pytest.raises(KeyError):
+        hello_module.deliver_push_envelope("does-not-exist")
+    with pytest.raises(ValueError):
+        hello_module.deliver_push_envelope("")
+    with pytest.raises(ValueError):
+        hello_module.enqueue_push_envelopes("")
+    with pytest.raises(ValueError):
+        hello_module.push_envelope_dedupe_key("", "PASS")
+    with pytest.raises(ValueError):
+        hello_module.build_push_envelope(
+            {"task_id": "t", "classification": "NOT_A_CLASS"}
+        )
+    with pytest.raises(ValueError):
+        hello_module.build_push_envelope({"classification": "PASS"})
+
+
+def test_push_adapter_explicit_endpoint_env_does_not_claim_pass(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        hello_module.PUSH_EXTERNAL_ENDPOINT_ENV,
+        "https://push.invalid/authorized-endpoint",
+    )
+    status = hello_module.push_outbox_status()
+    assert status["external_endpoint_configured"] is True
+    assert status["external_blocker"] is None
+    # Even when an endpoint is declared, no credentialed sender is wired into
+    # the report builder, so the real push leg must still not be claimed PASS.
+    report = hello_module.push_adapter_report()
+    assert report["status"] == "BLOCKED"
+    assert report["external_blocker"] == hello_module.BLOCKED_EXTERNAL_ENDPOINT

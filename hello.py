@@ -15433,6 +15433,1040 @@ def mcp_notification_reader_golden_verify(now: datetime | None = None) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_B_MINIMAL_TRUE_PUSH_V0.1  (task cf-26c20a48d03c)
+#
+# Minimal server-side preparation for Execution B: turn an already-classified,
+# durable notification (from the existing event notification consumer / delivery
+# inbox) into a one-time OUTBOUND PUSH ENVELOPE held in an idempotent, retryable
+# outbox. This does NOT rebuild the notification system and adds no Router,
+# generic orchestrator or multi-agent platform.
+#
+# The envelope is machine-readable and carries exactly:
+#   task_id, classification, summary, review_required, dedupe_key, created_at
+# plus outbox bookkeeping (state / attempt_count / retryable / ...). Enqueue is
+# idempotent on dedupe_key; delivery is retryable up to a bounded attempt count.
+#
+# The adapter is strictly read-only with respect to the execution layer: it
+# never reviews, never grants PASS and never dispatches, so the Human Gate is
+# never bypassed and an envelope can never start an unapproved next task.
+#
+# Real push boundary: there is NO authorized external target endpoint or
+# credential reachable from this repository/runner, and a pull inbox / MCP read
+# is NOT a true push. The outbox therefore stops at BLOCKED_EXTERNAL_ENDPOINT for
+# the real external delivery leg and says so explicitly instead of faking an
+# end-to-end true-push PASS. Only the in-process dispatch seam (used to prove
+# retry semantics) is exercised locally.
+# ---------------------------------------------------------------------------
+
+PUSH_ADAPTER_GOAL = "PERSONAL_AI_EXECUTION_B_MINIMAL_TRUE_PUSH_V0.1"
+PUSH_ADAPTER_TASK_ID = "cf-26c20a48d03c"
+PUSH_ADAPTER_REPORT = "PERSONAL_AI_PUSH_ADAPTER_OUTBOX_REPORT"
+
+PUSH_OUTBOX_STATE_ENV = "PERSONAL_AI_PUSH_OUTBOX_STATE"
+PUSH_OUTBOX_STATE_DEFAULT = "personal_ai_push_outbox.json"
+PUSH_OUTBOX_EVIDENCE_KIND = "personal_ai_push_outbox"
+PUSH_OUTBOX_SOURCE = "push_adapter_outbox"
+
+PUSH_ENVELOPE_SCHEMA = "personal-ai-push-envelope/v1"
+PUSH_ENVELOPE_FIELDS = (
+    "task_id",
+    "classification",
+    "summary",
+    "review_required",
+    "dedupe_key",
+    "created_at",
+)
+PUSH_ENVELOPE_CHANNEL = "outbound_push_outbox"
+PUSH_ENVELOPE_PUSH_CAPABILITY = "outbox_queue_no_external_endpoint"
+PUSH_ENVELOPE_STATES = ("pending", "retry", "delivered", "blocked")
+PUSH_MAX_ATTEMPTS = 3
+
+PUSH_EXTERNAL_ENDPOINT_ENV = "PERSONAL_AI_PUSH_ENDPOINT"
+BLOCKED_EXTERNAL_ENDPOINT = "BLOCKED_EXTERNAL_ENDPOINT"
+
+# Server-side outbox only: no credentialed external sender is wired into the
+# report builder, so the real push leg can never be reported as PASS here.
+PUSH_EXTERNAL_SENDER_IMPLEMENTED = False
+
+PUSH_QUEUE_EVENT = "push_envelope_queued"
+PUSH_ATTEMPT_EVENT = "push_envelope_attempted"
+PUSH_DELIVERED_EVENT = "push_envelope_delivered"
+
+PUSH_ADAPTER_ACCEPTANCE_FIELDS = (
+    "machine-readable one-time outbound push envelope with task_id, "
+    "classification, summary, review_required, dedupe_key, created_at",
+    "PASS/FAIL/BLOCKED/PENDING_APPROVAL each generate a push envelope",
+    "enqueue is idempotent on dedupe_key (no duplicate envelope on re-read)",
+    "delivery is retryable with a bounded attempt count",
+    "Human Gate preserved; no auto review / auto pass / auto dispatch",
+    "external true-push leg is BLOCKED_EXTERNAL_ENDPOINT when no authorized "
+    "endpoint/credential exists (never faked as PASS)",
+    "no Router / generic orchestrator / multi-agent added; scope + secret "
+    "guards intact",
+)
+
+# Frozen independent Golden (Execution A) baseline evidence. These constants
+# describe an existing repository artifact that this task must NOT modify.
+EXECUTION_A_GOLDEN_TASK_ID = "cf-0f908ee294c4"
+EXECUTION_A_GOLDEN_GOAL = "MOBILE_CLOUD_AGENT_INDEPENDENT_E2E_GOLDEN_01"
+EXECUTION_A_GOLDEN_JSON = "PERSONAL_AI_MOBILE_CLOUD_E2E_PROBE.json"
+EXECUTION_A_GOLDEN_MD = "PERSONAL_AI_MOBILE_CLOUD_E2E_PROBE.md"
+EXECUTION_A_GOLDEN_INPUT = "personal-ai-mobile-cloud-e2e"
+EXECUTION_A_GOLDEN_SHA256 = (
+    "1e1adecec9caf932f005688de87d414c1f9aff58839881c50559f1cf7e3c0a14"
+)
+
+PUSH_OUTBOX: list[dict] = []
+
+
+def execution_a_golden_baseline_integrity() -> dict:
+    """Prove the frozen independent Golden cf-0f908ee294c4 baseline is intact.
+
+    Reads the two Execution A artifacts (never edits them) and re-derives the
+    fixed-string SHA-256 so the baseline cannot silently drift.
+    """
+    json_path = REPO_ROOT / EXECUTION_A_GOLDEN_JSON
+    md_path = REPO_ROOT / EXECUTION_A_GOLDEN_MD
+    json_available = json_path.is_file()
+    md_available = md_path.is_file()
+    data: dict = {}
+    if json_available:
+        try:
+            loaded = json.loads(json_path.read_text(encoding="utf-8"))
+            data = loaded if isinstance(loaded, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    md_text = md_path.read_text(encoding="utf-8") if md_available else ""
+    recomputed = hashlib.sha256(
+        EXECUTION_A_GOLDEN_INPUT.encode("utf-8")
+    ).hexdigest()
+    recorded = str((data.get("sha256") or {}).get("digest") or "")
+    checks = {
+        "json_present": json_available,
+        "md_present": md_available,
+        "task_id_matches": data.get("task_id") == EXECUTION_A_GOLDEN_TASK_ID,
+        "goal_matches": data.get("goal") == EXECUTION_A_GOLDEN_GOAL,
+        "overall_status_pass": data.get("overall_status") == PASS,
+        "sha256_recomputed_matches": recomputed == EXECUTION_A_GOLDEN_SHA256,
+        "sha256_recorded_matches": recorded == EXECUTION_A_GOLDEN_SHA256,
+        "markdown_consistent": bool(
+            EXECUTION_A_GOLDEN_SHA256 in md_text
+            and EXECUTION_A_GOLDEN_TASK_ID in md_text
+        ),
+    }
+    intact = all(checks.values())
+    return {
+        "task_id": EXECUTION_A_GOLDEN_TASK_ID,
+        "goal": EXECUTION_A_GOLDEN_GOAL,
+        "status": PASS if intact else FAIL,
+        "intact": intact,
+        "checks": checks,
+        "sha256": {
+            "input_string": EXECUTION_A_GOLDEN_INPUT,
+            "algorithm": "sha256",
+            "recorded_digest": recorded,
+            "recomputed_digest": recomputed,
+            "expected_digest": EXECUTION_A_GOLDEN_SHA256,
+        },
+        "artifacts": [EXECUTION_A_GOLDEN_JSON, EXECUTION_A_GOLDEN_MD],
+        "modified": False,
+        "detail": (
+            "Execution A Golden cf-0f908ee294c4 artifacts are present, "
+            "unmodified and self-consistent (recomputed SHA-256 matches)"
+            if intact
+            else "Execution A Golden cf-0f908ee294c4 baseline evidence drifted"
+        ),
+    }
+
+
+def get_push_outbox_path() -> Path:
+    """Return the durable push-outbox state path (env-overridable)."""
+    override = os.environ.get(PUSH_OUTBOX_STATE_ENV)
+    if override and override.strip():
+        return Path(override).expanduser()
+    return Path(tempfile.gettempdir()) / PUSH_OUTBOX_STATE_DEFAULT
+
+
+def _load_push_outbox() -> list[dict]:
+    path = get_push_outbox_path()
+    if not path.is_file():
+        return []
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(loaded, dict):
+        loaded = loaded.get("envelopes", [])
+    if not isinstance(loaded, list):
+        return []
+    return [dict(item) for item in loaded if isinstance(item, dict)]
+
+
+def _persist_push_outbox() -> bool:
+    path = get_push_outbox_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "kind": PUSH_OUTBOX_EVIDENCE_KIND,
+            "updated_at": _utc_now(),
+            "envelopes": push_outbox_records(),
+        }
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except OSError:
+        return False
+    return True
+
+
+def push_outbox_records() -> list[dict]:
+    """Return the durable envelopes, keyed/deduplicated by ``dedupe_key``.
+
+    In-memory records are applied after the persisted ones so a state
+    transition (for example ``retry`` -> ``delivered``) is never shadowed by the
+    older persisted copy.
+    """
+    merged: dict[str, dict] = {}
+    for item in _load_push_outbox() + PUSH_OUTBOX:
+        merged[str(item.get("dedupe_key"))] = dict(item)
+    records = list(merged.values())
+    records.sort(
+        key=lambda item: (
+            str(item.get("created_at")),
+            str(item.get("dedupe_key")),
+        )
+    )
+    return records
+
+
+def get_push_envelope(dedupe_key: str) -> dict | None:
+    """Return one envelope by its dedupe key, or ``None``."""
+    if not dedupe_key:
+        raise ValueError("get_push_envelope requires a dedupe_key")
+    for item in push_outbox_records():
+        if str(item.get("dedupe_key")) == str(dedupe_key):
+            return item
+    return None
+
+
+def list_push_envelopes(
+    *,
+    task_id: str | None = None,
+    classification: str | None = None,
+    state: str | None = None,
+) -> list[dict]:
+    """Return outbox envelopes with optional task / classification / state filters."""
+    records = push_outbox_records()
+    if task_id is not None:
+        records = [item for item in records if item.get("task_id") == task_id]
+    if classification is not None:
+        records = [
+            item for item in records if item.get("classification") == classification
+        ]
+    if state is not None:
+        records = [item for item in records if item.get("state") == state]
+    return records
+
+
+def push_envelope_dedupe_key(
+    task_id: str,
+    classification: str,
+    notification_key: str | None = None,
+) -> str:
+    """Return the deterministic one-time dedupe key for a push envelope."""
+    if not task_id:
+        raise ValueError("push_envelope_dedupe_key requires a task_id")
+    if not classification:
+        raise ValueError("push_envelope_dedupe_key requires a classification")
+    raw = str(notification_key or f"{task_id}|{classification}")
+    signal = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"push:{task_id}:{classification}:{signal}"
+
+
+def build_push_envelope(
+    notification: dict, *, now: datetime | None = None
+) -> dict:
+    """Build one machine-readable outbound push envelope from a notification.
+
+    The envelope carries the six contract fields (task_id, classification,
+    summary, review_required, dedupe_key, created_at) plus outbox bookkeeping.
+    It is created ``pending`` with ``human_review_gate=True`` and can never
+    carry an approval or a dispatch instruction.
+    """
+    if not isinstance(notification, dict):
+        raise TypeError("build_push_envelope requires a notification dict")
+    task_id = str(notification.get("task_id") or "")
+    classification = str(notification.get("classification") or "")
+    if not task_id:
+        raise ValueError("build_push_envelope requires a task_id")
+    if classification not in NOTIFICATION_CLASSES:
+        raise ValueError(
+            f"unknown notification classification: {classification!r}"
+        )
+    now = now if now is not None else datetime.now(timezone.utc)
+    summary = (
+        str(notification.get("message") or "").strip()
+        or str(notification.get("title") or "").strip()
+        or f"Task {task_id} classified {classification}"
+    )
+    review_required = bool(
+        notification.get("requires_human_approval")
+        or classification == NOTIFICATION_CLASS_PENDING_APPROVAL
+    )
+    dedupe_key = push_envelope_dedupe_key(
+        task_id, classification, notification.get("notification_key")
+    )
+    return {
+        "schema": PUSH_ENVELOPE_SCHEMA,
+        "envelope_id": dedupe_key,
+        "dedupe_key": dedupe_key,
+        "task_id": task_id,
+        "classification": classification,
+        "summary": summary,
+        "review_required": review_required,
+        "created_at": now.isoformat(),
+        "source": PUSH_OUTBOX_SOURCE,
+        "channel": PUSH_ENVELOPE_CHANNEL,
+        "push_capability": PUSH_ENVELOPE_PUSH_CAPABILITY,
+        "state": "pending",
+        "attempt_count": 0,
+        "max_attempts": PUSH_MAX_ATTEMPTS,
+        "retryable": True,
+        "last_attempt_at": None,
+        "delivered_at": None,
+        "last_error": None,
+        "external_blocker": None,
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+    }
+
+
+def _push_notification_index() -> dict[str, dict]:
+    return {
+        str(item.get("notification_key")): item for item in list_notifications()
+    }
+
+
+def enqueue_push_envelopes(
+    consumer_id: str = NOTIFICATION_DELIVERY_CONSUMER_DEFAULT,
+    *,
+    task_id: str | None = None,
+    classification: str | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Delivery-adapter -> outbox bridge: create one-time push envelopes.
+
+    It first delivers new notifications through the existing idempotent pull
+    adapter, then maps each newly delivered notification to a push envelope.
+    Enqueue is idempotent on ``dedupe_key``: a repeated call creates no duplicate
+    envelope. It never reviews, never PASSes and never dispatches.
+    """
+    if not consumer_id:
+        raise ValueError("enqueue_push_envelopes requires a consumer_id")
+    now = now if now is not None else datetime.now(timezone.utc)
+    pull = pull_notifications(
+        consumer_id,
+        task_id=task_id,
+        classification=classification,
+        now=now,
+    )
+    notifications = _push_notification_index()
+    existing = {str(item.get("dedupe_key")) for item in push_outbox_records()}
+    created: list[dict] = []
+    skipped: list[str] = []
+    for record in pull["delivered"]:
+        key = str(record.get("notification_key"))
+        source_notification = notifications.get(key) or record
+        envelope = build_push_envelope(source_notification, now=now)
+        if envelope["dedupe_key"] in existing:
+            skipped.append(envelope["dedupe_key"])
+            continue
+        existing.add(envelope["dedupe_key"])
+        PUSH_OUTBOX.append(envelope)
+        created.append(envelope)
+        record_consumer_evidence(
+            PUSH_QUEUE_EVENT,
+            envelope["task_id"],
+            detail=(
+                f"push envelope {envelope['dedupe_key']} queued "
+                f"({envelope['classification']})"
+            ),
+            extra={
+                "dedupe_key": envelope["dedupe_key"],
+                "classification": envelope["classification"],
+                "review_required": envelope["review_required"],
+                "consumer_id": consumer_id,
+                "channel": PUSH_ENVELOPE_CHANNEL,
+            },
+        )
+    _persist_push_outbox()
+    return {
+        "goal": PUSH_ADAPTER_GOAL,
+        "consumer_id": consumer_id,
+        "now": now.isoformat(),
+        "channel": PUSH_ENVELOPE_CHANNEL,
+        "has_new": bool(created),
+        "created": created,
+        "created_count": len(created),
+        "skipped_duplicate": skipped,
+        "skipped_count": len(skipped),
+        "delivered_notification_count": len(pull["delivered"]),
+        "outbox": push_outbox_records(),
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+    }
+
+
+def _push_external_endpoint_configured() -> bool:
+    value = os.environ.get(PUSH_EXTERNAL_ENDPOINT_ENV, "")
+    return bool(value and value.strip())
+
+
+def _update_push_envelope(updated: dict) -> dict:
+    PUSH_OUTBOX.append(dict(updated))
+    _persist_push_outbox()
+    return dict(updated)
+
+
+def deliver_push_envelope(
+    dedupe_key: str,
+    *,
+    sender=None,
+    now: datetime | None = None,
+) -> dict:
+    """Attempt delivery of one envelope through an (optionally injected) sender.
+
+    With ``sender=None`` (the real sandbox case, no authorized endpoint) the
+    envelope is marked ``blocked`` with ``external_blocker=
+    BLOCKED_EXTERNAL_ENDPOINT`` and never silently reported as delivered. When a
+    sender is supplied it must return ``{"ok": bool}`` (or raise); a failure
+    keeps the envelope ``retry`` up to ``max_attempts`` and then ``blocked``.
+    """
+    if not dedupe_key:
+        raise ValueError("deliver_push_envelope requires a dedupe_key")
+    envelope = get_push_envelope(dedupe_key)
+    if envelope is None:
+        raise KeyError(dedupe_key)
+    now = now if now is not None else datetime.now(timezone.utc)
+    updated = dict(envelope)
+
+    if sender is None:
+        updated["state"] = "blocked"
+        updated["external_blocker"] = BLOCKED_EXTERNAL_ENDPOINT
+        updated["retryable"] = False
+        updated["last_attempt_at"] = now.isoformat()
+        result = _update_push_envelope(updated)
+        record_consumer_evidence(
+            PUSH_ATTEMPT_EVENT,
+            result["task_id"],
+            detail=(
+                f"push envelope {dedupe_key} blocked: {BLOCKED_EXTERNAL_ENDPOINT} "
+                "(no authorized external endpoint)"
+            ),
+            extra={
+                "dedupe_key": dedupe_key,
+                "state": result["state"],
+                "external_blocker": BLOCKED_EXTERNAL_ENDPOINT,
+            },
+        )
+        return result
+
+    attempt = int(envelope.get("attempt_count") or 0) + 1
+    max_attempts = int(envelope.get("max_attempts") or PUSH_MAX_ATTEMPTS)
+    updated["attempt_count"] = attempt
+    updated["last_attempt_at"] = now.isoformat()
+    ok = False
+    error = None
+    try:
+        outcome = sender(dict(envelope))
+        if isinstance(outcome, dict):
+            ok = bool(outcome.get("ok", True))
+            error = outcome.get("error")
+        else:
+            ok = outcome is not False
+    except Exception as exc:  # noqa: BLE001 - sender failures are retryable
+        ok = False
+        error = f"{type(exc).__name__}: {exc}"
+
+    if ok:
+        updated["state"] = "delivered"
+        updated["delivered_at"] = now.isoformat()
+        updated["retryable"] = False
+        updated["external_blocker"] = None
+        updated["last_error"] = None
+    elif attempt >= max_attempts:
+        updated["state"] = "blocked"
+        updated["retryable"] = False
+        updated["last_error"] = error or "retry_exhausted"
+    else:
+        updated["state"] = "retry"
+        updated["retryable"] = True
+        updated["last_error"] = error or "transient_failure"
+    result = _update_push_envelope(updated)
+    record_consumer_evidence(
+        PUSH_DELIVERED_EVENT if ok else PUSH_ATTEMPT_EVENT,
+        result["task_id"],
+        detail=(
+            f"push envelope {dedupe_key} attempt {attempt}/{max_attempts} -> "
+            f"{result['state']}"
+        ),
+        extra={
+            "dedupe_key": dedupe_key,
+            "state": result["state"],
+            "attempt_count": attempt,
+            "retryable": result["retryable"],
+        },
+    )
+    return result
+
+
+def retry_push_envelopes(*, sender=None, now: datetime | None = None) -> dict:
+    """Attempt every ``pending``/``retry`` envelope once.
+
+    Retry semantics are bounded by each envelope's ``max_attempts``; a sender
+    that cannot reach the external endpoint yields the explicit
+    ``BLOCKED_EXTERNAL_ENDPOINT`` state rather than a false success.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)
+    attempted: list[dict] = []
+    for envelope in push_outbox_records():
+        if str(envelope.get("state")) in ("pending", "retry"):
+            attempted.append(
+                deliver_push_envelope(
+                    str(envelope["dedupe_key"]), sender=sender, now=now
+                )
+            )
+    return {
+        "attempted": attempted,
+        "attempted_count": len(attempted),
+        "external_endpoint_configured": _push_external_endpoint_configured(),
+        "external_blocker": (
+            None if _push_external_endpoint_configured()
+            else BLOCKED_EXTERNAL_ENDPOINT
+        ),
+        "outbox_status": push_outbox_status(),
+    }
+
+
+def push_outbox_status() -> dict:
+    """Report outbox persistence, envelope states and the real push boundary."""
+    path = get_push_outbox_path()
+    records = push_outbox_records()
+    by_state = {state: 0 for state in PUSH_ENVELOPE_STATES}
+    for item in records:
+        state = str(item.get("state") or "pending")
+        by_state[state] = by_state.get(state, 0) + 1
+    configured = _push_external_endpoint_configured()
+    return {
+        "path": str(path),
+        "persisted": path.is_file(),
+        "record_count": len(records),
+        "by_state": by_state,
+        "pending_count": by_state.get("pending", 0),
+        "retry_count": by_state.get("retry", 0),
+        "delivered_count": by_state.get("delivered", 0),
+        "blocked_count": by_state.get("blocked", 0),
+        "queryable": isinstance(records, list),
+        "channel": PUSH_ENVELOPE_CHANNEL,
+        "push_capability": PUSH_ENVELOPE_PUSH_CAPABILITY,
+        "true_push_supported": False,
+        "external_endpoint_configured": configured,
+        "external_blocker": None if configured else BLOCKED_EXTERNAL_ENDPOINT,
+        "detail": (
+            f"{len(records)} push envelope(s) at {path}; "
+            f"external_endpoint_configured={configured}"
+        ),
+    }
+
+
+def push_adapter_report(now: datetime | None = None) -> dict:
+    """Build the PERSONAL_AI_EXECUTION_B_MINIMAL_TRUE_PUSH_V0.1 report.
+
+    It drives a real, disposable chain: PASS/FAIL/BLOCKED/PENDING_APPROVAL probes
+    are classified by the existing notification consumer, delivered through the
+    existing delivery adapter, and mapped to one-time push envelopes. Enqueue is
+    exercised twice (idempotency), the retry seam is exercised with a local
+    in-process sender, and the Human Gate is asserted untouched. The real
+    external push leg is reported as ``BLOCKED_EXTERNAL_ENDPOINT`` because no
+    authorized endpoint/credential exists here; it is never faked as PASS.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)
+    seq = uuid.uuid4().hex[:10]
+    consumer_id = f"push-adapter-consumer-{seq}"
+    pending_probe = f"push-adapter-pending-{seq}"
+    pass_probe = f"push-adapter-pass-{seq}"
+    fail_probe = f"push-adapter-fail-{seq}"
+    blocked_probe = f"push-adapter-blocked-{seq}"
+    retry_probe = f"push-adapter-retry-{seq}"
+    exhaust_probe = f"push-adapter-exhaust-{seq}"
+    chain_probe = f"push-adapter-chain-{seq}"
+    probe_ids = {pending_probe, pass_probe, fail_probe, blocked_probe}
+
+    submit_task(
+        pending_probe,
+        goal=PUSH_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    submit_task(
+        pass_probe,
+        goal=PUSH_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    mark_reviewed(pass_probe, PASS, "push adapter PASS scenario")
+    submit_task(
+        fail_probe,
+        goal=PUSH_ADAPTER_GOAL,
+        status="fail",
+        requires_review=True,
+    )
+    submit_task(
+        blocked_probe,
+        goal=PUSH_ADAPTER_GOAL,
+        status="blocked",
+        requires_review=True,
+    )
+
+    review_states_before = {
+        task_id: bool(TASK_REGISTRY.get(task_id, {}).get("reviewed"))
+        for task_id in probe_ids
+    }
+
+    first = enqueue_push_envelopes(consumer_id, now=now)
+    second = enqueue_push_envelopes(consumer_id, now=now)
+
+    first_probe = [
+        envelope for envelope in first["created"] if envelope["task_id"] in probe_ids
+    ]
+    second_probe = [
+        envelope for envelope in second["created"] if envelope["task_id"] in probe_ids
+    ]
+    observed_classes = {envelope["classification"] for envelope in first_probe}
+    all_classes_present = set(NOTIFICATION_CLASSES) <= observed_classes
+    classification_by_task = {
+        task_id: sorted(
+            [
+                envelope["classification"]
+                for envelope in first_probe
+                if envelope["task_id"] == task_id
+            ]
+        )
+        for task_id in sorted(probe_ids)
+    }
+    envelope_fields_ok = all(
+        all(field in envelope for field in PUSH_ENVELOPE_FIELDS)
+        and isinstance(envelope["summary"], str)
+        and envelope["summary"]
+        and isinstance(envelope["review_required"], bool)
+        and envelope["dedupe_key"].startswith("push:")
+        for envelope in first_probe
+    )
+    machine_readable_ok = envelope_fields_ok
+    try:
+        for envelope in first_probe:
+            json.loads(json.dumps(envelope, sort_keys=True))
+    except (TypeError, ValueError):
+        machine_readable_ok = False
+    idempotent = bool(first_probe) and not second_probe
+    dedupe_keys_unique = len(
+        {envelope["dedupe_key"] for envelope in first["created"]}
+    ) == len(first["created"])
+
+    # Retry seam: a local in-process sender fails once then succeeds.
+    submit_task(
+        retry_probe,
+        goal=PUSH_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    mark_reviewed(retry_probe, PASS, "push adapter retry scenario")
+    retry_enqueue = enqueue_push_envelopes(
+        consumer_id, task_id=retry_probe, now=now
+    )
+    retry_key = retry_enqueue["created"][0]["dedupe_key"]
+    retry_calls = {"count": 0}
+
+    def _flaky_sender(envelope: dict) -> dict:
+        retry_calls["count"] += 1
+        if retry_calls["count"] == 1:
+            return {"ok": False, "error": "synthetic_transient"}
+        return {"ok": True}
+
+    retry_first = deliver_push_envelope(retry_key, sender=_flaky_sender, now=now)
+    retry_second = deliver_push_envelope(retry_key, sender=_flaky_sender, now=now)
+    retry_semantics_ok = bool(
+        retry_first["state"] == "retry"
+        and retry_first["attempt_count"] == 1
+        and retry_first["retryable"] is True
+        and retry_second["state"] == "delivered"
+        and retry_second["attempt_count"] == 2
+        and retry_second["retryable"] is False
+    )
+
+    # Retry exhaustion: an always-failing sender blocks after max_attempts.
+    submit_task(
+        exhaust_probe,
+        goal=PUSH_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    mark_reviewed(exhaust_probe, PASS, "push adapter exhaustion scenario")
+    exhaust_enqueue = enqueue_push_envelopes(
+        consumer_id, task_id=exhaust_probe, now=now
+    )
+    exhaust_key = exhaust_enqueue["created"][0]["dedupe_key"]
+
+    def _dead_sender(envelope: dict) -> dict:
+        return {"ok": False, "error": "synthetic_permanent"}
+
+    exhaust_states = []
+    for _ in range(PUSH_MAX_ATTEMPTS):
+        exhaust_states.append(
+            deliver_push_envelope(exhaust_key, sender=_dead_sender, now=now)["state"]
+        )
+    exhaustion_ok = bool(
+        exhaust_states[: PUSH_MAX_ATTEMPTS - 1] == ["retry"] * (PUSH_MAX_ATTEMPTS - 1)
+        and exhaust_states[-1] == "blocked"
+    )
+
+    # Real push boundary: no authorized external endpoint here.
+    external_endpoint_configured = _push_external_endpoint_configured()
+    blocked_envelope = first_probe[0]
+    blocked_attempt = deliver_push_envelope(
+        blocked_envelope["dedupe_key"], sender=None, now=now
+    )
+    external_blocked_ok = bool(
+        blocked_attempt["state"] == "blocked"
+        and blocked_attempt["external_blocker"] == BLOCKED_EXTERNAL_ENDPOINT
+        and blocked_attempt["retryable"] is False
+    )
+
+    # Real completion-event chain into the outbox.
+    completion_event = build_completion_event(
+        chain_probe,
+        status="success",
+        tests="1 passed in 0.01s",
+        execution_result=_event_driven_terminal_result(chain_probe),
+    )
+    handled = handle_completion_event(completion_event, auto_apply=False)
+    chain_enqueue = enqueue_push_envelopes(
+        consumer_id, task_id=chain_probe, now=now
+    )
+    chain_envelopes = chain_enqueue["created"]
+    real_chain = {
+        "task_id": chain_probe,
+        "completion_event_action": handled["action"],
+        "review_ready": handled["review_ready"]["review_ready"],
+        "auto_applied": handled["review"]["auto_applied"],
+        "envelope_classifications": sorted(
+            envelope["classification"] for envelope in chain_envelopes
+        ),
+        "external_blocker": None if external_endpoint_configured
+        else BLOCKED_EXTERNAL_ENDPOINT,
+    }
+    real_chain_ok = bool(
+        real_chain["completion_event_action"] == "completion_event_handled"
+        and real_chain["review_ready"]
+        and real_chain["auto_applied"] is False
+        and NOTIFICATION_CLASS_PENDING_APPROVAL
+        in real_chain["envelope_classifications"]
+    )
+
+    review_states_after = {
+        task_id: bool(TASK_REGISTRY.get(task_id, {}).get("reviewed"))
+        for task_id in probe_ids
+    }
+    review_states_unchanged = review_states_before == review_states_after
+    dispatch_events = [
+        event
+        for event in get_consumption_evidence()
+        if event.get("event_type") == AUTO_DISPATCH_EVENT
+        and event.get("task_id") in (probe_ids | {retry_probe, exhaust_probe, chain_probe})
+    ]
+    pending_record = get_task_review(pending_probe) or {}
+    gate_ok = bool(
+        review_states_unchanged
+        and not dispatch_events
+        and pending_record.get("reviewed") is False
+        and pending_record.get("review_verdict") is None
+        and all(
+            envelope["human_review_gate"]
+            and not envelope["auto_pass"]
+            and not envelope["auto_trigger_next"]
+            for envelope in first_probe
+        )
+    )
+
+    golden = execution_a_golden_baseline_integrity()
+
+    contracts_unchanged = bool(
+        list(inspect.signature(submit_task).parameters) == SUBMIT_TASK_PARAMS
+        and list(inspect.signature(get_task_result).parameters) == ["task_id"]
+        and list(inspect.signature(mark_reviewed).parameters)
+        == ["task_id", "verdict", "note"]
+        and list(inspect.signature(pull_notifications).parameters)
+        == ["consumer_id", "task_id", "classification", "limit", "now"]
+    )
+
+    outbox_status = push_outbox_status()
+    external_reachable = bool(
+        external_endpoint_configured and PUSH_EXTERNAL_SENDER_IMPLEMENTED
+    )
+    if any(check_value is False for check_value in (
+        machine_readable_ok,
+        all_classes_present,
+        idempotent,
+        dedupe_keys_unique,
+        retry_semantics_ok,
+        exhaustion_ok,
+        gate_ok,
+        real_chain_ok,
+        golden["intact"],
+        contracts_unchanged,
+        external_blocked_ok,
+    )):
+        final = FAIL
+    elif not external_reachable:
+        final = BLOCKED
+    else:
+        final = PASS
+    external_blocker = None if final == PASS else BLOCKED_EXTERNAL_ENDPOINT
+
+    required_human_actions = [
+        "Provide an authorized outbound target endpoint (env "
+        f"{PUSH_EXTERNAL_ENDPOINT_ENV}) and its credential via the runner "
+        "secret store; no secret is written to the repository.",
+        "Authorize network egress from the runner to that endpoint.",
+        "Provide/verify an inbound wake or notification channel on the ChatGPT "
+        "side: an outbox cannot itself wake a dormant session.",
+        "Re-run push_adapter_report() with a real credentialed sender to close "
+        "the true-push E2E.",
+    ]
+
+    limitations = [
+        "No authorized external endpoint or credential exists in this sandbox; "
+        f"the real push leg is {BLOCKED_EXTERNAL_ENDPOINT} and is NOT reported "
+        "as a true-push PASS. A pull inbox / MCP read is not a push.",
+        "Retry semantics are proven with an in-process sender seam only; that "
+        "seam is test infrastructure, not an external delivery channel.",
+        "Human Gate: the adapter is read-only over the execution layer; it never "
+        "reviews, never PASSes and never dispatches, so an envelope cannot start "
+        "an unapproved next task.",
+        "Scope: only hello.py and test_hello.py are changed; no workflow, "
+        "secret, scope gate or production module is modified, and the frozen "
+        "Execution A Golden cf-0f908ee294c4 baseline is untouched.",
+    ]
+
+    checks = [
+        {
+            "check": "machine-readable envelope with task_id/classification/"
+            "summary/review_required/dedupe_key/created_at",
+            "status": PASS if machine_readable_ok else FAIL,
+            "detail": (
+                "all six contract fields present and JSON-serializable; "
+                f"dedupe_key unique across {len(first['created'])} envelope(s)"
+            ),
+        },
+        {
+            "check": "PASS/FAIL/BLOCKED/PENDING_APPROVAL each generate a push "
+            "envelope",
+            "status": PASS if all_classes_present else FAIL,
+            "detail": (
+                "observed classifications: "
+                + ", ".join(sorted(observed_classes))
+            ),
+        },
+        {
+            "check": "enqueue is idempotent on dedupe_key",
+            "status": PASS if (idempotent and dedupe_keys_unique) else FAIL,
+            "detail": (
+                f"first enqueue created {len(first_probe)} probe envelope(s); a "
+                f"repeated enqueue created {len(second_probe)} (no duplicates)"
+            ),
+        },
+        {
+            "check": "delivery is retryable and bounded",
+            "status": PASS if (retry_semantics_ok and exhaustion_ok) else FAIL,
+            "detail": (
+                "in-process sender: attempt 1 -> retry, attempt 2 -> delivered; "
+                f"always-failing sender -> {exhaust_states} (blocked at "
+                f"max_attempts={PUSH_MAX_ATTEMPTS})"
+            ),
+        },
+        {
+            "check": "Human Gate preserved",
+            "status": PASS if gate_ok else FAIL,
+            "detail": (
+                "review states unchanged, no auto review, no auto dispatch, "
+                "every envelope has human_review_gate=True, auto_pass=False, "
+                "auto_trigger_next=False"
+            ),
+        },
+        {
+            "check": "independent Golden cf-0f908ee294c4 Execution A baseline "
+            "intact",
+            "status": PASS if golden["intact"] else FAIL,
+            "detail": golden["detail"],
+        },
+        {
+            "check": "real completion-event chain reaches the outbox",
+            "status": PASS if real_chain_ok else FAIL,
+            "detail": (
+                f"{chain_probe}: completion event -> "
+                f"{real_chain['completion_event_action']} -> review_ready="
+                f"{real_chain['review_ready']} -> envelope(s)="
+                + (", ".join(real_chain["envelope_classifications"]) or "none")
+            ),
+        },
+        {
+            "check": "external true-push endpoint reachable",
+            "status": PASS if external_reachable else BLOCKED,
+            "detail": (
+                f"external_endpoint_configured={external_endpoint_configured}; "
+                f"external_sender_implemented={PUSH_EXTERNAL_SENDER_IMPLEMENTED}; "
+                f"external_blocker={BLOCKED_EXTERNAL_ENDPOINT}; "
+                "no authorized endpoint/credential, so no true-push PASS is "
+                "claimed"
+            ),
+        },
+        {
+            "check": "contracts unchanged; no Router/orchestrator/multi-agent",
+            "status": PASS if contracts_unchanged else FAIL,
+            "detail": (
+                "submit_task/get_task_result/mark_reviewed/pull_notifications "
+                "signatures unchanged; a single outbox adapter, no Router, "
+                "generic orchestrator or multi-agent scheduler added"
+            ),
+        },
+    ]
+
+    lines = [
+        f"# {PUSH_ADAPTER_REPORT}",
+        "",
+        f"- goal: {PUSH_ADAPTER_GOAL}",
+        f"- task_id: {PUSH_ADAPTER_TASK_ID}",
+        f"- FINAL: {final}",
+        f"- external_blocker: {external_blocker or 'none'}",
+        f"- envelope_schema: {PUSH_ENVELOPE_SCHEMA}",
+        "- human_review_gate: True",
+        "- auto_pass: False",
+        "- auto_trigger_next: False",
+        "",
+        "## Envelope contract",
+        "- fields: " + ", ".join(PUSH_ENVELOPE_FIELDS),
+        f"- channel: {PUSH_ENVELOPE_CHANNEL}",
+        f"- states: {', '.join(PUSH_ENVELOPE_STATES)}",
+        f"- dedupe_key: deterministic per task+classification+notification",
+        f"- max_attempts: {PUSH_MAX_ATTEMPTS}",
+        "",
+        "## Classifications",
+    ]
+    for task_id in sorted(probe_ids):
+        lines.append(
+            f"- {task_id}: "
+            + (", ".join(classification_by_task[task_id]) or "none")
+        )
+    lines += [
+        "",
+        "## Idempotency & retry",
+        f"- first_enqueue_created: {len(first_probe)}",
+        f"- repeated_enqueue_created: {len(second_probe)}",
+        f"- idempotent: {idempotent}",
+        f"- retry_semantics_ok: {retry_semantics_ok}",
+        f"- exhaustion_states: {', '.join(exhaust_states)}",
+        "",
+        "## Real completion-event chain",
+        f"- task_id: {real_chain['task_id']}",
+        f"- action: {real_chain['completion_event_action']}",
+        f"- review_ready: {real_chain['review_ready']}",
+        f"- auto_applied: {real_chain['auto_applied']}",
+        f"- envelopes: "
+        + (", ".join(real_chain["envelope_classifications"]) or "none"),
+        "",
+        "## Outbox",
+        f"- store: {outbox_status['path']}",
+        f"- record_count: {outbox_status['record_count']}",
+        "- by_state: "
+        + ", ".join(
+            f"{state}={count}" for state, count in outbox_status["by_state"].items()
+        ),
+        "",
+        "## Execution A Golden baseline",
+        f"- task_id: {golden['task_id']}",
+        f"- intact: {golden['intact']}",
+        f"- sha256_recomputed: {golden['sha256']['recomputed_digest']}",
+        "",
+        "## Required human actions to close true push",
+    ]
+    lines += [f"- {item}" for item in required_human_actions]
+    lines += ["", "## Limitations"]
+    lines += [f"- {item}" for item in limitations]
+    lines += ["", "## Checks"]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final}"]
+
+    return {
+        "report": PUSH_ADAPTER_REPORT,
+        "goal": PUSH_ADAPTER_GOAL,
+        "task_id": PUSH_ADAPTER_TASK_ID,
+        "status": final,
+        "final_status": final,
+        "external_blocker": external_blocker,
+        "blocked_reason": BLOCKED_EXTERNAL_ENDPOINT if final == BLOCKED else None,
+        "acceptance_fields": list(PUSH_ADAPTER_ACCEPTANCE_FIELDS),
+        "entrypoint": "enqueue_push_envelopes",
+        "envelope_schema": PUSH_ENVELOPE_SCHEMA,
+        "envelope_fields": list(PUSH_ENVELOPE_FIELDS),
+        "channel": PUSH_ENVELOPE_CHANNEL,
+        "push_capability": PUSH_ENVELOPE_PUSH_CAPABILITY,
+        "true_push_supported": False,
+        "external_endpoint_configured": external_endpoint_configured,
+        "consumer_id": consumer_id,
+        "categories": list(NOTIFICATION_CLASSES),
+        "observed_classifications": sorted(observed_classes),
+        "all_classes_present": all_classes_present,
+        "classification_by_task": classification_by_task,
+        "first_enqueue_created_count": len(first_probe),
+        "repeated_enqueue_created_count": len(second_probe),
+        "probe_envelopes": first_probe,
+        "idempotent": idempotent,
+        "dedupe_keys_unique": dedupe_keys_unique,
+        "machine_readable_ok": machine_readable_ok,
+        "retry_semantics_ok": retry_semantics_ok,
+        "exhaustion_ok": exhaustion_ok,
+        "exhaustion_states": exhaust_states,
+        "external_blocked_ok": external_blocked_ok,
+        "outbox_status": outbox_status,
+        "real_chain": real_chain,
+        "real_chain_ok": real_chain_ok,
+        "human_gate_preserved": gate_ok,
+        "review_states_unchanged": review_states_unchanged,
+        "no_auto_dispatch": not dispatch_events,
+        "execution_a_golden": golden,
+        "required_human_actions": required_human_actions,
+        "limitations": limitations,
+        "checks": checks,
+        "contracts_unchanged": contracts_unchanged,
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "no_router": True,
+        "no_orchestrator": True,
+        "no_multi_agent": True,
+        "workflow_modified": False,
+        "changed_files": ["hello.py", "test_hello.py"],
+        "submit_task_contract": "UNCHANGED",
+        "get_task_result_contract": "UNCHANGED",
+        "mark_reviewed_contract": "COMPATIBLE",
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(runtime_provenance_v0_1_report()["markdown"])
     print(cloudflare_runtime_audit_report()["markdown"])
@@ -15457,3 +16491,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(event_notification_consumer_report()["markdown"])
     print(notification_delivery_adapter_report()["markdown"])
     print(mcp_notification_reader_golden_verify()["markdown"])
+    print(push_adapter_report()["markdown"])
