@@ -4822,3 +4822,340 @@ def test_next_task_proposal_preserves_contracts(
         "verdict",
         "note",
     ]
+
+# -- PERSONAL_AI_EVENT_DRIVEN_REVIEW_TRIGGER_V0.1 --------------------------
+# Event-driven review trigger: a terminal completion event produces a
+# discoverable review-ready state, PASS/FAIL/BLOCKED route to the correct
+# follow-up path, replays are idempotent, and the Human Gate is preserved.
+
+EVENT_DRIVEN_EXPECTED_CHECKS = {
+    "terminal completion event produces review-ready state",
+    "review-ready state is discoverable",
+    "PASS/FAIL/BLOCKED follow-up paths",
+    "duplicate completion event is idempotent",
+    "human gate preserved",
+    "production dispatch/review-ready golden evidence",
+    "contracts unchanged and security gates intact",
+}
+
+
+def _event_driven_test_id(kind: str) -> str:
+    return f"event-driven-test-{kind}-{hello_module.uuid.uuid4().hex[:10]}"
+
+
+def _event_driven_test_result(
+    task_id: str, *, tests: str = "6 passed in 0.11s"
+) -> dict:
+    return {
+        "task_id": task_id,
+        "status": "success",
+        "tests": tests,
+        "artifacts": [
+            {
+                "name": "hello.py",
+                "path": "hello.py",
+                "sha256": "a" * 64,
+                "bytes": 42,
+            }
+        ],
+        "evidence": {"validation": {"pytest": tests}},
+        "workflow_run_conclusion": "success",
+    }
+
+
+def _event_driven_completion_events(task_id: str) -> list:
+    return [
+        event
+        for event in hello_module.get_consumption_evidence(task_id)
+        if event.get("event_type") == "completion_event"
+    ]
+
+
+def _event_driven_ready_events(task_id: str) -> list:
+    return [
+        event
+        for event in hello_module.get_consumption_evidence(task_id)
+        if event.get("event_type") == "review_ready"
+    ]
+
+
+def _event_driven_dispatch_events(task_id: str) -> list:
+    return [
+        event
+        for event in hello_module.get_consumption_evidence(task_id)
+        if event.get("event_type") == "auto_dispatched"
+    ]
+
+
+@pytest.fixture(scope="module")
+def event_driven_report() -> dict:
+    return hello_module.personal_ai_event_driven_review_trigger_v0_1()
+
+
+def test_event_driven_report_contract(event_driven_report: dict) -> None:
+    report = event_driven_report
+    assert report["report"] == "PERSONAL_AI_EVENT_DRIVEN_REVIEW_TRIGGER_REPORT"
+    assert report["goal"] == "PERSONAL_AI_EVENT_DRIVEN_REVIEW_TRIGGER_V0.1"
+    assert report["task_id"] == "cf-8d8b86aa8d3a"
+    assert report["status"] == "PASS"
+    assert report["final_status"] == "PASS"
+    assert report["review_ready_state"] == "review_ready"
+    assert report["markdown"].startswith(
+        "# PERSONAL_AI_EVENT_DRIVEN_REVIEW_TRIGGER_REPORT"
+    )
+    assert "FINAL_STATUS=PASS" in report["markdown"]
+
+
+def test_event_driven_checks_all_pass(event_driven_report: dict) -> None:
+    checks = {check["check"]: check for check in event_driven_report["checks"]}
+    assert set(checks) == EVENT_DRIVEN_EXPECTED_CHECKS
+    for check in event_driven_report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] == "PASS"
+        assert check["detail"]
+
+
+def test_event_driven_follow_up_paths(event_driven_report: dict) -> None:
+    report = event_driven_report
+    assert report["follow_up_paths"] == {
+        "PASS": "advance",
+        "FAIL": "remediate",
+        "BLOCKED": "unblock",
+    }
+    scenarios = {item["scenario"]: item for item in report["scenarios"]}
+    assert scenarios["pass_auto_apply_advances_no_dispatch"]["follow_up"] == "advance"
+    assert scenarios["fail_auto_apply_remediates"]["follow_up"] == "remediate"
+    assert scenarios["blocked_auto_apply_unblocks"]["follow_up"] == "unblock"
+    assert report["discoverable"] is True
+    assert report["idempotent"] is True
+    assert report["human_gate_preserved"] is True
+
+
+def test_event_driven_terminal_event_makes_review_ready() -> None:
+    probe = _event_driven_test_id("ready")
+    hello_module.submit_task(
+        probe,
+        goal="PERSONAL_AI_EVENT_DRIVEN_REVIEW_TRIGGER_V0.1",
+        status="submitted",
+        requires_review=True,
+    )
+    assert hello_module.review_ready_state(probe)["discoverable"] is False
+
+    event = hello_module.build_completion_event(
+        probe,
+        status="success",
+        tests="6 passed in 0.11s",
+        execution_result=_event_driven_test_result(probe),
+    )
+    handled = hello_module.handle_completion_event(event)
+    assert handled["action"] == "completion_event_handled"
+    assert handled["follow_up"] == "advance"
+
+    state = hello_module.review_ready_state(probe)
+    assert state["discoverable"] is True
+    assert state["review_state"] == "review_ready"
+    assert state["result_available"] is True
+    assert probe in {item["task_id"] for item in hello_module.list_review_ready()}
+    assert probe in {item["task_id"] for item in hello_module.list_pending_results()}
+    assert len(_event_driven_completion_events(probe)) == 1
+    assert len(_event_driven_ready_events(probe)) == 1
+
+
+def test_event_driven_duplicate_completion_is_idempotent() -> None:
+    probe = _event_driven_test_id("duplicate")
+    hello_module.submit_task(
+        probe,
+        goal="PERSONAL_AI_EVENT_DRIVEN_REVIEW_TRIGGER_V0.1",
+        status="success",
+        requires_review=True,
+    )
+    event = hello_module.build_completion_event(
+        probe,
+        status="success",
+        tests="6 passed in 0.11s",
+        execution_result=_event_driven_test_result(probe),
+    )
+    first = hello_module.handle_completion_event(event)
+    assert first["action"] == "completion_event_handled"
+
+    duplicate = hello_module.handle_completion_event(event)
+    assert duplicate["action"] == "skipped_duplicate_completion"
+    assert duplicate["duplicate_prevented"] is True
+    assert duplicate["side_effect"] is False
+    assert duplicate["child_dispatch"] is None
+    assert len(_event_driven_completion_events(probe)) == 1
+    assert len(_event_driven_ready_events(probe)) == 1
+    assert hello_module.get_task_review(probe)["reviewed"] is False
+    assert hello_module.get_review_events(probe) == []
+
+
+def test_event_driven_human_gate_blocks_unapproved_dispatch() -> None:
+    probe = _event_driven_test_id("unapproved")
+    hello_module.submit_task(
+        probe,
+        goal="PERSONAL_AI_EVENT_DRIVEN_REVIEW_TRIGGER_V0.1",
+        status="success",
+        requires_review=True,
+    )
+    event = hello_module.build_completion_event(
+        probe,
+        status="success",
+        tests="6 passed in 0.11s",
+        execution_result=_event_driven_test_result(probe),
+    )
+    handled = hello_module.handle_completion_event(event, auto_apply=True)
+    assert handled["review_verdict"] == "PASS"
+    dispatch = handled["child_dispatch"] or {}
+    assert dispatch.get("action") == "blocked_no_approved_next_task"
+    assert dispatch.get("dispatched") is False
+    assert _event_driven_dispatch_events(probe) == []
+
+
+def test_event_driven_approved_child_dispatches_once_and_replay_noop() -> None:
+    probe = _event_driven_test_id("approved")
+    child = {
+        "task_id": f"{probe}-child",
+        "goal": "advance to the next approved task",
+        "approved": True,
+    }
+    hello_module.submit_task(
+        probe,
+        goal="PERSONAL_AI_EVENT_DRIVEN_REVIEW_TRIGGER_V0.1",
+        status="success",
+        requires_review=True,
+    )
+    event = hello_module.build_completion_event(
+        probe,
+        status="success",
+        tests="6 passed in 0.11s",
+        execution_result=_event_driven_test_result(probe),
+    )
+    first = hello_module.handle_completion_event(
+        event, auto_apply=True, approved_next_task=child
+    )
+    dispatched = first["child_dispatch"] or {}
+    assert dispatched.get("dispatched") is True
+    assert dispatched.get("next_task_id") == child["task_id"]
+
+    second = hello_module.handle_completion_event(
+        event, auto_apply=True, approved_next_task=child
+    )
+    assert second["action"] == "skipped_duplicate_completion"
+    assert second["child_dispatch"] is None
+    assert len(_event_driven_dispatch_events(probe)) == 1
+    review_events = [
+        event
+        for event in hello_module.get_review_events(probe)
+        if event.get("action") == "review"
+    ]
+    assert len(review_events) == 1
+
+
+def test_event_driven_fail_and_blocked_paths() -> None:
+    fail_probe = _event_driven_test_id("fail")
+    hello_module.submit_task(
+        fail_probe,
+        goal="PERSONAL_AI_EVENT_DRIVEN_REVIEW_TRIGGER_V0.1",
+        status="success",
+        requires_review=True,
+    )
+    fail_event = hello_module.build_completion_event(
+        fail_probe,
+        status="success",
+        tests="3 failed, 2 passed",
+        execution_result=_event_driven_test_result(
+            fail_probe, tests="3 failed, 2 passed"
+        ),
+    )
+    fail_handled = hello_module.handle_completion_event(fail_event, auto_apply=True)
+    assert fail_handled["review_verdict"] == "FAIL"
+    assert fail_handled["follow_up"] == "remediate"
+    assert fail_handled["child_dispatch"] is None
+    assert hello_module.get_task_review(fail_probe)["review_verdict"] == "FAIL"
+
+    blocked_probe = _event_driven_test_id("blocked")
+    hello_module.submit_task(
+        blocked_probe,
+        goal="PERSONAL_AI_EVENT_DRIVEN_REVIEW_TRIGGER_V0.1",
+        status="success",
+        requires_review=True,
+    )
+    blocked_event = hello_module.build_completion_event(
+        blocked_probe,
+        status="success",
+        execution_result={
+            "task_id": blocked_probe,
+            "status": "success",
+            "workflow_run_conclusion": "success",
+        },
+    )
+    blocked_handled = hello_module.handle_completion_event(
+        blocked_event, auto_apply=True
+    )
+    assert blocked_handled["review_verdict"] == "BLOCKED"
+    assert blocked_handled["follow_up"] == "unblock"
+    assert blocked_handled["child_dispatch"] is None
+    assert hello_module.get_task_review(blocked_probe)["review_verdict"] == "BLOCKED"
+
+
+def test_event_driven_preserves_contracts_and_security(
+    event_driven_report: dict,
+) -> None:
+    report = event_driven_report
+    assert report["contracts_unchanged"] is True
+    assert report["security"]["secret_guard_present"] is True
+    assert report["security"]["secret_guard_active"] is True
+    assert report["security"]["scope_guard_present"] is True
+    assert report["workflow_modified"] is False
+    assert report["changed_files"] == ["hello.py", "test_hello.py"]
+    assert report["no_router"] is True
+    assert report["no_orchestrator"] is True
+    assert report["no_multi_agent"] is True
+    assert report["human_review_gate"] is True
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert report["mark_reviewed_contract"] == "COMPATIBLE"
+    assert list(
+        inspect.signature(hello_module.handle_completion_event).parameters
+    ) == ["event", "auto_apply", "approved_next_task", "dispatcher", "next_task"]
+    assert list(inspect.signature(hello_module.submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+
+
+def test_event_driven_real_chain_evidence(event_driven_report: dict) -> None:
+    real = event_driven_report["real_chain"]
+    assert real["status"] in ("PASS", "BLOCKED")
+    assert real["production_mutated"] is False
+    if real["status"] == "PASS":
+        assert real["exactly_once"]["verified"] is True
+        assert real["fail_closed"]["verified"] is True
+        assert real["parent_task_id"]
+        assert real["child_task_id"]
+
+
+def test_event_driven_rejects_bad_input() -> None:
+    with pytest.raises(ValueError):
+        hello_module.handle_completion_event(None)
+    with pytest.raises(ValueError):
+        hello_module.handle_completion_event({"status": "success"})
+    with pytest.raises(ValueError):
+        hello_module.build_completion_event("")
+    with pytest.raises(ValueError):
+        hello_module.review_ready_state("")
+
+
+def test_event_driven_real_task_artifact_is_truthful(event_driven_report: dict) -> None:
+    artifact = event_driven_report["real_task_artifact"]
+    assert artifact["status"] in ("PASS", "BLOCKED")
+    assert artifact["reason"]
+    if not artifact["available"]:
+        assert artifact["status"] == "BLOCKED"
+        assert artifact["task_id"] is None
+    else:
+        assert artifact["status"] == "PASS"
+        assert artifact["task_id"]
