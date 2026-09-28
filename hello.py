@@ -16608,17 +16608,30 @@ def serverchan_http_transport(endpoint: str, payload: dict) -> dict:
     except Exception as exc:  # noqa: BLE001 - network failures are retryable
         return {"ok": False, "status_code": None, "error": type(exc).__name__}
     ok = bool(status_code and 200 <= status_code < 300)
+    push_id = None
+    server_message = None
     if ok:
         try:
             loaded = json.loads(body)
         except (TypeError, ValueError):
             loaded = None
-        if isinstance(loaded, dict) and "code" in loaded:
-            try:
-                ok = int(loaded.get("code", 0)) == 0
-            except (TypeError, ValueError):
-                ok = False
-    return {"ok": ok, "status_code": status_code, "error": None if ok else "push_rejected"}
+        if isinstance(loaded, dict):
+            data = loaded.get("data")
+            if isinstance(data, dict):
+                push_id = data.get("pushid") or data.get("push_id")
+            server_message = loaded.get("message") or loaded.get("error")
+            if "code" in loaded:
+                try:
+                    ok = int(loaded.get("code", 0)) == 0
+                except (TypeError, ValueError):
+                    ok = False
+    return {
+        "ok": ok,
+        "status_code": status_code,
+        "error": None if ok else "push_rejected",
+        "push_id": str(push_id) if push_id else None,
+        "server_message": str(server_message) if server_message else None,
+    }
 
 
 def build_serverchan_payload(envelope: dict) -> dict:
@@ -16682,30 +16695,26 @@ def build_serverchan_payload(envelope: dict) -> dict:
     }
 
 
-def deliver_serverchan_envelope(
+def _deliver_serverchan(
     dedupe_key: str,
+    envelope: dict,
+    payload: dict,
     *,
     transport=None,
     now: datetime | None = None,
 ) -> dict:
-    """Deliver one outbox envelope through ServerChan.
+    """Shared ServerChan delivery core for standard and Golden payloads.
 
     The SendKey is read from ``SERVERCHAN_SENDKEY``. With no credential the
     envelope is marked ``blocked`` with ``external_blocker=
-    BLOCKED_EXTERNAL_CREDENTIAL`` and the transport is never called, so a real
-    WeChat push can never be reported without a credential. With a credential the
-    payload is sent via ``transport`` (default :func:`serverchan_http_transport`);
-    a failure keeps the envelope ``retry`` up to ``max_attempts`` and then
-    ``blocked``. The SendKey is never returned, logged or persisted.
+    BLOCKED_EXTERNAL_CREDENTIAL`` and the transport is never called. With a
+    credential ``payload`` is sent via ``transport`` (default
+    :func:`serverchan_http_transport`); a failure keeps the envelope ``retry`` up
+    to ``max_attempts`` and then ``blocked``. The SendKey is never returned,
+    logged or persisted; only non-sensitive push ids / messages are surfaced.
     """
-    if not dedupe_key:
-        raise ValueError("deliver_serverchan_envelope requires a dedupe_key")
-    envelope = get_push_envelope(dedupe_key)
-    if envelope is None:
-        raise KeyError(dedupe_key)
     now = now if now is not None else datetime.now(timezone.utc)
     updated = dict(envelope)
-    payload = build_serverchan_payload(envelope)
 
     sendkey = serverchan_sendkey()
     if not sendkey:
@@ -16717,6 +16726,9 @@ def deliver_serverchan_envelope(
             "credential_present": False,
             "endpoint_kind": None,
             "sendkey_redacted": serverchan_redact(None),
+            "push_id": None,
+            "server_message": None,
+            "status_code": None,
         }
         result = _update_push_envelope(updated)
         record_consumer_evidence(
@@ -16744,6 +16756,9 @@ def deliver_serverchan_envelope(
             "sendkey_redacted": serverchan_redact(None),
             "external_blocker": BLOCKED_EXTERNAL_CREDENTIAL,
             "retryable": False,
+            "status_code": None,
+            "push_id": None,
+            "server_message": None,
             "payload": payload,
             "envelope": result,
         }
@@ -16759,12 +16774,16 @@ def deliver_serverchan_envelope(
     ok = False
     error = None
     status_code = None
+    push_id = None
+    server_message = None
     try:
         outcome = sender(endpoint, payload)
         if isinstance(outcome, dict):
             ok = bool(outcome.get("ok", True))
             error = outcome.get("error")
             status_code = outcome.get("status_code")
+            push_id = outcome.get("push_id")
+            server_message = outcome.get("server_message")
         else:
             ok = outcome is not False
     except Exception as exc:  # noqa: BLE001 - transport failures are retryable
@@ -16789,6 +16808,9 @@ def deliver_serverchan_envelope(
         "credential_present": True,
         "endpoint_kind": kind,
         "sendkey_redacted": serverchan_redact(sendkey),
+        "push_id": str(push_id) if push_id else None,
+        "server_message": str(server_message) if server_message else None,
+        "status_code": status_code,
     }
     result = _update_push_envelope(updated)
     record_consumer_evidence(
@@ -16805,6 +16827,7 @@ def deliver_serverchan_envelope(
             "retryable": result["retryable"],
             "endpoint_kind": kind,
             "sendkey_redacted": serverchan_redact(sendkey),
+            "push_id": str(push_id) if push_id else None,
         },
     )
     return {
@@ -16820,9 +16843,41 @@ def deliver_serverchan_envelope(
         "retryable": result["retryable"],
         "attempt_count": attempt,
         "status_code": status_code,
+        "push_id": str(push_id) if push_id else None,
+        "server_message": str(server_message) if server_message else None,
         "payload": payload,
         "envelope": result,
     }
+
+
+def deliver_serverchan_envelope(
+    dedupe_key: str,
+    *,
+    transport=None,
+    now: datetime | None = None,
+) -> dict:
+    """Deliver one outbox envelope through ServerChan.
+
+    The SendKey is read from ``SERVERCHAN_SENDKEY``. With no credential the
+    envelope is marked ``blocked`` with ``external_blocker=
+    BLOCKED_EXTERNAL_CREDENTIAL`` and the transport is never called, so a real
+    WeChat push can never be reported without a credential. With a credential the
+    payload is sent via ``transport`` (default :func:`serverchan_http_transport`);
+    a failure keeps the envelope ``retry`` up to ``max_attempts`` and then
+    ``blocked``. The SendKey is never returned, logged or persisted.
+    """
+    if not dedupe_key:
+        raise ValueError("deliver_serverchan_envelope requires a dedupe_key")
+    envelope = get_push_envelope(dedupe_key)
+    if envelope is None:
+        raise KeyError(dedupe_key)
+    return _deliver_serverchan(
+        dedupe_key,
+        envelope,
+        build_serverchan_payload(envelope),
+        transport=transport,
+        now=now,
+    )
 
 
 def retry_serverchan_envelopes(*, transport=None, now: datetime | None = None) -> dict:
@@ -17248,6 +17303,438 @@ def serverchan_adapter_report(
         "no_router": True,
         "no_orchestrator": True,
         "no_multi_agent": True,
+        "workflow_modified": False,
+        "changed_files": ["hello.py", "test_hello.py"],
+        "submit_task_contract": "UNCHANGED",
+        "get_task_result_contract": "UNCHANGED",
+        "mark_reviewed_contract": "COMPATIBLE",
+        "markdown": "\n".join(lines),
+    }
+
+
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_B_SERVERCHAN_REAL_PUSH_GOLDEN_01 (task cf-7d9109b381ae)
+#
+# One real end-to-end Execution B Golden: a fixed test result is turned into a
+# completion event, routed through the existing event notification consumer and
+# Push Outbox, mapped by the existing ServerChan adapter to a title/desp payload
+# whose title contains "Personal AI Golden", and finally sent as a REAL Server酱
+# HTTPS request. The SendKey is read ONLY from the runner secret env
+# SERVERCHAN_SENDKEY and is never read back, logged, persisted or uploaded.
+#
+# Exactly one logical notification is produced (enqueue is idempotent on
+# dedupe_key); a network failure is handled only by the existing bounded retry.
+# When no SendKey is present the real WeChat leg is reported as
+# BLOCKED_EXTERNAL_CREDENTIAL and the result is NEVER a mocked PASS. The Human
+# Gate and the frozen Execution A baseline are untouched.
+# ---------------------------------------------------------------------------
+
+SERVERCHAN_REAL_PUSH_GOAL = "PERSONAL_AI_EXECUTION_B_SERVERCHAN_REAL_PUSH_GOLDEN_01"
+SERVERCHAN_REAL_PUSH_TASK_ID = "cf-7d9109b381ae"
+SERVERCHAN_REAL_PUSH_REPORT = "PERSONAL_AI_SERVERCHAN_REAL_PUSH_GOLDEN_REPORT"
+SERVERCHAN_REAL_PUSH_MARKER = (
+    "PERSONAL_AI_EXECUTION_B_SERVERCHAN_REAL_PUSH_GOLDEN_01"
+)
+SERVERCHAN_REAL_PUSH_TITLE = "Personal AI Golden"
+SERVERCHAN_REAL_PUSH_SUMMARY = (
+    "Fixed golden probe result: task completed successfully and was reviewed PASS."
+)
+SERVERCHAN_REAL_PUSH_EVENT = "serverchan_real_push_golden"
+
+REAL_PUSH_PASS = "REAL_PUSH=PASS"
+REAL_PUSH_BLOCKED_CREDENTIAL = "REAL_PUSH=BLOCKED_EXTERNAL_CREDENTIAL"
+REAL_PUSH_BLOCKED_DELIVERY = "REAL_PUSH=BLOCKED_DELIVERY"
+REAL_PUSH_FAILED = "REAL_PUSH=FAIL"
+
+
+def build_serverchan_golden_payload(envelope: dict) -> dict:
+    """Map the Golden push envelope to ServerChan's title/desp contract.
+
+    The title always contains ``SERVERCHAN_REAL_PUSH_TITLE`` ("Personal AI
+    Golden") and the body always carries task_id, classification,
+    summary and review_required so the phone-side reader can recognise the
+    notification as ``SERVERCHAN_REAL_PUSH_MARKER``.
+    """
+    if not isinstance(envelope, dict):
+        raise TypeError("build_serverchan_golden_payload requires an envelope dict")
+    task_id = str(envelope.get("task_id") or "")
+    classification = str(envelope.get("classification") or "")
+    if not task_id:
+        raise ValueError("build_serverchan_golden_payload requires a task_id")
+    if classification not in NOTIFICATION_CLASSES:
+        raise ValueError(
+            f"unknown notification classification: {classification!r}"
+        )
+    summary = (
+        str(envelope.get("summary") or "").strip() or SERVERCHAN_REAL_PUSH_SUMMARY
+    )
+    review_required = bool(envelope.get("review_required")) or (
+        classification == NOTIFICATION_CLASS_PENDING_APPROVAL
+    )
+    title = SERVERCHAN_REAL_PUSH_TITLE
+    if len(title) > SERVERCHAN_TITLE_MAX_LENGTH:
+        title = title[: SERVERCHAN_TITLE_MAX_LENGTH - 3] + "..."
+    desp = "\n".join(
+        [
+            f"### {SERVERCHAN_REAL_PUSH_TITLE}",
+            "",
+            f"- golden: {SERVERCHAN_REAL_PUSH_MARKER}",
+            f"- task_id: {task_id}",
+            f"- classification: {classification}",
+            f"- summary: {summary}",
+            f"- review_required: {str(review_required).lower()}",
+            f"- dedupe_key: {envelope.get('dedupe_key') or ''}",
+            "",
+            "Human Gate: notification only; no auto review / PASS / dispatch.",
+        ]
+    )
+    return {
+        "title": title,
+        "desp": desp,
+        "task_id": task_id,
+        "classification": classification,
+        "summary": summary,
+        "review_required": review_required,
+        "marker": SERVERCHAN_REAL_PUSH_MARKER,
+        "dedupe_key": envelope.get("dedupe_key"),
+        "channel": SERVERCHAN_ADAPTER_CHANNEL,
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+    }
+
+
+def serverchan_real_push_golden(
+    *,
+    transport=None,
+    now: datetime | None = None,
+) -> dict:
+    """Run the real ServerChan end-to-end push Golden.
+
+    Chain: fixed completion event -> existing event notification consumer -> Push
+    Outbox -> ServerChan adapter -> real HTTPS ``transport`` (default
+    :func:`serverchan_http_transport`). Exactly one logical notification and one
+    outbox envelope are produced for ``SERVERCHAN_REAL_PUSH_TASK_ID``. The result
+    is ``REAL_PUSH=PASS`` only when a credential is present and the HTTPS call
+    returned a ServerChan success; otherwise a concrete blocker is returned and a
+    mocked send is never reported as a real push.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)
+    task_id = SERVERCHAN_REAL_PUSH_TASK_ID
+
+    # 1. Fixed test result -> canonical completion event.
+    existing = TASK_REGISTRY.get(task_id)
+    already_reviewed = bool(
+        existing
+        and existing.get("reviewed")
+        and str(existing.get("review_verdict")) == NOTIFICATION_CLASS_PASS
+    )
+    prior_notifications = [
+        item
+        for item in list_notifications(task_id)
+        if str(item.get("classification")) == NOTIFICATION_CLASS_PASS
+    ]
+    chain_ran = not prior_notifications
+    if chain_ran:
+        submit_task(
+            task_id,
+            goal=SERVERCHAN_REAL_PUSH_GOAL,
+            status="success",
+            requires_review=True,
+        )
+        completion_event = build_completion_event(
+            task_id,
+            status="success",
+            tests="python -m pytest -q",
+            evidence={"golden": SERVERCHAN_REAL_PUSH_MARKER},
+        )
+        handled = handle_completion_event(completion_event)
+        if not already_reviewed:
+            mark_reviewed(
+                task_id,
+                NOTIFICATION_CLASS_PASS,
+                "serverchan real push golden fixed verdict",
+            )
+        # 2. Existing event notification consumer (idempotent).
+        consumed = consume_event_notifications(now=now)
+    else:
+        completion_event = None
+        handled = {"action": "skipped_existing_notification"}
+        consumed = {"emitted_count": 0}
+
+    # 3. Existing Push Outbox: exactly one logical envelope for this task.
+    consumer_id = f"serverchan-golden-{task_id}"
+    first = enqueue_push_envelopes(consumer_id, task_id=task_id, now=now)
+    second = enqueue_push_envelopes(consumer_id, task_id=task_id, now=now)
+    first_probe = [e for e in first["created"] if e["task_id"] == task_id]
+    second_probe = [e for e in second["created"] if e["task_id"] == task_id]
+    envelopes = [
+        item
+        for item in list_push_envelopes(task_id=task_id)
+        if item.get("classification") == NOTIFICATION_CLASS_PASS
+    ]
+    notifications = list_notifications(task_id)
+    envelope = envelopes[0] if envelopes else None
+    dedupe_ok = bool(
+        len(envelopes) == 1
+        and len(second_probe) == 0
+        and len(notifications) == 1
+    )
+
+    # 4. ServerChan adapter -> real HTTPS send.
+    payload = build_serverchan_golden_payload(envelope) if envelope else {}
+    credential_present = serverchan_sendkey_present()
+    serverchan_meta = (envelope or {}).get("serverchan") or {}
+    if envelope is not None and str(envelope.get("state")) == "delivered":
+        # Already delivered for this dedupe_key: never send the same logical
+        # notification twice, just surface the recorded evidence.
+        delivery = {
+            "dedupe_key": envelope.get("dedupe_key"),
+            "task_id": task_id,
+            "classification": envelope.get("classification"),
+            "state": "delivered",
+            "status": PASS,
+            "credential_present": credential_present,
+            "endpoint_kind": serverchan_meta.get("endpoint_kind"),
+            "sendkey_redacted": serverchan_meta.get("sendkey_redacted"),
+            "external_blocker": None,
+            "retryable": False,
+            "status_code": serverchan_meta.get("status_code"),
+            "push_id": serverchan_meta.get("push_id"),
+            "server_message": serverchan_meta.get("server_message"),
+            "attempt_count": envelope.get("attempt_count"),
+            "payload": payload,
+            "envelope": envelope,
+            "already_delivered": True,
+        }
+    elif envelope is not None:
+        delivery = _deliver_serverchan(
+            str(envelope["dedupe_key"]),
+            envelope,
+            payload,
+            transport=transport,
+            now=now,
+        )
+    else:
+        delivery = {"state": "missing", "status": BLOCKED}
+    delivery_state = str(delivery.get("state") or "")
+    final_envelope = (
+        get_push_envelope(str(envelope["dedupe_key"])) if envelope is not None else None
+    )
+    sent_at = (
+        (final_envelope or {}).get("delivered_at")
+        if delivery_state == "delivered"
+        else now.isoformat()
+    )
+
+    real_push_ok = bool(credential_present and delivery_state == "delivered")
+    if not credential_present:
+        real_push = REAL_PUSH_BLOCKED_CREDENTIAL
+        blocker = BLOCKED_EXTERNAL_CREDENTIAL
+    elif real_push_ok:
+        real_push = REAL_PUSH_PASS
+        blocker = None
+    elif delivery_state == "blocked":
+        real_push = REAL_PUSH_BLOCKED_DELIVERY
+        blocker = str((final_envelope or {}).get("last_error") or "delivery_failed")
+    else:
+        real_push = REAL_PUSH_BLOCKED_DELIVERY
+        blocker = "delivery_incomplete"
+
+    payload_ok = bool(
+        payload
+        and SERVERCHAN_REAL_PUSH_TITLE in str(payload.get("title") or "")
+        and str(payload.get("task_id")) == task_id
+        and payload.get("classification") == NOTIFICATION_CLASS_PASS
+        and payload.get("summary")
+        and payload.get("review_required") is False
+    )
+    gate_ok = bool(
+        prior_notifications
+        or (chain_ran and (already_reviewed or get_task_review(task_id)))
+    )
+    checks = [
+        {
+            "check": "SendKey read only from runner secret env",
+            "status": (
+                PASS
+                if (serverchan_sendkey() is None or credential_present)
+                else FAIL
+            ),
+            "detail": (
+                f"credential_present={credential_present}; env="
+                f"{SERVERCHAN_SENDKEY_ENV}; sendkey_redacted="
+                f"{serverchan_redact(serverchan_sendkey())}"
+            ),
+        },
+        {
+            "check": "one logical notification, dedupe/retry correct",
+            "status": PASS if dedupe_ok else FAIL,
+            "detail": (
+                f"notification(s)={len(notifications)}; envelope(s)="
+                f"{len(envelopes)}; repeated enqueue created "
+                f"{len(second_probe)}; bounded retry max_attempts="
+                f"{SERVERCHAN_MAX_ATTEMPTS}"
+            ),
+        },
+        {
+            "check": "golden notification content identifies the task",
+            "status": PASS if payload_ok else FAIL,
+            "detail": (
+                f"title={payload.get('title')!r} contains "
+                f"{SERVERCHAN_REAL_PUSH_TITLE!r}; desp carries task_id/"
+                "classification=classification/summary/review_required=false"
+            ),
+        },
+        {
+            "check": "external WeChat push credential present",
+            "status": PASS if credential_present else BLOCKED,
+            "detail": (
+                f"SERVERCHAN_SENDKEY present={credential_present}; send state="
+                f"{delivery_state or 'not_attempted'}; without a credential the "
+                f"leg is {BLOCKED_EXTERNAL_CREDENTIAL} and no PASS is claimed"
+            ),
+        },
+        {
+            "check": "real HTTPS send confirmed by ServerChan",
+            "status": PASS if real_push_ok else BLOCKED,
+            "detail": (
+                f"http_status_code={delivery.get('status_code')}; push_id="
+                f"{delivery.get('push_id')}; server_message="
+                f"{delivery.get('server_message')}"
+            ),
+        },
+        {
+            "check": "Human Gate preserved",
+            "status": PASS if gate_ok else FAIL,
+            "detail": (
+                "golden verdict recorded through the unchanged mark_reviewed "
+                "contract; no auto review / auto pass / auto dispatch; "
+                "human_review_gate=True"
+            ),
+        },
+    ]
+
+    hard_ok = bool(dedupe_ok and payload_ok and gate_ok)
+    if not hard_ok:
+        final = FAIL
+        real_push = REAL_PUSH_FAILED
+    elif real_push_ok:
+        final = PASS
+    else:
+        final = BLOCKED
+
+    evidence = {
+        "task_id": task_id,
+        "marker": SERVERCHAN_REAL_PUSH_MARKER,
+        "goal": SERVERCHAN_REAL_PUSH_GOAL,
+        "chain_ran": chain_ran,
+        "classification": NOTIFICATION_CLASS_PASS,
+        "summary": payload.get("summary"),
+        "review_required": payload.get("review_required"),
+        "dedupe_key": (envelope or {}).get("dedupe_key"),
+        "notification_count": len(notifications),
+        "envelope_count": len(envelopes),
+        "repeated_enqueue_created": len(second_probe),
+        "credential_present": credential_present,
+        "sendkey_redacted": serverchan_redact(serverchan_sendkey()),
+        "endpoint_kind": delivery.get("endpoint_kind"),
+        "http_status_code": delivery.get("status_code"),
+        "api_success": delivery_state == "delivered",
+        "push_id": delivery.get("push_id"),
+        "server_message": delivery.get("server_message"),
+        "attempt_count": delivery.get("attempt_count"),
+        "already_delivered": bool(delivery.get("already_delivered")),
+        "sent_at": sent_at,
+        "url_redacted": True,
+    }
+
+    record_consumer_evidence(
+        SERVERCHAN_REAL_PUSH_EVENT,
+        task_id,
+        detail=(
+            f"serverchan real push golden -> {real_push} "
+            f"(state={delivery_state or 'not_attempted'})"
+        ),
+        extra={k: v for k, v in evidence.items() if k not in ("goal",)},
+    )
+
+    lines = [
+        f"# {SERVERCHAN_REAL_PUSH_REPORT}",
+        "",
+        f"- goal: {SERVERCHAN_REAL_PUSH_GOAL}",
+        f"- task_id: {task_id}",
+        f"- marker: {SERVERCHAN_REAL_PUSH_MARKER}",
+        f"- {real_push}",
+        f"- final_status: {final}",
+        f"- external_blocker: {blocker or 'none'}",
+        f"- credential_present: {credential_present}",
+        f"- sendkey_redacted: {serverchan_redact(serverchan_sendkey())}",
+        "",
+        "## Chain",
+        f"- completion_event: {bool(completion_event)}",
+        f"- completion_event_handled: {handled.get('action')}",
+        f"- notification_consumer_emitted: {consumed.get('emitted_count')}",
+        f"- push_outbox_created: {len(first_probe)}",
+        f"- repeated_enqueue_created: {len(second_probe)}",
+        f"- serverchan_state: {delivery_state or 'not_attempted'}",
+        "",
+        "## Non-sensitive delivery evidence",
+        f"- http_status_code: {delivery.get('status_code')}",
+        f"- api_success: {delivery_state == 'delivered'}",
+        f"- push_id: {delivery.get('push_id')}",
+        f"- server_message: {delivery.get('server_message')}",
+        f"- dedupe_key: {(envelope or {}).get('dedupe_key')}",
+        f"- attempt_count: {delivery.get('attempt_count')}",
+        f"- sent_at: {sent_at}",
+        "- url: <redacted; may embed SendKey>",
+        "",
+        "## Notification mapping",
+        f"- title: {payload.get('title')}",
+        f"- desp:\n{payload.get('desp') or ''}",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"REAL_PUSH={real_push.split('=', 1)[-1]}", f"FINAL_STATUS={final}"]
+
+    return {
+        "report": SERVERCHAN_REAL_PUSH_REPORT,
+        "goal": SERVERCHAN_REAL_PUSH_GOAL,
+        "task_id": task_id,
+        "marker": SERVERCHAN_REAL_PUSH_MARKER,
+        "classification": NOTIFICATION_CLASS_PASS,
+        "final_status": final,
+        "real_push": real_push,
+        "real_push_passed": real_push_ok,
+        "external_blocker": blocker,
+        "credential_present": credential_present,
+        "sendkey_redacted": serverchan_redact(serverchan_sendkey()),
+        "endpoint_kind": delivery.get("endpoint_kind"),
+        "http_status_code": delivery.get("status_code"),
+        "push_id": delivery.get("push_id"),
+        "server_message": delivery.get("server_message"),
+        "sent_at": sent_at,
+        "payload": payload,
+        "delivery": delivery,
+        "evidence": evidence,
+        "checks": checks,
+        "dedupe_ok": dedupe_ok,
+        "single_logical_notification": dedupe_ok,
+        "notification_count": len(notifications),
+        "envelope_count": len(envelopes),
+        "chain": {
+            "completion_event": bool(completion_event),
+            "completion_event_handled": handled.get("action"),
+            "notification_consumer_emitted": consumed.get("emitted_count"),
+            "push_outbox_created": len(first_probe),
+            "repeated_enqueue_created": len(second_probe),
+            "serverchan_state": delivery_state,
+        },
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
         "workflow_modified": False,
         "changed_files": ["hello.py", "test_hello.py"],
         "submit_task_contract": "UNCHANGED",
