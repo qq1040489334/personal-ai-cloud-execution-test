@@ -63,6 +63,115 @@ def verify_tests_timeout_is_within_policy(minutes: int) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_MCP_NOTIFICATION_READER_RETRY_FAILURE_DIAGNOSIS_V0.1
+# (diagnosis task cf-ae43fa43d063 / failed task cf-ef9992753250)
+#
+# Read-only, evidence-backed classification of the `cloud-agent-dispatch`
+# retry failure (workflow run 36397264915, step 11 `Verify tests
+# (independent)`). The step was killed by its declared `timeout-minutes: 3`
+# budget; the repository pytest suite already needs ~154s for 637 tests, so
+# this is a workflow/configuration failure, not a business-code failure.
+# This section never edits .github/workflows/, secrets or production code.
+# ---------------------------------------------------------------------------
+VERIFY_TESTS_STEP_NAME = "Verify tests (independent)"
+VERIFY_TESTS_FAILURE_ROOT_CAUSE = "verify_tests_step_timeout"
+VERIFY_TESTS_FAILURE_STAGE = "workflow"
+
+VERIFY_TESTS_TIMEOUT_ACTION_CODE_FIX = "code_fix"
+VERIFY_TESTS_TIMEOUT_ACTION_CONFIG_FIX = "config_fix"
+VERIFY_TESTS_TIMEOUT_ACTION_RETRY_ONLY = "retry_only"
+
+
+def classify_verify_tests_timeout_failure(
+    *,
+    configured_timeout_minutes: int,
+    observed_step_seconds: int,
+    suite_completed_green: bool = False,
+) -> dict:
+    """Classify a Verify-tests step failure without guessing.
+
+    A step that overruns its declared timeout is a workflow-run failure. It is
+    never treated as a business-code failure here: the step is killed mid-run,
+    so a green/red suite result was never observed. When the declared budget is
+    still below the hardening policy band the required action is a workflow
+    configuration fix (raise ``timeout-minutes``); once the budget is inside the
+    band an overrun is transient and a plain retry is sufficient.
+    """
+    if (
+        isinstance(configured_timeout_minutes, bool)
+        or not isinstance(configured_timeout_minutes, int)
+        or configured_timeout_minutes <= 0
+    ):
+        raise ValueError("configured_timeout_minutes must be a positive int")
+    if (
+        isinstance(observed_step_seconds, bool)
+        or not isinstance(observed_step_seconds, int)
+        or observed_step_seconds < 0
+    ):
+        raise ValueError("observed_step_seconds must be a non-negative int")
+
+    timeout_observed = observed_step_seconds >= configured_timeout_minutes * 60
+    within_policy = verify_tests_timeout_is_within_policy(
+        configured_timeout_minutes
+    )
+
+    if not timeout_observed:
+        action = VERIFY_TESTS_TIMEOUT_ACTION_CODE_FIX
+        reason = (
+            "the step did not overrun its declared timeout, so this is not a "
+            "Verify-tests timeout and the failure needs code/test investigation"
+        )
+    elif not within_policy:
+        action = VERIFY_TESTS_TIMEOUT_ACTION_CONFIG_FIX
+        reason = (
+            f"declared timeout {configured_timeout_minutes}m is below the "
+            f"hardening policy band "
+            f"{VERIFY_TESTS_TIMEOUT_POLICY_MIN_MINUTES}-"
+            f"{VERIFY_TESTS_TIMEOUT_POLICY_MAX_MINUTES}m; the suite cannot "
+            "finish, so raise timeout-minutes (config fix). A bare retry will "
+            "fail again."
+        )
+    else:
+        action = VERIFY_TESTS_TIMEOUT_ACTION_RETRY_ONLY
+        reason = (
+            "declared timeout already satisfies the policy band; the overrun is "
+            "a transient slow run and a plain retry is sufficient"
+        )
+
+    return {
+        "root_cause": VERIFY_TESTS_FAILURE_ROOT_CAUSE,
+        "failure_stage": VERIFY_TESTS_FAILURE_STAGE,
+        "failing_step": VERIFY_TESTS_STEP_NAME,
+        "workflow_failure": True,
+        "business_code_failure": False,
+        "timeout_config_in_effect": timeout_observed,
+        "suite_completed_green": bool(suite_completed_green),
+        "configured_timeout_minutes": configured_timeout_minutes,
+        "observed_step_seconds": observed_step_seconds,
+        "timeout_within_policy": within_policy,
+        "required_action": action,
+        "retry_sufficient": action
+        == VERIFY_TESTS_TIMEOUT_ACTION_RETRY_ONLY,
+        "code_fix_required": action == VERIFY_TESTS_TIMEOUT_ACTION_CODE_FIX,
+        "config_fix_required": action
+        == VERIFY_TESTS_TIMEOUT_ACTION_CONFIG_FIX,
+        "reason": reason,
+    }
+
+
+def verify_tests_timeout_next_action(
+    configured_timeout_minutes: int = 3,
+) -> str:
+    """Return the recommended action for the current Verify-tests budget."""
+    observed = configured_timeout_minutes * 60 + 1
+    classification = classify_verify_tests_timeout_failure(
+        configured_timeout_minutes=configured_timeout_minutes,
+        observed_step_seconds=observed,
+    )
+    return classification["required_action"]
+
+
 def hello() -> str:
     """Return a greeting."""
     return "hello from cloud execution golden test"

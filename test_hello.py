@@ -176,7 +176,15 @@ from hello import (
     task_result_auto_consumer_report,
     task_review_action_report,
     trigger_bridge_test,
+    VERIFY_TESTS_FAILURE_ROOT_CAUSE,
+    VERIFY_TESTS_FAILURE_STAGE,
+    VERIFY_TESTS_STEP_NAME,
+    VERIFY_TESTS_TIMEOUT_ACTION_CODE_FIX,
+    VERIFY_TESTS_TIMEOUT_ACTION_CONFIG_FIX,
+    VERIFY_TESTS_TIMEOUT_ACTION_RETRY_ONLY,
+    classify_verify_tests_timeout_failure,
     verify_tests_timeout_is_within_policy,
+    verify_tests_timeout_next_action,
     write_production_golden_runtime_execution_result,
 )
 
@@ -5796,3 +5804,140 @@ def test_secret_guard_still_detects_api_keys() -> None:
     assert "KEY_PATTERN = re.compile" in source
     assert r"sk-[A-Za-z0-9]{10,}" in source
     assert "MODEL_API_KEY" in source
+
+
+# Retry-failure diagnosis for cloud-agent-dispatch run 36397264915
+# (PERSONAL_AI_MCP_NOTIFICATION_READER_RETRY_FAILURE_DIAGNOSIS_V0.1).
+#
+# Verifiable evidence, read from the public GitHub Actions API:
+#   run 36397264915 (run_number 110) HEAD c56ef2a4d01bc6959ed8c50a3b1f07eba4c0d828
+#   failed job `cloud-agent-dispatch` (job id 108846499796), step 11
+#   `Verify tests (independent)` started 08:35:34Z and completed 08:38:47Z
+#   (193s). The job annotation is:
+#     "The action 'Verify tests (independent)' has timed out after 3 minutes."
+#   The step is declared with `timeout-minutes: 3` in
+#   .github/workflows/agent-dispatch.yml. The uploaded artifact is
+#   `execution_result-cf-ef9992753250`.
+#
+# The same root cause already blocked the earlier non-retry diagnosis run
+# 36385350185 (step 11 timeout, 192s), so a bare retry does not fix it.
+CLOUD_AGENT_DISPATCH_RUN_36397264915 = {
+    "workflow": "cloud-agent-dispatch",
+    "run_id": 36397264915,
+    "run_number": 110,
+    "head_sha": "c56ef2a4d01bc6959ed8c50a3b1f07eba4c0d828",
+    "job": "cloud-agent-dispatch",
+    "job_id": 108846499796,
+    "failed_task_id": "cf-ef9992753250",
+    "artifact_name": "execution_result-cf-ef9992753250",
+    "failing_step_number": 11,
+    "failing_step": VERIFY_TESTS_STEP_NAME,
+    "configured_timeout_minutes": 3,
+    "observed_step_seconds": 193,
+    "annotation": (
+        "The action 'Verify tests (independent)' has timed out after 3 minutes."
+    ),
+    "root_cause": VERIFY_TESTS_FAILURE_ROOT_CAUSE,
+}
+
+LOCAL_SUITE_EVIDENCE = {
+    "tests_collected": 637,
+    "tests_passed": 637,
+    "wall_clock_seconds": 154.56,
+}
+
+
+def test_cloud_agent_dispatch_run_36397264915_retry_failed_on_verify_tests_timeout() -> None:
+    evidence = CLOUD_AGENT_DISPATCH_RUN_36397264915
+    assert evidence["failing_step"] == "Verify tests (independent)"
+    assert evidence["failing_step_number"] == 11
+    assert evidence["configured_timeout_minutes"] == 3
+    assert evidence["observed_step_seconds"] > (
+        evidence["configured_timeout_minutes"] * 60
+    )
+    assert "timed out after 3 minutes" in evidence["annotation"]
+    assert evidence["root_cause"] == VERIFY_TESTS_FAILURE_ROOT_CAUSE
+    assert evidence["failed_task_id"] == "cf-ef9992753250"
+
+
+def test_retry_failure_matches_prior_run_root_cause() -> None:
+    assert (
+        CLOUD_AGENT_DISPATCH_RUN_36397264915["root_cause"]
+        == CLOUD_AGENT_DISPATCH_RUN_36385350185["root_cause"]
+        == VERIFY_TESTS_FAILURE_ROOT_CAUSE
+    )
+    assert (
+        CLOUD_AGENT_DISPATCH_RUN_36397264915["failing_step_number"]
+        == CLOUD_AGENT_DISPATCH_RUN_36385350185["failing_step_number"]
+        == 11
+    )
+
+
+def test_retry_failure_classifies_as_config_fix_not_code_or_bare_retry() -> None:
+    evidence = CLOUD_AGENT_DISPATCH_RUN_36397264915
+    classification = classify_verify_tests_timeout_failure(
+        configured_timeout_minutes=evidence["configured_timeout_minutes"],
+        observed_step_seconds=evidence["observed_step_seconds"],
+    )
+    assert classification["root_cause"] == VERIFY_TESTS_FAILURE_ROOT_CAUSE
+    assert classification["failure_stage"] == VERIFY_TESTS_FAILURE_STAGE
+    assert classification["timeout_config_in_effect"] is True
+    assert classification["required_action"] == VERIFY_TESTS_TIMEOUT_ACTION_CONFIG_FIX
+    assert classification["config_fix_required"] is True
+    assert classification["code_fix_required"] is False
+    assert classification["retry_sufficient"] is False
+
+
+def test_retry_failure_is_workflow_failure_not_business_code_failure() -> None:
+    evidence = CLOUD_AGENT_DISPATCH_RUN_36397264915
+    classification = classify_verify_tests_timeout_failure(
+        configured_timeout_minutes=evidence["configured_timeout_minutes"],
+        observed_step_seconds=evidence["observed_step_seconds"],
+    )
+    assert classification["workflow_failure"] is True
+    assert classification["business_code_failure"] is False
+    assert classification["failing_step"] == VERIFY_TESTS_STEP_NAME
+
+
+def test_verify_tests_timeout_next_action_is_config_fix_for_three_minutes() -> None:
+    assert verify_tests_timeout_next_action(3) == VERIFY_TESTS_TIMEOUT_ACTION_CONFIG_FIX
+    assert (
+        verify_tests_timeout_next_action(VERIFY_TESTS_TIMEOUT_POLICY_MIN_MINUTES)
+        == VERIFY_TESTS_TIMEOUT_ACTION_RETRY_ONLY
+    )
+
+
+def test_timeout_classification_never_asks_for_code_fix_after_a_real_timeout() -> None:
+    for minutes in (3, 5, 9):
+        classification = classify_verify_tests_timeout_failure(
+            configured_timeout_minutes=minutes,
+            observed_step_seconds=minutes * 60 + 10,
+        )
+        assert classification["required_action"] == VERIFY_TESTS_TIMEOUT_ACTION_CONFIG_FIX
+        assert classification["code_fix_required"] is False
+        assert classification["business_code_failure"] is False
+
+
+def test_timeout_classification_rejects_invalid_inputs() -> None:
+    with pytest.raises(ValueError):
+        classify_verify_tests_timeout_failure(
+            configured_timeout_minutes=0, observed_step_seconds=1
+        )
+    with pytest.raises(ValueError):
+        classify_verify_tests_timeout_failure(
+            configured_timeout_minutes=True, observed_step_seconds=1
+        )
+    with pytest.raises(ValueError):
+        classify_verify_tests_timeout_failure(
+            configured_timeout_minutes="3", observed_step_seconds=1
+        )
+    with pytest.raises(ValueError):
+        classify_verify_tests_timeout_failure(
+            configured_timeout_minutes=3, observed_step_seconds=-1
+        )
+
+
+def test_local_suite_runtime_is_close_to_the_three_minute_budget() -> None:
+    assert LOCAL_SUITE_EVIDENCE["tests_passed"] == LOCAL_SUITE_EVIDENCE["tests_collected"]
+    budget = CLOUD_AGENT_DISPATCH_RUN_36397264915["configured_timeout_minutes"] * 60
+    assert LOCAL_SUITE_EVIDENCE["wall_clock_seconds"] > 0.8 * budget
