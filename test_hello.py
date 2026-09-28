@@ -4624,3 +4624,201 @@ def test_auto_review_gate_contracts_unchanged(
         "verdict",
         "note",
     ]
+
+
+# -- PERSONAL_AI_NEXT_TASK_PROPOSAL_GATE_V0.1 ------------------------------
+# Advisory-only next-task proposal generated from the existing auto_review_gate
+# PASS/FAIL/BLOCKED verdict. No dispatch, no submit_task rewrite.
+
+NEXT_TASK_PROPOSAL_ACCEPTANCE_FIELDS = (
+    "proposal generated for PASS/FAIL/BLOCKED",
+    "proposal is advisory only",
+    "next_task_proposal schema stable",
+    "no dispatch or review side effect",
+    "execution_result structure preserved",
+    "contracts unchanged",
+)
+
+NEXT_TASK_PROPOSAL_EXPECTED_FIELDS = {
+    "task_id",
+    "verdict",
+    "action",
+    "next_task_goal",
+    "reason",
+    "blockers",
+    "source",
+    "auto_dispatch",
+    "dispatch_allowed",
+    "requires_human_approval",
+}
+
+
+@pytest.fixture(scope="module")
+def next_task_proposal_report() -> dict:
+    return hello_module.personal_ai_next_task_proposal_gate_v0_1()
+
+
+def test_next_task_proposal_report_contract(
+    next_task_proposal_report: dict,
+) -> None:
+    report = next_task_proposal_report
+    assert report["report"] == "PERSONAL_AI_NEXT_TASK_PROPOSAL_REPORT"
+    assert report["goal"] == "PERSONAL_AI_NEXT_TASK_PROPOSAL_GATE_V0.1"
+    assert report["task_id"] == "cf-86f2f7e8512e"
+    assert report["status"] == "PASS"
+    assert report["final_status"] == "PASS"
+    assert report["decision_logic"]
+    assert report["markdown"].startswith("# PERSONAL_AI_NEXT_TASK_PROPOSAL_REPORT")
+    assert "FINAL_STATUS=PASS" in report["markdown"]
+
+
+def test_next_task_proposal_checks_all_pass(
+    next_task_proposal_report: dict,
+) -> None:
+    report = next_task_proposal_report
+    checks = {check["check"]: check for check in report["checks"]}
+    assert set(checks) == set(NEXT_TASK_PROPOSAL_ACCEPTANCE_FIELDS)
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] == "PASS"
+        assert check["detail"]
+
+
+def test_next_task_proposal_maps_three_verdicts(
+    next_task_proposal_report: dict,
+) -> None:
+    scenarios = {
+        item["scenario"]: item for item in next_task_proposal_report["scenarios"]
+    }
+    assert set(scenarios) == {
+        "pass_proposal_advances",
+        "fail_proposal_remediates",
+        "blocked_proposal_unblocks",
+    }
+    assert scenarios["pass_proposal_advances"]["actual"] == "PASS"
+    assert scenarios["pass_proposal_advances"]["action"] == "advance"
+    assert scenarios["fail_proposal_remediates"]["actual"] == "FAIL"
+    assert scenarios["fail_proposal_remediates"]["action"] == "remediate"
+    assert scenarios["blocked_proposal_unblocks"]["actual"] == "BLOCKED"
+    assert scenarios["blocked_proposal_unblocks"]["action"] == "unblock"
+    assert next_task_proposal_report["distinct_actions"] is True
+    assert next_task_proposal_report["proposal_mapping"] == {
+        "PASS": "advance",
+        "FAIL": "remediate",
+        "BLOCKED": "unblock",
+    }
+
+
+def test_next_task_proposal_schema_and_explicit_goal(
+    next_task_proposal_report: dict,
+) -> None:
+    assert set(next_task_proposal_report["proposal_fields"]) == (
+        NEXT_TASK_PROPOSAL_EXPECTED_FIELDS
+    )
+    for item in next_task_proposal_report["scenarios"]:
+        proposal = item["proposal"]
+        assert set(proposal) == NEXT_TASK_PROPOSAL_EXPECTED_FIELDS
+        assert proposal["task_id"]
+        assert proposal["source"] == "auto_review_gate"
+        assert proposal["next_task_goal"]
+        assert item["status"] == "PASS"
+        assert item["evidence"]
+
+
+def test_next_task_proposal_is_advisory_only(
+    next_task_proposal_report: dict,
+) -> None:
+    report = next_task_proposal_report
+    assert report["advisory_only"] is True
+    assert report["auto_dispatch"] is False
+    assert report["dispatch_allowed"] is False
+    for item in report["scenarios"]:
+        proposal = item["proposal"]
+        assert proposal["auto_dispatch"] is False
+        assert proposal["dispatch_allowed"] is False
+        assert proposal["requires_human_approval"] is True
+
+
+def test_next_task_proposal_has_no_side_effect(
+    next_task_proposal_report: dict,
+) -> None:
+    report = next_task_proposal_report
+    assert report["no_side_effect"] is True
+    for kind in ("pass", "fail", "blocked"):
+        probe_id = report["scenario_ids"][kind]
+        record = hello_module.get_task_review(probe_id)
+        assert record["reviewed"] is False
+        assert record["review_verdict"] is None
+        assert hello_module.get_review_events(probe_id) == []
+
+
+def test_next_task_proposal_builds_from_verdicts_directly() -> None:
+    for verdict, action in (
+        ("PASS", "advance"),
+        ("FAIL", "remediate"),
+        ("BLOCKED", "unblock"),
+    ):
+        proposal = hello_module.build_next_task_proposal(
+            f"direct-{verdict.lower()}",
+            review_result={
+                "verdict": verdict,
+                "reason": f"{verdict} reason",
+                "blockers": ["b"] if verdict != "PASS" else [],
+            },
+        )
+        assert proposal["verdict"] == verdict
+        assert proposal["action"] == action
+        assert proposal["auto_dispatch"] is False
+        assert proposal["dispatch_allowed"] is False
+        assert proposal["requires_human_approval"] is True
+        assert proposal["next_task_goal"]
+
+
+def test_next_task_proposal_rejects_bad_input() -> None:
+    with pytest.raises(ValueError):
+        hello_module.build_next_task_proposal("")
+    with pytest.raises(ValueError):
+        hello_module.build_next_task_proposal(
+            "bad-verdict", review_result={"verdict": "MAYBE"}
+        )
+
+
+def test_next_task_proposal_preserves_contracts(
+    next_task_proposal_report: dict,
+) -> None:
+    report = next_task_proposal_report
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert report["mark_reviewed_contract"] == "COMPATIBLE"
+    assert report["workflow_modified"] is False
+    assert report["read_only_execution_result"] is True
+    assert report["execution_result_contract_preserved"] is True
+    assert report["execution_result_evidence_preserved"] is True
+    assert report["execution_result_json_preserved"] is True
+    assert set(report["execution_result_contract_fields"]) == {
+        "execution_summary",
+        "commit",
+        "tests",
+        "artifacts",
+        "execution_result_json",
+        "evidence",
+    }
+    probe_id = report["scenario_ids"]["pass"]
+    result = hello_module.get_task_result(probe_id)
+    assert set(result) == set(report["execution_result_contract_fields"])
+    assert isinstance(result["execution_result_json"], dict)
+    assert list(inspect.signature(hello_module.submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(hello_module.get_task_result).parameters) == [
+        "task_id"
+    ]
+    assert list(inspect.signature(hello_module.mark_reviewed).parameters) == [
+        "task_id",
+        "verdict",
+        "note",
+    ]

@@ -11849,6 +11849,398 @@ def personal_ai_auto_review_gate_v0_1() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_NEXT_TASK_PROPOSAL_GATE_V0.1
+#
+# Minimal, advisory-only next-task proposal layer built on top of the existing
+# ``auto_review_gate`` result. It reads the PASS / FAIL / BLOCKED verdict and
+# emits a structured ``next_task_proposal`` describing what a human/planner
+# could do next. It never dispatches, never rewrites ``submit_task``, and never
+# introduces a Router or Orchestrator. The ``execution_result`` /
+# ``get_task_result`` / ``mark_reviewed`` contracts are preserved verbatim.
+# ---------------------------------------------------------------------------
+NEXT_TASK_PROPOSAL_GOAL = "PERSONAL_AI_NEXT_TASK_PROPOSAL_GATE_V0.1"
+NEXT_TASK_PROPOSAL_TASK_ID = "cf-86f2f7e8512e"
+NEXT_TASK_PROPOSAL_REPORT = "PERSONAL_AI_NEXT_TASK_PROPOSAL_REPORT"
+NEXT_TASK_PROPOSAL_STATES = (PASS, FAIL, BLOCKED)
+NEXT_TASK_PROPOSAL_ACTIONS = {
+    PASS: "advance",
+    FAIL: "remediate",
+    BLOCKED: "unblock",
+}
+NEXT_TASK_PROPOSAL_FIELDS = (
+    "task_id",
+    "verdict",
+    "action",
+    "next_task_goal",
+    "reason",
+    "blockers",
+    "source",
+    "auto_dispatch",
+    "dispatch_allowed",
+    "requires_human_approval",
+)
+
+
+def build_next_task_proposal(task_id: str, review_result: dict | None = None) -> dict:
+    """Build an advisory-only ``next_task_proposal`` from an auto-review result.
+
+    The verdict from the existing ``auto_review_gate`` maps deterministically:
+    PASS -> advance, FAIL -> remediate, BLOCKED -> unblock. The proposal never
+    dispatches and never mutates review state; it only records a suggestion that
+    always requires explicit human approval before any dispatch.
+    """
+    if not task_id:
+        raise ValueError("build_next_task_proposal requires a task_id")
+    review = (
+        review_result
+        if review_result is not None
+        else auto_review_gate(task_id, apply=False)
+    )
+    verdict = review.get("verdict")
+    if verdict not in NEXT_TASK_PROPOSAL_STATES:
+        raise ValueError(
+            f"build_next_task_proposal received unknown verdict {verdict!r}"
+        )
+    action = NEXT_TASK_PROPOSAL_ACTIONS[verdict]
+    if verdict == PASS:
+        next_task_goal = (
+            f"advance {task_id}: keep the PASSed result and select the next "
+            "approved task (human approval required before any dispatch)"
+        )
+    elif verdict == FAIL:
+        next_task_goal = (
+            f"remediate {task_id}: diagnose the failing tests/status, fix the "
+            "implementation, then re-run the execution gate"
+        )
+    else:
+        next_task_goal = (
+            f"unblock {task_id}: supply the missing tests/artifacts/evidence, "
+            "then re-run the execution gate"
+        )
+    return {
+        "task_id": task_id,
+        "verdict": verdict,
+        "action": action,
+        "next_task_goal": next_task_goal,
+        "reason": review.get("reason", ""),
+        "blockers": list(review.get("blockers", [])),
+        "source": "auto_review_gate",
+        "auto_dispatch": False,
+        "dispatch_allowed": False,
+        "requires_human_approval": True,
+    }
+
+
+def _next_task_proposal_probe_id(kind: str) -> str:
+    return f"next-task-proposal-{kind}-{uuid.uuid4().hex[:10]}"
+
+
+def _next_task_proposal_scenarios() -> dict:
+    """Execute the auditable PASS/FAIL/BLOCKED proposal scenarios.
+
+    Every probe is submitted through the unchanged ``submit_task`` contract and
+    reviewed with ``apply=False`` so the proposal layer has no side effect.
+    """
+    scenarios: list[dict] = []
+    ids: dict = {}
+
+    # Scenario 1: PASS -> advance proposal.
+    pass_id = _next_task_proposal_probe_id("pass")
+    ids["pass"] = pass_id
+    submit_task(
+        pass_id,
+        goal=NEXT_TASK_PROPOSAL_GOAL,
+        status="success",
+        requires_review=True,
+        **_auto_review_gate_evidence(pass_id),
+    )
+    pass_proposal = build_next_task_proposal(pass_id)
+    pass_ok = (
+        pass_proposal["verdict"] == PASS
+        and pass_proposal["action"] == NEXT_TASK_PROPOSAL_ACTIONS[PASS]
+        and pass_proposal["auto_dispatch"] is False
+        and pass_proposal["dispatch_allowed"] is False
+        and pass_proposal["requires_human_approval"] is True
+    )
+    scenarios.append(
+        {
+            "scenario": "pass_proposal_advances",
+            "expected": PASS,
+            "actual": pass_proposal["verdict"],
+            "action": pass_proposal["action"],
+            "status": PASS if pass_ok else FAIL,
+            "proposal": pass_proposal,
+            "evidence": (
+                f"{pass_id} verdict={pass_proposal['verdict']} "
+                f"action={pass_proposal['action']} "
+                f"auto_dispatch={pass_proposal['auto_dispatch']}"
+            ),
+        }
+    )
+
+    # Scenario 2: FAIL -> remediate proposal.
+    fail_id = _next_task_proposal_probe_id("fail")
+    ids["fail"] = fail_id
+    fail_evidence = _auto_review_gate_evidence(fail_id)
+    submit_task(
+        fail_id,
+        goal=NEXT_TASK_PROPOSAL_GOAL,
+        status="success",
+        requires_review=True,
+        tests="2 failed, 1 passed",
+        artifacts=fail_evidence["artifacts"],
+        evidence=fail_evidence["evidence"],
+        execution_result_json={
+            "task_id": fail_id,
+            "status": "success",
+            "tests": "2 failed",
+        },
+    )
+    fail_proposal = build_next_task_proposal(fail_id)
+    fail_ok = (
+        fail_proposal["verdict"] == FAIL
+        and fail_proposal["action"] == NEXT_TASK_PROPOSAL_ACTIONS[FAIL]
+        and fail_proposal["blockers"]
+        and fail_proposal["dispatch_allowed"] is False
+    )
+    scenarios.append(
+        {
+            "scenario": "fail_proposal_remediates",
+            "expected": FAIL,
+            "actual": fail_proposal["verdict"],
+            "action": fail_proposal["action"],
+            "status": PASS if fail_ok else FAIL,
+            "proposal": fail_proposal,
+            "evidence": (
+                f"{fail_id} verdict={fail_proposal['verdict']} "
+                f"action={fail_proposal['action']} "
+                f"blockers={fail_proposal['blockers']}"
+            ),
+        }
+    )
+
+    # Scenario 3: BLOCKED -> unblock proposal.
+    blocked_id = _next_task_proposal_probe_id("blocked")
+    ids["blocked"] = blocked_id
+    submit_task(
+        blocked_id,
+        goal=NEXT_TASK_PROPOSAL_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    blocked_proposal = build_next_task_proposal(blocked_id)
+    blocked_ok = (
+        blocked_proposal["verdict"] == BLOCKED
+        and blocked_proposal["action"] == NEXT_TASK_PROPOSAL_ACTIONS[BLOCKED]
+        and blocked_proposal["blockers"]
+        and blocked_proposal["dispatch_allowed"] is False
+    )
+    scenarios.append(
+        {
+            "scenario": "blocked_proposal_unblocks",
+            "expected": BLOCKED,
+            "actual": blocked_proposal["verdict"],
+            "action": blocked_proposal["action"],
+            "status": PASS if blocked_ok else FAIL,
+            "proposal": blocked_proposal,
+            "evidence": (
+                f"{blocked_id} verdict={blocked_proposal['verdict']} "
+                f"action={blocked_proposal['action']} "
+                f"blockers={blocked_proposal['blockers']}"
+            ),
+        }
+    )
+
+    return {"scenarios": scenarios, "ids": ids}
+
+
+def personal_ai_next_task_proposal_gate_v0_1() -> dict:
+    """Build the PERSONAL_AI_NEXT_TASK_PROPOSAL_GATE_V0.1 acceptance report.
+
+    Proves that a structured next_task_proposal is generated for each of the
+    PASS / FAIL / BLOCKED auto-review verdicts, that the proposal is advisory
+    only (no auto-dispatch, no review side effect), and that the existing
+    ``execution_result`` / ``get_task_result`` / ``mark_reviewed`` contracts are
+    preserved.
+    """
+    golden = _next_task_proposal_scenarios()
+    scenarios = golden["scenarios"]
+    scenario_map = {item["scenario"]: item for item in scenarios}
+    scenario_names = (
+        "pass_proposal_advances",
+        "fail_proposal_remediates",
+        "blocked_proposal_unblocks",
+    )
+
+    proposal_fields_ok = all(
+        set(item["proposal"]) == set(NEXT_TASK_PROPOSAL_FIELDS)
+        for item in scenarios
+    )
+    advisory_ok = all(
+        item["proposal"]["auto_dispatch"] is False
+        and item["proposal"]["dispatch_allowed"] is False
+        and item["proposal"]["requires_human_approval"] is True
+        for item in scenarios
+    )
+    distinct_actions = {
+        scenario_map[name]["action"] for name in scenario_names
+    } == set(NEXT_TASK_PROPOSAL_ACTIONS.values())
+    verdict_actions_ok = all(
+        scenario_map[name]["actual"] == scenario_map[name]["expected"]
+        and scenario_map[name]["action"]
+        == NEXT_TASK_PROPOSAL_ACTIONS[scenario_map[name]["expected"]]
+        for name in scenario_names
+    )
+
+    # The advisory layer must be read-only: every probe stays unreviewed and no
+    # dispatch/auto-review event is emitted.
+    no_side_effect_ok = all(
+        (get_task_review(golden["ids"][kind]) or {}).get("reviewed") is False
+        and not get_review_events(golden["ids"][kind])
+        for kind in ("pass", "fail", "blocked")
+    )
+
+    # Existing execution_result / get_task_result structure must be preserved.
+    probe_result = get_task_result(golden["ids"]["pass"])
+    contract_fields = tuple(probe_result)
+    structure_preserved = set(contract_fields) == set(
+        AUTO_REVIEW_GATE_CONTRACT_FIELDS
+    )
+    evidence = probe_result.get("evidence")
+    evidence_preserved = (
+        isinstance(evidence, dict)
+        and {"acceptance", "logs", "validation", "decision"} <= set(evidence)
+    )
+    raw_preserved = isinstance(probe_result.get("execution_result_json"), dict)
+
+    contracts_unchanged = (
+        list(inspect.signature(submit_task).parameters) == SUBMIT_TASK_PARAMS
+        and list(inspect.signature(get_task_result).parameters) == ["task_id"]
+        and list(inspect.signature(mark_reviewed).parameters)
+        == ["task_id", "verdict", "note"]
+    )
+
+    checks = [
+        {
+            "check": "proposal generated for PASS/FAIL/BLOCKED",
+            "status": PASS
+            if all(scenario_map[name]["status"] == PASS for name in scenario_names)
+            and distinct_actions
+            and verdict_actions_ok
+            else FAIL,
+            "detail": (
+                "verdict -> action: "
+                + ", ".join(
+                    f"{scenario_map[name]['actual']}->"
+                    f"{scenario_map[name]['action']}"
+                    for name in scenario_names
+                )
+            ),
+        },
+        {
+            "check": "proposal is advisory only",
+            "status": PASS if advisory_ok else FAIL,
+            "detail": (
+                "every proposal sets auto_dispatch=False, dispatch_allowed=False "
+                "and requires_human_approval=True"
+            ),
+        },
+        {
+            "check": "next_task_proposal schema stable",
+            "status": PASS if proposal_fields_ok else FAIL,
+            "detail": "fields: " + ", ".join(NEXT_TASK_PROPOSAL_FIELDS),
+        },
+        {
+            "check": "no dispatch or review side effect",
+            "status": PASS if no_side_effect_ok else FAIL,
+            "detail": "probe tasks remain unreviewed with no review/dispatch events",
+        },
+        {
+            "check": "execution_result structure preserved",
+            "status": PASS
+            if structure_preserved and evidence_preserved and raw_preserved
+            else FAIL,
+            "detail": "get_task_result fields: " + ", ".join(contract_fields),
+        },
+        {
+            "check": "contracts unchanged",
+            "status": PASS if contracts_unchanged else FAIL,
+            "detail": "submit_task / get_task_result / mark_reviewed signatures unchanged",
+        },
+    ]
+
+    final = (
+        PASS if all(check["status"] == PASS for check in checks) else FAIL
+    )
+
+    decision_logic = (
+        "build_next_task_proposal(task_id): auto_review_gate(task_id, "
+        "apply=False) -> verdict. PASS -> advance, FAIL -> remediate, "
+        "BLOCKED -> unblock. The proposal is advisory only: no dispatch, no "
+        "mark_reviewed side effect, and requires explicit human approval."
+    )
+    markdown_lines = [
+        f"# {NEXT_TASK_PROPOSAL_REPORT}",
+        "",
+        f"- goal: {NEXT_TASK_PROPOSAL_GOAL}",
+        f"- task_id: {NEXT_TASK_PROPOSAL_TASK_ID}",
+        f"- FINAL: {final}",
+        "",
+        "## Decision logic",
+        decision_logic,
+        "",
+        "## Proposal mapping",
+    ]
+    for state in NEXT_TASK_PROPOSAL_STATES:
+        markdown_lines.append(
+            f"- {state} -> {NEXT_TASK_PROPOSAL_ACTIONS[state]}"
+        )
+    markdown_lines += ["", "## Scenarios"]
+    for item in scenarios:
+        markdown_lines.append(
+            f"- [{item['status']}] {item['scenario']}: "
+            f"expected={item['expected']} actual={item['actual']} "
+            f"action={item['action']}"
+        )
+    markdown_lines += ["", "## Checks"]
+    for check in checks:
+        markdown_lines.append(
+            f"- [{check['status']}] {check['check']}: {check['detail']}"
+        )
+    markdown_lines += ["", f"FINAL_STATUS={final}"]
+
+    return {
+        "report": NEXT_TASK_PROPOSAL_REPORT,
+        "goal": NEXT_TASK_PROPOSAL_GOAL,
+        "task_id": NEXT_TASK_PROPOSAL_TASK_ID,
+        "status": final,
+        "final_status": final,
+        "decision_logic": decision_logic,
+        "proposal_mapping": dict(NEXT_TASK_PROPOSAL_ACTIONS),
+        "states": list(NEXT_TASK_PROPOSAL_STATES),
+        "proposal_fields": list(NEXT_TASK_PROPOSAL_FIELDS),
+        "scenarios": scenarios,
+        "scenario_ids": golden["ids"],
+        "checks": checks,
+        "distinct_actions": distinct_actions,
+        "advisory_only": advisory_ok,
+        "no_side_effect": no_side_effect_ok,
+        "execution_result_contract_fields": list(AUTO_REVIEW_GATE_CONTRACT_FIELDS),
+        "execution_result_contract_preserved": structure_preserved,
+        "execution_result_evidence_preserved": evidence_preserved,
+        "execution_result_json_preserved": raw_preserved,
+        "submit_task_contract": "UNCHANGED",
+        "get_task_result_contract": "UNCHANGED",
+        "mark_reviewed_contract": "COMPATIBLE",
+        "auto_dispatch": False,
+        "dispatch_allowed": False,
+        "workflow_modified": False,
+        "read_only_execution_result": True,
+        "markdown": "\n".join(markdown_lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(runtime_provenance_v0_1_report()["markdown"])
     print(cloudflare_runtime_audit_report()["markdown"])
