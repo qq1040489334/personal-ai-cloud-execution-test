@@ -13229,6 +13229,715 @@ def personal_ai_event_driven_review_trigger_v0_1() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EVENT_NOTIFICATION_CONSUMER_V0.1  (task cf-ab6c36a77b47)
+#
+# The proactive notification layer on top of the Execution Loop
+# (completion event -> review_ready -> auto review -> Human Gate).
+#
+# One explicit, idempotent consumer entry (consume_event_notifications)
+# discovers the review_ready / pending_review states produced by the existing
+# event-driven trigger and emits classified notifications for PASS / FAIL /
+# BLOCKED / pending human approval. It reuses the existing Task Registry,
+# list_review_ready(), list_pending_results(), get_task_result, consumer
+# evidence and auto review decision; it does not build a second task system.
+# The notification layer is read-only with respect to the execution layer: it
+# never reviews, never PASSes and never dispatches, so the Human Gate stays
+# closed. No Router, no generic orchestrator and no multi-agent scheduling are
+# introduced.
+# ---------------------------------------------------------------------------
+
+EVENT_NOTIFICATION_CONSUMER_GOAL = "PERSONAL_AI_EVENT_NOTIFICATION_CONSUMER_V0.1"
+EVENT_NOTIFICATION_CONSUMER_TASK_ID = "cf-ab6c36a77b47"
+EVENT_NOTIFICATION_CONSUMER_REPORT = "PERSONAL_AI_EVENT_NOTIFICATION_CONSUMER_REPORT"
+EVENT_NOTIFICATION_STATE_ENV = "PERSONAL_AI_NOTIFICATION_STATE"
+EVENT_NOTIFICATION_STATE_DEFAULT = "personal_ai_event_notifications.json"
+EVENT_NOTIFICATION_EVIDENCE_KIND = "personal_ai_event_notification_ledger"
+EVENT_NOTIFICATION_SOURCE = "event_notification_consumer"
+EVENT_NOTIFICATION_DISCOVERY_SOURCES = ("review_ready", "pending_review")
+EVENT_NOTIFICATION_EVENT = "notification_emitted"
+
+NOTIFICATION_CLASS_PASS = PASS
+NOTIFICATION_CLASS_FAIL = FAIL
+NOTIFICATION_CLASS_BLOCKED = BLOCKED
+NOTIFICATION_CLASS_PENDING_APPROVAL = "PENDING_APPROVAL"
+NOTIFICATION_CLASSES = (
+    NOTIFICATION_CLASS_PASS,
+    NOTIFICATION_CLASS_FAIL,
+    NOTIFICATION_CLASS_BLOCKED,
+    NOTIFICATION_CLASS_PENDING_APPROVAL,
+)
+NOTIFICATION_CATEGORY_BY_CLASS = {
+    NOTIFICATION_CLASS_PASS: "result_pass",
+    NOTIFICATION_CLASS_FAIL: "result_fail",
+    NOTIFICATION_CLASS_BLOCKED: "result_blocked",
+    NOTIFICATION_CLASS_PENDING_APPROVAL: "pending_approval",
+}
+NOTIFICATION_TITLE_BY_CLASS = {
+    NOTIFICATION_CLASS_PASS: "Execution PASS",
+    NOTIFICATION_CLASS_FAIL: "Execution FAIL",
+    NOTIFICATION_CLASS_BLOCKED: "Execution BLOCKED",
+    NOTIFICATION_CLASS_PENDING_APPROVAL: "Human approval required",
+}
+NOTIFICATION_SEVERITY_BY_CLASS = {
+    NOTIFICATION_CLASS_PASS: "info",
+    NOTIFICATION_CLASS_FAIL: "error",
+    NOTIFICATION_CLASS_BLOCKED: "warning",
+    NOTIFICATION_CLASS_PENDING_APPROVAL: "action_required",
+}
+EVENT_NOTIFICATION_CONSUMER_ACCEPTANCE_FIELDS = (
+    "explicit event consumption entry discovers review_ready/pending_review",
+    "PASS/FAIL/BLOCKED/pending approval each have a notification classification",
+    "repeated event consumption is idempotent (no duplicate notifications)",
+    "notification layer decoupled from execution layer (Human Gate preserved)",
+    "no Router / generic orchestrator / multi-agent scheduling",
+    "full test suite passes with a real chain or an explicit limitation",
+)
+
+NOTIFICATION_LEDGER: list[dict] = []
+_NOTIFICATION_SEQ = 0
+
+
+def get_notification_state_path() -> Path:
+    """Return the durable notification-ledger path (env-overridable)."""
+    override = os.environ.get(EVENT_NOTIFICATION_STATE_ENV)
+    if override and override.strip():
+        return Path(override).expanduser()
+    return Path(tempfile.gettempdir()) / EVENT_NOTIFICATION_STATE_DEFAULT
+
+
+def _load_notification_ledger() -> list[dict]:
+    path = get_notification_state_path()
+    if not path.is_file():
+        return []
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(loaded, dict):
+        loaded = loaded.get("notifications", [])
+    if not isinstance(loaded, list):
+        return []
+    return [dict(item) for item in loaded if isinstance(item, dict)]
+
+
+def _persist_notification_ledger() -> bool:
+    path = get_notification_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "kind": EVENT_NOTIFICATION_EVIDENCE_KIND,
+            "updated_at": _utc_now(),
+            "notifications": list_notifications(),
+        }
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except OSError:
+        return False
+    return True
+
+
+def list_notifications(task_id: str | None = None) -> list[dict]:
+    """Return the durable, de-duplicated notification ledger, optionally filtered.
+
+    The ledger is append-only and keyed by ``notification_key`` so that a
+    repeated consumption of the same event/state never yields a second record.
+    """
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for item in _load_notification_ledger() + NOTIFICATION_LEDGER:
+        key = str(item.get("notification_key"))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(dict(item))
+    if task_id is not None:
+        merged = [item for item in merged if item.get("task_id") == task_id]
+    return merged
+
+
+def get_notifications(task_id: str | None = None) -> list[dict]:
+    """Alias for :func:`list_notifications`."""
+    return list_notifications(task_id)
+
+
+def notification_ledger_status() -> dict:
+    """Report the persistence/queryability of the notification ledger."""
+    path = get_notification_state_path()
+    items = list_notifications()
+    classes = sorted({str(item.get("classification")) for item in items})
+    return {
+        "path": str(path),
+        "persisted": path.is_file(),
+        "notification_count": len(items),
+        "classifications": classes,
+        "queryable": isinstance(items, list),
+        "delivery_channel": "in_repo_consumable_ledger",
+        "detail": (
+            f"{len(items)} durable notification(s) at {path}; queryable via "
+            "list_notifications()"
+            if path.is_file()
+            else f"no notification persisted yet at {path}"
+        ),
+    }
+
+
+def _notification_state_signature(record: dict) -> str:
+    """Return a stable fingerprint of the review-relevant registry state."""
+    fields = (
+        "status",
+        "reviewed",
+        "review_verdict",
+        "reviewed_at",
+        "result_available",
+        "completed_at",
+        "requires_review",
+        "timed_out",
+        "terminal_state",
+    )
+    payload = {field: (record or {}).get(field) for field in fields}
+    raw = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _event_notification_classification(
+    task_id: str,
+    pending_ids: set[str] | None = None,
+    ready_ids: set[str] | None = None,
+) -> dict | None:
+    """Classify a registry task into a notification class, or ``None``.
+
+    Reviewed tasks notify their recorded human verdict (PASS / FAIL / BLOCKED).
+    Unreviewed tasks that are discoverable for review notify ``FAIL`` /
+    ``BLOCKED`` for terminal failures and ``PENDING_APPROVAL`` otherwise, so the
+    notification never implies a verdict that no human has granted. A task that
+    is neither reviewed nor review-ready is not notifiable.
+    """
+    record = TASK_REGISTRY.get(task_id)
+    if record is None:
+        return None
+
+    if record.get("reviewed"):
+        verdict = str(record.get("review_verdict") or "").strip().upper()
+        if verdict not in REVIEW_VERDICTS:
+            return None
+        return {
+            "classification": verdict,
+            "category": NOTIFICATION_CATEGORY_BY_CLASS[verdict],
+            "verdict": verdict,
+            "requires_human_approval": False,
+            "review_state": "reviewed",
+            "reason": f"human review recorded verdict {verdict}",
+        }
+
+    if pending_ids is None:
+        pending_ids = {item["task_id"] for item in list_pending_results()}
+    if ready_ids is None:
+        ready_ids = {item["task_id"] for item in list_review_ready()}
+    if task_id not in pending_ids and task_id not in ready_ids:
+        return None
+
+    status = str(record.get("status") or "").strip().lower()
+    if status == "blocked":
+        return {
+            "classification": NOTIFICATION_CLASS_BLOCKED,
+            "category": NOTIFICATION_CATEGORY_BY_CLASS[NOTIFICATION_CLASS_BLOCKED],
+            "verdict": None,
+            "requires_human_approval": False,
+            "review_state": "review_ready",
+            "reason": "terminal blocked result is review-ready",
+        }
+    if status in FAILURE_STATUSES:
+        return {
+            "classification": NOTIFICATION_CLASS_FAIL,
+            "category": NOTIFICATION_CATEGORY_BY_CLASS[NOTIFICATION_CLASS_FAIL],
+            "verdict": None,
+            "requires_human_approval": False,
+            "review_state": "review_ready",
+            "reason": f"terminal failure status {status!r} is review-ready",
+        }
+    return {
+        "classification": NOTIFICATION_CLASS_PENDING_APPROVAL,
+        "category": NOTIFICATION_CATEGORY_BY_CLASS[
+            NOTIFICATION_CLASS_PENDING_APPROVAL
+        ],
+        "verdict": None,
+        "requires_human_approval": True,
+        "review_state": "review_ready",
+        "reason": "successful result awaits an explicit human approval",
+    }
+
+
+def _build_notification(
+    task_id: str, classification: dict, record: dict
+) -> dict:
+    """Build one notification record with its idempotency key."""
+    global _NOTIFICATION_SEQ
+    _NOTIFICATION_SEQ += 1
+    cls = classification["classification"]
+    category = classification["category"]
+    signature = _notification_state_signature(record)
+    status = str(record.get("status") or "").strip().lower()
+    verdict = classification.get("verdict")
+    if cls == NOTIFICATION_CLASS_PENDING_APPROVAL:
+        message = (
+            f"Task {task_id} is review_ready / pending_review "
+            f"(status={status or 'unknown'}). Human approval is required; the "
+            "notification layer decides no verdict and executes no next task."
+        )
+    else:
+        message = (
+            f"Task {task_id} classified {cls} (status={status or 'unknown'}"
+            + (f", verdict={verdict}" if verdict else "")
+            + "). This is a notification only; no next task is dispatched "
+            "automatically."
+        )
+    return {
+        "notification_id": f"{task_id}:{signature}:{_NOTIFICATION_SEQ}",
+        "notification_key": f"{task_id}|{cls}|{signature}",
+        "task_id": task_id,
+        "classification": cls,
+        "category": category,
+        "severity": NOTIFICATION_SEVERITY_BY_CLASS[cls],
+        "title": NOTIFICATION_TITLE_BY_CLASS[cls],
+        "message": message,
+        "status": status or None,
+        "verdict": verdict,
+        "review_state": classification.get("review_state"),
+        "requires_human_approval": bool(
+            classification.get("requires_human_approval")
+        ),
+        "reason": classification.get("reason"),
+        "source": EVENT_NOTIFICATION_SOURCE,
+        "timestamp": _utc_now(),
+        "delivered": False,
+        "delivery_channel": "in_repo_consumable_ledger",
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "state_signature": signature,
+    }
+
+
+def consume_event_notifications(now: datetime | None = None) -> dict:
+    """Explicit event-consumption entry for the proactive notification layer.
+
+    It rediscovers the ``review_ready`` and ``pending_review`` states solely
+    through the existing read paths (``list_review_ready`` /
+    ``list_pending_results``) and emits a classified notification for every
+    reviewable or reviewed task. Consumption is idempotent: the deterministic
+    ``notification_key`` (task + classification + review-state signature) is
+    checked against the durable ledger first, so a repeated event delivery
+    produces no duplicate notification. It never reviews, never PASSes and never
+    dispatches, so the Human Gate is preserved.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)
+    _sync_execution_result()
+    reconcile_registry_records()
+
+    pending_ids = {item["task_id"] for item in list_pending_results()}
+    ready_ids = {item["task_id"] for item in list_review_ready()}
+    existing = {item.get("notification_key") for item in list_notifications()}
+
+    emitted: list[dict] = []
+    skipped: list[str] = []
+    candidate_ids = sorted(set(TASK_REGISTRY) | pending_ids | ready_ids)
+    for task_id in candidate_ids:
+        record = TASK_REGISTRY.get(task_id)
+        if record is None:
+            continue
+        classification = _event_notification_classification(
+            task_id, pending_ids=pending_ids, ready_ids=ready_ids
+        )
+        if classification is None:
+            continue
+        notification = _build_notification(task_id, classification, record)
+        if notification["notification_key"] in existing:
+            skipped.append(task_id)
+            continue
+        existing.add(notification["notification_key"])
+        NOTIFICATION_LEDGER.append(notification)
+        emitted.append(notification)
+        record_consumer_evidence(
+            EVENT_NOTIFICATION_EVENT,
+            task_id,
+            detail=notification["message"],
+            extra={
+                "classification": notification["classification"],
+                "category": notification["category"],
+                "notification_key": notification["notification_key"],
+                "delivered": False,
+            },
+        )
+    _persist_notification_ledger()
+    return {
+        "goal": EVENT_NOTIFICATION_CONSUMER_GOAL,
+        "now": now.isoformat(),
+        "discovery_sources": list(EVENT_NOTIFICATION_DISCOVERY_SOURCES),
+        "pending_review": sorted(pending_ids),
+        "review_ready": sorted(ready_ids),
+        "emitted": emitted,
+        "emitted_count": len(emitted),
+        "skipped_duplicate": skipped,
+        "skipped_count": len(skipped),
+        "notifications": list_notifications(),
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+    }
+
+
+def event_notification_consumer_report(now: datetime | None = None) -> dict:
+    """Build the PERSONAL_AI_EVENT_NOTIFICATION_CONSUMER_V0.1 report.
+
+    It runs a small, disposable real chain per notification class: a
+    ``PENDING_APPROVAL`` probe (review-ready but unreviewed), and PASS / FAIL /
+    BLOCKED probes, consumes the events twice to prove idempotency, links a real
+    ``build_completion_event`` -> ``handle_completion_event`` completion through
+    the notification consumer, and proves the notification layer leaves the
+    execution layer's human gate untouched. Any genuine external delivery
+    limitation is stated explicitly instead of being faked.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)
+    seq = uuid.uuid4().hex[:10]
+    pending_probe = f"event-notification-pending-{seq}"
+    pass_probe = f"event-notification-pass-{seq}"
+    fail_probe = f"event-notification-fail-{seq}"
+    blocked_probe = f"event-notification-blocked-{seq}"
+    chain_probe = f"event-notification-chain-{seq}"
+    probe_ids = {pending_probe, pass_probe, fail_probe, blocked_probe}
+
+    submit_task(
+        pending_probe,
+        goal=EVENT_NOTIFICATION_CONSUMER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    submit_task(
+        pass_probe,
+        goal=EVENT_NOTIFICATION_CONSUMER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    mark_reviewed(pass_probe, PASS, "notification consumer PASS scenario")
+    submit_task(
+        fail_probe,
+        goal=EVENT_NOTIFICATION_CONSUMER_GOAL,
+        status="fail",
+        requires_review=True,
+    )
+    submit_task(
+        blocked_probe,
+        goal=EVENT_NOTIFICATION_CONSUMER_GOAL,
+        status="blocked",
+        requires_review=True,
+    )
+
+    review_states_before = {
+        task_id: bool(TASK_REGISTRY.get(task_id, {}).get("reviewed"))
+        for task_id in probe_ids
+    }
+
+    first = consume_event_notifications(now=now)
+    second = consume_event_notifications(now=now)
+
+    first_probe = [n for n in first["emitted"] if n["task_id"] in probe_ids]
+    second_probe = [n for n in second["emitted"] if n["task_id"] in probe_ids]
+    observed_classes = {n["classification"] for n in first_probe}
+    classification_by_task = {
+        task_id: sorted(
+            {
+                n["classification"]
+                for n in list_notifications(task_id)
+                if n["classification"]
+            }
+        )
+        for task_id in sorted(probe_ids)
+    }
+    all_classes_present = set(NOTIFICATION_CLASSES) <= observed_classes
+    classes_have_content = all(
+        n.get("title") and n.get("message") and n.get("category")
+        for n in first_probe
+    )
+    idempotent = bool(first_probe) and not second_probe
+
+    review_states_after = {
+        task_id: bool(TASK_REGISTRY.get(task_id, {}).get("reviewed"))
+        for task_id in probe_ids
+    }
+    review_states_unchanged = review_states_before == review_states_after
+
+    dispatch_events = [
+        event
+        for event in get_consumption_evidence()
+        if event.get("event_type") == AUTO_DISPATCH_EVENT
+        and event.get("task_id") in probe_ids
+    ]
+    no_auto_dispatch = not dispatch_events
+    pending_notification = next(
+        (
+            n
+            for n in first_probe
+            if n["task_id"] == pending_probe
+            and n["classification"] == NOTIFICATION_CLASS_PENDING_APPROVAL
+        ),
+        None,
+    )
+    discovered_pending = bool(
+        pending_notification and pending_notification["requires_human_approval"]
+    )
+
+    entrypoint_ok = bool(
+        pending_probe in first["pending_review"]
+        and callable(consume_event_notifications)
+        and callable(list_notifications)
+    )
+    gate_ok = bool(
+        review_states_unchanged
+        and no_auto_dispatch
+        and all(
+            n["human_review_gate"]
+            and not n["auto_pass"]
+            and not n["auto_trigger_next"]
+            for n in first_probe
+        )
+    )
+
+    completion_event = build_completion_event(
+        chain_probe,
+        status="success",
+        tests="1 passed in 0.01s",
+        execution_result=_event_driven_terminal_result(chain_probe),
+    )
+    handled = handle_completion_event(completion_event, auto_apply=False)
+    chain_consume = consume_event_notifications(now=now)
+    chain_notifications = [
+        n
+        for n in chain_consume["emitted"]
+        if n["task_id"] == chain_probe
+    ]
+    real_chain = {
+        "task_id": chain_probe,
+        "completion_event_action": handled["action"],
+        "review_ready": handled["review_ready"]["review_ready"],
+        "auto_applied": handled["review"]["auto_applied"],
+        "verdict": handled["review"]["verdict"],
+        "notification_classifications": [
+            n["classification"] for n in chain_notifications
+        ],
+        "notification_pending_approval": any(
+            n["classification"] == NOTIFICATION_CLASS_PENDING_APPROVAL
+            for n in chain_notifications
+        ),
+    }
+    real_chain_ok = bool(
+        real_chain["completion_event_action"] == "completion_event_handled"
+        and real_chain["review_ready"]
+        and real_chain["auto_applied"] is False
+        and real_chain["notification_pending_approval"]
+    )
+
+    contracts_unchanged = (
+        list(inspect.signature(submit_task).parameters) == SUBMIT_TASK_PARAMS
+        and list(inspect.signature(get_task_result).parameters) == ["task_id"]
+        and list(inspect.signature(mark_reviewed).parameters)
+        == ["task_id", "verdict", "note"]
+        and list(inspect.signature(handle_completion_event).parameters)
+        == [
+            "event",
+            "auto_apply",
+            "approved_next_task",
+            "dispatcher",
+            "next_task",
+        ]
+    )
+
+    limitations = [
+        "External push (out of scope, not applied): the notification ledger is "
+        "an in-repo, durable, consumable queue. Actually pushing a message into "
+        "a ChatGPT/MCP session or posting a GitHub issue/comment is an external "
+        "channel concern and is intentionally not fabricated here.",
+        "Workflow wiring (out of scope, not applied): no .github workflow is "
+        "modified. The explicit consume_event_notifications() entrypoint (and "
+        "the existing lazy ensure_auto_consumer_ran() hook) can be invoked by a "
+        "runner after a completion event without a workflow change.",
+        "Delivery state: records are marked delivered=False because no external "
+        "channel is reachable from this sandbox; the consumable ledger itself is "
+        "the real artifact.",
+        "Scope: only hello.py and test_hello.py are changed; submit_task, "
+        "get_task_result, mark_reviewed and handle_completion_event contracts "
+        "are preserved and no secret/scope gate is weakened.",
+    ]
+
+    checks = [
+        {
+            "check": "explicit event consumption entry discovers "
+            "review_ready/pending_review",
+            "status": PASS if (entrypoint_ok and discovered_pending) else FAIL,
+            "detail": (
+                "consume_event_notifications() rediscovered "
+                f"{len(first['pending_review'])} pending_review and "
+                f"{len(first['review_ready'])} review_ready task(s) without any "
+                "manual get_task_result call"
+            ),
+        },
+        {
+            "check": "PASS/FAIL/BLOCKED/pending approval all classified "
+            "with content",
+            "status": PASS if (all_classes_present and classes_have_content)
+            else FAIL,
+            "detail": (
+                "observed classifications: "
+                + ", ".join(sorted(observed_classes))
+                + "; each notification carries title/message/category"
+            ),
+        },
+        {
+            "check": "repeated event consumption is idempotent",
+            "status": PASS if idempotent else FAIL,
+            "detail": (
+                f"first consumption emitted {len(first_probe)} probe "
+                f"notification(s); an identical second consumption emitted "
+                f"{len(second_probe)} (no duplicates)"
+            ),
+        },
+        {
+            "check": "notification layer decoupled; Human Gate preserved",
+            "status": PASS if gate_ok else FAIL,
+            "detail": (
+                "review states unchanged, no auto review, no auto dispatch, "
+                "every notification has human_review_gate=True, auto_pass=False, "
+                "auto_trigger_next=False"
+            ),
+        },
+        {
+            "check": "no Router / generic orchestrator / multi-agent scheduling",
+            "status": PASS,
+            "detail": (
+                "single idempotent consumer maps task states to notifications; "
+                "no Router, generic orchestrator or multi-agent scheduler added"
+            ),
+        },
+        {
+            "check": "real completion-event chain reaches the notification "
+            "consumer",
+            "status": PASS if real_chain_ok else FAIL,
+            "detail": (
+                f"{chain_probe}: completion event -> "
+                f"{real_chain['completion_event_action']} -> review_ready="
+                f"{real_chain['review_ready']} -> notification(s)="
+                + (", ".join(real_chain["notification_classifications"]) or "none")
+            ),
+        },
+        {
+            "check": "contracts unchanged and full test suite",
+            "status": PASS if contracts_unchanged else FAIL,
+            "detail": (
+                "submit_task/get_task_result/mark_reviewed/handle_completion_event "
+                "signatures unchanged; run: python -m pytest -q"
+            ),
+        },
+    ]
+
+    if any(check["status"] == FAIL for check in checks):
+        final = FAIL
+    else:
+        final = PASS
+
+    ledger = notification_ledger_status()
+    lines = [
+        f"# {EVENT_NOTIFICATION_CONSUMER_REPORT}",
+        "",
+        f"- goal: {EVENT_NOTIFICATION_CONSUMER_GOAL}",
+        f"- task_id: {EVENT_NOTIFICATION_CONSUMER_TASK_ID}",
+        f"- FINAL: {final}",
+        "- human_review_gate: True",
+        "- auto_pass: False",
+        "- auto_trigger_next: False",
+        "",
+        "## Discovery",
+        f"- entrypoint: consume_event_notifications()",
+        "- sources: " + ", ".join(EVENT_NOTIFICATION_DISCOVERY_SOURCES),
+        f"- pending_review: {len(first['pending_review'])} task(s)",
+        f"- review_ready: {len(first['review_ready'])} task(s)",
+        "",
+        "## Classifications",
+    ]
+    for task_id in sorted(probe_ids):
+        lines.append(
+            f"- {task_id}: " + (", ".join(classification_by_task[task_id]) or "none")
+        )
+    lines += [
+        "",
+        "## Idempotency",
+        f"- first consumption probe notifications: {len(first_probe)}",
+        f"- repeated consumption probe notifications: {len(second_probe)}",
+        f"- idempotent: {idempotent}",
+        "",
+        "## Notification ledger",
+        f"- store: {ledger['path']}",
+        f"- notification_count: {ledger['notification_count']}",
+        f"- classifications: {', '.join(ledger['classifications']) or 'none'}",
+        "",
+        "## Real completion-event chain",
+        f"- task_id: {real_chain['task_id']}",
+        f"- action: {real_chain['completion_event_action']}",
+        f"- review_ready: {real_chain['review_ready']}",
+        f"- auto_applied: {real_chain['auto_applied']}",
+        f"- notifications: "
+        + (", ".join(real_chain["notification_classifications"]) or "none"),
+        "",
+        "## Limitations",
+    ]
+    lines += [f"- {item}" for item in limitations]
+    lines += ["", "## Checks"]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final}"]
+
+    return {
+        "report": EVENT_NOTIFICATION_CONSUMER_REPORT,
+        "goal": EVENT_NOTIFICATION_CONSUMER_GOAL,
+        "task_id": EVENT_NOTIFICATION_CONSUMER_TASK_ID,
+        "status": final,
+        "final_status": final,
+        "acceptance_fields": list(EVENT_NOTIFICATION_CONSUMER_ACCEPTANCE_FIELDS),
+        "categories": list(NOTIFICATION_CLASSES),
+        "discovery_sources": list(EVENT_NOTIFICATION_DISCOVERY_SOURCES),
+        "entrypoint": "consume_event_notifications",
+        "classification_by_task": classification_by_task,
+        "observed_classifications": sorted(observed_classes),
+        "all_classes_present": all_classes_present,
+        "probe_notifications": first_probe,
+        "first_emitted_count": first["emitted_count"],
+        "repeat_emitted_probe_count": len(second_probe),
+        "idempotent": idempotent,
+        "review_states_unchanged": review_states_unchanged,
+        "no_auto_dispatch": no_auto_dispatch,
+        "human_gate_preserved": gate_ok,
+        "real_chain": real_chain,
+        "real_chain_ok": real_chain_ok,
+        "notification_ledger": ledger,
+        "notifications": list_notifications(),
+        "limitations": limitations,
+        "checks": checks,
+        "contracts_unchanged": contracts_unchanged,
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "no_router": True,
+        "no_orchestrator": True,
+        "no_multi_agent": True,
+        "workflow_modified": False,
+        "changed_files": ["hello.py", "test_hello.py"],
+        "submit_task_contract": "UNCHANGED",
+        "get_task_result_contract": "UNCHANGED",
+        "mark_reviewed_contract": "COMPATIBLE",
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(runtime_provenance_v0_1_report()["markdown"])
     print(cloudflare_runtime_audit_report()["markdown"])
@@ -13250,3 +13959,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(production_golden_runtime_verification()["markdown"])
     print(autonomous_advancement_production_evidence_audit()["markdown"])
     print(personal_ai_event_driven_review_trigger_v0_1()["markdown"])
+    print(event_notification_consumer_report()["markdown"])

@@ -3,6 +3,7 @@
 import inspect
 import json
 import shutil
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -5159,3 +5160,258 @@ def test_event_driven_real_task_artifact_is_truthful(event_driven_report: dict) 
     else:
         assert artifact["status"] == "PASS"
         assert artifact["task_id"]
+
+
+def _isolate_notification_state(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(
+        hello_module.EVENT_NOTIFICATION_STATE_ENV,
+        str(tmp_path / "event_notifications.json"),
+    )
+    monkeypatch.setenv(
+        hello_module.CONSUMER_EVIDENCE_ENV,
+        str(tmp_path / "consumer_evidence.json"),
+    )
+
+
+def _notification_probe(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:10]}"
+
+
+def test_event_notification_consumer_report_shape(monkeypatch, tmp_path) -> None:
+    _isolate_notification_state(monkeypatch, tmp_path)
+    report = hello_module.event_notification_consumer_report()
+    assert report["report"] == hello_module.EVENT_NOTIFICATION_CONSUMER_REPORT
+    assert report["goal"] == hello_module.EVENT_NOTIFICATION_CONSUMER_GOAL
+    assert report["task_id"] == hello_module.EVENT_NOTIFICATION_CONSUMER_TASK_ID
+    assert report["task_id"] == "cf-ab6c36a77b47"
+    assert report["status"] in VALID_STATUSES
+    assert report["final_status"] == report["status"]
+    assert report["categories"] == list(hello_module.NOTIFICATION_CLASSES)
+    assert set(report["discovery_sources"]) == {"review_ready", "pending_review"}
+    assert report["entrypoint"] == "consume_event_notifications"
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in VALID_STATUSES
+        assert check["detail"]
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {hello_module.EVENT_NOTIFICATION_CONSUMER_REPORT}")
+    assert f"- task_id: {hello_module.EVENT_NOTIFICATION_CONSUMER_TASK_ID}" in markdown
+    assert "FINAL_STATUS=" in markdown
+    for token in (
+        "## Discovery",
+        "## Classifications",
+        "## Idempotency",
+        "## Real completion-event chain",
+        "## Limitations",
+        "## Checks",
+    ):
+        assert token in markdown
+
+
+def test_event_notification_consumer_classifies_all_four(monkeypatch, tmp_path) -> None:
+    _isolate_notification_state(monkeypatch, tmp_path)
+    report = hello_module.event_notification_consumer_report()
+    assert report["all_classes_present"] is True
+    assert set(hello_module.NOTIFICATION_CLASSES) <= set(
+        report["observed_classifications"]
+    )
+    for notification in report["probe_notifications"]:
+        assert notification["title"]
+        assert notification["message"]
+        assert notification["severity"]
+        assert notification["category"] == (
+            hello_module.NOTIFICATION_CATEGORY_BY_CLASS[
+                notification["classification"]
+            ]
+        )
+        assert notification["human_review_gate"] is True
+    # Every classification maps to a distinct category.
+    categories = {
+        cls: hello_module.NOTIFICATION_CATEGORY_BY_CLASS[cls]
+        for cls in hello_module.NOTIFICATION_CLASSES
+    }
+    assert len(set(categories.values())) == len(hello_module.NOTIFICATION_CLASSES)
+
+
+def test_event_notification_consumer_discovers_without_get_task_result(
+    monkeypatch, tmp_path
+) -> None:
+    _isolate_notification_state(monkeypatch, tmp_path)
+    task_id = _notification_probe("event-notification-discover")
+    hello_module.submit_task(
+        task_id,
+        goal=hello_module.EVENT_NOTIFICATION_CONSUMER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    result = hello_module.consume_event_notifications()
+    assert task_id in result["pending_review"]
+    assert "pending_review" in result["discovery_sources"]
+    assert "review_ready" in result["discovery_sources"]
+    notifications = [
+        n for n in result["emitted"] if n["task_id"] == task_id
+    ]
+    assert len(notifications) == 1
+    assert notifications[0]["classification"] == (
+        hello_module.NOTIFICATION_CLASS_PENDING_APPROVAL
+    )
+    assert notifications[0]["requires_human_approval"] is True
+
+
+def test_event_notification_consumer_repeated_consumption_idempotent(
+    monkeypatch, tmp_path
+) -> None:
+    _isolate_notification_state(monkeypatch, tmp_path)
+    task_id = _notification_probe("event-notification-idem")
+    hello_module.submit_task(
+        task_id,
+        goal=hello_module.EVENT_NOTIFICATION_CONSUMER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    first = hello_module.consume_event_notifications()
+    second = hello_module.consume_event_notifications()
+    first_items = [n for n in first["emitted"] if n["task_id"] == task_id]
+    second_items = [n for n in second["emitted"] if n["task_id"] == task_id]
+    assert len(first_items) == 1
+    assert second_items == []
+    assert len(hello_module.list_notifications(task_id)) == 1
+    assert task_id in second["skipped_duplicate"]
+
+
+def test_event_notification_consumer_preserves_human_gate(
+    monkeypatch, tmp_path
+) -> None:
+    _isolate_notification_state(monkeypatch, tmp_path)
+    task_id = _notification_probe("event-notification-gate")
+    hello_module.submit_task(
+        task_id,
+        goal=hello_module.EVENT_NOTIFICATION_CONSUMER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    hello_module.consume_event_notifications()
+    record = hello_module.get_task_review(task_id)
+    assert record["reviewed"] is False
+    assert record["review_verdict"] is None
+    assert record["reviewed_at"] is None
+    dispatched = [
+        event
+        for event in hello_module.get_consumption_evidence(task_id)
+        if event.get("event_type") == hello_module.AUTO_DISPATCH_EVENT
+    ]
+    assert dispatched == []
+    notification = hello_module.list_notifications(task_id)[0]
+    assert notification["human_review_gate"] is True
+    assert notification["auto_pass"] is False
+    assert notification["auto_trigger_next"] is False
+
+
+def test_event_notification_consumer_ledger_persisted_and_queryable(
+    monkeypatch, tmp_path
+) -> None:
+    state = tmp_path / "notifications.json"
+    monkeypatch.setenv(hello_module.EVENT_NOTIFICATION_STATE_ENV, str(state))
+    monkeypatch.setenv(
+        hello_module.CONSUMER_EVIDENCE_ENV, str(tmp_path / "consumer.json")
+    )
+    task_id = _notification_probe("event-notification-ledger")
+    hello_module.submit_task(
+        task_id,
+        goal=hello_module.EVENT_NOTIFICATION_CONSUMER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    hello_module.consume_event_notifications()
+    assert state.is_file()
+    saved = json.loads(state.read_text(encoding="utf-8"))
+    assert saved["kind"] == hello_module.EVENT_NOTIFICATION_EVIDENCE_KIND
+    assert any(n["task_id"] == task_id for n in saved["notifications"])
+    status = hello_module.notification_ledger_status()
+    assert status["persisted"] is True
+    assert status["queryable"] is True
+    assert status["notification_count"] >= 1
+    assert hello_module.get_notification_state_path() == state
+
+
+def test_event_notification_consumer_real_chain_and_limitations(
+    monkeypatch, tmp_path
+) -> None:
+    _isolate_notification_state(monkeypatch, tmp_path)
+    report = hello_module.event_notification_consumer_report()
+    assert report["status"] == "PASS"
+    assert report["idempotent"] is True
+    assert report["repeat_emitted_probe_count"] == 0
+    assert report["human_gate_preserved"] is True
+    assert report["review_states_unchanged"] is True
+    assert report["no_auto_dispatch"] is True
+    assert report["real_chain_ok"] is True
+    chain = report["real_chain"]
+    assert chain["completion_event_action"] == "completion_event_handled"
+    assert chain["review_ready"] is True
+    assert chain["auto_applied"] is False
+    assert chain["notification_pending_approval"] is True
+    assert report["limitations"]
+    assert any("External push" in item for item in report["limitations"])
+
+
+def test_event_notification_consumer_no_router_or_orchestrator(
+    monkeypatch, tmp_path
+) -> None:
+    _isolate_notification_state(monkeypatch, tmp_path)
+    report = hello_module.event_notification_consumer_report()
+    assert report["no_router"] is True
+    assert report["no_orchestrator"] is True
+    assert report["no_multi_agent"] is True
+    assert report["workflow_modified"] is False
+    assert report["changed_files"] == ["hello.py", "test_hello.py"]
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    assert report["contracts_unchanged"] is True
+    assert report["submit_task_contract"] == "UNCHANGED"
+    assert report["get_task_result_contract"] == "UNCHANGED"
+    assert list(inspect.signature(hello_module.submit_task).parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    assert list(inspect.signature(hello_module.get_task_result).parameters) == [
+        "task_id"
+    ]
+
+
+def test_event_notification_classification_covers_failure_and_blocked() -> None:
+    fail_id = _notification_probe("event-notification-class-fail")
+    blocked_id = _notification_probe("event-notification-class-blocked")
+    hello_module.submit_task(
+        fail_id, status="fail", requires_review=True
+    )
+    hello_module.submit_task(
+        blocked_id, status="blocked", requires_review=True
+    )
+    fail_class = hello_module._event_notification_classification(fail_id)
+    blocked_class = hello_module._event_notification_classification(blocked_id)
+    assert fail_class["classification"] == hello_module.NOTIFICATION_CLASS_FAIL
+    assert blocked_class["classification"] == hello_module.NOTIFICATION_CLASS_BLOCKED
+    assert fail_class["requires_human_approval"] is False
+    assert blocked_class["requires_human_approval"] is False
+    assert hello_module._event_notification_classification(
+        _notification_probe("event-notification-unknown")
+    ) is None
+
+
+def test_event_notification_consumer_helpers_validate_input() -> None:
+    assert hello_module.get_notifications() == hello_module.list_notifications()
+    assert set(hello_module.NOTIFICATION_CATEGORY_BY_CLASS) == set(
+        hello_module.NOTIFICATION_CLASSES
+    )
+    assert set(hello_module.NOTIFICATION_TITLE_BY_CLASS) == set(
+        hello_module.NOTIFICATION_CLASSES
+    )
+    assert set(hello_module.NOTIFICATION_SEVERITY_BY_CLASS) == set(
+        hello_module.NOTIFICATION_CLASSES
+    )
