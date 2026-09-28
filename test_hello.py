@@ -229,6 +229,7 @@ def isolate_hello_state(monkeypatch, tmp_path):
         str(state_dir / "push_outbox.json"),
     )
     monkeypatch.delenv(hello_module.PUSH_EXTERNAL_ENDPOINT_ENV, raising=False)
+    monkeypatch.delenv(hello_module.SERVERCHAN_SENDKEY_ENV, raising=False)
     for name in _RESETTABLE_HELLO_STATE:
         container = getattr(hello_module, name, None)
         if container is not None:
@@ -6644,3 +6645,290 @@ def test_push_adapter_explicit_endpoint_env_does_not_claim_pass(
     report = hello_module.push_adapter_report()
     assert report["status"] == "BLOCKED"
     assert report["external_blocker"] == hello_module.BLOCKED_EXTERNAL_ENDPOINT
+
+
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_B_SERVERCHAN_ADAPTER_V0.1 (task cf-7eef880257a8)
+# ServerChan (Server酱) WeChat adapter over the existing Push Outbox. All keys
+# and transports here are fake; no real credential or network is used.
+# ---------------------------------------------------------------------------
+
+
+def _serverchan_fake_key(kind: str = "SCT") -> str:
+    if kind == "sctp":
+        return "sctp4242t" + uuid.uuid4().hex[:16]
+    return "SCT" + uuid.uuid4().hex[:16]
+
+
+def _serverchan_queue(task_id: str) -> str:
+    hello_module.submit_task(
+        task_id,
+        goal=hello_module.SERVERCHAN_ADAPTER_GOAL,
+        status="success",
+        requires_review=True,
+    )
+    consumer = f"serverchan-consumer-{uuid.uuid4().hex[:8]}"
+    queued = hello_module.enqueue_push_envelopes(consumer, task_id=task_id)
+    return queued["created"][0]["dedupe_key"]
+
+
+def test_serverchan_sendkey_is_read_only_from_env(monkeypatch) -> None:
+    assert hello_module.SERVERCHAN_SENDKEY_ENV == "SERVERCHAN_SENDKEY"
+    monkeypatch.delenv(hello_module.SERVERCHAN_SENDKEY_ENV, raising=False)
+    assert hello_module.serverchan_sendkey() is None
+    assert hello_module.serverchan_sendkey_present() is False
+    fake = _serverchan_fake_key()
+    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, fake)
+    assert hello_module.serverchan_sendkey() == fake
+    assert hello_module.serverchan_sendkey_present() is True
+    assert hello_module.serverchan_redact(fake) != fake
+    assert hello_module.serverchan_redact(fake).startswith(fake[:3])
+
+
+def test_serverchan_endpoint_selection_for_sct_and_sctp() -> None:
+    sct = _serverchan_fake_key("SCT")
+    sctp = _serverchan_fake_key("sctp")
+    assert hello_module.serverchan_sendkey_kind(sct) == "SCT"
+    assert hello_module.serverchan_sendkey_kind(sctp) == "sctp"
+    sct_endpoint = hello_module.serverchan_endpoint(sct)
+    sctp_endpoint = hello_module.serverchan_endpoint(sctp)
+    assert sct_endpoint == f"https://sctapi.ftqq.com/{sct}.send"
+    assert sctp_endpoint == f"https://4242.push.ft07.com/send/{sctp}.send"
+    assert sct_endpoint != sctp_endpoint
+    with pytest.raises(ValueError):
+        hello_module.serverchan_sendkey_kind("")
+    with pytest.raises(ValueError):
+        hello_module.serverchan_endpoint("")
+
+
+def test_serverchan_payload_maps_all_four_classifications() -> None:
+    for classification in hello_module.NOTIFICATION_CLASSES:
+        envelope = {
+            "task_id": f"task-{classification}",
+            "classification": classification,
+            "summary": f"summary for {classification}",
+            "review_required": (
+                classification == hello_module.NOTIFICATION_CLASS_PENDING_APPROVAL
+            ),
+            "dedupe_key": f"push:task-{classification}:{classification}:sig",
+        }
+        payload = hello_module.build_serverchan_payload(envelope)
+        for field in hello_module.SERVERCHAN_REQUIRED_PAYLOAD_FIELDS:
+            assert field in payload
+        assert payload["task_id"] == f"task-{classification}"
+        assert payload["classification"] == classification
+        assert payload["summary"] == f"summary for {classification}"
+        assert payload["review_required"] == (
+            classification == hello_module.NOTIFICATION_CLASS_PENDING_APPROVAL
+        )
+        assert payload["title"] and "\n" not in payload["title"]
+        assert payload["desp"]
+        assert payload["human_review_gate"] is True
+        assert payload["auto_pass"] is False
+        assert payload["auto_trigger_next"] is False
+        for token in ("task_id", "classification", "summary", "review_required"):
+            assert token in payload["desp"]
+        json.dumps(payload, sort_keys=True)
+
+
+def test_serverchan_payload_validates_inputs() -> None:
+    with pytest.raises(ValueError):
+        hello_module.build_serverchan_payload(
+            {"task_id": "t", "classification": "NOT_A_CLASS"}
+        )
+    with pytest.raises(ValueError):
+        hello_module.build_serverchan_payload({"classification": "PASS"})
+    with pytest.raises(TypeError):
+        hello_module.build_serverchan_payload("not-a-dict")
+
+
+def test_serverchan_delivery_without_credential_is_blocked(monkeypatch) -> None:
+    monkeypatch.delenv(hello_module.SERVERCHAN_SENDKEY_ENV, raising=False)
+    task_id = _notification_probe("serverchan-nocred")
+    key = _serverchan_queue(task_id)
+    calls: list[tuple] = []
+
+    def fake_transport(endpoint: str, payload: dict) -> dict:
+        calls.append((endpoint, payload))
+        return {"ok": True}
+
+    result = hello_module.deliver_serverchan_envelope(key, transport=fake_transport)
+    assert result["state"] == "blocked"
+    assert result["status"] == "BLOCKED"
+    assert result["credential_present"] is False
+    assert result["external_blocker"] == hello_module.BLOCKED_EXTERNAL_CREDENTIAL
+    assert result["retryable"] is False
+    assert calls == []
+    envelope = hello_module.get_push_envelope(key)
+    assert envelope["external_blocker"] == hello_module.BLOCKED_EXTERNAL_CREDENTIAL
+    assert envelope["retryable"] is False
+    assert envelope["serverchan"]["credential_present"] is False
+
+
+def test_serverchan_delivery_with_fake_credential_uses_fake_transport(
+    monkeypatch,
+) -> None:
+    fake_key = _serverchan_fake_key("sctp")
+    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, fake_key)
+    task_id = _notification_probe("serverchan-cred")
+    key = _serverchan_queue(task_id)
+    seen: dict = {}
+
+    def fake_transport(endpoint: str, payload: dict) -> dict:
+        seen["endpoint"] = endpoint
+        seen["payload"] = payload
+        return {"ok": True, "status_code": 200}
+
+    result = hello_module.deliver_serverchan_envelope(key, transport=fake_transport)
+    assert result["state"] == "delivered"
+    assert result["status"] == "PASS"
+    assert result["credential_present"] is True
+    assert result["endpoint_kind"] == "sctp"
+    assert result["external_blocker"] is None
+    assert seen["endpoint"] == f"https://4242.push.ft07.com/send/{fake_key}.send"
+    assert seen["payload"]["task_id"] == task_id
+    assert "summary" in seen["payload"]["desp"]
+    assert "review_required" in seen["payload"]["desp"]
+    # The SendKey must never appear in the result we keep (redacted only).
+    assert fake_key not in json.dumps(result, sort_keys=True)
+
+
+def test_serverchan_retry_semantics_are_bounded(monkeypatch) -> None:
+    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, _serverchan_fake_key())
+    task_id = _notification_probe("serverchan-retry")
+    key = _serverchan_queue(task_id)
+    calls = {"count": 0}
+
+    def flaky_transport(endpoint: str, payload: dict) -> dict:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {"ok": False, "error": "synthetic_transient"}
+        return {"ok": True}
+
+    first = hello_module.deliver_serverchan_envelope(key, transport=flaky_transport)
+    assert first["state"] == "retry"
+    assert first["attempt_count"] == 1
+    assert first["retryable"] is True
+    second = hello_module.deliver_serverchan_envelope(key, transport=flaky_transport)
+    assert second["state"] == "delivered"
+    assert second["attempt_count"] == 2
+    assert second["retryable"] is False
+    assert hello_module.get_push_envelope(key)["state"] == "delivered"
+
+
+def test_serverchan_retry_exhaustion_blocks(monkeypatch) -> None:
+    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, _serverchan_fake_key())
+    task_id = _notification_probe("serverchan-exhaust")
+    key = _serverchan_queue(task_id)
+
+    def dead_transport(endpoint: str, payload: dict) -> dict:
+        return {"ok": False, "error": "synthetic_permanent"}
+
+    states = [
+        hello_module.deliver_serverchan_envelope(key, transport=dead_transport)["state"]
+        for _ in range(hello_module.SERVERCHAN_MAX_ATTEMPTS)
+    ]
+    assert states == ["retry", "retry", "blocked"]
+    final = hello_module.get_push_envelope(key)
+    assert final["state"] == "blocked"
+    assert final["retryable"] is False
+    assert final["last_error"]
+
+
+def test_serverchan_report_without_credential_blocks_external_credential(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(hello_module.SERVERCHAN_SENDKEY_ENV, raising=False)
+    report = hello_module.serverchan_adapter_report()
+    assert report["report"] == "PERSONAL_AI_SERVERCHAN_ADAPTER_REPORT"
+    assert report["goal"] == "PERSONAL_AI_EXECUTION_B_SERVERCHAN_ADAPTER_V0.1"
+    assert report["task_id"] == "cf-7eef880257a8"
+    assert report["status"] == "BLOCKED"
+    assert report["final_status"] == "BLOCKED"
+    assert report["credential_present"] is False
+    assert report["external_blocker"] == hello_module.BLOCKED_EXTERNAL_CREDENTIAL
+    assert report["true_push_supported"] is False
+    assert report["all_classes_present"] is True
+    assert report["mapping_ok"] is True
+    assert report["endpoint_selection_ok"] is True
+    assert report["execution_a_golden"]["intact"] is True
+    assert report["required_human_actions"]
+    assert report["acceptance_fields"] == list(
+        hello_module.SERVERCHAN_ACCEPTANCE_FIELDS
+    )
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in VALID_STATUSES
+        assert check["detail"]
+    markdown = report["markdown"]
+    assert markdown.startswith("# PERSONAL_AI_SERVERCHAN_ADAPTER_REPORT")
+    for token in (
+        "## SendKey credential boundary",
+        "## Endpoint selection",
+        "## Envelope -> title/desp mapping",
+        "## Classifications",
+        "## Delivery & retry",
+        "## Execution A Golden baseline",
+        "## Required human actions to connect WeChat",
+        "## Limitations",
+        "## Checks",
+    ):
+        assert token in markdown
+    assert "FINAL_STATUS=BLOCKED" in markdown
+    external_check = next(
+        check
+        for check in report["checks"]
+        if "credential present" in check["check"]
+    )
+    assert external_check["status"] == "BLOCKED"
+
+
+def test_serverchan_report_with_fake_credential_and_transport_passes(
+    monkeypatch,
+) -> None:
+    fake_key = _serverchan_fake_key("SCT")
+    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, fake_key)
+    calls: list[tuple] = []
+
+    def fake_transport(endpoint: str, payload: dict) -> dict:
+        calls.append((endpoint, payload))
+        return {"ok": True, "status_code": 200}
+
+    report = hello_module.serverchan_adapter_report(transport=fake_transport)
+    assert report["status"] == "PASS"
+    assert report["credential_present"] is True
+    assert report["real_delivery_ok"] is True
+    assert report["true_push_supported"] is True
+    assert report["external_blocker"] is None
+    assert len(calls) == 1
+    endpoint, payload = calls[0]
+    assert endpoint == f"https://sctapi.ftqq.com/{fake_key}.send"
+    assert payload["task_id"] == report["delivery"]["task_id"]
+    # No SendKey may leak into the report or its markdown.
+    assert fake_key not in json.dumps(report, sort_keys=True)
+    assert fake_key not in report["markdown"]
+    assert report["sendkey_redacted"] != fake_key
+
+
+def test_serverchan_report_preserves_human_gate_and_contracts(monkeypatch) -> None:
+    monkeypatch.delenv(hello_module.SERVERCHAN_SENDKEY_ENV, raising=False)
+    report = hello_module.serverchan_adapter_report()
+    assert report["human_gate_preserved"] is True
+    assert report["review_states_unchanged"] is True
+    assert report["no_auto_dispatch"] is True
+    assert report["human_review_gate"] is True
+    assert report["auto_pass"] is False
+    assert report["auto_trigger_next"] is False
+    assert report["contracts_unchanged"] is True
+    assert report["no_router"] is True
+    assert report["no_orchestrator"] is True
+    assert report["no_multi_agent"] is True
+    assert report["workflow_modified"] is False
+    assert report["changed_files"] == ["hello.py", "test_hello.py"]
+    assert list(
+        inspect.signature(hello_module.deliver_serverchan_envelope).parameters
+    ) == ["dedupe_key", "transport", "now"]
+    assert list(
+        inspect.signature(hello_module.serverchan_adapter_report).parameters
+    ) == ["now", "transport"]
