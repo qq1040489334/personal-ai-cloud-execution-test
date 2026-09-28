@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import hashlib
 import inspect
@@ -18508,17 +18509,31 @@ def serverchan_workflow_wiring_status(workflow_text: str) -> dict:
     """
     block = _workflow_agent_step_block(workflow_text)
     secret_ref = "secrets." + SERVERCHAN_SENDKEY_ENV
-    wired = bool(
+    agent_secret_present = bool(
         block
-        and secret_ref in block
         and re.search(
             r"(?m)^\s*" + re.escape(SERVERCHAN_SENDKEY_ENV) + r"\s*:", block
         )
     )
+    wired = bool(block and secret_ref in block and agent_secret_present)
+    text = str(workflow_text or "")
+    # Least-privilege split (control-plane commit 1d4d557): the SendKey must NOT
+    # be injected into the agent execution step; it belongs only to the dedicated
+    # push step, which invokes the ``notification-push`` entrypoint. These extra
+    # fields are value-free and read-only so the audit can report that split.
+    dedicated_push_step_present = bool(
+        re.search(r"notification-push", text)
+    )
     return {
         "has_agent_step": bool(block),
         "secret_wired": wired,
-        "secret_reference_present": secret_ref in str(workflow_text or ""),
+        "secret_reference_present": secret_ref in text,
+        "agent_step_secret_present": agent_secret_present,
+        "least_privilege_agent_step": bool(block) and not agent_secret_present,
+        "dedicated_push_step_present": dedicated_push_step_present,
+        "dedicated_push_step_secret_present": bool(
+            dedicated_push_step_present and secret_ref in text
+        ),
         "expected_env_line": SERVERCHAN_WIRING_ENV_LINE,
     }
 
@@ -18720,7 +18735,830 @@ def serverchan_workflow_secret_wiring_audit(
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_B_DEDICATED_PUSH_STEP_DESIGN_AND_IMPLEMENT_01
+# (task cf-94cafa503270)
+#
+# Production notification entrypoint for a dedicated workflow push step. It reads
+# a terminal execution result (execution_result.json or an equivalent final
+# result dict), classifies it into exactly one of PASS / FAIL / BLOCKED /
+# PENDING_APPROVAL, and delivers ONE notification through the existing ServerChan
+# adapter, which is gated by the durable task_id+classification delivery ledger.
+#
+# Least privilege: the SendKey is read ONLY from SERVERCHAN_SENDKEY at delivery
+# time, never from CLI arguments, logs or artifacts; the CLI never writes it.
+# Tests always inject a fake transport and hello's in-process pytest isolation
+# guard makes a real HTTPS call impossible inside pytest, so the agent/pytest
+# process can never consume a runner SERVERCHAN_SENDKEY.
+#
+# Cross-run durability: the dedupe ledger is the JSON file whose path is
+# controlled by PERSONAL_AI_SERVERCHAN_DELIVERY_LEDGER. A bare runner-temp file
+# is discarded between reruns, so the dedicated push step must restore/save that
+# exact path through the GitHub Actions cache (see dedicated_push_step_spec()).
+# Committing the ledger into the code repo is rejected because it would dirty the
+# repository on every delivery. No Cloudflare production artifact is touched.
+# ---------------------------------------------------------------------------
+
+DEDICATED_PUSH_STEP_GOAL = (
+    "PERSONAL_AI_EXECUTION_B_DEDICATED_PUSH_STEP_DESIGN_AND_IMPLEMENT_01"
+)
+DEDICATED_PUSH_STEP_TASK_ID = "cf-94cafa503270"
+DEDICATED_PUSH_STEP_REPORT = "PERSONAL_AI_DEDICATED_PUSH_STEP_REPORT"
+DEDICATED_PUSH_STEP_ENTRYPOINT = "python hello.py notification-push"
+DEDICATED_PUSH_STEP_SUBCOMMANDS = ("notification-push", "push-notification")
+DEDICATED_PUSH_STEP_RESULT_ENV = "PERSONAL_AI_EXECUTION_RESULT"
+DEDICATED_PUSH_STEP_RESULT_DEFAULT = "execution_result.json"
+DEDICATED_PUSH_STEP_EVENT = "dedicated_push_step_notification"
+DEDICATED_PUSH_STEP_CACHE_PREFIX = "personal-ai-serverchan-delivery-ledger-v1-"
+DEDICATED_PUSH_STEP_LEDGER_DEFAULT = (
+    "${{ runner.temp }}/personal_ai_serverchan_delivery_ledger.json"
+)
+DEDICATED_PUSH_STEP_OUTBOX_DEFAULT = (
+    "${{ runner.temp }}/personal_ai_push_outbox.json"
+)
+DEDICATED_PUSH_STEP_COMMAND = (
+    DEDICATED_PUSH_STEP_ENTRYPOINT
+    + ' --result "$RUNNER_TEMP/execution_result.json"'
+)
+
+DEDICATED_PUSH_STEP_NOTIFIABLE_CLASSES = tuple(NOTIFICATION_CLASSES)
+DEDICATED_PUSH_STEP_STATUS_ALIASES = {
+    "pass": NOTIFICATION_CLASS_PASS,
+    "passed": NOTIFICATION_CLASS_PASS,
+    "success": NOTIFICATION_CLASS_PENDING_APPROVAL,
+    "succeeded": NOTIFICATION_CLASS_PENDING_APPROVAL,
+    "ok": NOTIFICATION_CLASS_PENDING_APPROVAL,
+    "fail": NOTIFICATION_CLASS_FAIL,
+    "failed": NOTIFICATION_CLASS_FAIL,
+    "failure": NOTIFICATION_CLASS_FAIL,
+    "error": NOTIFICATION_CLASS_FAIL,
+    "errored": NOTIFICATION_CLASS_FAIL,
+    "timeout": NOTIFICATION_CLASS_FAIL,
+    "timed_out": NOTIFICATION_CLASS_FAIL,
+    "stuck": NOTIFICATION_CLASS_FAIL,
+    "blocked": NOTIFICATION_CLASS_BLOCKED,
+    "pending_approval": NOTIFICATION_CLASS_PENDING_APPROVAL,
+    "awaiting_approval": NOTIFICATION_CLASS_PENDING_APPROVAL,
+}
+DEDICATED_PUSH_STEP_NON_NOTIFIABLE_STATUSES = (
+    "pending",
+    "queued",
+    "running",
+    "in_progress",
+    "started",
+)
+
+DEDICATED_PUSH_STEP_ACCEPTANCE_FIELDS = (
+    "production CLI entrypoint reads a terminal execution result",
+    "only PASS/FAIL/BLOCKED/PENDING_APPROVAL terminal states notify",
+    "SendKey read ONLY from SERVERCHAN_SENDKEY at delivery time",
+    "reuses the existing ServerChan adapter and durable delivery ledger",
+    "task_id+classification dedupe: at most one transport call, cross-process",
+    "ledger survives workflow rerun via a documented persistence mechanism",
+    "Human Gate preserved; no Router / orchestrator / multi-agent",
+)
+
+
+@contextlib.contextmanager
+def _temporary_env(**pairs):
+    """Temporarily set/restore ``os.environ`` entries (side-effect scoped)."""
+    saved = {name: os.environ.get(name) for name in pairs}
+    for name, value in pairs.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = str(value)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _normalize_result_token(value) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def notification_classification_for_result(result) -> dict:
+    """Classify a terminal execution result into a notification class.
+
+    Value-only and side-effect free. Explicit ``classification`` /
+    ``notification_classification`` win, then a human ``review_verdict``, then
+    ``final_status`` / ``status`` / ``state`` / ``outcome``. Only
+    PASS / FAIL / BLOCKED / PENDING_APPROVAL are notifiable; a non-terminal state
+    (pending/queued/running) returns ``notifiable=False`` so no notification is
+    sent for work that has not reached a terminal state.
+    """
+    if not isinstance(result, dict):
+        raise TypeError("notification_classification_for_result requires a dict")
+    for field in ("classification", "notification_classification"):
+        token = str(result.get(field) or "").strip().upper()
+        if token in NOTIFICATION_CLASSES:
+            return {
+                "notifiable": True,
+                "classification": token,
+                "source": field,
+                "reason": f"explicit {field}={token}",
+            }
+    verdict = str(result.get("review_verdict") or "").strip().upper()
+    if verdict in NOTIFICATION_CLASSES:
+        return {
+            "notifiable": True,
+            "classification": verdict,
+            "source": "review_verdict",
+            "reason": f"human review verdict {verdict}",
+        }
+    for field in ("final_status", "status", "state", "outcome", "result"):
+        raw = result.get(field)
+        token = _normalize_result_token(raw)
+        if not token:
+            continue
+        if token in DEDICATED_PUSH_STEP_STATUS_ALIASES:
+            cls = DEDICATED_PUSH_STEP_STATUS_ALIASES[token]
+            return {
+                "notifiable": True,
+                "classification": cls,
+                "source": field,
+                "reason": f"{field}={raw!r} maps to {cls}",
+            }
+        if token in DEDICATED_PUSH_STEP_NON_NOTIFIABLE_STATUSES:
+            return {
+                "notifiable": False,
+                "classification": None,
+                "source": field,
+                "reason": f"{field}={raw!r} is not a terminal notifiable state",
+            }
+        upper = token.upper()
+        if upper.startswith("PENDING"):
+            cls = NOTIFICATION_CLASS_PENDING_APPROVAL
+        elif upper.startswith("BLOCKED"):
+            cls = NOTIFICATION_CLASS_BLOCKED
+        elif upper.startswith("PASS"):
+            cls = NOTIFICATION_CLASS_PASS
+        elif upper.startswith("FAIL"):
+            cls = NOTIFICATION_CLASS_FAIL
+        else:
+            continue
+        return {
+            "notifiable": True,
+            "classification": cls,
+            "source": field,
+            "reason": f"{field}={raw!r} classified {cls}",
+        }
+    return {
+        "notifiable": False,
+        "classification": None,
+        "source": None,
+        "reason": (
+            "no terminal PASS/FAIL/BLOCKED/PENDING_APPROVAL classification found"
+        ),
+    }
+
+
+def build_result_notification(
+    result, *, classification: str | None = None, now: datetime | None = None
+) -> dict:
+    """Build the notification record the existing outbox/adapter consumes."""
+    if not isinstance(result, dict):
+        raise TypeError("build_result_notification requires a dict")
+    decision = notification_classification_for_result(result)
+    cls = classification or decision.get("classification")
+    if classification is None and not decision.get("notifiable"):
+        raise ValueError(f"result is not notifiable: {decision.get('reason')}")
+    if cls not in NOTIFICATION_CLASSES:
+        raise ValueError(f"unknown notification classification: {cls!r}")
+    task_id = str(result.get("task_id") or "").strip()
+    if not task_id:
+        raise ValueError("result has no task_id")
+    now = now if now is not None else datetime.now(timezone.utc)
+    summary = str(result.get("summary") or result.get("goal") or "").strip()
+    if not summary:
+        summary = f"Task {task_id} classified {cls}"
+    return {
+        "task_id": task_id,
+        "classification": cls,
+        "title": NOTIFICATION_TITLE_BY_CLASS[cls],
+        "message": summary,
+        "requires_human_approval": cls == NOTIFICATION_CLASS_PENDING_APPROVAL,
+        "source": "dedicated_push_step",
+        "created_at": now.isoformat(),
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+    }
+
+
+def enqueue_result_push_envelope(
+    notification: dict, *, now: datetime | None = None, persist: bool = True
+) -> tuple[dict, bool]:
+    """Idempotently map a notification to one outbox envelope.
+
+    Returns ``(envelope, created)``. The dedupe key is the stable
+    ``task_id|classification`` identity, so a repeated enqueue returns the
+    existing envelope and creates no duplicate.
+    """
+    if not isinstance(notification, dict):
+        raise TypeError("enqueue_result_push_envelope requires a notification dict")
+    now = now if now is not None else datetime.now(timezone.utc)
+    envelope = build_push_envelope(notification, now=now)
+    existing = get_push_envelope(envelope["dedupe_key"])
+    if existing is not None:
+        return existing, False
+    if persist:
+        _update_push_envelope(envelope)
+    else:
+        PUSH_OUTBOX.append(dict(envelope))
+    record_consumer_evidence(
+        DEDICATED_PUSH_STEP_EVENT,
+        envelope["task_id"],
+        detail=(
+            f"dedicated push step queued {envelope['dedupe_key']} "
+            f"({envelope['classification']})"
+        ),
+        extra={
+            "dedupe_key": envelope["dedupe_key"],
+            "classification": envelope["classification"],
+            "channel": PUSH_ENVELOPE_CHANNEL,
+            "human_review_gate": True,
+        },
+    )
+    return envelope, True
+
+
+def load_notification_result(source) -> dict:
+    """Load a terminal execution result from a JSON path or return a dict copy."""
+    if isinstance(source, dict):
+        return dict(source)
+    path = Path(str(source))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, str):
+        data = json.loads(data)
+    if not isinstance(data, dict):
+        raise ValueError("execution result must be a JSON object")
+    return data
+
+
+def run_notification_push(
+    result,
+    *,
+    consumer_id: str = NOTIFICATION_DELIVERY_CONSUMER_DEFAULT,
+    transport=None,
+    now: datetime | None = None,
+    persist: bool = True,
+) -> dict:
+    """Production push core: one terminal result -> at most one ServerChan send.
+
+    Reads the terminal result, classifies it, idempotently enqueues one outbox
+    envelope and delegates to :func:`deliver_serverchan_envelope`, which is gated
+    by the durable task_id+classification delivery ledger. The SendKey is read
+    only inside the adapter from the environment; nothing sensitive is written to
+    the result, logs or artifacts. ``transport`` is injectable for tests; the
+    production CLI leaves it ``None`` (the real default transport).
+    """
+    if not consumer_id:
+        raise ValueError("run_notification_push requires a consumer_id")
+    now = now if now is not None else datetime.now(timezone.utc)
+    source_label = "<dict>" if isinstance(result, dict) else str(result)
+    base = {
+        "goal": DEDICATED_PUSH_STEP_GOAL,
+        "report": DEDICATED_PUSH_STEP_REPORT,
+        "entrypoint": DEDICATED_PUSH_STEP_ENTRYPOINT,
+        "channel": SERVERCHAN_ADAPTER_CHANNEL,
+        "source": source_label,
+        "consumer_id": consumer_id,
+        "now": now.isoformat(),
+        "credential_present": serverchan_sendkey_present(),
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+    }
+    try:
+        data = load_notification_result(result)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        base.update(
+            {
+                "loaded": False,
+                "task_id": "",
+                "notifiable": False,
+                "dispatched": False,
+                "notification_created": False,
+                "classification": None,
+                "skipped_reason": f"result_load_failed:{type(exc).__name__}",
+                "error": type(exc).__name__,
+            }
+        )
+        return base
+    task_id = str(data.get("task_id") or "").strip()
+    decision = notification_classification_for_result(data)
+    base["task_id"] = task_id
+    base["loaded"] = True
+    if not task_id:
+        base.update(
+            {
+                "notifiable": False,
+                "dispatched": False,
+                "notification_created": False,
+                "classification": None,
+                "classification_source": decision.get("source"),
+                "skipped_reason": "missing_task_id",
+            }
+        )
+        return base
+    if not decision["notifiable"]:
+        base.update(
+            {
+                "notifiable": False,
+                "dispatched": False,
+                "notification_created": False,
+                "classification": None,
+                "classification_source": decision.get("source"),
+                "skipped_reason": decision.get("reason"),
+            }
+        )
+        return base
+    classification = decision["classification"]
+    notification = build_result_notification(
+        data, classification=classification, now=now
+    )
+    envelope, created = enqueue_result_push_envelope(
+        notification, now=now, persist=persist
+    )
+    dedupe_key = str(envelope["dedupe_key"])
+    delivery = deliver_serverchan_envelope(dedupe_key, transport=transport, now=now)
+    state = str(delivery.get("state") or "")
+    base.update(
+        {
+            "notifiable": True,
+            "classification": classification,
+            "classification_source": decision.get("source"),
+            "classification_reason": decision.get("reason"),
+            "notification_created": created,
+            "dedupe_key": dedupe_key,
+            "delivery_state": state,
+            "delivery_status": delivery.get("status"),
+            "dispatched": state == "delivered",
+            "already_delivered": bool(delivery.get("already_delivered")),
+            "fail_closed": bool(delivery.get("fail_closed")),
+            "external_blocker": delivery.get("external_blocker"),
+            "sendkey_redacted": delivery.get("sendkey_redacted"),
+            "endpoint_kind": delivery.get("endpoint_kind"),
+            "push_id": delivery.get("push_id"),
+            "server_message": delivery.get("server_message"),
+            "delivery": delivery,
+            "envelope": envelope,
+            "payload": delivery.get("payload"),
+            "skipped_reason": None,
+        }
+    )
+    record_consumer_evidence(
+        DEDICATED_PUSH_STEP_EVENT,
+        task_id,
+        detail=(
+            f"dedicated push step -> {state or 'not_attempted'} ({classification})"
+        ),
+        extra={
+            "dedupe_key": dedupe_key,
+            "classification": classification,
+            "state": state,
+            "already_delivered": bool(delivery.get("already_delivered")),
+            "external_blocker": delivery.get("external_blocker"),
+        },
+    )
+    return base
+
+
+def notification_push_cli(argv=None, *, transport=None, now=None) -> int:
+    """CLI entrypoint for the dedicated workflow push step.
+
+    ``python hello.py notification-push --result <execution_result.json>`` reads
+    one terminal result and delivers at most one ServerChan notification. The
+    SendKey is never accepted as an argument; it is read only from
+    ``SERVERCHAN_SENDKEY`` by the adapter at delivery time. ``--describe`` prints
+    the wiring spec (command / env / ledger mechanism) without sending anything.
+    """
+    parser = argparse.ArgumentParser(
+        prog=DEDICATED_PUSH_STEP_ENTRYPOINT,
+        description=(
+            "Deliver one ServerChan notification for a terminal execution result."
+        ),
+    )
+    parser.add_argument(
+        "--result",
+        default=(
+            os.environ.get(DEDICATED_PUSH_STEP_RESULT_ENV)
+            or DEDICATED_PUSH_STEP_RESULT_DEFAULT
+        ),
+        help="Path to execution_result.json (or an equivalent terminal result).",
+    )
+    parser.add_argument(
+        "--ledger",
+        default=None,
+        help=f"Override {DELIVERY_LEDGER_STATE_ENV} (durable dedupe ledger path).",
+    )
+    parser.add_argument(
+        "--outbox",
+        default=None,
+        help=f"Override {PUSH_OUTBOX_STATE_ENV} (outbox state path).",
+    )
+    parser.add_argument(
+        "--consumer-id",
+        default=NOTIFICATION_DELIVERY_CONSUMER_DEFAULT,
+        help="Logical consumer id recorded with the evidence.",
+    )
+    parser.add_argument(
+        "--describe",
+        action="store_true",
+        help="Print the dedicated push step spec (command/env/ledger) and exit.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.describe:
+        print(
+            json.dumps(
+                dedicated_push_step_spec(), indent=2, ensure_ascii=False, sort_keys=True
+            )
+        )
+        return 0
+
+    overrides: dict = {}
+    if args.ledger:
+        overrides[DELIVERY_LEDGER_STATE_ENV] = args.ledger
+    if args.outbox:
+        overrides[PUSH_OUTBOX_STATE_ENV] = args.outbox
+    with _temporary_env(**overrides):
+        result = run_notification_push(
+            args.result,
+            consumer_id=args.consumer_id,
+            transport=transport,
+            now=now,
+        )
+    print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True))
+    return 0 if result.get("loaded") else 1
+
+
+def dedicated_push_step_spec() -> dict:
+    """Return the exact command, env and ledger mechanism for the push step.
+
+    This is the hand-off contract for the control plane: it names the CLI
+    command, the environment variables, the durable ledger path and the
+    cross-run persistence mechanism (GitHub Actions cache) the dedicated push
+    step must use.
+    """
+    ledger_path = (
+        os.environ.get(DELIVERY_LEDGER_STATE_ENV) or DEDICATED_PUSH_STEP_LEDGER_DEFAULT
+    )
+    outbox_path = (
+        os.environ.get(PUSH_OUTBOX_STATE_ENV) or DEDICATED_PUSH_STEP_OUTBOX_DEFAULT
+    )
+    workflow_step_yaml = "\n".join(
+        [
+            "- name: Restore ServerChan delivery ledger",
+            "  uses: actions/cache/restore@v4",
+            "  with:",
+            "    path: " + DEDICATED_PUSH_STEP_LEDGER_DEFAULT,
+            "    key: "
+            + DEDICATED_PUSH_STEP_CACHE_PREFIX
+            + "${{ github.run_id }}-${{ github.run_attempt }}",
+            "    restore-keys: |",
+            "      " + DEDICATED_PUSH_STEP_CACHE_PREFIX,
+            "",
+            "- name: Dedicated ServerChan push (credential only here)",
+            "  env:",
+            "    " + SERVERCHAN_WIRING_ENV_LINE,
+            "    " + DELIVERY_LEDGER_STATE_ENV + ": "
+            + DEDICATED_PUSH_STEP_LEDGER_DEFAULT,
+            "    " + PUSH_OUTBOX_STATE_ENV + ": " + DEDICATED_PUSH_STEP_OUTBOX_DEFAULT,
+            "    " + DEDICATED_PUSH_STEP_RESULT_ENV
+            + ": ${{ runner.temp }}/execution_result.json",
+            '  run: python hello.py notification-push --result "$RUNNER_TEMP/execution_result.json"',
+            "",
+            "- name: Save ServerChan delivery ledger",
+            "  if: always()",
+            "  uses: actions/cache/save@v4",
+            "  with:",
+            "    path: " + DEDICATED_PUSH_STEP_LEDGER_DEFAULT,
+            "    key: "
+            + DEDICATED_PUSH_STEP_CACHE_PREFIX
+            + "${{ github.run_id }}-${{ github.run_attempt }}",
+        ]
+    )
+    return {
+        "goal": DEDICATED_PUSH_STEP_GOAL,
+        "task_id": DEDICATED_PUSH_STEP_TASK_ID,
+        "report": DEDICATED_PUSH_STEP_REPORT,
+        "entrypoint": DEDICATED_PUSH_STEP_ENTRYPOINT,
+        "command": DEDICATED_PUSH_STEP_COMMAND,
+        "describe_command": DEDICATED_PUSH_STEP_ENTRYPOINT + " --describe",
+        "working_directory": "${{ github.workspace }}",
+        "result": {
+            "env": DEDICATED_PUSH_STEP_RESULT_ENV,
+            "default_path": DEDICATED_PUSH_STEP_RESULT_DEFAULT,
+            "workflow_path": "${{ runner.temp }}/execution_result.json",
+            "accepted_fields": [
+                "task_id",
+                "classification",
+                "review_verdict",
+                "final_status",
+                "status",
+            ],
+        },
+        "env": {
+            SERVERCHAN_SENDKEY_ENV: SERVERCHAN_WIRING_ENV_LINE.split(": ", 1)[1],
+            DELIVERY_LEDGER_STATE_ENV: ledger_path,
+            PUSH_OUTBOX_STATE_ENV: outbox_path,
+            DEDICATED_PUSH_STEP_RESULT_ENV: "${{ runner.temp }}/execution_result.json",
+        },
+        "secret_boundary": {
+            "read_from": SERVERCHAN_SENDKEY_ENV,
+            "read_at": "delivery_time_only",
+            "never_from": ["cli_arguments", "logs", "artifacts", "committed_files"],
+            "redaction": "serverchan_redact()",
+        },
+        "ledger": {
+            "env": DELIVERY_LEDGER_STATE_ENV,
+            "default_path": str(REPO_ROOT / DELIVERY_LEDGER_STATE_DEFAULT),
+            "recommended_path": ledger_path,
+            "schema": DELIVERY_LEDGER_SCHEMA,
+            "kind": DELIVERY_LEDGER_EVIDENCE_KIND,
+            "identity_fields": ["task_id", "classification"],
+            "guarantee": (
+                "at most one successful transport send per task_id+classification"
+            ),
+            "atomicity": "POSIX flock read-modify-write",
+            "persist_across_rerun": True,
+            "persistence_mechanism": (
+                "GitHub Actions cache (actions/cache/restore + save)"
+            ),
+            "cache_key_prefix": DEDICATED_PUSH_STEP_CACHE_PREFIX,
+            "cache_path": DEDICATED_PUSH_STEP_LEDGER_DEFAULT,
+            "restore_keys": DEDICATED_PUSH_STEP_CACHE_PREFIX,
+            "why_not_repo_commit": (
+                "committing the ledger would dirty the code repository on every "
+                "delivery and is outside the task allowlist"
+            ),
+            "why_not_bare_temp": (
+                "a runner temp file is discarded between workflow reruns, so "
+                "dedupe would silently reset"
+            ),
+            "note": (
+                "Cache entries are immutable: save under a unique key "
+                "(stable prefix + run id/attempt) and restore with restore-keys "
+                "prefixed by the stable prefix. The dispatch workflow's "
+                "concurrency group already serialises the writer, so the "
+                "restore/modify/save sequence does not race."
+            ),
+        },
+        "workflow_step_yaml": workflow_step_yaml,
+        "acceptance_fields": list(DEDICATED_PUSH_STEP_ACCEPTANCE_FIELDS),
+        "limitations": [
+            "GitHub Actions cache is the minimal cross-rerun store available to "
+            "the workflow without dirtying the code repo or touching Cloudflare "
+            "production; entries can be evicted after ~7 days of no access, after "
+            "which the ledger would reset.",
+            "actions/cache/save@v4 requires the ledger path to exist; guard the "
+            "save step (for example if hashFiles(...) != '') so a no-op push "
+            "does not fail the workflow.",
+            "Cache entries are immutable, so the save key must be unique per "
+            "run/attempt while restore-keys use the stable prefix.",
+            "Absolute multi-region durability would need an external store "
+            "(Cloudflare KV/D1); that is out of scope here and Cloudflare "
+            "production must not be modified.",
+        ],
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "no_router": True,
+        "no_orchestrator": True,
+        "no_multi_agent": True,
+        "workflow_modified": False,
+        "blocker": None,
+        "next_action": (
+            "Control plane only: add the dedicated push step shown in "
+            "workflow_step_yaml after Build execution_result.json, wiring "
+            f"{SERVERCHAN_SENDKEY_ENV} into that step alone and persisting "
+            f"{DELIVERY_LEDGER_STATE_ENV} via the GitHub Actions cache."
+        ),
+    }
+
+
+def dedicated_push_step_report(
+    *, now: datetime | None = None, transport=None
+) -> dict:
+    """Self-test report for the dedicated push step design (no real send).
+
+    It runs disposable probes with a fake credential and an injected fake
+    transport only, so it can never send a WeChat notification. It proves the
+    class mapping, the one-notification-per-terminal-state rule, and the
+    task_id+classification dedupe (a repeated result does not call the transport
+    again).
+    """
+    now = now if now is not None else datetime.now(timezone.utc)
+    seq = uuid.uuid4().hex[:10]
+    calls: list = []
+    counter = {"n": 0}
+
+    def fake_transport(endpoint: str, payload: dict) -> dict:
+        counter["n"] += 1
+        calls.append({"endpoint": endpoint, "payload": payload})
+        return {
+            "ok": True,
+            "status_code": 200,
+            "push_id": f"pid-dedicated-push-{counter['n']}",
+            "server_message": "SUCCESS",
+        }
+
+    sender = transport if transport is not None else fake_transport
+    probes: list[dict] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = Path(tmp) / "delivery_ledger.json"
+        outbox = Path(tmp) / "push_outbox.json"
+        fake_key = "SCT" + uuid.uuid4().hex[:16]
+        with _temporary_env(
+            **{
+                DELIVERY_LEDGER_STATE_ENV: str(ledger),
+                PUSH_OUTBOX_STATE_ENV: str(outbox),
+                SERVERCHAN_SENDKEY_ENV: fake_key,
+            }
+        ):
+            cases = (
+                ("PASS", {"classification": "PASS"}, NOTIFICATION_CLASS_PASS),
+                ("FAIL", {"final_status": "FAIL"}, NOTIFICATION_CLASS_FAIL),
+                ("BLOCKED", {"status": "blocked"}, NOTIFICATION_CLASS_BLOCKED),
+                (
+                    "PENDING_APPROVAL",
+                    {"status": "success"},
+                    NOTIFICATION_CLASS_PENDING_APPROVAL,
+                ),
+            )
+            for label, extra, expected in cases:
+                task_id = f"dedicated-push-{label.lower()}-{seq}"
+                result = {"task_id": task_id, "summary": f"probe {label}", **extra}
+                outcome = run_notification_push(result, transport=sender, now=now)
+                probes.append(
+                    {
+                        "label": label,
+                        "task_id": task_id,
+                        "expected_classification": expected,
+                        "observed_classification": outcome.get("classification"),
+                        "dispatched": outcome.get("dispatched"),
+                        "already_delivered": outcome.get("already_delivered"),
+                        "match": outcome.get("classification") == expected,
+                    }
+                )
+            # Repeat the exact PASS result: the durable identity must suppress it.
+            repeat = run_notification_push(
+                {
+                    "task_id": f"dedicated-push-pass-{seq}",
+                    "summary": "probe PASS",
+                    "classification": "PASS",
+                },
+                transport=sender,
+                now=now,
+            )
+            # Non-terminal state must not notify at all.
+            non_terminal = run_notification_push(
+                {
+                    "task_id": f"dedicated-push-running-{seq}",
+                    "status": "running",
+                },
+                transport=sender,
+                now=now,
+            )
+        with _temporary_env(
+            **{
+                DELIVERY_LEDGER_STATE_ENV: str(ledger),
+                PUSH_OUTBOX_STATE_ENV: str(outbox),
+                SERVERCHAN_SENDKEY_ENV: None,
+            }
+        ):
+            no_credential = run_notification_push(
+                {
+                    "task_id": f"dedicated-push-nocred-{seq}",
+                    "classification": "PASS",
+                },
+                transport=sender,
+                now=now,
+            )
+
+    notifiable_probes = [p for p in probes if p["dispatched"]]
+    all_match = all(p["match"] for p in probes)
+    dedupe_ok = bool(
+        repeat.get("already_delivered") is True
+        and repeat.get("dispatched") is True
+    )
+    non_terminal_ok = non_terminal.get("notifiable") is False
+    no_credential_ok = bool(
+        no_credential.get("delivery_state") == "blocked"
+        and no_credential.get("external_blocker") == BLOCKED_EXTERNAL_CREDENTIAL
+    )
+    expected_calls = len(probes)  # one per distinct terminal probe, repeat suppressed
+    transport_ok = counter["n"] == expected_calls
+
+    checks = [
+        {
+            "check": "all four terminal classes map correctly",
+            "status": PASS if all_match else FAIL,
+            "detail": "; ".join(
+                f"{p['label']}->{p['observed_classification']}" for p in probes
+            ),
+        },
+        {
+            "check": "one notification per terminal state",
+            "status": PASS if len(notifiable_probes) == len(probes) else FAIL,
+            "detail": f"{len(notifiable_probes)}/{len(probes)} probes dispatched",
+        },
+        {
+            "check": "task_id+classification dedupe suppresses repeat transport",
+            "status": PASS if dedupe_ok else FAIL,
+            "detail": (
+                f"repeat already_delivered={repeat.get('already_delivered')}; "
+                f"transport_calls={counter['n']} expected={expected_calls}"
+            ),
+        },
+        {
+            "check": "non-terminal state does not notify",
+            "status": PASS if non_terminal_ok else FAIL,
+            "detail": f"running notifiable={non_terminal.get('notifiable')}",
+        },
+        {
+            "check": "missing credential is BLOCKED_EXTERNAL_CREDENTIAL",
+            "status": PASS if no_credential_ok else FAIL,
+            "detail": (
+                f"state={no_credential.get('delivery_state')}; "
+                f"blocker={no_credential.get('external_blocker')}"
+            ),
+        },
+        {
+            "check": "at most one transport call per distinct identity",
+            "status": PASS if transport_ok else FAIL,
+            "detail": f"transport_calls={counter['n']} expected={expected_calls}",
+        },
+        {
+            "check": "Human Gate preserved; no Router / orchestrator / multi-agent",
+            "status": PASS,
+            "detail": "notification only; no auto review / PASS / dispatch",
+        },
+    ]
+    spec = dedicated_push_step_spec()
+    final = PASS if all(c["status"] == PASS for c in checks) else FAIL
+    lines = [
+        f"# {DEDICATED_PUSH_STEP_REPORT}",
+        "",
+        f"- goal: {DEDICATED_PUSH_STEP_GOAL}",
+        f"- task_id: {DEDICATED_PUSH_STEP_TASK_ID}",
+        f"- final_status: {final}",
+        f"- entrypoint: {DEDICATED_PUSH_STEP_ENTRYPOINT}",
+        f"- command: {DEDICATED_PUSH_STEP_COMMAND}",
+        f"- result_env: {DEDICATED_PUSH_STEP_RESULT_ENV}",
+        f"- ledger_env: {DELIVERY_LEDGER_STATE_ENV}",
+        f"- ledger_path: {spec['ledger']['recommended_path']}",
+        f"- ledger_mechanism: {spec['ledger']['persistence_mechanism']}",
+        f"- transport_calls: {counter['n']}",
+        "- real_notification_sent: false (fake transport only)",
+        "",
+        "## Probes",
+    ]
+    for probe in probes:
+        lines.append(
+            f"- {probe['label']}: classification={probe['observed_classification']} "
+            f"dispatched={probe['dispatched']}"
+        )
+    lines += ["", "## Checks"]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final}"]
+    return {
+        "report": DEDICATED_PUSH_STEP_REPORT,
+        "goal": DEDICATED_PUSH_STEP_GOAL,
+        "task_id": DEDICATED_PUSH_STEP_TASK_ID,
+        "status": final,
+        "final_status": final,
+        "entrypoint": DEDICATED_PUSH_STEP_ENTRYPOINT,
+        "command": DEDICATED_PUSH_STEP_COMMAND,
+        "spec": spec,
+        "probes": probes,
+        "transport_calls": counter["n"],
+        "real_notification_sent": False,
+        "checks": checks,
+        "acceptance_fields": list(DEDICATED_PUSH_STEP_ACCEPTANCE_FIELDS),
+        "human_review_gate": True,
+        "auto_pass": False,
+        "auto_trigger_next": False,
+        "no_router": True,
+        "no_orchestrator": True,
+        "no_multi_agent": True,
+        "workflow_modified": False,
+        "changed_files": ["hello.py", "test_hello.py"],
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
+    if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
+        raise SystemExit(notification_push_cli(sys.argv[2:]))
     print(runtime_provenance_v0_1_report()["markdown"])
     print(cloudflare_runtime_audit_report()["markdown"])
     print(mcp_runtime_deploy_verify()["final_return_markdown"])
@@ -18746,3 +19584,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(mcp_notification_reader_golden_verify()["markdown"])
     print(push_adapter_report()["markdown"])
     print(serverchan_adapter_report()["markdown"])
+    print(dedicated_push_step_report()["markdown"])

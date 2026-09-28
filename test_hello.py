@@ -7445,6 +7445,10 @@ def test_serverchan_real_push_golden_02_is_idempotent(monkeypatch) -> None:
 
 
 def test_serverchan_real_push_golden_02_workflow_wiring_confirmed() -> None:
+    # Least privilege (control-plane commit 1d4d557): the SendKey is deliberately
+    # NOT injected into the agent execution step, so agent/pytest cannot observe
+    # it. The dedicated push step is where the control plane will wire it; the
+    # hand-off spec must be complete and credential-free in the agent scope.
     workflow = pathlib.Path(
         hello_module.REPO_ROOT,
         *hello_module.SERVERCHAN_WORKFLOW_DIR,
@@ -7454,11 +7458,19 @@ def test_serverchan_real_push_golden_02_workflow_wiring_confirmed() -> None:
         workflow.read_text(encoding="utf-8")
     )
     assert status["has_agent_step"] is True
-    assert status["secret_wired"] is True
-    assert status["secret_reference_present"] is True
+    assert status["secret_wired"] is False
+    assert status["secret_reference_present"] is False
+    assert status["agent_step_secret_present"] is False
+    assert status["least_privilege_agent_step"] is True
     assert status["expected_env_line"] == (
         "SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}"
     )
+    spec = hello_module.dedicated_push_step_spec()
+    assert spec["env"][hello_module.SERVERCHAN_SENDKEY_ENV] == (
+        "${{ secrets.SERVERCHAN_SENDKEY }}"
+    )
+    assert spec["ledger"]["identity_fields"] == ["task_id", "classification"]
+    assert spec["ledger"]["persist_across_rerun"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -7691,3 +7703,306 @@ def test_durable_dedupe_across_independent_processes(tmp_path) -> None:
     ]
     assert len(delivered) == 1
     assert delivered[0]["push_id"] == "pid-xproc"
+
+
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_EXECUTION_B_DEDICATED_PUSH_STEP_DESIGN_AND_IMPLEMENT_01
+# (task cf-94cafa503270)
+#
+# The production push entrypoint reads a terminal result and delivers at most one
+# ServerChan notification through the existing adapter + durable ledger. Every
+# test here uses a fake credential and a fake transport, so the real HTTPS leg is
+# never entered and no WeChat notification is produced.
+# ---------------------------------------------------------------------------
+
+
+def test_notification_classification_for_result_terminal_states() -> None:
+    cases = (
+        ({"classification": "PASS"}, "PASS"),
+        ({"review_verdict": "FAIL"}, "FAIL"),
+        ({"final_status": "BLOCKED_EVIDENCE_MISSING"}, "BLOCKED"),
+        ({"status": "success"}, "PENDING_APPROVAL"),
+        ({"final_status": "PASSED"}, "PASS"),
+        ({"status": "blocked"}, "BLOCKED"),
+    )
+    for result, expected in cases:
+        decision = hello_module.notification_classification_for_result(result)
+        assert decision["notifiable"] is True
+        assert decision["classification"] == expected
+
+
+def test_notification_classification_for_result_non_terminal_is_skipped() -> None:
+    for state in ("pending", "queued", "running", "in_progress"):
+        decision = hello_module.notification_classification_for_result(
+            {"status": state}
+        )
+        assert decision["notifiable"] is False
+        assert decision["classification"] is None
+    assert (
+        hello_module.notification_classification_for_result({})["notifiable"]
+        is False
+    )
+
+
+def test_build_result_notification_requires_task_and_classification() -> None:
+    with pytest.raises(ValueError):
+        hello_module.build_result_notification(
+            {"task_id": "t", "status": "running"}
+        )
+    with pytest.raises(ValueError):
+        hello_module.build_result_notification({"classification": "PASS"})
+    with pytest.raises(TypeError):
+        hello_module.build_result_notification("not-a-dict")
+
+
+def test_notification_push_delivers_once_and_dedupes_repeat(monkeypatch) -> None:
+    monkeypatch.setenv(hello_module.SERVERCHAN_SENDKEY_ENV, _serverchan_fake_key())
+    calls: list = []
+
+    def fake_transport(endpoint: str, payload: dict) -> dict:
+        calls.append((endpoint, payload))
+        return {
+            "ok": True,
+            "status_code": 200,
+            "push_id": "pid-push-once",
+            "server_message": "SUCCESS",
+        }
+
+    result = {
+        "task_id": "dedicated-push-once",
+        "classification": "PASS",
+        "summary": "dedicated push probe",
+    }
+    first = hello_module.run_notification_push(result, transport=fake_transport)
+    assert first["dispatched"] is True
+    assert first["notification_created"] is True
+    assert first["classification"] == "PASS"
+    assert first["dedupe_key"] == hello_module.push_envelope_dedupe_key(
+        "dedicated-push-once", "PASS"
+    )
+    assert first["push_id"] == "pid-push-once"
+    assert len(calls) == 1
+
+    second = hello_module.run_notification_push(result, transport=fake_transport)
+    assert second["already_delivered"] is True
+    assert second["dispatched"] is True
+    assert second["push_id"] == "pid-push-once"
+    assert len(calls) == 1  # task_id+classification never consumes a 2nd send
+
+
+def test_notification_push_without_credential_blocks_without_network(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(hello_module.SERVERCHAN_SENDKEY_ENV, raising=False)
+    calls: list = []
+
+    def fake_transport(endpoint: str, payload: dict) -> dict:
+        calls.append(endpoint)
+        return {"ok": True}
+
+    result = hello_module.run_notification_push(
+        {"task_id": "dedicated-push-nocred", "classification": "PASS"},
+        transport=fake_transport,
+    )
+    assert result["delivery_state"] == "blocked"
+    assert result["external_blocker"] == hello_module.BLOCKED_EXTERNAL_CREDENTIAL
+    assert result["dispatched"] is False
+    assert result["credential_present"] is False
+    assert calls == []
+
+
+def test_notification_push_skips_non_terminal_result() -> None:
+    result = hello_module.run_notification_push(
+        {"task_id": "dedicated-push-running", "status": "running"}
+    )
+    assert result["notifiable"] is False
+    assert result["dispatched"] is False
+    assert result["notification_created"] is False
+    assert result["skipped_reason"]
+
+
+def test_notification_push_reports_load_failure(tmp_path) -> None:
+    missing = tmp_path / "nope.json"
+    result = hello_module.run_notification_push(str(missing))
+    assert result["loaded"] is False
+    assert result["dispatched"] is False
+    assert result["error"]
+
+
+def test_notification_push_cli_describe_is_value_only(capsys) -> None:
+    rc = hello_module.notification_push_cli(["--describe"])
+    assert rc == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["command"] == hello_module.DEDICATED_PUSH_STEP_COMMAND
+    assert printed["entrypoint"] == hello_module.DEDICATED_PUSH_STEP_ENTRYPOINT
+    assert printed["ledger"]["identity_fields"] == ["task_id", "classification"]
+
+
+def test_notification_push_cli_subprocess_is_credential_safe(tmp_path) -> None:
+    result_path = tmp_path / "execution_result.json"
+    result_path.write_text(
+        json.dumps({"task_id": "cli-subproc-nocred", "classification": "PASS"}),
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.pop(hello_module.SERVERCHAN_SENDKEY_ENV, None)
+    env[hello_module.SERVERCHAN_TEST_ISOLATION_ENV] = "1"
+    env[hello_module.DELIVERY_LEDGER_STATE_ENV] = str(tmp_path / "ledger.json")
+    env[hello_module.PUSH_OUTBOX_STATE_ENV] = str(tmp_path / "outbox.json")
+    env[hello_module.CONSUMER_EVIDENCE_ENV] = str(tmp_path / "evidence.json")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(hello_module.REPO_ROOT / "hello.py"),
+            "notification-push",
+            "--result",
+            str(result_path),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=str(hello_module.REPO_ROOT),
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["delivery_state"] == "blocked"
+    assert out["external_blocker"] == hello_module.BLOCKED_EXTERNAL_CREDENTIAL
+    assert out["notifiable"] is True
+
+
+def test_dedicated_push_step_spec_names_command_env_and_ledger() -> None:
+    spec = hello_module.dedicated_push_step_spec()
+    assert "notification-push" in spec["command"]
+    assert spec["env"][hello_module.DELIVERY_LEDGER_STATE_ENV]
+    assert spec["env"][hello_module.SERVERCHAN_SENDKEY_ENV] == (
+        "${{ secrets." + hello_module.SERVERCHAN_SENDKEY_ENV + " }}"
+    )
+    ledger = spec["ledger"]
+    assert ledger["env"] == hello_module.DELIVERY_LEDGER_STATE_ENV
+    assert ledger["identity_fields"] == ["task_id", "classification"]
+    assert ledger["persist_across_rerun"] is True
+    assert ledger["cache_key_prefix"] == hello_module.DEDICATED_PUSH_STEP_CACHE_PREFIX
+    assert "actions/cache" in ledger["persistence_mechanism"]
+    assert spec["workflow_modified"] is False
+    assert spec["human_review_gate"] is True
+    assert "notification-push" in spec["workflow_step_yaml"]
+
+
+def test_dedicated_push_step_report_is_offline_and_passes() -> None:
+    hello_module.reset_serverchan_test_isolation_counters()
+    report = hello_module.dedicated_push_step_report()
+    assert report["final_status"] == "PASS"
+    assert report["real_notification_sent"] is False
+    assert report["transport_calls"] == 4
+    assert hello_module.serverchan_real_network_attempts() == 0
+    assert report["workflow_modified"] is False
+    for check in report["checks"]:
+        assert check["status"] in VALID_STATUSES
+        assert check["detail"]
+
+
+_XPROC_PUSH_STEP_SCRIPT = r'''
+import json
+import os
+import sys
+
+repo = os.environ["HELLO_REPO"]
+if repo not in sys.path:
+    sys.path.insert(0, repo)
+import hello  # noqa: E402
+
+marker = os.environ["XPROC_MARKER"]
+result_path = os.environ["XPROC_RESULT"]
+
+
+def fake_transport(endpoint, payload):
+    with open(marker, "w", encoding="utf-8") as handle:
+        handle.write("called")
+    return {"ok": True, "status_code": 200, "push_id": "pid-xproc-push"}
+
+
+outcome = hello.run_notification_push(result_path, transport=fake_transport)
+print(json.dumps({
+    "classification": outcome.get("classification"),
+    "state": outcome.get("delivery_state"),
+    "already_delivered": bool(outcome.get("already_delivered")),
+    "transport_called": os.path.exists(marker),
+}))
+'''
+
+
+def _xproc_push_env(tmp_path, tag: str, ledger_path, result_path) -> dict:
+    base_env = dict(os.environ)
+    base_env.update(
+        {
+            "HELLO_REPO": str(hello_module.REPO_ROOT),
+            hello_module.SERVERCHAN_SENDKEY_ENV: _serverchan_fake_key(),
+            hello_module.DELIVERY_LEDGER_STATE_ENV: str(ledger_path),
+            hello_module.PUSH_OUTBOX_STATE_ENV: str(
+                tmp_path / f"push-outbox-{tag}.json"
+            ),
+            hello_module.CONSUMER_EVIDENCE_ENV: str(
+                tmp_path / f"push-evidence-{tag}.json"
+            ),
+            "XPROC_MARKER": str(tmp_path / f"push-marker-{tag}"),
+            "XPROC_RESULT": str(result_path),
+        }
+    )
+    # A genuinely independent process must not see the pytest isolation marker;
+    # only the shared durable ledger can dedupe it.
+    base_env.pop(hello_module.SERVERCHAN_TEST_ISOLATION_ENV, None)
+    base_env.pop("PYTEST_CURRENT_TEST", None)
+    return base_env
+
+
+def test_dedicated_push_step_dedupes_across_independent_processes(tmp_path) -> None:
+    ledger_path = tmp_path / "push_delivery_ledger.json"
+    result_path = tmp_path / "execution_result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "task_id": "dedicated-push-xproc",
+                "classification": "PASS",
+                "summary": "cross-process dedicated push",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    first = subprocess.run(
+        [sys.executable, "-c", _XPROC_PUSH_STEP_SCRIPT],
+        env=_xproc_push_env(tmp_path, "first", ledger_path, result_path),
+        capture_output=True,
+        text=True,
+        cwd=str(hello_module.REPO_ROOT),
+    )
+    assert first.returncode == 0, first.stderr
+    first_result = json.loads(first.stdout.strip().splitlines()[-1])
+    assert first_result["state"] == "delivered"
+    assert first_result["classification"] == "PASS"
+    assert first_result["transport_called"] is True
+
+    # Fresh outbox / evidence; only the shared ledger survives. The same
+    # task_id+classification must suppress the second transport call.
+    second = subprocess.run(
+        [sys.executable, "-c", _XPROC_PUSH_STEP_SCRIPT],
+        env=_xproc_push_env(tmp_path, "second", ledger_path, result_path),
+        capture_output=True,
+        text=True,
+        cwd=str(hello_module.REPO_ROOT),
+    )
+    assert second.returncode == 0, second.stderr
+    second_result = json.loads(second.stdout.strip().splitlines()[-1])
+    assert second_result["already_delivered"] is True
+    assert second_result["state"] == "delivered"
+    assert second_result["transport_called"] is False
+    assert not (tmp_path / "push-marker-second").exists()
+
+    persisted = json.loads(ledger_path.read_text(encoding="utf-8"))
+    delivered = [
+        record
+        for record in persisted["deliveries"].values()
+        if record.get("state") == "delivered"
+    ]
+    assert len(delivered) == 1
+    assert delivered[0]["push_id"] == "pid-xproc-push"
