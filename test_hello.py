@@ -7459,9 +7459,13 @@ def test_serverchan_real_push_golden_02_workflow_wiring_confirmed() -> None:
     )
     assert status["has_agent_step"] is True
     assert status["secret_wired"] is False
-    assert status["secret_reference_present"] is False
+    # The secret reference is now intentionally scoped to the dedicated push step
+    # only (control-plane commit dec89ce), never the agent execution step.
+    assert status["secret_reference_present"] is True
     assert status["agent_step_secret_present"] is False
     assert status["least_privilege_agent_step"] is True
+    assert status["dedicated_push_step_present"] is True
+    assert status["dedicated_push_step_secret_present"] is True
     assert status["expected_env_line"] == (
         "SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}"
     )
