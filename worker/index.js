@@ -1986,6 +1986,177 @@ async function toolGetAsset(env, args) {
 }
 __name(toolGetAsset, "toolGetAsset");
 __name2(toolGetAsset, "toolGetAsset");
+var KNOWLEDGE_WRITE_CONTRACT = "PERSONAL_AI_KNOWLEDGE_CANDIDATE_WRITER_V0.1";
+var KNOWLEDGE_ASSET_TYPE = "KNOWLEDGE";
+var KNOWLEDGE_WRITE_LIMITS = { title: 300 };
+function canonicalKnowledgeContent(content) {
+  if (typeof content === "string") return content;
+  return JSON.stringify(content);
+}
+__name(canonicalKnowledgeContent, "canonicalKnowledgeContent");
+__name2(canonicalKnowledgeContent, "canonicalKnowledgeContent");
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  let hex = "";
+  for (const byte of new Uint8Array(digest)) hex += byte.toString(16).padStart(2, "0");
+  return hex;
+}
+__name(sha256Hex, "sha256Hex");
+__name2(sha256Hex, "sha256Hex");
+function buildKnowledgeProvenance(input) {
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  const capturedAt = String(input.captured_at ?? nowIso);
+  const promotedAt = String(input.promoted_at ?? nowIso);
+  const sourceVersion = String(input.source_version ?? "v1");
+  return {
+    source: {
+      identity: String(input.source_identity ?? `knowledge-candidate:${input.asset_id}`),
+      location: String(input.source_location ?? "cloud://knowledge-inbox")
+    },
+    source_version: sourceVersion,
+    content_version: String(input.content_version ?? sourceVersion),
+    source_content_hash: input.source_content_hash == null ? null : String(input.source_content_hash),
+    canonical_version: input.canonical_version,
+    content_hash: input.content_hash,
+    verification: {
+      method: "recompute_content_hash",
+      evidence: {
+        checked_by: "knowledge_candidate_writer",
+        recomputed: input.content_hash
+      },
+      verified_at: promotedAt,
+      expected_content_hash: input.content_hash,
+      content_hash_matches: true
+    },
+    promotion: {
+      decision: String(input.promotion_decision ?? "PROMOTE"),
+      event_id: String(input.promotion_event ?? `promote:${input.asset_id}:${input.canonical_version}`),
+      decided_at: promotedAt,
+      actor: String(input.actor ?? "cloud-agent")
+    },
+    captured_at: capturedAt,
+    promoted_at: promotedAt,
+    supersedes: Array.isArray(input.supersedes) ? input.supersedes.slice() : [],
+    superseded_by: input.superseded_by ?? null
+  };
+}
+__name(buildKnowledgeProvenance, "buildKnowledgeProvenance");
+__name2(buildKnowledgeProvenance, "buildKnowledgeProvenance");
+async function writeKnowledgeCandidate(env, args) {
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
+  const assetType = String(input.asset_type ?? KNOWLEDGE_ASSET_TYPE).trim().toUpperCase();
+  if (assetType !== KNOWLEDGE_ASSET_TYPE) return { isError: true, text: "INVALID_ASSET_TYPE" };
+  const assetId = String(input.asset_id ?? input.candidate_id ?? "").trim();
+  if (!ASSET_ID_RE.test(assetId)) return { isError: true, text: "INVALID_ASSET_ID" };
+  const title = String(input.title ?? "").trim().slice(0, KNOWLEDGE_WRITE_LIMITS.title);
+  if (!title) return { isError: true, text: "INVALID_TITLE" };
+  if (input.content == null) return { isError: true, text: "INVALID_CONTENT" };
+  const canonicalContent = canonicalKnowledgeContent(input.content);
+  if (!canonicalContent.trim()) return { isError: true, text: "INVALID_CONTENT" };
+  const contentHash = `sha256:${await sha256Hex(canonicalContent)}`;
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  const db = env.ASSET_DB;
+  let existing;
+  try {
+    existing = await db.prepare(
+      "SELECT asset_id, current_version, content_hash, updated_at FROM assets WHERE asset_id = ?"
+    ).bind(assetId).first();
+  } catch {
+    return { isError: true, text: "ASSET_WRITE_FAILED" };
+  }
+  if (existing && normalizeProvenanceHash(existing.content_hash) === normalizeProvenanceHash(contentHash)) {
+    const replay = {
+      contract: KNOWLEDGE_WRITE_CONTRACT,
+      asset_id: assetId,
+      asset_type: KNOWLEDGE_ASSET_TYPE,
+      status: "IDEMPOTENT",
+      created: false,
+      idempotent: true,
+      version: Number(existing.current_version) || 1,
+      content_hash: existing.content_hash ?? contentHash,
+      provenance_status: PROVENANCE_STATUS_VERIFIED,
+      provenance_verified: true,
+      updated_at: existing.updated_at ?? nowIso
+    };
+    return { isError: false, text: JSON.stringify(replay), structuredContent: replay };
+  }
+  const previousVersion = existing ? Number(existing.current_version) || 0 : 0;
+  const version = previousVersion + 1;
+  const provenance = buildKnowledgeProvenance({
+    ...input,
+    asset_id: assetId,
+    canonical_version: version,
+    content_hash: contentHash,
+    supersedes: previousVersion > 0 ? [...(Array.isArray(input.supersedes) ? input.supersedes : []), String(previousVersion)] : input.supersedes
+  });
+  const verification = provenance.verification;
+  const schemaVersion = String(input.schema_version ?? "v0.1");
+  const recordStatus = String(input.status ?? "ACTIVE");
+  try {
+    if (existing) {
+      await db.prepare(
+        "UPDATE assets SET schema_version = ?, title = ?, status = ?, current_version = ?, content_hash = ?, updated_at = ? WHERE asset_id = ?"
+      ).bind(schemaVersion, title, recordStatus, version, contentHash, nowIso, assetId).run();
+    } else {
+      await db.prepare(
+        "INSERT INTO assets (asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(assetId, KNOWLEDGE_ASSET_TYPE, schemaVersion, title, recordStatus, version, contentHash, nowIso, nowIso).run();
+    }
+    const insert = await db.prepare(
+      "INSERT OR IGNORE INTO asset_versions (asset_id, version, content, provenance, verification, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+    ).bind(assetId, version, canonicalContent, JSON.stringify(provenance), JSON.stringify(verification), nowIso).run();
+    const changed = insert && insert.meta ? Number(insert.meta.changes) || 0 : 0;
+    if (!changed) {
+      const replay = {
+        contract: KNOWLEDGE_WRITE_CONTRACT,
+        asset_id: assetId,
+        asset_type: KNOWLEDGE_ASSET_TYPE,
+        status: "IDEMPOTENT",
+        created: false,
+        idempotent: true,
+        version,
+        content_hash: contentHash,
+        provenance_status: PROVENANCE_STATUS_VERIFIED,
+        provenance_verified: true,
+        updated_at: nowIso
+      };
+      return { isError: false, text: JSON.stringify(replay), structuredContent: replay };
+    }
+  } catch {
+    return { isError: true, text: "ASSET_WRITE_FAILED" };
+  }
+  const result = {
+    contract: KNOWLEDGE_WRITE_CONTRACT,
+    asset_id: assetId,
+    asset_type: KNOWLEDGE_ASSET_TYPE,
+    schema_version: schemaVersion,
+    title,
+    status: "WRITTEN",
+    created: !existing,
+    idempotent: false,
+    version,
+    previous_version: previousVersion > 0 ? previousVersion : null,
+    content_hash: contentHash,
+    provenance_status: PROVENANCE_STATUS_VERIFIED,
+    provenance_verified: true,
+    promotion_event: provenance.promotion.event_id,
+    supersedes: provenance.supersedes,
+    updated_at: nowIso
+  };
+  return { isError: false, text: JSON.stringify(result), structuredContent: result };
+}
+__name(writeKnowledgeCandidate, "writeKnowledgeCandidate");
+__name2(writeKnowledgeCandidate, "writeKnowledgeCandidate");
+async function toolWriteKnowledgeCandidate(env, args) {
+  try {
+    return await writeKnowledgeCandidate(env, args);
+  } catch (err2) {
+    return { isError: true, text: `KNOWLEDGE_WRITE_FAILED: ${err2?.message || "unknown"}` };
+  }
+}
+__name(toolWriteKnowledgeCandidate, "toolWriteKnowledgeCandidate");
+__name2(toolWriteKnowledgeCandidate, "toolWriteKnowledgeCandidate");
 var TOOLS = [
   {
     name: "submit_task",
@@ -2093,6 +2264,45 @@ var TOOLS = [
       properties: { asset_id: { type: "string" } },
       required: ["asset_id"]
     }
+  },
+  {
+    name: "write_knowledge_candidate",
+    description: "Controlled canonical writer for a KNOWLEDGE candidate. Validates input, computes the canonical content hash, versions against the existing assets/asset_versions rows, is idempotent for identical content, and records verified provenance. Write only; never used for non-KNOWLEDGE assets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        asset_id: { type: "string" },
+        candidate_id: { type: "string" },
+        asset_type: { type: "string", enum: ["KNOWLEDGE"] },
+        title: { type: "string" },
+        content: { type: ["string", "object", "array"] },
+        schema_version: { type: "string" },
+        status: { type: "string" },
+        source_identity: { type: "string" },
+        source_location: { type: "string" },
+        source_version: { type: "string" },
+        content_version: { type: "string" },
+        source_content_hash: { type: "string" },
+        promotion_decision: { type: "string" },
+        promotion_event: { type: "string" },
+        captured_at: { type: "string" },
+        promoted_at: { type: "string" }
+      },
+      required: ["title", "content"]
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        asset_id: { type: "string" },
+        asset_type: { type: "string" },
+        version: { type: "number" },
+        content_hash: { type: "string" },
+        idempotent: { type: "boolean" },
+        created: { type: "boolean" },
+        provenance_status: { type: "string" }
+      },
+      additionalProperties: true
+    }
   }
 ];
 async function handleMcp(request, env, cors, auth) {
@@ -2139,6 +2349,9 @@ async function handleMcp(request, env, cors, auth) {
       } else if (name === "get_asset") {
         if (!hasReadScope(auth)) return fail(-32001, "asset.read scope required");
         outcome = await toolGetAsset(env, args);
+      } else if (name === "write_knowledge_candidate") {
+        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
+        outcome = await toolWriteKnowledgeCandidate(env, args);
       } else return fail(-32602, `unknown tool: ${name}`);
       const toolResult = { content: [{ type: "text", text: outcome.text }], isError: outcome.isError };
       if (outcome.structuredContent !== void 0) toolResult.structuredContent = outcome.structuredContent;
