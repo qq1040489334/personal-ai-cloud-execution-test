@@ -1992,7 +1992,7 @@ var KNOWLEDGE_WRITE_LIMITS = { title: 300 };
 var KNOWLEDGE_WRITE_STATUS = "accepted";
 var KNOWLEDGE_HASH_RE = /^[0-9a-f]{64}$/;
 var KNOWLEDGE_VERSION_INSERT = "INSERT INTO asset_versions (asset_id, version, content, content_hash, provenance, verification, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
-var KNOWLEDGE_VERSION_VERIFY = "SELECT a.current_version AS asset_version, a.content_hash AS asset_content_hash, a.status AS asset_status, v.version AS version_version, v.content AS version_content, v.content_hash AS version_content_hash, v.created_by AS version_created_by FROM assets a JOIN asset_versions v ON v.asset_id = a.asset_id AND v.version = a.current_version WHERE a.asset_id = ?";
+var KNOWLEDGE_VERSION_VERIFY = "SELECT a.current_version AS asset_version, a.content_hash AS asset_content_hash, a.status AS asset_status, v.version AS version_version, v.content AS version_content, v.content_hash AS version_content_hash, v.created_by AS version_created_by, v.provenance AS version_provenance, v.verification AS version_verification FROM assets a JOIN asset_versions v ON v.asset_id = a.asset_id AND v.version = a.current_version WHERE a.asset_id = ?";
 function canonicalKnowledgeContent(content) {
   if (typeof content === "string") return content;
   return JSON.stringify(content);
@@ -2059,6 +2059,17 @@ async function verifyKnowledgeVersion(db, assetId, expectedVersion, expectedHash
   if (String(row.asset_content_hash) !== String(expectedHash)) return false;
   if (String(row.version_content_hash) !== String(expectedHash)) return false;
   if (expectedContent !== void 0 && String(row.version_content) !== String(expectedContent)) return false;
+  if (String(row.asset_status) !== KNOWLEDGE_WRITE_STATUS) return false;
+  const createdBy = row.version_created_by == null ? "" : String(row.version_created_by).trim();
+  if (!createdBy) return false;
+  const persistedProvenance = parseAssetJson(row.version_provenance);
+  const persistedVerification = parseAssetJson(row.version_verification);
+  const evaluation = evaluateAssetProvenance(persistedProvenance, {
+    content_hash: expectedHash,
+    canonical_version: expectedVersion,
+    verification: persistedVerification
+  });
+  if (evaluation.status !== PROVENANCE_STATUS_VERIFIED || evaluation.verified !== true) return false;
   return true;
 }
 __name(verifyKnowledgeVersion, "verifyKnowledgeVersion");
@@ -2133,13 +2144,9 @@ async function writeKnowledgeCandidate(env, args) {
     createdBy,
     nowIso
   );
+  if (typeof db.batch !== "function") return { isError: true, text: "ASSET_WRITE_FAILED" };
   try {
-    if (typeof db.batch === "function") {
-      await db.batch([assetWrite, versionWrite]);
-    } else {
-      await assetWrite.run();
-      await versionWrite.run();
-    }
+    await db.batch([assetWrite, versionWrite]);
   } catch {
     return { isError: true, text: "ASSET_WRITE_FAILED" };
   }

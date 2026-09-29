@@ -144,7 +144,9 @@ function queryFirst(sql, args) {
       version_version: version.version,
       version_content: version.content,
       version_content_hash: version.content_hash,
-      version_created_by: version.created_by
+      version_created_by: version.created_by,
+      version_provenance: version.provenance,
+      version_verification: version.verification
     };
   }
   if (sql.indexOf("SELECT a.asset_id") === 0) {
@@ -255,6 +257,89 @@ def sha256_of(content) -> str:
 
 
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def knowledge_provenance(
+    content, *, asset_id: str = "knowledge:inbox:1", version: int = 1
+) -> dict:
+    digest = sha256_of(content)
+    return {
+        "source": {
+            "identity": f"knowledge-candidate:{asset_id}",
+            "location": "cloud://knowledge-inbox",
+        },
+        "source_version": "v1",
+        "content_version": "v1",
+        "canonical_version": version,
+        "content_hash": digest,
+        "verification": {
+            "method": "recompute_content_hash",
+            "evidence": {
+                "checked_by": "knowledge_candidate_writer",
+                "recomputed": digest,
+            },
+            "expected_content_hash": digest,
+            "content_hash_matches": True,
+        },
+        "promotion": {
+            "decision": "PROMOTE",
+            "event_id": f"promote:{asset_id}:{version}",
+            "actor": "cloud-agent",
+        },
+        "captured_at": "2026-01-01T00:00:00.000Z",
+        "promoted_at": "2026-01-01T00:00:00.000Z",
+    }
+
+
+def seed_matching_asset(
+    content,
+    *,
+    asset_id: str = "knowledge:inbox:1",
+    version: int = 1,
+    status: str = "accepted",
+    created_by: str = "cloud-agent",
+    provenance=None,
+    verification=None,
+) -> str:
+    """Seed an existing asset + current version row that matches ``content``.
+
+    The writer's idempotent fast path triggers on a matching ``content_hash``,
+    so this lets tests vary the persisted status / creator / provenance and
+    assert the fast path fails closed when the stored version is not a genuine
+    verified, accepted version row.
+    """
+    digest = sha256_of(content)
+    if provenance is None:
+        provenance = knowledge_provenance(content, asset_id=asset_id, version=version)
+    if verification is None:
+        verification = provenance.get("verification", {})
+    asset = {
+        "asset_id": asset_id,
+        "asset_type": "KNOWLEDGE",
+        "schema_version": "v0.1",
+        "title": "t",
+        "status": status,
+        "current_version": version,
+        "content_hash": digest,
+        "created_at": "2026-01-01T00:00:00.000Z",
+        "updated_at": "2026-01-01T00:00:00.000Z",
+    }
+    version_row = {
+        "asset_id": asset_id,
+        "version": version,
+        "content": canonical_json(content),
+        "content_hash": digest,
+        "provenance": json.dumps(provenance),
+        "verification": json.dumps(verification),
+        "created_by": created_by,
+        "created_at": "2026-01-01T00:00:00.000Z",
+    }
+    return (
+        f"assetRows.set({json.dumps(asset_id)}, {json.dumps(asset)});\n"
+        f"versionRows.set(vkey({json.dumps(asset_id)}, {version}), "
+        f"{json.dumps(version_row)});"
+    )
+
 
 
 # -- Source contract --------------------------------------------------------
@@ -517,15 +602,94 @@ def test_failed_version_insertion_rolls_back_and_fails_closed() -> None:
 
 
 def test_ignored_version_insertion_fails_closed_without_false_success() -> None:
-    # Without batch support an ignored version INSERT must still be detected by
-    # the mandatory read-back and reported as a failure, never WRITTEN.
-    setup = "ALLOW_BATCH = false;\nIGNORE_VERSION_INSERT = true;"
+    # An ignored version INSERT (reported success, nothing persisted) must still
+    # be detected by the mandatory read-back and reported as a failure, never
+    # WRITTEN.
+    setup = "IGNORE_VERSION_INSERT = true;"
     report = writer_probe([candidate()], setup=setup)
     entry = report["results"][0]
 
     assert entry["isError"] is True
     assert entry["text"] == "ASSET_WRITE_FAILED"
     assert report["versions"] == []
+
+
+def test_batch_unavailable_fails_closed_before_writing_either_row() -> None:
+    # Cloudflare D1 always supports batch; without it the writer must fail
+    # closed *before* writing, never fall back to a non-atomic sequential write.
+    setup = "ALLOW_BATCH = false;"
+    report = writer_probe([candidate()], setup=setup)
+    entry = report["results"][0]
+
+    assert entry["isError"] is True
+    assert entry["text"] == "ASSET_WRITE_FAILED"
+    assert report["assets"] == []
+    assert report["versions"] == []
+
+
+def test_idempotent_path_fails_closed_on_incomplete_provenance() -> None:
+    content = {"text": "same"}
+    setup = seed_matching_asset(
+        content, provenance={"content_hash": sha256_of(content)}
+    )
+    report = writer_probe([candidate(content=content)], setup=setup)
+    entry = report["results"][0]
+
+    assert entry["isError"] is True
+    assert entry["text"] == "ASSET_WRITE_FAILED"
+    # The incomplete stored version is never treated as verified and no new
+    # version is appended.
+    assert len(report["versions"]) == 1
+
+
+def test_idempotent_path_fails_closed_on_hash_mismatch_provenance() -> None:
+    content = {"text": "same"}
+    provenance = knowledge_provenance(content)
+    provenance["verification"]["content_hash_matches"] = False
+    setup = seed_matching_asset(content, provenance=provenance)
+    report = writer_probe([candidate(content=content)], setup=setup)
+    entry = report["results"][0]
+
+    assert entry["isError"] is True
+    assert entry["text"] == "ASSET_WRITE_FAILED"
+    assert len(report["versions"]) == 1
+
+
+def test_idempotent_path_fails_closed_on_non_accepted_status() -> None:
+    content = {"text": "same"}
+    setup = seed_matching_asset(content, status="staging")
+    report = writer_probe([candidate(content=content)], setup=setup)
+    entry = report["results"][0]
+
+    assert entry["isError"] is True
+    assert entry["text"] == "ASSET_WRITE_FAILED"
+    assert len(report["versions"]) == 1
+
+
+def test_idempotent_path_fails_closed_on_missing_created_by() -> None:
+    content = {"text": "same"}
+    setup = seed_matching_asset(content, created_by="")
+    report = writer_probe([candidate(content=content)], setup=setup)
+    entry = report["results"][0]
+
+    assert entry["isError"] is True
+    assert entry["text"] == "ASSET_WRITE_FAILED"
+    assert len(report["versions"]) == 1
+
+
+def test_idempotent_path_accepts_a_genuine_verified_version() -> None:
+    # Sanity: a fully valid stored version still short-circuits idempotently.
+    content = {"text": "same"}
+    setup = seed_matching_asset(content)
+    report = writer_probe([candidate(content=content)], setup=setup)
+    entry = report["results"][0]
+
+    assert entry["isError"] is False
+    result = structured(entry)
+    assert result["status"] == "IDEMPOTENT"
+    assert result["idempotent"] is True
+    assert len(report["versions"]) == 1
+
 
 
 def test_idempotent_path_fails_closed_when_version_row_is_missing() -> None:
