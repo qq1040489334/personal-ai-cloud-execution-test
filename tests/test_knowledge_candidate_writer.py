@@ -1,21 +1,34 @@
 """P0 Knowledge Candidate -> Cloud Canonical KNOWLEDGE writer regression tests.
 
-The controlled writer ``write_knowledge_candidate`` in ``worker/index.js`` is the
+The controlled writer ``writeKnowledgeCandidate`` in ``worker/index.js`` is the
 only entry point that turns a Knowledge Inbox candidate into a canonical Cloud
 Asset. It is intentionally narrow:
 
 * it only ever writes ``asset_type = KNOWLEDGE``;
 * it validates every input (asset id, title, content) and fails closed;
-* it derives the canonical ``content_hash`` from the canonicalized content;
+* it derives the canonical ``content_hash`` from the canonicalized content and
+  stores the raw 64-character lowercase SHA-256 hex (no ``sha256:`` prefix) in
+  both ``assets.content_hash`` and ``asset_versions.content_hash``;
+* it writes the audited production status ``accepted`` (never ``ACTIVE``),
+  which is the only promotion value the ``assets.status`` CHECK permits;
+* it supplies the NOT NULL ``asset_versions.content_hash`` and
+  ``asset_versions.created_by`` columns on every version INSERT;
 * it versions against the existing ``assets`` / ``asset_versions`` rows and
   records a ``supersedes`` lineage when a new version is created;
 * it is idempotent for identical content (no duplicate version, no rewrite);
+* it fails closed: it never returns ``WRITTEN`` / ``IDEMPOTENT`` unless the
+  canonical ``asset_versions`` row is present and matches the current
+  version/content/hash;
+* it keeps the ``assets`` pointer and the version row consistent by writing
+  them in a single D1 batch when the binding supports it;
 * it records provenance that satisfies the existing
   ``evaluateAssetProvenance`` / ``get_asset`` / ``search_assets`` read semantics;
 * it is exposed as an MCP tool that requires the write scope.
 
 The production Worker source is executed directly under Node with a mocked D1
-``ASSET_DB`` binding, exactly like the other Worker regression suites.
+``ASSET_DB`` binding. The mock *enforces* the audited production constraints
+(status CHECK, 64-character lowercase hash, NOT NULL version hash/created_by)
+so the tests fail if the writer relies on a permissive mock.
 """
 
 from __future__ import annotations
@@ -56,70 +69,139 @@ def run_worker_probe(script: str) -> dict:
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
+# The mock models the audited production D1 schema:
+#   * assets.status CHECK in (staging, accepted, superseded, retired)
+#   * assets.content_hash is exactly 64 lowercase hex
+#   * asset_versions.content_hash NOT NULL and 64 lowercase hex
+#   * asset_versions.created_by NOT NULL
+# ``ALLOW_BATCH`` toggles D1 batch support; ``IGNORE_VERSION_INSERT`` models an
+# ignored/duplicate version INSERT that reports success without persisting.
 FakeD1 = r"""
 const assetRows = new Map();
 const versionRows = new Map();
+let ALLOW_BATCH = true;
+let IGNORE_VERSION_INSERT = false;
 function vkey(a, v) { return a + ":" + v; }
+const ASSET_STATUSES = new Set(["staging", "accepted", "superseded", "retired"]);
+const KNOWN_HASH_RE = /^[0-9a-f]{64}$/;
+function assertAsset(row) {
+  if (!ASSET_STATUSES.has(String(row.status))) throw new Error("CHECK constraint failed: assets.status");
+  if (row.content_hash !== null && row.content_hash !== undefined && !KNOWN_HASH_RE.test(String(row.content_hash))) {
+    throw new Error("CHECK constraint failed: assets.content_hash");
+  }
+}
+function assertVersion(row) {
+  if (row.content_hash === null || row.content_hash === undefined) throw new Error("NOT NULL constraint failed: asset_versions.content_hash");
+  if (!KNOWN_HASH_RE.test(String(row.content_hash))) throw new Error("CHECK constraint failed: asset_versions.content_hash");
+  if (row.created_by === null || row.created_by === undefined || String(row.created_by).trim() === "") throw new Error("NOT NULL constraint failed: asset_versions.created_by");
+  if (row.content === null || row.content === undefined) throw new Error("NOT NULL constraint failed: asset_versions.content");
+}
+function seedVersion(asset_id, version, content, content_hash, created_by) {
+  versionRows.set(vkey(asset_id, version), { asset_id, version, content, content_hash, provenance: "{}", verification: "{}", created_by, created_at: "2026-01-01T00:00:00.000Z" });
+}
+function runStatement(sql, args) {
+  if (sql.indexOf("INSERT INTO assets") === 0) {
+    const [asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at] = args;
+    const row = { asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at };
+    assertAsset(row);
+    assetRows.set(asset_id, row);
+    return { success: true, meta: { changes: 1 } };
+  }
+  if (sql.indexOf("UPDATE assets") === 0) {
+    const [schema_version, title, status, current_version, content_hash, updated_at, asset_id] = args;
+    const current = assetRows.get(asset_id);
+    if (!current) return { success: true, meta: { changes: 0 } };
+    const row = { ...current, schema_version, title, status, current_version, content_hash, updated_at };
+    assertAsset(row);
+    assetRows.set(asset_id, row);
+    return { success: true, meta: { changes: 1 } };
+  }
+  if (sql.indexOf("INSERT INTO asset_versions") === 0) {
+    const [asset_id, version, content, content_hash, provenance, verification, created_by, created_at] = args;
+    if (IGNORE_VERSION_INSERT) return { success: true, meta: { changes: 0 } };
+    const key = vkey(asset_id, version);
+    if (versionRows.has(key)) throw new Error("UNIQUE constraint failed: asset_versions.asset_id, asset_versions.version");
+    const row = { asset_id, version, content, content_hash, provenance, verification, created_by, created_at };
+    assertVersion(row);
+    versionRows.set(key, row);
+    return { success: true, meta: { changes: 1 } };
+  }
+  throw new Error("unsupported SQL: " + sql);
+}
+function queryFirst(sql, args) {
+  if (sql.indexOf("SELECT asset_id, current_version, content_hash, updated_at FROM assets") === 0) {
+    return assetRows.get(args[0]) || null;
+  }
+  if (sql.indexOf("SELECT a.current_version AS asset_version") === 0) {
+    const asset = assetRows.get(args[0]);
+    if (!asset) return null;
+    const version = versionRows.get(vkey(asset.asset_id, asset.current_version));
+    if (!version) return null;
+    return {
+      asset_version: asset.current_version,
+      asset_content_hash: asset.content_hash,
+      asset_status: asset.status,
+      version_version: version.version,
+      version_content: version.content,
+      version_content_hash: version.content_hash,
+      version_created_by: version.created_by
+    };
+  }
+  if (sql.indexOf("SELECT a.asset_id") === 0) {
+    const asset = assetRows.get(args[0]);
+    if (!asset) return null;
+    const version = versionRows.get(vkey(asset.asset_id, asset.current_version));
+    return { ...asset, content: version ? version.content : null, provenance: version ? version.provenance : null, verification: version ? version.verification : null };
+  }
+  return null;
+}
+function queryAll() {
+  const results = [];
+  for (const asset of assetRows.values()) {
+    const version = versionRows.get(vkey(asset.asset_id, asset.current_version));
+    results.push({ ...asset, content: version ? version.content : null, provenance: version ? version.provenance : null, verification: version ? version.verification : null });
+  }
+  return { results };
+}
 function makeD1() {
-  return {
+  const db = {
     prepare: function(sql) {
       return {
         bind: function(...args) {
           return {
-            run: async function() {
-              if (sql.indexOf("INSERT INTO assets") === 0) {
-                const [asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at] = args;
-                assetRows.set(asset_id, { asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at });
-                return { success: true, meta: { changes: 1 } };
-              }
-              if (sql.indexOf("UPDATE assets") === 0) {
-                const [schema_version, title, status, current_version, content_hash, updated_at, asset_id] = args;
-                const row = assetRows.get(asset_id);
-                if (!row) return { success: true, meta: { changes: 0 } };
-                row.schema_version = schema_version; row.title = title; row.status = status;
-                row.current_version = current_version; row.content_hash = content_hash;
-                row.updated_at = updated_at;
-                return { success: true, meta: { changes: 1 } };
-              }
-              if (sql.indexOf("INSERT OR IGNORE INTO asset_versions") === 0) {
-                const [asset_id, version, content, provenance, verification, created_at] = args;
-                const key = vkey(asset_id, version);
-                if (versionRows.has(key)) return { success: true, meta: { changes: 0 } };
-                versionRows.set(key, { asset_id, version, content, provenance, verification, created_at });
-                return { success: true, meta: { changes: 1 } };
-              }
-              return { success: true, meta: { changes: 0 } };
-            },
-            first: async function() {
-              if (sql.indexOf("SELECT asset_id, current_version, content_hash, updated_at FROM assets") === 0) {
-                return assetRows.get(args[0]) || null;
-              }
-              if (sql.indexOf("SELECT a.asset_id") === 0) {
-                const asset = assetRows.get(args[0]);
-                if (!asset) return null;
-                const version = versionRows.get(vkey(asset.asset_id, asset.current_version));
-                return { ...asset, content: version ? version.content : null, provenance: version ? version.provenance : null, verification: version ? version.verification : null };
-              }
-              return null;
-            },
-            all: async function() {
-              const results = [];
-              for (const asset of assetRows.values()) {
-                const version = versionRows.get(vkey(asset.asset_id, asset.current_version));
-                results.push({ ...asset, content: version ? version.content : null, provenance: version ? version.provenance : null, verification: version ? version.verification : null });
-              }
-              return { results };
-            }
+            _sql: sql,
+            _args: args,
+            run: async function() { return runStatement(sql, args); },
+            first: async function() { return queryFirst(sql, args); },
+            all: async function() { return queryAll(sql, args); }
           };
         }
       };
     }
   };
+  if (ALLOW_BATCH) {
+    db.batch = async function(statements) {
+      const assetSnapshot = new Map(assetRows);
+      const versionSnapshot = new Map(versionRows);
+      const results = [];
+      try {
+        for (const statement of statements) results.push(runStatement(statement._sql, statement._args));
+      } catch (err) {
+        assetRows.clear();
+        versionRows.clear();
+        for (const [k, v] of assetSnapshot) assetRows.set(k, v);
+        for (const [k, v] of versionSnapshot) versionRows.set(k, v);
+        throw err;
+      }
+      return results;
+    };
+  }
+  return db;
 }
 """
 
 
-def writer_probe(calls: list[dict], asset_id: str | None = None) -> dict:
+def writer_probe(calls: list[dict], asset_id: str | None = None, setup: str = "") -> dict:
     ops = "\n".join(
         f"results.push(await writeKnowledgeCandidate(env, {json.dumps(call)}));"
         for call in calls
@@ -134,6 +216,8 @@ def writer_probe(calls: list[dict], asset_id: str | None = None) -> dict:
         )
     script = (
         FakeD1
+        + "\n"
+        + setup
         + "\nconst env = { ASSET_DB: makeD1() };\n"
         + "const results = [];\nlet read = null;\n"
         + ops
@@ -160,12 +244,17 @@ def structured(entry: dict) -> dict:
     return entry.get("structuredContent", json.loads(entry["text"]))
 
 
-def sha256_of(content) -> str:
+def canonical_json(content) -> str:
     if isinstance(content, str):
-        text = content
-    else:
-        text = json.dumps(content, separators=(",", ":"), ensure_ascii=False)
-    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return content
+    return json.dumps(content, separators=(",", ":"), ensure_ascii=False)
+
+
+def sha256_of(content) -> str:
+    return hashlib.sha256(canonical_json(content).encode("utf-8")).hexdigest()
+
+
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 # -- Source contract --------------------------------------------------------
@@ -178,7 +267,7 @@ def test_worker_source_encodes_the_knowledge_writer() -> None:
         "writeKnowledgeCandidate",
         "toolWriteKnowledgeCandidate",
         '"write_knowledge_candidate"',
-        "INSERT OR IGNORE INTO asset_versions",
+        "INSERT INTO asset_versions",
         "INSERT INTO assets",
         "UPDATE assets",
         "ASSET_WRITE_UNAVAILABLE",
@@ -189,8 +278,17 @@ def test_worker_source_encodes_the_knowledge_writer() -> None:
         "ASSET_WRITE_FAILED",
         "canonicalKnowledgeContent",
         "sha256Hex",
+        "verifyKnowledgeVersion",
+        "KNOWLEDGE_WRITE_STATUS",
+        "KNOWLEDGE_HASH_RE",
+        "created_by",
     ):
         assert token in source, f"worker is missing knowledge writer token {token}"
+    # The audited schema stores raw 64-hex, never a prefixed digest, and only
+    # the promotion statuses the CHECK permits.
+    assert "sha256:${await sha256Hex" not in source
+    assert 'KNOWLEDGE_WRITE_STATUS = "accepted"' in source
+    assert '"ACTIVE"' not in source
 
 
 def test_write_tool_is_registered_and_scoped_to_write() -> None:
@@ -270,6 +368,7 @@ def test_write_persists_canonical_knowledge_with_content_hash() -> None:
     assert result["provenance_status"] == "VERIFIED"
     assert result["provenance_verified"] is True
     assert result["content_hash"] == sha256_of(content)
+    assert HASH_RE.match(result["content_hash"])
 
     assert len(report["assets"]) == 1
     asset = report["assets"][0]
@@ -282,6 +381,29 @@ def test_write_persists_canonical_knowledge_with_content_hash() -> None:
     version = report["versions"][0]
     assert version["version"] == 1
     assert json.loads(version["content"]) == content
+
+
+def test_persisted_rows_satisfy_audited_production_constraints() -> None:
+    content = {"type": "note", "text": "constraint check"}
+    report = writer_probe([candidate(content=content)])
+    result = structured(report["results"][0])
+
+    # assets.status CHECK permits only the four canonical values; the promotion
+    # writer must use "accepted" rather than the legacy "ACTIVE".
+    asset = report["assets"][0]
+    assert asset["status"] == "accepted"
+    assert asset["status"] in {"staging", "accepted", "superseded", "retired"}
+
+    # Both D1 hash columns carry the raw 64-character lowercase hex digest.
+    assert HASH_RE.match(asset["content_hash"])
+    assert asset["content_hash"] == result["content_hash"]
+    assert "sha256:" not in asset["content_hash"]
+
+    # asset_versions.content_hash and created_by are NOT NULL.
+    version = report["versions"][0]
+    assert HASH_RE.match(version["content_hash"])
+    assert version["content_hash"] == result["content_hash"]
+    assert version["created_by"] not in (None, "")
 
 
 def test_written_provenance_satisfies_canonical_verification() -> None:
@@ -332,6 +454,7 @@ def test_new_content_creates_a_new_version_and_supersedes_lineage() -> None:
     asset = report["assets"][0]
     assert asset["current_version"] == 2
     assert asset["content_hash"] == second["content_hash"]
+    assert asset["status"] == "accepted"
     assert len(report["versions"]) == 2
 
     latest = [v for v in report["versions"] if v["version"] == 2][0]
@@ -375,6 +498,88 @@ def test_idempotent_replay_matches_on_normalized_hash() -> None:
     replay = structured(report["results"][1])
     assert replay["idempotent"] is True
     assert replay["content_hash"] == sha256_of({"text": "same"})
+
+
+# -- Fail-closed persistence ------------------------------------------------
+
+
+def test_failed_version_insertion_rolls_back_and_fails_closed() -> None:
+    # A conflicting version row makes the atomic batch fail; the writer must not
+    # leave a half-written assets pointer behind or claim success.
+    setup = 'seedVersion("knowledge:inbox:1", 1, "conflict", "deadbeef", "other");'
+    report = writer_probe([candidate()], setup=setup)
+    entry = report["results"][0]
+
+    assert entry["isError"] is True
+    assert entry["text"] == "ASSET_WRITE_FAILED"
+    assert report["assets"] == []
+    assert len(report["versions"]) == 1
+
+
+def test_ignored_version_insertion_fails_closed_without_false_success() -> None:
+    # Without batch support an ignored version INSERT must still be detected by
+    # the mandatory read-back and reported as a failure, never WRITTEN.
+    setup = "ALLOW_BATCH = false;\nIGNORE_VERSION_INSERT = true;"
+    report = writer_probe([candidate()], setup=setup)
+    entry = report["results"][0]
+
+    assert entry["isError"] is True
+    assert entry["text"] == "ASSET_WRITE_FAILED"
+    assert report["versions"] == []
+
+
+def test_idempotent_path_fails_closed_when_version_row_is_missing() -> None:
+    content = {"text": "same"}
+    digest = sha256_of(content)
+    setup = (
+        "assetRows.set("
+        + json.dumps("knowledge:inbox:1")
+        + ", { asset_id: "
+        + json.dumps("knowledge:inbox:1")
+        + ", asset_type: "
+        + json.dumps("KNOWLEDGE")
+        + ", schema_version: "
+        + json.dumps("v0.1")
+        + ", title: "
+        + json.dumps("t")
+        + ", status: "
+        + json.dumps("accepted")
+        + ", current_version: 1, content_hash: "
+        + json.dumps(digest)
+        + ", created_at: "
+        + json.dumps("2026-01-01T00:00:00.000Z")
+        + ", updated_at: "
+        + json.dumps("2026-01-01T00:00:00.000Z")
+        + " });"
+    )
+    report = writer_probe([candidate(content=content)], setup=setup)
+    entry = report["results"][0]
+
+    assert entry["isError"] is True
+    assert entry["text"] == "ASSET_WRITE_FAILED"
+
+
+def test_mock_enforces_the_audited_constraints() -> None:
+    hash64 = "a" * 64
+    bad_hash = "sha256:" + hash64
+    script = (
+        FakeD1
+        + "\nconst db = makeD1();\nconst out = {};\n"
+        + "try { await db.prepare(\"INSERT INTO assets (asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)\").bind(\"a1\", \"KNOWLEDGE\", \"v0.1\", \"t\", \"ACTIVE\", 1, "
+        + json.dumps(hash64)
+        + ", \"n\", \"n\").run(); out.bad_status_accepted = true; } catch (e) { out.bad_status_accepted = false; }\n"
+        + "try { await db.prepare(\"INSERT INTO assets (asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)\").bind(\"a2\", \"KNOWLEDGE\", \"v0.1\", \"t\", \"accepted\", 1, "
+        + json.dumps(bad_hash)
+        + ", \"n\", \"n\").run(); out.bad_hash_accepted = true; } catch (e) { out.bad_hash_accepted = false; }\n"
+        + "try { await db.prepare(\"INSERT INTO asset_versions (asset_id, version, content, content_hash, provenance, verification, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)\").bind(\"a3\", 1, \"c\", "
+        + json.dumps(hash64)
+        + ", \"p\", \"v\", null, \"n\").run(); out.null_created_by_accepted = true; } catch (e) { out.null_created_by_accepted = false; }\n"
+        + "console.log(JSON.stringify(out));\n"
+    )
+    report = run_worker_probe(script)
+    assert report["bad_status_accepted"] is False
+    assert report["bad_hash_accepted"] is False
+    assert report["null_created_by_accepted"] is False
 
 
 # -- Read compatibility -----------------------------------------------------

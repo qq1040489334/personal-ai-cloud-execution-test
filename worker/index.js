@@ -1989,6 +1989,10 @@ __name2(toolGetAsset, "toolGetAsset");
 var KNOWLEDGE_WRITE_CONTRACT = "PERSONAL_AI_KNOWLEDGE_CANDIDATE_WRITER_V0.1";
 var KNOWLEDGE_ASSET_TYPE = "KNOWLEDGE";
 var KNOWLEDGE_WRITE_LIMITS = { title: 300 };
+var KNOWLEDGE_WRITE_STATUS = "accepted";
+var KNOWLEDGE_HASH_RE = /^[0-9a-f]{64}$/;
+var KNOWLEDGE_VERSION_INSERT = "INSERT INTO asset_versions (asset_id, version, content, content_hash, provenance, verification, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+var KNOWLEDGE_VERSION_VERIFY = "SELECT a.current_version AS asset_version, a.content_hash AS asset_content_hash, a.status AS asset_status, v.version AS version_version, v.content AS version_content, v.content_hash AS version_content_hash, v.created_by AS version_created_by FROM assets a JOIN asset_versions v ON v.asset_id = a.asset_id AND v.version = a.current_version WHERE a.asset_id = ?";
 function canonicalKnowledgeContent(content) {
   if (typeof content === "string") return content;
   return JSON.stringify(content);
@@ -2042,6 +2046,23 @@ function buildKnowledgeProvenance(input) {
 }
 __name(buildKnowledgeProvenance, "buildKnowledgeProvenance");
 __name2(buildKnowledgeProvenance, "buildKnowledgeProvenance");
+async function verifyKnowledgeVersion(db, assetId, expectedVersion, expectedHash, expectedContent) {
+  let row;
+  try {
+    row = await db.prepare(KNOWLEDGE_VERSION_VERIFY).bind(assetId).first();
+  } catch {
+    return false;
+  }
+  if (!row) return false;
+  if (Number(row.asset_version) !== Number(expectedVersion)) return false;
+  if (Number(row.version_version) !== Number(expectedVersion)) return false;
+  if (String(row.asset_content_hash) !== String(expectedHash)) return false;
+  if (String(row.version_content_hash) !== String(expectedHash)) return false;
+  if (expectedContent !== void 0 && String(row.version_content) !== String(expectedContent)) return false;
+  return true;
+}
+__name(verifyKnowledgeVersion, "verifyKnowledgeVersion");
+__name2(verifyKnowledgeVersion, "verifyKnowledgeVersion");
 async function writeKnowledgeCandidate(env, args) {
   const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
@@ -2054,7 +2075,8 @@ async function writeKnowledgeCandidate(env, args) {
   if (input.content == null) return { isError: true, text: "INVALID_CONTENT" };
   const canonicalContent = canonicalKnowledgeContent(input.content);
   if (!canonicalContent.trim()) return { isError: true, text: "INVALID_CONTENT" };
-  const contentHash = `sha256:${await sha256Hex(canonicalContent)}`;
+  const contentHash = await sha256Hex(canonicalContent);
+  if (!KNOWLEDGE_HASH_RE.test(contentHash)) return { isError: true, text: "ASSET_WRITE_FAILED" };
   const nowIso = (/* @__PURE__ */ new Date()).toISOString();
   const db = env.ASSET_DB;
   let existing;
@@ -2065,7 +2087,10 @@ async function writeKnowledgeCandidate(env, args) {
   } catch {
     return { isError: true, text: "ASSET_WRITE_FAILED" };
   }
-  if (existing && normalizeProvenanceHash(existing.content_hash) === normalizeProvenanceHash(contentHash)) {
+  if (existing && normalizeProvenanceHash(existing.content_hash) === contentHash) {
+    const currentVersion = Number(existing.current_version) || 1;
+    const present = await verifyKnowledgeVersion(db, assetId, currentVersion, contentHash, canonicalContent);
+    if (!present) return { isError: true, text: "ASSET_WRITE_FAILED" };
     const replay = {
       contract: KNOWLEDGE_WRITE_CONTRACT,
       asset_id: assetId,
@@ -2073,8 +2098,8 @@ async function writeKnowledgeCandidate(env, args) {
       status: "IDEMPOTENT",
       created: false,
       idempotent: true,
-      version: Number(existing.current_version) || 1,
-      content_hash: existing.content_hash ?? contentHash,
+      version: currentVersion,
+      content_hash: contentHash,
       provenance_status: PROVENANCE_STATUS_VERIFIED,
       provenance_verified: true,
       updated_at: existing.updated_at ?? nowIso
@@ -2092,40 +2117,34 @@ async function writeKnowledgeCandidate(env, args) {
   });
   const verification = provenance.verification;
   const schemaVersion = String(input.schema_version ?? "v0.1");
-  const recordStatus = String(input.status ?? "ACTIVE");
+  const createdBy = String(input.created_by ?? input.actor ?? "cloud-agent").trim() || "cloud-agent";
+  const assetWrite = existing ? db.prepare(
+    "UPDATE assets SET schema_version = ?, title = ?, status = ?, current_version = ?, content_hash = ?, updated_at = ? WHERE asset_id = ?"
+  ).bind(schemaVersion, title, KNOWLEDGE_WRITE_STATUS, version, contentHash, nowIso, assetId) : db.prepare(
+    "INSERT INTO assets (asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(assetId, KNOWLEDGE_ASSET_TYPE, schemaVersion, title, KNOWLEDGE_WRITE_STATUS, version, contentHash, nowIso, nowIso);
+  const versionWrite = db.prepare(KNOWLEDGE_VERSION_INSERT).bind(
+    assetId,
+    version,
+    canonicalContent,
+    contentHash,
+    JSON.stringify(provenance),
+    JSON.stringify(verification),
+    createdBy,
+    nowIso
+  );
   try {
-    if (existing) {
-      await db.prepare(
-        "UPDATE assets SET schema_version = ?, title = ?, status = ?, current_version = ?, content_hash = ?, updated_at = ? WHERE asset_id = ?"
-      ).bind(schemaVersion, title, recordStatus, version, contentHash, nowIso, assetId).run();
+    if (typeof db.batch === "function") {
+      await db.batch([assetWrite, versionWrite]);
     } else {
-      await db.prepare(
-        "INSERT INTO assets (asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-      ).bind(assetId, KNOWLEDGE_ASSET_TYPE, schemaVersion, title, recordStatus, version, contentHash, nowIso, nowIso).run();
-    }
-    const insert = await db.prepare(
-      "INSERT OR IGNORE INTO asset_versions (asset_id, version, content, provenance, verification, created_at) VALUES (?, ?, ?, ?, ?, ?)"
-    ).bind(assetId, version, canonicalContent, JSON.stringify(provenance), JSON.stringify(verification), nowIso).run();
-    const changed = insert && insert.meta ? Number(insert.meta.changes) || 0 : 0;
-    if (!changed) {
-      const replay = {
-        contract: KNOWLEDGE_WRITE_CONTRACT,
-        asset_id: assetId,
-        asset_type: KNOWLEDGE_ASSET_TYPE,
-        status: "IDEMPOTENT",
-        created: false,
-        idempotent: true,
-        version,
-        content_hash: contentHash,
-        provenance_status: PROVENANCE_STATUS_VERIFIED,
-        provenance_verified: true,
-        updated_at: nowIso
-      };
-      return { isError: false, text: JSON.stringify(replay), structuredContent: replay };
+      await assetWrite.run();
+      await versionWrite.run();
     }
   } catch {
     return { isError: true, text: "ASSET_WRITE_FAILED" };
   }
+  const persisted = await verifyKnowledgeVersion(db, assetId, version, contentHash, canonicalContent);
+  if (!persisted) return { isError: true, text: "ASSET_WRITE_FAILED" };
   const result = {
     contract: KNOWLEDGE_WRITE_CONTRACT,
     asset_id: assetId,
