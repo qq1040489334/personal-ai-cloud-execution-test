@@ -155,6 +155,13 @@ from hello import (
     personal_ai_autonomous_advancement_production_evidence_audit_v0_1,
     personal_ai_cold_start_capability_revalidation_v1,
     personal_ai_cold_start_live_read_path_verification_v1,
+    personal_ai_cloud_assets_activation_v1,
+    activation_read_terminal_result_via_v2,
+    activation_execution_v2_round_trip,
+    ACTIVATION_DOMAINS,
+    ACTIVATION_PATH_ORDER,
+    ACTIVATION_STATUSES,
+    ACTIVATION_EVIDENCE_SOURCES,
     personal_ai_execution_dispatch_live_failure_audit,
     personal_ai_execution_result_exposure_audit_detail_export,
     personal_ai_task_runtime_audit,
@@ -8204,3 +8211,194 @@ def test_live_read_path_markdown_tokens() -> None:
     assert "historical_record_is_live_verified: False" in markdown
     for name in hello_module.LIVE_READ_PATH_COMPONENTS:
         assert name in markdown
+
+
+# ---------------------------------------------------------------------------
+# CLOUD_ASSETS_ACTIVATION_V1
+# ---------------------------------------------------------------------------
+def test_activation_shape_and_orders() -> None:
+    report = personal_ai_cloud_assets_activation_v1()
+    assert report["report"] == "CLOUD_ASSETS_ACTIVATION_V1"
+    assert report["goal"] == "CLOUD_ASSETS_ACTIVATION_V1"
+    assert report["task_id"] == "cf-d623dfda0107"
+    assert report["mode"] == "READ_ONLY"
+    assert report["status"] in VALID_STATUSES
+    assert report["domain_order"] == list(ACTIVATION_DOMAINS)
+    assert report["path_order"] == list(ACTIVATION_PATH_ORDER)
+    assert report["path_order"] == [p["path_id"] for p in report["paths"]]
+    assert all(check["status"] == "PASS" for check in report["checks"])
+
+
+def test_activation_four_domains_have_status_and_evidence() -> None:
+    report = personal_ai_cloud_assets_activation_v1()
+    assert set(report["domains"]) == {"REALITY", "KNOWLEDGE", "SKILL", "DECISION"}
+    for name, info in report["domains"].items():
+        assert info["status"] in ACTIVATION_STATUSES, name
+        assert info["summary"]
+        assert info["canonical_storage"]
+        assert info["read_contracts"]
+        assert info["missing_ingestion_interfaces"]
+        assert info["gaps"]
+        assert info["evidence"], name
+
+
+def test_activation_evidence_is_source_tagged() -> None:
+    report = personal_ai_cloud_assets_activation_v1()
+    allowed = ACTIVATION_EVIDENCE_SOURCES
+    for info in report["domains"].values():
+        for item in info["evidence"]:
+            assert set(item) == {"source", "detail"}
+            assert item["source"] in allowed
+            assert item["detail"]
+    for path in report["paths"]:
+        assert path["evidence"], path["path_id"]
+        for item in path["evidence"]:
+            assert item["source"] in allowed
+            assert item["detail"]
+
+
+def test_activation_six_paths_assessed_once() -> None:
+    report = personal_ai_cloud_assets_activation_v1()
+    assert len(report["paths"]) == 6
+    assert [p["path_id"] for p in report["paths"]] == list(ACTIVATION_PATH_ORDER)
+    for path in report["paths"]:
+        assert path["status"] in ACTIVATION_STATUSES
+        assert path["target_domain"] in ACTIVATION_DOMAINS
+        assert path["existing_contracts"]
+        assert path["gap"]
+
+
+def test_activation_separation_matches_flags() -> None:
+    report = personal_ai_cloud_assets_activation_v1()
+    separation = report["separation"]
+    assert set(separation) == {
+        "cloud_only",
+        "local_device_required",
+        "oauth_required",
+        "human_gate_required",
+    }
+    assert set(separation["cloud_only"]) == {
+        p["path_id"] for p in report["paths"] if p["cloud_only"]
+    }
+    assert set(separation["local_device_required"]) == {
+        p["path_id"] for p in report["paths"] if p["requires_local_device"]
+    }
+    assert set(separation["oauth_required"]) == {
+        p["path_id"] for p in report["paths"] if p["requires_oauth"]
+    }
+    assert set(separation["cloud_only"]).isdisjoint(separation["local_device_required"])
+    assert set(separation["cloud_only"]).isdisjoint(separation["oauth_required"])
+    assert "email_to_reality" in separation["oauth_required"]
+    assert "wechat_snapshot_to_reality" in separation["local_device_required"]
+
+
+def test_activation_dependency_graph_resolves() -> None:
+    report = personal_ai_cloud_assets_activation_v1()
+    nodes = {node["node"] for node in report["dependency_graph"]}
+    assert nodes
+    for node in report["dependency_graph"]:
+        assert set(node["depends_on"]).issubset(nodes)
+        assert node["dependency_kind"] in hello_module.ACTIVATION_DEPENDENCY_KINDS
+    assert len(report["implementation_order"]) == len(report["dependency_graph"])
+    assert set(report["implementation_order"]) == nodes
+
+
+def test_activation_exactly_one_bounded_next_action() -> None:
+    report = personal_ai_cloud_assets_activation_v1()
+    assert report["next_action_count"] == 1
+    action = report["next_action"]
+    assert action["risk_level"] == "LOW"
+    assert action["cloud_only"] is True
+    assert action["production_writes"] is False
+    assert action["credential_changes"] is False
+    assert action["reversible"] is True
+    assert action["supervisor_v0_2_evaluable"] is True
+    assert report["next_action_bounded"] is True
+    contract = report["next_action_contract"]
+    assert set(contract) == {"goal", "instructions", "acceptance", "expected_files"}
+    assert contract["goal"]
+    assert contract["instructions"]
+    assert contract["acceptance"]
+    assert contract["expected_files"]
+
+
+def test_activation_no_production_side_effects_or_store() -> None:
+    report = personal_ai_cloud_assets_activation_v1()
+    for flag in (
+        "production_writes",
+        "deployment_performed",
+        "credential_changes",
+        "oauth_mutation",
+        "destructive_action",
+        "personos_resurrected",
+        "second_state_store",
+        "submit_task_called",
+        "mark_reviewed_called",
+        "workflow_dispatched",
+        "historical_record_is_live_verified",
+    ):
+        assert report[flag] is False, flag
+    assert report["historical_status_policy"]
+    for info in report["domains"].values():
+        assert info["status"] != "VERIFIED"
+    for path in report["paths"]:
+        assert path["status"] != "VERIFIED"
+
+
+def test_activation_execution_v2_read_path_round_trip(monkeypatch) -> None:
+    sample = {
+        "task_id": "cf-d623dfda0107",
+        "status": "success",
+        "tests": "1 passed",
+        "commit": "a" * 40,
+        "summary": "CLOUD_ASSETS_ACTIVATION_V1",
+        "changed_files": ["hello.py", "test_hello.py"],
+    }
+    injected = activation_read_terminal_result_via_v2(sample)
+    assert injected["execution_result_readable"] is True
+    assert injected["terminal_result_available"] is True
+    assert injected["source"] == "injected-terminal-sample"
+    assert injected["authoritative_status"] in VALID_STATUSES
+    assert "execution_summary" in injected["v2_payload_fields"]
+
+    monkeypatch.setattr(hello_module, "_read_execution_result", lambda: sample)
+    read = activation_read_terminal_result_via_v2()
+    assert read["execution_result_readable"] is True
+    assert read["task_id"] == "cf-d623dfda0107"
+    assert read["tests_summary"] == "1 passed"
+
+    round_trip = activation_execution_v2_round_trip()
+    assert round_trip["round_trip_ok"] is True
+
+
+def test_activation_worker_facts_ground_four_domains() -> None:
+    report = personal_ai_cloud_assets_activation_v1()
+    facts = report["worker_facts"]
+    assert facts["worker_source_present"] is True
+    assert facts["asset_types_set_declared"] is True
+    assert report["worker_asset_types_declared"] == ["REALITY", "KNOWLEDGE", "SKILL", "DECISION"]
+    assert report["worker_asset_types_ok"] is True
+    assert facts["canonical_read_path_present"] is True
+    assert facts["knowledge_writer_present"] is True
+    assert facts["knowledge_writer_knowledge_only"] is True
+    assert facts["review_dispatch_edge_present"] is True
+    assert facts["dispatch_idempotency_present"] is True
+    assert "0002_dispatch_idempotency.sql" in facts["migrations"]
+
+
+def test_activation_markdown_tokens() -> None:
+    report = personal_ai_cloud_assets_activation_v1()
+    markdown = report["markdown"]
+    assert "CLOUD_ASSETS_ACTIVATION_V1" in markdown
+    assert "## Four-domain status matrix" in markdown
+    assert "## Intended activation paths" in markdown
+    assert "## Cloud-only vs local / OAuth / Human-Gate" in markdown
+    assert "## Dependency graph" in markdown
+    assert "## Next action (exactly one)" in markdown
+    for name in ACTIVATION_DOMAINS:
+        assert name in markdown
+    assert "production_writes: False" in markdown
+
+    # Runner entry point must expose the new report.
+    source = pathlib.Path(hello_module.__file__).read_text(encoding="utf-8")
+    assert 'personal_ai_cloud_assets_activation_v1()["markdown"]' in source

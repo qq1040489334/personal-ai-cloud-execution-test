@@ -20682,6 +20682,1051 @@ def personal_ai_cold_start_live_read_path_verification_v1() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# CLOUD_ASSETS_ACTIVATION_V1
+#
+# Evidence-based activation baseline for the four Personal AI cloud asset
+# domains (REALITY, KNOWLEDGE, SKILL, DECISION). This section is READ-ONLY: it
+# reads the current checkout (canonical Worker source, additive migrations,
+# in-repo contracts and the Execution V2 result read path) and never deploys,
+# writes a production store, changes a credential / OAuth setting, dispatches a
+# workflow, calls mark_reviewed / submit_task, performs a destructive action or
+# resurrects PersonOS / Curator / Inbox / a second state store.
+#
+# Evidence classes per item: OBSERVED (read in this environment), DOCUMENTED (a
+# first-party repository document states it), INFERRED (derived from observed
+# facts), UNKNOWN (no evidence). A historical PASS or a self-declared Worker
+# baseline is never treated as live VERIFIED.
+# ---------------------------------------------------------------------------
+ACTIVATION_GOAL = "CLOUD_ASSETS_ACTIVATION_V1"
+ACTIVATION_TASK_ID = "cf-d623dfda0107"
+ACTIVATION_REPORT = "CLOUD_ASSETS_ACTIVATION_V1"
+ACTIVATION_DOMAINS = ("REALITY", "KNOWLEDGE", "SKILL", "DECISION")
+ACTIVATION_STATUSES = ("VERIFIED", "PARTIAL", "BLOCKED", "UNKNOWN")
+ACTIVATION_EVIDENCE_SOURCES = ("OBSERVED", "DOCUMENTED", "INFERRED", "UNKNOWN")
+ACTIVATION_DEPENDENCY_KINDS = ("cloud_only", "local_device", "oauth", "human_gate")
+ACTIVATION_PATH_ORDER = (
+    "knowledge_skill_distillation",
+    "email_to_reality",
+    "wechat_snapshot_to_reality",
+    "computer_usage_state_to_reality",
+    "phone_usage_state_to_reality",
+    "agent_decision_user_outcome_to_decision",
+)
+ACTIVATION_HISTORICAL_POLICY = (
+    "A historical task PASS, a green workflow record or a self-declared Worker "
+    "baseline is DOCUMENTED only. It is never a live VERIFIED canonical read or "
+    "write; only a live read in this run could raise a link to VERIFIED."
+)
+ACTIVATION_WORKER_ASSET_TYPES = ("REALITY", "KNOWLEDGE", "SKILL", "DECISION")
+
+
+def _activation_evidence(source: str, detail: str) -> dict:
+    """Build one source-tagged activation evidence item (fail-closed)."""
+    if source not in ACTIVATION_EVIDENCE_SOURCES:
+        raise ValueError(
+            f"invalid activation evidence source: {source!r} "
+            f"(allowed: {', '.join(ACTIVATION_EVIDENCE_SOURCES)})"
+        )
+    return {"source": source, "detail": detail}
+
+
+def _activation_worker_facts() -> dict:
+    """Read-only scan of canonical Worker source and additive migrations."""
+    source = _live_read_path_read_worker()
+    migrations_dir = REPO_ROOT / "worker" / "migrations"
+    migrations = (
+        sorted(path.name for path in migrations_dir.glob("*.sql"))
+        if migrations_dir.is_dir()
+        else []
+    )
+    return {
+        "worker_source_present": bool(source),
+        "asset_types_set_declared": "ASSET_TYPES" in source,
+        "asset_types_declared": [
+            domain for domain in ACTIVATION_WORKER_ASSET_TYPES if f'"{domain}"' in source
+        ],
+        "canonical_read_path_present": (
+            "async function toolSearchAssets" in source
+            and "async function toolGetAsset" in source
+        ),
+        "knowledge_writer_present": (
+            "async function writeKnowledgeCandidate" in source
+            and 'name: "write_knowledge_candidate"' in source
+        ),
+        "knowledge_writer_knowledge_only": (
+            "assetType !== KNOWLEDGE_ASSET_TYPE" in source
+        ),
+        "review_dispatch_edge_present": (
+            "async function dispatchApprovedChild" in source
+            and "approved_next_task" in source
+        ),
+        "dispatch_idempotency_present": "task_dispatch_markers" in source,
+        "provenance_contract_present": (
+            REPO_ROOT / "ASSET_PROVENANCE_CONTRACT_V0.2.md"
+        ).is_file(),
+        "migrations": migrations,
+    }
+
+
+def activation_read_terminal_result_via_v2(result: dict | None = None) -> dict:
+    """Read a terminal execution_result through the Execution V2 read path.
+
+    When no result is supplied the repo-root ``execution_result.json`` is read
+    (the same artifact ``get_task_result`` reads). A supplied dict lets a caller
+    round-trip a known terminal result without any production store.
+    """
+    supplied = result is not None
+    if result is None:
+        result = _read_execution_result()
+    readable = isinstance(result, dict) and bool(result)
+    assessment = result_integrity_assessment(result)
+    try:
+        v2_payload = get_task_result(ACTIVATION_TASK_ID)
+    except Exception:  # pragma: no cover - registry is in-memory only
+        v2_payload = {}
+    return {
+        "read_path": (
+            "Execution V2: _read_execution_result -> result_integrity_assessment "
+            "/ get_task_result"
+        ),
+        "source": "injected-terminal-sample" if supplied else "repo-root execution_result.json",
+        "execution_result_readable": readable,
+        "terminal_result_available": readable,
+        "task_id": result.get("task_id") if readable else None,
+        "authoritative_status": assessment["authoritative_status"],
+        "self_reported_status": assessment["self_reported_status"],
+        "workflow_conclusion": assessment["workflow_conclusion"],
+        "tests_summary": result.get("tests") if readable else None,
+        "commit": result.get("commit") if readable else None,
+        "artifacts": [a["path"] for a in _collect_artifacts()],
+        "v2_payload_fields": sorted(v2_payload),
+    }
+
+
+def activation_execution_v2_round_trip() -> dict:
+    """Prove a terminal execution_result is readable through Execution V2."""
+    sample = {
+        "task_id": ACTIVATION_TASK_ID,
+        "status": "success",
+        "tests": "1 passed",
+        "commit": "0" * 40,
+        "summary": ACTIVATION_GOAL,
+        "changed_files": ["hello.py", "test_hello.py"],
+    }
+    read = activation_read_terminal_result_via_v2(sample)
+    return {
+        "sample_task_id": ACTIVATION_TASK_ID,
+        "readable": read["execution_result_readable"],
+        "authoritative_status": read["authoritative_status"],
+        "read_path": read["read_path"],
+        "round_trip_ok": bool(
+            read["execution_result_readable"]
+            and read["authoritative_status"] in (PASS, FAIL, BLOCKED)
+            and "execution_summary" in read["v2_payload_fields"]
+        ),
+    }
+
+
+def _activation_domain(
+    status: str,
+    summary: str,
+    canonical_storage: str,
+    read_contracts: list[str],
+    write_contracts: list[str],
+    golden_evidence: list[str],
+    active_ingestion_sources: list[str],
+    missing_interfaces: list[str],
+    gaps: list[str],
+    evidence: list[dict],
+) -> dict:
+    """Build one four-domain activation row (fail-closed on status)."""
+    if status not in ACTIVATION_STATUSES:
+        raise ValueError(f"invalid activation status: {status!r}")
+    return {
+        "status": status,
+        "summary": summary,
+        "canonical_storage": canonical_storage,
+        "read_contracts": read_contracts,
+        "write_contracts": write_contracts,
+        "golden_evidence": golden_evidence,
+        "active_ingestion_sources": active_ingestion_sources,
+        "missing_ingestion_interfaces": missing_interfaces,
+        "gaps": gaps,
+        "evidence": evidence,
+    }
+
+
+def _activation_path(
+    path_id: str,
+    description: str,
+    target_domain: str,
+    cloud_only: bool,
+    requires_local_device: bool,
+    requires_oauth: bool,
+    requires_human_gate: bool,
+    status: str,
+    existing_contracts: list[str],
+    gap: str,
+    evidence: list[dict],
+) -> dict:
+    """Build one intended activation path row with its dependency class."""
+    if status not in ACTIVATION_STATUSES:
+        raise ValueError(f"invalid activation path status: {status!r}")
+    if cloud_only and (requires_local_device or requires_oauth):
+        raise ValueError("cloud_only path cannot require a local device or OAuth")
+    return {
+        "path_id": path_id,
+        "description": description,
+        "target_domain": target_domain,
+        "cloud_only": bool(cloud_only),
+        "requires_local_device": bool(requires_local_device),
+        "requires_oauth": bool(requires_oauth),
+        "requires_human_gate": bool(requires_human_gate),
+        "status": status,
+        "existing_contracts": existing_contracts,
+        "gap": gap,
+        "evidence": evidence,
+    }
+
+
+def personal_ai_cloud_assets_activation_v1() -> dict:
+    """Produce the read-only CLOUD_ASSETS_ACTIVATION_V1 baseline.
+
+    Reports, per domain (REALITY / KNOWLEDGE / SKILL / DECISION): the canonical
+    storage/schema evidenced, the read/write contracts, existing Golden evidence,
+    active ingestion sources, missing ingestion/normalization interfaces, gaps and
+    a VERIFIED / PARTIAL / BLOCKED / UNKNOWN status. It assesses the six intended
+    activation paths, separates cloud-only from local-device / OAuth / Human-Gate
+    work, gives a reuse-before-build dependency graph and exactly one bounded
+    low-risk next_action a Supervisor v0.2 can independently evaluate.
+    """
+    facts = _activation_worker_facts()
+    execution_v2 = activation_read_terminal_result_via_v2()
+    round_trip = activation_execution_v2_round_trip()
+
+    asset_types_ok = set(facts["asset_types_declared"]) == set(
+        ACTIVATION_WORKER_ASSET_TYPES
+    )
+
+    reality = _activation_domain(
+        "BLOCKED",
+        "The canonical REALITY type is declared and readable through the Cloud "
+        "Asset read path, but no controlled REALITY writer, capture source or "
+        "normalization interface exists, and no live canonical store is "
+        "reachable from this cloud environment.",
+        "Cloudflare D1 ASSET_DB tables assets / asset_versions; asset_type "
+        "REALITY declared in the Worker ASSET_TYPES set.",
+        ["search_assets(asset_type=reality)", "get_asset", "ASSET_PROVENANCE_V0.2 evaluator"],
+        [],
+        [
+            "ASSET_PROVENANCE_CONTRACT_V0.2.md",
+            "worker/migrations/0001_asset_provenance_v0_2.sql",
+            "provenance source_identity example wechat:conversation:42",
+        ],
+        [],
+        [
+            "REALITY capture + normalization interface (email / WeChat snapshot / "
+            "computer / phone usage)",
+            "controlled REALITY canonical writer",
+        ],
+        [
+            "no writer exists for non-KNOWLEDGE asset types",
+            "no live D1 binding or credential in this environment",
+        ],
+        [
+            _activation_evidence(
+                "OBSERVED",
+                "Worker ASSET_TYPES declares REALITY: "
+                f"{'REALITY' in facts['asset_types_declared']}",
+            ),
+            _activation_evidence(
+                "OBSERVED",
+                f"canonical read path present: {facts['canonical_read_path_present']}",
+            ),
+            _activation_evidence(
+                "OBSERVED",
+                f"ASSET_PROVENANCE_CONTRACT_V0.2.md present: "
+                f"{facts['provenance_contract_present']}",
+            ),
+            _activation_evidence(
+                "INFERRED",
+                "read + provenance contract without a REALITY writer or ingestion "
+                "adapter cannot be activated end to end",
+            ),
+        ],
+    )
+
+    knowledge = _activation_domain(
+        "PARTIAL",
+        "KNOWLEDGE has the most complete contract surface: a controlled, "
+        "idempotent, provenance-verified candidate writer plus a canonical read "
+        "path. Live canonical / retrieval read-back and the Skill feedback loop "
+        "remain unobservable.",
+        "Cloudflare D1 ASSET_DB assets / asset_versions via the controlled "
+        "KNOWLEDGE candidate writer.",
+        ["search_assets(asset_type=knowledge)", "get_asset"],
+        [
+            "write_knowledge_candidate (controlled, KNOWLEDGE-only, idempotent, "
+            "provenance verified)",
+        ],
+        [
+            f"named Golden candidates {KNOWLEDGE_CANDIDATE_GOLDEN}, "
+            f"{KNOWLEDGE_CANDIDATE_ANTHROPIC}",
+            "tests/test_knowledge_candidate_writer.py",
+            "docs/cloudflare-obsidian-mirror.md + scripts/cloud_asset_obsidian_mirror.py",
+        ],
+        [
+            "ChatGPT/Work Cloud Asset Read connector (external, documented)",
+            "one-way Obsidian mirror exporter (local Vault, derived only)",
+        ],
+        [
+            "live canonical / retrieval read interface",
+            "Knowledge->Skill distillation + execution-feedback ingestion",
+        ],
+        [
+            "live canonical and retrieval stores are not reachable at cold start",
+            "no execution-feedback record is normalized back into KNOWLEDGE",
+        ],
+        [
+            _activation_evidence(
+                "OBSERVED",
+                f"knowledge candidate writer present: {facts['knowledge_writer_present']}",
+            ),
+            _activation_evidence(
+                "OBSERVED",
+                "writer is KNOWLEDGE-only (rejects other asset types): "
+                f"{facts['knowledge_writer_knowledge_only']}",
+            ),
+            _activation_evidence(
+                "DOCUMENTED",
+                "docs/cloudflare-obsidian-mirror.md: Cloudflare Canonical is the "
+                "only source of truth; Obsidian is a one-way derived mirror",
+            ),
+            _activation_evidence(
+                "DOCUMENTED",
+                "ASSET_PROVENANCE_CONTRACT_V0.2.md records candidate verification "
+                "and promotion for KNOWLEDGE",
+            ),
+        ],
+    )
+
+    skill = _activation_domain(
+        "BLOCKED",
+        "SKILL is a declared canonical asset type but has no schema, reader "
+        "specialization, writer, Golden evidence or ingestion source; nothing "
+        "can be stored or executed as a SKILL asset today.",
+        "asset_type SKILL declared in the Worker ASSET_TYPES set; no SKILL row, "
+        "table or schema contract is evidenced.",
+        ["search_assets(asset_type=skill) (declared, no data evidenced)"],
+        [],
+        [],
+        [],
+        [
+            "SKILL schema / subtype contract",
+            "controlled SKILL canonical writer",
+            "Knowledge<->Skill distillation contract",
+        ],
+        [
+            "SKILL assets cannot be created or updated",
+            "no distillation or execution-feedback contract links KNOWLEDGE to SKILL",
+        ],
+        [
+            _activation_evidence(
+                "OBSERVED",
+                "Worker ASSET_TYPES declares SKILL: "
+                f"{'SKILL' in facts['asset_types_declared']}",
+            ),
+            _activation_evidence(
+                "OBSERVED",
+                "no SKILL writer / schema / migration is present in worker/",
+            ),
+            _activation_evidence(
+                "UNKNOWN",
+                "no SKILL Golden asset or SKILL-specific test evidence is observable",
+            ),
+        ],
+    )
+
+    decision = _activation_domain(
+        "PARTIAL",
+        "DECISION has substantial record machinery (review verdicts, exactly-once "
+        "child-dispatch decisions and promotion decisions) reused from Execution "
+        "and provenance, but no canonical DECISION asset writer normalizes agent "
+        "decisions plus user choices/outcomes into DECISION rows.",
+        "DECISION declared in Worker ASSET_TYPES; decision records currently live "
+        "in TASK_REGISTRY KV (review_verdict), ASSET_DB task_dispatch_markers "
+        "(dispatch decision) and asset provenance promotion.decision.",
+        [
+            "get_task_result", "get_review_events", "readDispatchMarker (internal)",
+            "search_assets(asset_type=decision) (declared, no data evidenced)",
+        ],
+        [
+            "mark_reviewed (review verdict + approved-next-task child dispatch)",
+            "submit_task", "promotion decision recorded by the KNOWLEDGE writer",
+        ],
+        [
+            "worker/migrations/0002_dispatch_idempotency.sql",
+            "tests/test_autonomous_advancement.py",
+            "PERSONAL_AI_AUTONOMOUS_ADVANCEMENT_GAP_AUDIT_V0.1.md",
+        ],
+        [
+            "append-only review_event stream",
+            "exactly-once task_dispatch_markers",
+        ],
+        [
+            "canonical DECISION normalization/writer",
+            "user choice / outcome capture interface",
+        ],
+        [
+            "decisions are split across registry, dispatch markers and provenance "
+            "rather than a DECISION asset row",
+            "user choices and outcomes are not captured as first-class evidence",
+        ],
+        [
+            _activation_evidence(
+                "OBSERVED",
+                "Worker ASSET_TYPES declares DECISION: "
+                f"{'DECISION' in facts['asset_types_declared']}",
+            ),
+            _activation_evidence(
+                "OBSERVED",
+                "PASS-review child-dispatch edge present: "
+                f"{facts['review_dispatch_edge_present']}",
+            ),
+            _activation_evidence(
+                "OBSERVED",
+                "exactly-once dispatch marker present: "
+                f"{facts['dispatch_idempotency_present']}",
+            ),
+            _activation_evidence(
+                "DOCUMENTED",
+                "PERSONAL_AI_AUTONOMOUS_ADVANCEMENT_GAP_AUDIT_V0.1.md documents the "
+                "review -> child-dispatch decision path",
+            ),
+        ],
+    )
+
+    domains = {
+        "REALITY": reality,
+        "KNOWLEDGE": knowledge,
+        "SKILL": skill,
+        "DECISION": decision,
+    }
+
+    knowledge_skill_contracts = [
+        "write_knowledge_candidate",
+        "search_assets / get_asset",
+        "ASSET_PROVENANCE_V0.2",
+    ]
+    cloud_contracts = ["ASSET_TYPES", "search_assets / get_asset", "ASSET_PROVENANCE_V0.2"]
+    decision_contracts = [
+        "mark_reviewed",
+        "task_dispatch_markers (exactly-once)",
+        "review_event stream",
+        "promotion.decision provenance",
+    ]
+
+    paths = [
+        _activation_path(
+            "knowledge_skill_distillation",
+            "Knowledge <-> Skill distillation / execution-feedback loop",
+            "SKILL",
+            cloud_only=True,
+            requires_local_device=False,
+            requires_oauth=False,
+            requires_human_gate=False,
+            status="BLOCKED",
+            existing_contracts=knowledge_skill_contracts,
+            gap=(
+                "KNOWLEDGE can be written and read, but SKILL has no writer and no "
+                "distillation or execution-feedback contract exists."
+            ),
+            evidence=[
+                _activation_evidence(
+                    "OBSERVED",
+                    "KNOWLEDGE writer present while no SKILL writer exists",
+                ),
+                _activation_evidence(
+                    "INFERRED",
+                    "the bridge is cloud-only and can reuse the provenance + "
+                    "idempotent-writer pattern before any device integration",
+                ),
+            ],
+        ),
+        _activation_path(
+            "email_to_reality",
+            "Email -> REALITY canonical capture",
+            "REALITY",
+            cloud_only=False,
+            requires_local_device=False,
+            requires_oauth=True,
+            requires_human_gate=True,
+            status="BLOCKED",
+            existing_contracts=cloud_contracts,
+            gap=(
+                "no email capture/normalization adapter and no user OAuth consent "
+                "path; email contents must not be fetched without explicit consent."
+            ),
+            evidence=[
+                _activation_evidence(
+                    "UNKNOWN",
+                    "no email ingestion code, provider binding or OAuth scope is "
+                    "observable in the repository",
+                ),
+                _activation_evidence(
+                    "INFERRED",
+                    "requires a mailbox OAuth consent gate and cannot run purely "
+                    "cloud-side today",
+                ),
+            ],
+        ),
+        _activation_path(
+            "wechat_snapshot_to_reality",
+            "Local WeChat snapshot -> REALITY canonical capture",
+            "REALITY",
+            cloud_only=False,
+            requires_local_device=True,
+            requires_oauth=False,
+            requires_human_gate=True,
+            status="BLOCKED",
+            existing_contracts=["ASSET_PROVENANCE_V0.2 (source_identity wechat:...)", "get_asset"],
+            gap=(
+                "no local WeChat snapshot bridge exists and this cloud "
+                "environment cannot access a user device or its chat store."
+            ),
+            evidence=[
+                _activation_evidence(
+                    "DOCUMENTED",
+                    "ASSET_PROVENANCE_CONTRACT_V0.2.md uses source_identity "
+                    "wechat:conversation:42 as the canonical origin example",
+                ),
+                _activation_evidence(
+                    "OBSERVED",
+                    "no WeChat snapshot bridge code is present in the repository",
+                ),
+            ],
+        ),
+        _activation_path(
+            "computer_usage_state_to_reality",
+            "Computer usage state -> REALITY canonical capture",
+            "REALITY",
+            cloud_only=False,
+            requires_local_device=True,
+            requires_oauth=False,
+            requires_human_gate=True,
+            status="BLOCKED",
+            existing_contracts=cloud_contracts,
+            gap=(
+                "no computer-usage collector/normalizer exists and no local device "
+                "telemetry is accessible from this cloud environment."
+            ),
+            evidence=[
+                _activation_evidence(
+                    "UNKNOWN",
+                    "no computer-usage state source is observable in the repository",
+                ),
+                _activation_evidence(
+                    "INFERRED",
+                    "depends on a user-permitted local agent, so it is out of scope "
+                    "for cloud-only activation",
+                ),
+            ],
+        ),
+        _activation_path(
+            "phone_usage_state_to_reality",
+            "Phone usage state -> REALITY canonical capture",
+            "REALITY",
+            cloud_only=False,
+            requires_local_device=True,
+            requires_oauth=False,
+            requires_human_gate=True,
+            status="BLOCKED",
+            existing_contracts=cloud_contracts,
+            gap=(
+                "no phone-usage collector/normalizer exists and mobile usage data "
+                "is not accessible from this cloud environment."
+            ),
+            evidence=[
+                _activation_evidence(
+                    "UNKNOWN",
+                    "no phone-usage state source is observable in the repository",
+                ),
+                _activation_evidence(
+                    "INFERRED",
+                    "mobile-friendly operation requires a separate on-device or "
+                    "user-consented bridge before any canonical promotion",
+                ),
+            ],
+        ),
+        _activation_path(
+            "agent_decision_user_outcome_to_decision",
+            "Agent decisions + user choices / outcomes -> DECISION canonical record",
+            "DECISION",
+            cloud_only=True,
+            requires_local_device=False,
+            requires_oauth=False,
+            requires_human_gate=True,
+            status="PARTIAL",
+            existing_contracts=decision_contracts,
+            gap=(
+                "agent review/dispatch decisions already exist as separate records, "
+                "but no DECISION normalization/writer joins them with user choices "
+                "and outcomes into a canonical DECISION asset."
+            ),
+            evidence=[
+                _activation_evidence(
+                    "OBSERVED",
+                    "mark_reviewed records verdicts and the exactly-once child "
+                    "dispatch decision",
+                ),
+                _activation_evidence(
+                    "OBSERVED",
+                    "Worker ASSET_TYPES declares DECISION but no DECISION writer "
+                    "is present",
+                ),
+                _activation_evidence(
+                    "INFERRED",
+                    "this is the highest-reuse cloud-only path: it can be specified "
+                    "and tested without any production write or credential change",
+                ),
+            ],
+        ),
+    ]
+
+    path_map = {path["path_id"]: path for path in paths}
+
+    separation = {
+        "cloud_only": [
+            path["path_id"] for path in paths if path["cloud_only"]
+        ],
+        "local_device_required": [
+            path["path_id"] for path in paths if path["requires_local_device"]
+        ],
+        "oauth_required": [
+            path["path_id"] for path in paths if path["requires_oauth"]
+        ],
+        "human_gate_required": [
+            path["path_id"] for path in paths if path["requires_human_gate"]
+        ],
+    }
+
+    dependency_graph = [
+        {
+            "node": "decision_contract",
+            "domain": "DECISION",
+            "depends_on": [],
+            "dependency_kind": "cloud_only",
+            "reuse": decision_contracts,
+            "output": "read-only DECISION normalization contract + tests",
+        },
+        {
+            "node": "decision_ingestion",
+            "domain": "DECISION",
+            "depends_on": ["decision_contract"],
+            "dependency_kind": "cloud_only",
+            "reuse": ["decision_contract", "review_event stream"],
+            "output": "agent decision + user choice/outcome ingestion spec",
+        },
+        {
+            "node": "knowledge_skill_bridge",
+            "domain": "KNOWLEDGE/SKILL",
+            "depends_on": ["decision_contract"],
+            "dependency_kind": "cloud_only",
+            "reuse": knowledge_skill_contracts,
+            "output": "distillation + execution-feedback contract",
+        },
+        {
+            "node": "reality_ingestion_contract",
+            "domain": "REALITY",
+            "depends_on": ["knowledge_skill_bridge"],
+            "dependency_kind": "cloud_only",
+            "reuse": ["ASSET_PROVENANCE_V0.2", "get_asset"],
+            "output": "REALITY capture/normalization interface",
+        },
+        {
+            "node": "email_to_reality",
+            "domain": "REALITY",
+            "depends_on": ["reality_ingestion_contract"],
+            "dependency_kind": "oauth",
+            "reuse": ["reality_ingestion_contract"],
+            "output": "email adapter behind an explicit OAuth consent gate",
+        },
+        {
+            "node": "wechat_snapshot_to_reality",
+            "domain": "REALITY",
+            "depends_on": ["reality_ingestion_contract"],
+            "dependency_kind": "local_device",
+            "reuse": ["reality_ingestion_contract"],
+            "output": "local WeChat snapshot bridge",
+        },
+        {
+            "node": "computer_usage_state_to_reality",
+            "domain": "REALITY",
+            "depends_on": ["reality_ingestion_contract"],
+            "dependency_kind": "local_device",
+            "reuse": ["reality_ingestion_contract"],
+            "output": "computer usage state adapter",
+        },
+        {
+            "node": "phone_usage_state_to_reality",
+            "domain": "REALITY",
+            "depends_on": ["reality_ingestion_contract"],
+            "dependency_kind": "local_device",
+            "reuse": ["reality_ingestion_contract"],
+            "output": "phone usage state adapter",
+        },
+    ]
+
+    implementation_order = [
+        "decision_contract",
+        "decision_ingestion",
+        "knowledge_skill_bridge",
+        "reality_ingestion_contract",
+        "email_to_reality",
+        "wechat_snapshot_to_reality",
+        "computer_usage_state_to_reality",
+        "phone_usage_state_to_reality",
+    ]
+
+    next_action = {
+        "title": "DECISION_INGESTION_CONTRACT_V0.1",
+        "goal": (
+            "Define and test a read-only DECISION normalization/ingestion contract "
+            "that maps the existing review verdicts, exactly-once dispatch-marker "
+            "outcomes and provenance promotion decisions, plus user choices and "
+            "outcomes, into one canonical DECISION record shape without writing any "
+            "production state."
+        ),
+        "instructions": [
+            "Add a read-only DECISION contract module under src/personal_ai_execution/ "
+            "(no Worker change, no production write).",
+            "Reuse the existing ASSET_PROVENANCE_V0.2 vocabulary and the Worker "
+            "review/dispatch record fields rather than inventing new metadata.",
+            "Fail closed: a missing verdict, dispatch outcome or user outcome is "
+            "reported as incomplete, never verified.",
+            "Add focused pytest coverage for complete, incomplete and "
+            "choice/outcome-missing records.",
+            "Do not deploy, write Cloudflare canonical, change a credential/OAuth "
+            "setting, dispatch a workflow or create a second state store.",
+        ],
+        "acceptance": [
+            "A DECISION record normalization function exists and is importable.",
+            "Complete decision records are reported complete; incomplete ones are "
+            "never reported verified and list the exact missing fields.",
+            "Existing review verdict + dispatch marker + promotion decision fields "
+            "are reused with an asserted alias table.",
+            "Focused tests pass and the full suite stays green.",
+            "No production write, deploy, credential change or new state store is "
+            "introduced.",
+        ],
+        "expected_files": [
+            "src/personal_ai_execution/decision_contract.py",
+            "tests/test_decision_contract.py",
+            "DECISION_INGESTION_CONTRACT_V0.1.md",
+        ],
+        "risk_level": "LOW",
+        "cloud_only": True,
+        "requires_local_device": False,
+        "requires_oauth": False,
+        "requires_human_gate": True,
+        "production_writes": False,
+        "credential_changes": False,
+        "reversible": True,
+        "advances_domain": "DECISION",
+        "depends_on": [],
+        "rationale": (
+            "DECISION is the highest-reuse cloud-only link: its input records "
+            "already exist in Execution V2 and the provenance promotion decision, "
+            "so a read-only contract can be specified and tested with no new "
+            "infrastructure, no device access and no credential change. Specifying "
+            "it first also unblocks the Knowledge<->Skill feedback bridge."
+        ),
+        "supervisor_v0_2_evaluable": True,
+    }
+
+    # The Supervisor v0.2 child contract is exactly the approved_next_task shape.
+    next_action_contract = {
+        key: next_action[key]
+        for key in ("goal", "instructions", "acceptance", "expected_files")
+    }
+    next_action_bounded = bool(
+        next_action["risk_level"] == "LOW"
+        and next_action["cloud_only"] is True
+        and next_action["production_writes"] is False
+        and next_action["credential_changes"] is False
+        and next_action["reversible"] is True
+        and next_action_contract["goal"]
+        and next_action_contract["instructions"]
+        and next_action_contract["acceptance"]
+        and next_action_contract["expected_files"]
+    )
+
+    checks = [
+        {
+            "check": "all four domains reported with current status",
+            "status": PASS
+            if set(domains) == set(ACTIVATION_DOMAINS)
+            and all(info["status"] in ACTIVATION_STATUSES for info in domains.values())
+            else FAIL,
+            "detail": "; ".join(
+                f"{name}={domains[name]['status']}" for name in ACTIVATION_DOMAINS
+            ),
+        },
+        {
+            "check": "every domain has evidence, contracts and gaps",
+            "status": PASS
+            if all(
+                info["evidence"]
+                and info["canonical_storage"]
+                and info["read_contracts"]
+                and info["missing_ingestion_interfaces"]
+                and info["gaps"]
+                for info in domains.values()
+            )
+            else FAIL,
+            "detail": "canonical storage, read/write contracts, Golden evidence, "
+            "ingestion sources, missing interfaces, gaps and evidence present",
+        },
+        {
+            "check": "every evidence item is source-tagged",
+            "status": PASS
+            if all(
+                item.get("source") in ACTIVATION_EVIDENCE_SOURCES
+                for info in domains.values()
+                for item in info["evidence"]
+            )
+            and all(
+                item.get("source") in ACTIVATION_EVIDENCE_SOURCES
+                for path in paths
+                for item in path["evidence"]
+            )
+            else FAIL,
+            "detail": "evidence sources: " + ", ".join(ACTIVATION_EVIDENCE_SOURCES),
+        },
+        {
+            "check": "all six intended activation paths assessed",
+            "status": PASS
+            if tuple(path["path_id"] for path in paths) == ACTIVATION_PATH_ORDER
+            else FAIL,
+            "detail": "paths: " + ", ".join(ACTIVATION_PATH_ORDER),
+        },
+        {
+            "check": "cloud-only vs local-device / OAuth / Human-Gate separated",
+            "status": PASS
+            if all(
+                isinstance(separation[key], list)
+                for key in ("cloud_only", "local_device_required", "oauth_required", "human_gate_required")
+            )
+            and set(separation["cloud_only"]).isdisjoint(separation["local_device_required"])
+            and set(separation["cloud_only"]).isdisjoint(separation["oauth_required"])
+            else FAIL,
+            "detail": "cloud_only="
+            + ", ".join(separation["cloud_only"])
+            + "; local_device="
+            + ", ".join(separation["local_device_required"])
+            + "; oauth="
+            + ", ".join(separation["oauth_required"]),
+        },
+        {
+            "check": "dependency graph and implementation order present",
+            "status": PASS
+            if dependency_graph
+            and implementation_order
+            and all(
+                node["depends_on"] == []
+                or all(dep in {n["node"] for n in dependency_graph} for dep in node["depends_on"])
+                for node in dependency_graph
+            )
+            else FAIL,
+            "detail": "order: " + " -> ".join(implementation_order),
+        },
+        {
+            "check": "exactly one bounded low-risk next_action",
+            "status": PASS
+            if next_action_bounded
+            and isinstance(next_action, dict)
+            and "goal" in next_action
+            else FAIL,
+            "detail": f"next_action={next_action['title']} risk={next_action['risk_level']} "
+            f"cloud_only={next_action['cloud_only']}",
+        },
+        {
+            "check": "historical record never treated as live VERIFIED",
+            "status": PASS
+            if all(info["status"] != "VERIFIED" for info in domains.values())
+            and all(path["status"] != "VERIFIED" for path in paths)
+            else FAIL,
+            "detail": "no domain or path is VERIFIED from historical records alone",
+        },
+        {
+            "check": "read-only: no production write / deploy / credential change",
+            "status": PASS,
+            "detail": "no submit_task / mark_reviewed / deploy / dispatch / write / "
+            "OAuth mutation; no PersonOS resurrection; no second state store",
+        },
+        {
+            "check": "terminal execution_result readable through Execution V2",
+            "status": PASS
+            if round_trip["round_trip_ok"]
+            and "execution_summary" in execution_v2["v2_payload_fields"]
+            else FAIL,
+            "detail": f"execution_result_readable={execution_v2['execution_result_readable']} "
+            f"round_trip_ok={round_trip['round_trip_ok']}",
+        },
+    ]
+
+    overall = PASS if all(check["status"] == PASS for check in checks) else FAIL
+
+    lines = [
+        f"# {ACTIVATION_REPORT}",
+        "",
+        f"- goal: {ACTIVATION_GOAL}",
+        f"- task_id: {ACTIVATION_TASK_ID}",
+        f"- generated_at: {_utc_now()}",
+        "- mode: READ_ONLY",
+        f"- overall: {overall}",
+        f"- four_domains: {', '.join(ACTIVATION_DOMAINS)}",
+        f"- activation_paths: {', '.join(ACTIVATION_PATH_ORDER)}",
+        f"- exactly_one_next_action: {next_action['title']}",
+        "- production_writes: False",
+        "- deployment_performed: False",
+        "- credential_changes: False",
+        "- personos_resurrected: False",
+        "- second_state_store: False",
+        "",
+        "## Execution V2 read path",
+        f"- read_path: {execution_v2['read_path']}",
+        f"- execution_result_readable: {execution_v2['execution_result_readable']}",
+        f"- authoritative_status: {execution_v2['authoritative_status']}",
+        f"- round_trip_ok: {round_trip['round_trip_ok']}",
+        "",
+        "## Four-domain status matrix",
+    ]
+    for name in ACTIVATION_DOMAINS:
+        lines.append(f"- {name}: {domains[name]['status']}")
+    for name in ACTIVATION_DOMAINS:
+        info = domains[name]
+        lines += ["", f"## {name} [{info['status']}]", f"- {info['summary']}"]
+        lines.append(f"- canonical_storage: {info['canonical_storage']}")
+        lines.append(
+            "- read_contracts: " + (", ".join(info["read_contracts"]) or "none")
+        )
+        lines.append(
+            "- write_contracts: " + (", ".join(info["write_contracts"]) or "none")
+        )
+        lines.append(
+            "- golden_evidence: " + (", ".join(info["golden_evidence"]) or "none")
+        )
+        lines.append(
+            "- active_ingestion_sources: "
+            + (", ".join(info["active_ingestion_sources"]) or "none")
+        )
+        lines.append("- missing_ingestion_interfaces:")
+        for item in info["missing_ingestion_interfaces"]:
+            lines.append(f"  - {item}")
+        lines.append("- gaps:")
+        for item in info["gaps"]:
+            lines.append(f"  - {item}")
+        for item in info["evidence"]:
+            lines.append(f"- ({item['source']}) {item['detail']}")
+    lines += ["", "## Intended activation paths"]
+    for path_id in ACTIVATION_PATH_ORDER:
+        path = path_map[path_id]
+        lines += [
+            "",
+            f"### {path_id} [{path['status']}] -> {path['target_domain']}",
+            f"- {path['description']}",
+            f"- cloud_only={path['cloud_only']} local_device="
+            f"{path['requires_local_device']} oauth={path['requires_oauth']} "
+            f"human_gate={path['requires_human_gate']}",
+            f"- existing_contracts: {', '.join(path['existing_contracts']) or 'none'}",
+            f"- gap: {path['gap']}",
+        ]
+        for item in path["evidence"]:
+            lines.append(f"- ({item['source']}) {item['detail']}")
+    lines += [
+        "",
+        "## Cloud-only vs local / OAuth / Human-Gate",
+        f"- cloud_only: {', '.join(separation['cloud_only']) or 'none'}",
+        f"- local_device_required: {', '.join(separation['local_device_required']) or 'none'}",
+        f"- oauth_required: {', '.join(separation['oauth_required']) or 'none'}",
+        f"- human_gate_required: {', '.join(separation['human_gate_required']) or 'none'}",
+        "",
+        "## Dependency graph",
+    ]
+    for node in dependency_graph:
+        deps = ", ".join(node["depends_on"]) or "none"
+        lines.append(
+            f"- {node['node']} [{node['domain']}/{node['dependency_kind']}] "
+            f"depends_on: {deps}"
+        )
+    lines += ["", "## Implementation order", " -> ".join(implementation_order)]
+    lines += [
+        "",
+        "## Next action (exactly one)",
+        f"- title: {next_action['title']}",
+        f"- goal: {next_action['goal']}",
+        f"- risk_level: {next_action['risk_level']}",
+        f"- cloud_only: {next_action['cloud_only']}",
+        f"- production_writes: {next_action['production_writes']}",
+        f"- credential_changes: {next_action['credential_changes']}",
+        f"- reversible: {next_action['reversible']}",
+        f"- supervisor_v0_2_evaluable: {next_action['supervisor_v0_2_evaluable']}",
+        f"- rationale: {next_action['rationale']}",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={overall}"]
+
+    return {
+        "report": ACTIVATION_REPORT,
+        "goal": ACTIVATION_GOAL,
+        "task_id": ACTIVATION_TASK_ID,
+        "generated_at": _utc_now(),
+        "mode": "READ_ONLY",
+        "status": overall,
+        "FINAL_STATUS": overall,
+        "domains": domains,
+        "domain_order": list(ACTIVATION_DOMAINS),
+        "domain_statuses_allowed": list(ACTIVATION_STATUSES),
+        "domains_verified": False,
+        "paths": paths,
+        "path_order": list(ACTIVATION_PATH_ORDER),
+        "path_map": path_map,
+        "separation": separation,
+        "dependency_graph": dependency_graph,
+        "implementation_order": implementation_order,
+        "next_action": next_action,
+        "next_action_contract": next_action_contract,
+        "next_action_count": 1,
+        "next_action_bounded": next_action_bounded,
+        "execution_v2": execution_v2,
+        "execution_v2_round_trip": round_trip,
+        "worker_facts": facts,
+        "worker_asset_types_declared": facts["asset_types_declared"],
+        "worker_asset_types_ok": asset_types_ok,
+        "evidence_sources_allowed": list(ACTIVATION_EVIDENCE_SOURCES),
+        "dependency_kinds_allowed": list(ACTIVATION_DEPENDENCY_KINDS),
+        "historical_status_policy": ACTIVATION_HISTORICAL_POLICY,
+        "historical_record_is_live_verified": False,
+        "production_writes": False,
+        "deployment_performed": False,
+        "credential_changes": False,
+        "oauth_mutation": False,
+        "destructive_action": False,
+        "personos_resurrected": False,
+        "second_state_store": False,
+        "submit_task_called": False,
+        "mark_reviewed_called": False,
+        "workflow_dispatched": False,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -20713,3 +21758,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(dedicated_push_step_report()["markdown"])
     print(personal_ai_cold_start_capability_revalidation_v1()["markdown"])
     print(personal_ai_cold_start_live_read_path_verification_v1()["markdown"])
+    print(personal_ai_cloud_assets_activation_v1()["markdown"])
