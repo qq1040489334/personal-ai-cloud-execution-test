@@ -1,10 +1,13 @@
 {
   "task_id": "cloudflare-canonical-obsidian-mirror-v1",
-  "goal": "Add a deterministic one-way Cloud Asset KNOWLEDGE to Obsidian mirror adapter and verify live canonical records by local Vault read-back.",
+  "goal": "Present the existing Cloud Asset KNOWLEDGE one-way Obsidian mirror as a Chinese, human-readable knowledge library while keeping Cloudflare Canonical authoritative and never written to.",
   "instructions": [
-    "Use the read-only Cloud Asset Read connector as the canonical source.",
-    "Only write derived Markdown notes under the local Vault's Cloudflare Canonical Mirror directory.",
-    "Do not write Cloudflare Canonical, restore PersonOS or Knowledge Curator, add Inbox behavior, or create bidirectional sync.",
+    "Use the read-only Cloud Asset Read connector as the canonical source; never write Cloudflare Canonical.",
+    "Render the three production assets into the Chinese vault layout: 00 知识首页.md, AI 架构/<two notes>, 工作流/<one note>, and _System/Mirror Index.md under Cloudflare Canonical Mirror.",
+    "Apply the reviewed Chinese translation override only while the asset content_hash matches the reviewed hash; otherwise render safe fallback content from the canonical record so stale translations cannot survive.",
+    "Keep machine-verification fields in YAML frontmatter and out of the rendered body, and keep the mirror index idempotent and partial-sync preserving.",
+    "Only migrate legacy flat asset_id.md notes after ownership checks and successful new-note read-back; never touch unmanaged files or path collisions.",
+    "Do not write Cloudflare Canonical, restore PersonOS or Knowledge Curator, add Inbox behavior, add automatic Cloudflare writes, or create bidirectional sync.",
     "Keep code, focused tests, operator documentation, and this complete expected_files list within the task scope."
   ],
   "risk_level": "LOW",
@@ -15,10 +18,11 @@
     "tests/test_cloud_asset_obsidian_mirror.py"
   ],
   "acceptance": [
-    "The renderer is deterministic and the writer is idempotent by asset ID, version, and content hash.",
-    "A new canonical version updates the same note path.",
-    "Unmanaged notes and unsafe asset IDs are not overwritten.",
-    "Three production Cloud Asset KNOWLEDGE records are written to a real Obsidian Vault and independently read back with matching asset ID, versions, hash, and canonical content.",
-    "The standard future chain is Candidate review and conflict checks, Cloudflare Canonical write/read-back, then one-way Obsidian mirror sync/read-back."
+    "The exporter deterministically renders the three named Canonical records into the specified Chinese Obsidian layout without changing any Canonical record.",
+    "Every note preserves asset_id, version, canonical_version, content_hash, category, provenance, confidence, and review_policy in machine-readable metadata and passes filesystem read-back checks.",
+    "The Chinese home page links to all three notes; note wikilinks resolve; the mirror index maps each asset_id to the correct path and keeps entries for assets omitted from a partial sync.",
+    "Repeat sync of identical asset content leaves managed notes, home page, and index unchanged; updated Canonical content invalidates the matching localized override and renders safe fallback content.",
+    "Legacy flat notes are migrated only after ownership checks and successful new-note read-back; unmanaged files and path collisions remain untouched.",
+    "Focused tests pass; a code-only cloud run does not claim live Vault synchronization from fixture tests alone."
   ]
 }
