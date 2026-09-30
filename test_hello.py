@@ -153,6 +153,7 @@ from hello import (
     opencode_go_provider_golden_e2e_marker,
     pending_acceptance_notice,
     personal_ai_autonomous_advancement_production_evidence_audit_v0_1,
+    personal_ai_cold_start_capability_revalidation_v1,
     personal_ai_execution_dispatch_live_failure_audit,
     personal_ai_execution_result_exposure_audit_detail_export,
     personal_ai_task_runtime_audit,
@@ -8010,3 +8011,97 @@ def test_dedicated_push_step_dedupes_across_independent_processes(tmp_path) -> N
     ]
     assert len(delivered) == 1
     assert delivered[0]["push_id"] == "pid-xproc-push"
+
+
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_COLD_START_EXTERNAL_CAPABILITY_REVALIDATION_V1
+# ---------------------------------------------------------------------------
+def test_cold_start_revalidation_shape() -> None:
+    report = personal_ai_cold_start_capability_revalidation_v1()
+    assert report["report"] == "PERSONAL_AI_COLD_START_CAPABILITY_REVALIDATION_V1"
+    assert report["task_id"] == "cf-b9044a59d31b"
+    assert report["mode"] == "READ_ONLY"
+    assert report["status"] in VALID_STATUSES
+    assert set(report["capabilities"]) == {
+        "Execution",
+        "Cloud Asset",
+        "Knowledge",
+        "PersonOS",
+    }
+    assert report["capability_order"] == [
+        "Execution",
+        "Cloud Asset",
+        "Knowledge",
+        "PersonOS",
+    ]
+
+
+def test_cold_start_revalidation_statuses_allowed() -> None:
+    report = personal_ai_cold_start_capability_revalidation_v1()
+    allowed = hello_module.CAPABILITY_STATUSES
+    for name, info in report["capabilities"].items():
+        assert info["status"] in allowed, name
+        assert info["summary"]
+        assert info["unknowns"]
+        assert info["next_minimal_safe_action"]
+
+
+def test_cold_start_revalidation_evidence_is_source_tagged() -> None:
+    report = personal_ai_cold_start_capability_revalidation_v1()
+    sources = hello_module.EVIDENCE_SOURCES
+    for name, info in report["capabilities"].items():
+        assert info["evidence"], name
+        for item in info["evidence"]:
+            assert set(item) == {"source", "detail"}
+            assert item["source"] in sources
+            assert item["detail"]
+
+
+def test_cold_start_revalidation_no_historical_pass_as_current_production() -> None:
+    report = personal_ai_cold_start_capability_revalidation_v1()
+    assert report["historical_task_pass_is_current_production_pass"] is False
+    assert report["historical_status_policy"]
+    # A cold start with no live store must never claim VERIFIED.
+    for name, info in report["capabilities"].items():
+        assert info["status"] != "VERIFIED", name
+
+
+def test_cold_start_revalidation_read_only_flags() -> None:
+    report = personal_ai_cold_start_capability_revalidation_v1()
+    assert report["production_writes"] is False
+    assert report["submit_task_called"] is False
+    assert report["mark_reviewed_called"] is False
+    assert report["deploy_performed"] is False
+    assert report["workflow_dispatched"] is False
+    assert all(check["status"] == "PASS" for check in report["checks"])
+
+
+def test_cold_start_revalidation_unreadable_targets_are_unknown() -> None:
+    report = personal_ai_cold_start_capability_revalidation_v1()
+    assert set(report["target_tasks"]) == {"cf-15d186c2ee3a", "cf-3203a5610b61"}
+    for task_id, present in report["target_task_presence"].items():
+        if not present:
+            assert report["target_task_results"][task_id] is None
+    execution_unknowns = " ".join(report["capabilities"]["Execution"]["unknowns"])
+    assert "cf-15d186c2ee3a" in execution_unknowns
+    assert "cf-3203a5610b61" in execution_unknowns
+
+
+def test_cold_start_revalidation_knowledge_layers_present() -> None:
+    knowledge = personal_ai_cold_start_capability_revalidation_v1()["capabilities"][
+        "Knowledge"
+    ]
+    assert set(knowledge["layers"]) == {"Candidate", "Canonical", "Retrieval"}
+    for layer in knowledge["layers"].values():
+        assert layer["status"] in {"OBSERVED_CODE", "UNKNOWN"}
+        assert layer["evidence"]["source"] in hello_module.EVIDENCE_SOURCES
+
+
+def test_cold_start_revalidation_markdown_tokens() -> None:
+    report = personal_ai_cold_start_capability_revalidation_v1()
+    markdown = report["markdown"]
+    assert "PERSONAL_AI_COLD_START_CAPABILITY_REVALIDATION_V1" in markdown
+    assert "## Capability matrix" in markdown
+    for name in ("Execution", "Cloud Asset", "Knowledge", "PersonOS"):
+        assert name in markdown
+    assert "historical_task_pass_is_current_production_pass: False" in markdown

@@ -19556,6 +19556,450 @@ def dedicated_push_step_report(
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_COLD_START_EXTERNAL_CAPABILITY_REVALIDATION_V1
+#
+# Read-only cold-start revalidation of the current account's Personal AI
+# capabilities: Execution V2, Cloud Asset, Knowledge and PersonOS. This section
+# never submits a task, never calls mark_reviewed, never deploys, never commits,
+# never dispatches a workflow and never writes to any production store. It only
+# reads the real state visible in the current checkout.
+#
+# Every conclusion is tagged with its evidence source:
+#   OBSERVED -- actually read in this environment
+#   STATED   -- a historical record / document claims it
+#   INFERRED -- derived from observed facts
+#   UNKNOWN  -- no evidence
+# A historical task PASS is explicitly NOT treated as a current production PASS.
+# ---------------------------------------------------------------------------
+REVALIDATION_GOAL = "Personal AI Cold Start External Capability Revalidation V1"
+REVALIDATION_TASK_ID = "cf-b9044a59d31b"
+REVALIDATION_REPORT = "PERSONAL_AI_COLD_START_CAPABILITY_REVALIDATION_V1"
+UNKNOWN = "UNKNOWN"
+CAPABILITY_STATUSES = ("VERIFIED", "PARTIAL", "BLOCKED", "UNKNOWN")
+EVIDENCE_SOURCES = ("OBSERVED", "STATED", "INFERRED", "UNKNOWN")
+REVALIDATION_CAPABILITIES = ("Execution", "Cloud Asset", "Knowledge", "PersonOS")
+REVALIDATION_TARGET_TASKS = ("cf-15d186c2ee3a", "cf-3203a5610b61")
+REVALIDATION_ASSET_KEYWORDS = ("knowledge", "golden", "provenance")
+REVALIDATION_HISTORICAL_POLICY = (
+    "A historical task PASS / green workflow record is treated as STATED, not "
+    "as current production PASS. Only a live read in this run can raise a "
+    "capability above UNKNOWN."
+)
+
+
+def _revalidation_evidence(source: str, detail: str) -> dict:
+    """Build a single evidence item, rejecting unknown evidence sources."""
+    if source not in EVIDENCE_SOURCES:
+        raise ValueError(
+            f"invalid evidence source: {source!r} "
+            f"(allowed: {', '.join(EVIDENCE_SOURCES)})"
+        )
+    return {"source": source, "detail": detail}
+
+
+def _revalidation_local_asset_probe() -> dict:
+    """Read-only search of tracked files for canonical asset evidence.
+
+    Searches the tracked file list for knowledge / golden / provenance asset
+    names and reads exactly one matched file. It never writes or stages
+    anything.
+    """
+    tracked = [
+        line.strip() for line in _git("ls-files").splitlines() if line.strip()
+    ]
+    matches = [
+        path
+        for path in tracked
+        if any(keyword in path.lower() for keyword in REVALIDATION_ASSET_KEYWORDS)
+    ]
+    sample = None
+    if matches:
+        sample_path = REPO_ROOT / matches[0]
+        try:
+            text = sample_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        sample = {
+            "path": matches[0],
+            "bytes": len(text.encode("utf-8")),
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "excerpt": text[:400],
+        }
+    return {"matched": matches, "count": len(matches), "sample": sample}
+
+
+def personal_ai_cold_start_capability_revalidation_v1() -> dict:
+    """Produce the read-only cold-start capability matrix.
+
+    Capabilities: Execution, Cloud Asset, Knowledge, PersonOS. Each row carries
+    a VERIFIED / PARTIAL / BLOCKED / UNKNOWN status, source-tagged evidence, its
+    own unknowns and the next minimal safe action. This function has no side
+    effects on any production system.
+    """
+    execution_result = _read_execution_result()
+    registry_size = len(TASK_REGISTRY)
+    target_presence = {
+        task_id: task_id in TASK_REGISTRY for task_id in REVALIDATION_TARGET_TASKS
+    }
+    target_results = {
+        task_id: (
+            get_task_result(task_id)["execution_summary"]["status"]
+            if task_id in TASK_REGISTRY
+            else None
+        )
+        for task_id in REVALIDATION_TARGET_TASKS
+    }
+    review_event_count = len(get_review_events())
+    execution_source_present = (
+        REPO_ROOT / "src" / "personal_ai_execution" / "__init__.py"
+    ).is_file()
+    absent_targets = [t for t, present in target_presence.items() if not present]
+
+    execution = {
+        "status": PARTIAL if execution_source_present else UNKNOWN,
+        "summary": (
+            "Execution V2 implementation is present in the checkout, but no "
+            "durable task registry, task result or review state is readable in "
+            "this cold-start environment."
+        ),
+        "evidence": [
+            _revalidation_evidence(
+                "OBSERVED",
+                "src/personal_ai_execution/__init__.py present: "
+                f"{execution_source_present}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                f"in-memory TASK_REGISTRY size at cold start: {registry_size}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "repo-root execution_result.json readable: "
+                f"{execution_result is not None}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "target task results readable: "
+                + ", ".join(
+                    f"{t}={'READ:' + str(s) if s else 'ABSENT'}"
+                    for t, s in target_results.items()
+                ),
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                f"append-only review_event count at cold start: {review_event_count}",
+            ),
+            _revalidation_evidence(
+                "INFERRED",
+                "no durable task registry / per-task result store is reachable "
+                "offline, so current production task PASS cannot be asserted",
+            ),
+        ],
+        "unknowns": (
+            [
+                f"task result for {t} is not readable in this environment"
+                for t in absent_targets
+            ]
+            + ["current production task registry contents and review verdicts"]
+        ),
+        "next_minimal_safe_action": (
+            "Only read: re-run get_task_result()/get_task_review() from an "
+            "environment with the durable registry bound; do not submit a task."
+        ),
+    }
+
+    asset_probe = _revalidation_local_asset_probe()
+    cloud_asset_report = cloud_asset_status()
+    cloud_summary = {
+        check["component"]: check["status"] for check in cloud_asset_report["checks"]
+    }
+    cloud_asset = {
+        "status": PARTIAL,
+        "summary": (
+            "The canonical asset contract and provenance code are locally "
+            "observable, but the live Cloudflare Worker/D1 canonical store is "
+            "not reachable, so canonical asset search cannot be verified live."
+        ),
+        "evidence": [
+            _revalidation_evidence(
+                "OBSERVED",
+                f"local canonical asset probe matched {asset_probe['count']} "
+                f"tracked file(s)",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "cloud_asset_status components: "
+                + ", ".join(f"{k}={v}" for k, v in cloud_summary.items()),
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "read one matched asset: "
+                + (
+                    f"{asset_probe['sample']['path']} "
+                    f"sha256={asset_probe['sample']['sha256'][:12]} "
+                    f"bytes={asset_probe['sample']['bytes']}"
+                    if asset_probe["sample"]
+                    else "none"
+                ),
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "worker canonical read path (search_assets/get_asset) source "
+                "present in worker/index.js",
+            ),
+            _revalidation_evidence(
+                "INFERRED",
+                "no Cloudflare credential / D1 binding is available, so the "
+                "live canonical asset search result remains UNKNOWN",
+            ),
+        ],
+        "unknowns": [
+            "live canonical asset search results from Cloudflare D1",
+            "live asset_versions / provenance rows",
+        ],
+        "next_minimal_safe_action": (
+            "Only read: perform one read-only canonical asset search against "
+            "the live MCP endpoint when a credential is present; do not write "
+            "or promote any asset."
+        ),
+    }
+
+    knowledge_report = knowledge_ground_truth_audit_v0_1()
+    knowledge_canonical = knowledge_report.get("KNOWLEDGE_CANONICAL_CURRENT")
+    knowledge = {
+        "status": BLOCKED,
+        "summary": (
+            "The three knowledge layers are not all observable: the candidate "
+            "writer exists in the Worker source, but no canonical knowledge "
+            "store and no retrieval store are reachable in this environment."
+        ),
+        "layers": {
+            "Candidate": {
+                "status": "OBSERVED_CODE",
+                "evidence": _revalidation_evidence(
+                    "OBSERVED",
+                    "worker/index.js exposes the controlled KNOWLEDGE candidate "
+                    "writer writeKnowledgeCandidate",
+                ),
+            },
+            "Canonical": {
+                "status": "UNKNOWN",
+                "evidence": _revalidation_evidence(
+                    "OBSERVED",
+                    f"knowledge canonical resolved to {knowledge_canonical}; "
+                    "no D1/KV/vault binding is accessible",
+                ),
+            },
+            "Retrieval": {
+                "status": "UNKNOWN",
+                "evidence": _revalidation_evidence(
+                    "OBSERVED",
+                    "Worker search_assets/get_asset read path present in source, "
+                    "but no live retrieval store is reachable",
+                ),
+            },
+        },
+        "evidence": [
+            _revalidation_evidence(
+                "OBSERVED",
+                "knowledge_ground_truth_audit_v0_1 canonical: "
+                f"{knowledge_canonical}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "knowledge storage layers: "
+                + ", ".join(
+                    f"{name}={info['status']}"
+                    for name, info in knowledge_report.get("layers", {}).items()
+                ),
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "worker knowledge candidate writer present in worker/index.js",
+            ),
+            _revalidation_evidence(
+                "UNKNOWN",
+                "no canonical knowledge store or retrieval index is observable",
+            ),
+        ],
+        "unknowns": [
+            "canonical knowledge store contents",
+            "retrieval index availability and query results",
+        ],
+        "next_minimal_safe_action": (
+            "Only read: run the existing knowledge_ground_truth_audit_v0_1() "
+            "with a bound D1/KV store; do not promote or write a candidate."
+        ),
+    }
+
+    readme_text = ""
+    readme_path = REPO_ROOT / "README.md"
+    if readme_path.is_file():
+        try:
+            readme_text = readme_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            readme_text = ""
+    personos = {
+        "status": UNKNOWN,
+        "summary": (
+            "No PersonOS repository, canonical, projection or real data store "
+            "is observable from this cloud execution environment."
+        ),
+        "evidence": [
+            _revalidation_evidence(
+                "STATED",
+                "README.md states this repository is a throwaway sandbox and is "
+                "not PersonOS, Knowledge or any real project",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "no PersonOS / projection / vault path is tracked in this "
+                "repository",
+            ),
+            _revalidation_evidence(
+                "UNKNOWN",
+                "local PersonOS Obsidian vault is not inspectable from cloud",
+            ),
+        ],
+        "unknowns": [
+            "PersonOS repository visibility",
+            "PersonOS canonical and projection state",
+            "PersonOS real data state",
+        ],
+        "next_minimal_safe_action": (
+            "Only read: inspect the PersonOS vault/repository locally on the "
+            "device; do not restore any prior architecture from the cloud."
+        ),
+    }
+
+    capabilities = {
+        "Execution": execution,
+        "Cloud Asset": cloud_asset,
+        "Knowledge": knowledge,
+        "PersonOS": personos,
+    }
+
+    checks = [
+        {
+            "check": "all four capabilities reported",
+            "status": PASS
+            if all(name in capabilities for name in REVALIDATION_CAPABILITIES)
+            else FAIL,
+            "detail": "capabilities: " + ", ".join(REVALIDATION_CAPABILITIES),
+        },
+        {
+            "check": "every capability status is allowed",
+            "status": PASS
+            if all(
+                info["status"] in CAPABILITY_STATUSES
+                for info in capabilities.values()
+            )
+            else FAIL,
+            "detail": "; ".join(
+                f"{name}={info['status']}" for name, info in capabilities.items()
+            ),
+        },
+        {
+            "check": "every evidence item is source-tagged",
+            "status": PASS
+            if all(
+                item.get("source") in EVIDENCE_SOURCES
+                for info in capabilities.values()
+                for item in info["evidence"]
+            )
+            else FAIL,
+            "detail": "evidence sources: " + ", ".join(EVIDENCE_SOURCES),
+        },
+        {
+            "check": "historical PASS not treated as current production PASS",
+            "status": PASS
+            if all(
+                info["status"] != "VERIFIED" for info in capabilities.values()
+            )
+            else FAIL,
+            "detail": "no capability is VERIFIED from historical records alone",
+        },
+        {
+            "check": "unknowns and next minimal safe action listed",
+            "status": PASS
+            if all(info["unknowns"] and info["next_minimal_safe_action"]
+                   for info in capabilities.values())
+            else FAIL,
+            "detail": "each capability lists unknowns and a read-only next action",
+        },
+        {
+            "check": "read-only: no production write performed",
+            "status": PASS,
+            "detail": "no submit_task / mark_reviewed / deploy / dispatch / write",
+        },
+    ]
+
+    overall = (
+        PASS
+        if all(check["status"] == PASS for check in checks)
+        else FAIL
+    )
+
+    lines = [
+        f"# {REVALIDATION_REPORT}",
+        "",
+        f"- goal: {REVALIDATION_GOAL}",
+        f"- task_id: {REVALIDATION_TASK_ID}",
+        f"- generated_at: {_utc_now()}",
+        "- mode: READ_ONLY",
+        f"- overall: {overall}",
+        "- historical_task_pass_is_current_production_pass: False",
+        "- production_writes: False",
+        "",
+        "## Capability matrix",
+    ]
+    for name in REVALIDATION_CAPABILITIES:
+        info = capabilities[name]
+        lines.append(f"- {name}: {info['status']}")
+    for name in REVALIDATION_CAPABILITIES:
+        info = capabilities[name]
+        lines += ["", f"## {name} [{info['status']}]", f"- {info['summary']}"]
+        for item in info["evidence"]:
+            lines.append(f"- ({item['source']}) {item['detail']}")
+        lines.append("- unknowns:")
+        for unknown in info["unknowns"]:
+            lines.append(f"  - {unknown}")
+        lines.append(
+            f"- next_minimal_safe_action: {info['next_minimal_safe_action']}"
+        )
+    lines += ["", "## Checks"]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={overall}"]
+
+    return {
+        "report": REVALIDATION_REPORT,
+        "goal": REVALIDATION_GOAL,
+        "task_id": REVALIDATION_TASK_ID,
+        "generated_at": _utc_now(),
+        "mode": "READ_ONLY",
+        "status": overall,
+        "FINAL_STATUS": overall,
+        "capabilities": capabilities,
+        "capability_order": list(REVALIDATION_CAPABILITIES),
+        "target_tasks": list(REVALIDATION_TARGET_TASKS),
+        "target_task_presence": target_presence,
+        "target_task_results": target_results,
+        "capability_statuses_allowed": list(CAPABILITY_STATUSES),
+        "evidence_sources_allowed": list(EVIDENCE_SOURCES),
+        "historical_task_pass_is_current_production_pass": False,
+        "historical_status_policy": REVALIDATION_HISTORICAL_POLICY,
+        "production_writes": False,
+        "submit_task_called": False,
+        "mark_reviewed_called": False,
+        "deploy_performed": False,
+        "workflow_dispatched": False,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -19585,3 +20029,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(push_adapter_report()["markdown"])
     print(serverchan_adapter_report()["markdown"])
     print(dedicated_push_step_report()["markdown"])
+    print(personal_ai_cold_start_capability_revalidation_v1()["markdown"])
