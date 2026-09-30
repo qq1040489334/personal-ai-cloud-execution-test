@@ -154,6 +154,7 @@ from hello import (
     pending_acceptance_notice,
     personal_ai_autonomous_advancement_production_evidence_audit_v0_1,
     personal_ai_cold_start_capability_revalidation_v1,
+    personal_ai_cold_start_live_read_path_verification_v1,
     personal_ai_execution_dispatch_live_failure_audit,
     personal_ai_execution_result_exposure_audit_detail_export,
     personal_ai_task_runtime_audit,
@@ -8105,3 +8106,101 @@ def test_cold_start_revalidation_markdown_tokens() -> None:
     for name in ("Execution", "Cloud Asset", "Knowledge", "PersonOS"):
         assert name in markdown
     assert "historical_task_pass_is_current_production_pass: False" in markdown
+
+
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_COLD_START_LIVE_READ_PATH_VERIFICATION_V1
+# ---------------------------------------------------------------------------
+def test_live_read_path_shape() -> None:
+    report = personal_ai_cold_start_live_read_path_verification_v1()
+    assert report["report"] == "PERSONAL_AI_COLD_START_LIVE_READ_PATH_VERIFICATION_V1"
+    assert report["task_id"] == "cf-7b8693a09445"
+    assert report["mode"] == "READ_ONLY"
+    assert report["status"] in VALID_STATUSES
+    assert report["read_path_order"] == list(hello_module.LIVE_READ_PATH_COMPONENTS)
+    assert set(report["read_path_matrix"]) == set(
+        hello_module.LIVE_READ_PATH_COMPONENTS
+    )
+
+
+def test_live_read_path_statuses_and_evidence() -> None:
+    report = personal_ai_cold_start_live_read_path_verification_v1()
+    allowed = hello_module.LIVE_READ_PATH_STATUSES
+    for name, info in report["read_path_matrix"].items():
+        assert info["status"] in allowed, name
+        assert info["summary"]
+        assert info["evidence"]
+        assert info["unknowns"]
+        assert info["next_minimal_safe_action"]
+        for item in info["evidence"]:
+            assert set(item) == {"source", "detail"}
+            assert item["source"] in hello_module.EVIDENCE_SOURCES
+            assert item["detail"]
+
+
+def test_live_read_path_cloud_asset_status_and_evidence() -> None:
+    cloud_asset = personal_ai_cold_start_live_read_path_verification_v1()["cloud_asset"]
+    assert cloud_asset["status"] in hello_module.LIVE_READ_PATH_STATUSES
+    assert cloud_asset["evidence"]
+    assert cloud_asset["unknowns"]
+    assert cloud_asset["next_minimal_safe_action"]
+    for item in cloud_asset["evidence"]:
+        assert item["source"] in hello_module.EVIDENCE_SOURCES
+
+
+def test_live_read_path_knowledge_three_layers() -> None:
+    report = personal_ai_cold_start_live_read_path_verification_v1()
+    knowledge = report["knowledge"]
+    assert knowledge["status"] in hello_module.LIVE_READ_PATH_STATUSES
+    assert set(knowledge["layers"]) == {"Candidate", "Canonical", "Retrieval"}
+    assert report["knowledge_layers_order"] == [
+        "Candidate",
+        "Canonical",
+        "Retrieval",
+    ]
+    for layer in knowledge["layers"].values():
+        assert layer["status"] in hello_module.LIVE_READ_PATH_STATUSES
+        assert layer["evidence"]
+        for item in layer["evidence"]:
+            assert item["source"] in hello_module.EVIDENCE_SOURCES
+
+
+def test_live_read_path_next_minimal_safe_action() -> None:
+    report = personal_ai_cold_start_live_read_path_verification_v1()
+    assert report["next_minimal_safe_action"]
+    assert report["missing"]["permissions"]
+    assert report["missing"]["bindings"]
+    assert report["missing"]["entry_points"]
+
+
+def test_live_read_path_no_production_side_effects() -> None:
+    report = personal_ai_cold_start_live_read_path_verification_v1()
+    assert report["production_writes"] is False
+    assert report["deployment_performed"] is False
+    assert report["review_performed"] is False
+    assert report["submit_task_called"] is False
+    assert report["mark_reviewed_called"] is False
+    assert report["workflow_dispatched"] is False
+    assert report["credential_values_recorded"] is False
+    assert all(check["status"] == "PASS" for check in report["checks"])
+
+
+def test_live_read_path_no_verified_without_live_probe() -> None:
+    report = personal_ai_cold_start_live_read_path_verification_v1()
+    assert report["historical_record_is_live_verified"] is False
+    assert report["historical_status_policy"]
+    if not report["live_probe_performed"]:
+        for name, info in report["read_path_matrix"].items():
+            assert info["status"] != "VERIFIED", name
+        assert report["cloud_asset"]["status"] != "VERIFIED"
+        assert report["knowledge"]["status"] != "VERIFIED"
+
+
+def test_live_read_path_markdown_tokens() -> None:
+    report = personal_ai_cold_start_live_read_path_verification_v1()
+    markdown = report["markdown"]
+    assert "PERSONAL_AI_COLD_START_LIVE_READ_PATH_VERIFICATION_V1" in markdown
+    assert "## Live Read Path status matrix" in markdown
+    assert "historical_record_is_live_verified: False" in markdown
+    for name in hello_module.LIVE_READ_PATH_COMPONENTS:
+        assert name in markdown

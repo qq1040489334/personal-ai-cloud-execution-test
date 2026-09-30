@@ -20000,6 +20000,688 @@ def personal_ai_cold_start_capability_revalidation_v1() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_COLD_START_LIVE_READ_PATH_VERIFICATION_V1
+#
+# Read-only, cold-start verification of whether this execution environment can
+# reach the real Personal AI Cloud Asset read / Execution production read path.
+# It only reads the current checkout and the *names* of environment variables;
+# it never authenticates, never performs an unbounded/unsafe network probe,
+# never deploys, never calls submit_task / mark_reviewed and never writes to any
+# production store. Missing permissions, bindings and entry points are recorded
+# explicitly instead of simulating success.
+#
+# Every conclusion is layered by evidence source:
+#   OBSERVED -- actually read in this environment
+#   STATED   -- a historical record / document claims it
+#   INFERRED -- derived from observed facts
+#   UNKNOWN  -- no evidence
+# A historical task PASS or a self-declared production baseline is STATED only
+# and is never treated as a live VERIFIED read.
+# ---------------------------------------------------------------------------
+LIVE_READ_PATH_GOAL = "Cold Start Live Read Path Verification V1"
+LIVE_READ_PATH_TASK_ID = "cf-7b8693a09445"
+LIVE_READ_PATH_REPORT = "PERSONAL_AI_COLD_START_LIVE_READ_PATH_VERIFICATION_V1"
+LIVE_READ_PATH_STATUSES = ("VERIFIED", "PARTIAL", "BLOCKED", "UNKNOWN")
+LIVE_READ_PATH_COMPONENTS = (
+    "Execution Read",
+    "Cloud Asset Canonical Read",
+    "Production Worker Binding",
+    "Production D1 ASSET_DB",
+    "Knowledge Candidate",
+    "Knowledge Canonical",
+    "Knowledge Retrieval",
+)
+KNOWLEDGE_READ_LAYERS = ("Candidate", "Canonical", "Retrieval")
+LIVE_READ_PATH_CREDENTIAL_ENV_NAMES = (
+    "CLOUDFLARE_API_TOKEN",
+    "CF_API_TOKEN",
+    "CLOUDFLARE_API_KEY",
+    "MCP_AUTH_TOKEN",
+)
+LIVE_READ_PATH_HOST_ENV_NAMES = (
+    "PERSONAL_AI_PRODUCTION_URL",
+    "PERSONAL_AI_MCP_URL",
+    "MCP_ENDPOINT",
+)
+LIVE_READ_PATH_WORKER_READ_TOKENS = (
+    "search_assets",
+    "get_asset",
+    "write_knowledge_candidate",
+    "writeKnowledgeCandidate",
+)
+LIVE_READ_PATH_HISTORICAL_POLICY = (
+    "A historical task PASS, a green workflow record or the self-declared "
+    "worker/PRODUCTION-BASELINE.json is treated as STATED, never as a live "
+    "VERIFIED read. Only a real read against the production read path in this "
+    "run can raise a component to VERIFIED."
+)
+
+
+def _live_read_path_present_env_names(names: tuple[str, ...]) -> list[str]:
+    """Return present env var *names* only; values are never read or recorded."""
+    return sorted(name for name in names if os.environ.get(name))
+
+
+def _live_read_path_read_worker() -> str:
+    """Read the canonical Worker source for read-path token evidence (read-only)."""
+    path = REPO_ROOT / "worker" / "index.js"
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _live_read_path_component(
+    status: str,
+    summary: str,
+    evidence: list[dict],
+    unknowns: list[str],
+    next_minimal_safe_action: str,
+) -> dict:
+    """Build one read-path matrix row with source-tagged evidence."""
+    if status not in LIVE_READ_PATH_STATUSES:
+        raise ValueError(f"invalid read-path status: {status!r}")
+    return {
+        "status": status,
+        "summary": summary,
+        "evidence": evidence,
+        "unknowns": unknowns,
+        "next_minimal_safe_action": next_minimal_safe_action,
+    }
+
+
+def _live_read_path_aggregate(statuses: list[str]) -> str:
+    """Aggregate child read-path statuses into one capability status."""
+    if statuses and all(status == "VERIFIED" for status in statuses):
+        return "VERIFIED"
+    if "VERIFIED" in statuses or "PARTIAL" in statuses:
+        return "PARTIAL"
+    if "BLOCKED" in statuses:
+        return "BLOCKED"
+    return "UNKNOWN"
+
+
+def personal_ai_cold_start_live_read_path_verification_v1() -> dict:
+    """Produce the read-only cold-start Live Read Path status matrix.
+
+    Reports whether this environment can reach the production Cloud Asset
+    read / Execution read path and the Knowledge Candidate / Canonical /
+    Retrieval layers, with VERIFIED / PARTIAL / BLOCKED / UNKNOWN plus
+    source-tagged evidence and a next minimal safe action. It has no side
+    effects on any production system: no write, deploy, review, submit or
+    dispatch is performed.
+    """
+    execution_result = _read_execution_result()
+    registry_size = len(TASK_REGISTRY)
+    review_event_count = len(get_review_events())
+
+    worker_present = _first_present(WORKER_EVIDENCE) or ""
+    d1_present = _first_present(D1_EVIDENCE) or ""
+    worker_source = _live_read_path_read_worker()
+    worker_tokens = {
+        token: token in worker_source for token in LIVE_READ_PATH_WORKER_READ_TOKENS
+    }
+    worker_read_path_present = bool(
+        worker_tokens["search_assets"] and worker_tokens["get_asset"]
+    )
+    candidate_writer_present = bool(worker_tokens["write_knowledge_candidate"])
+
+    credential_names = _live_read_path_present_env_names(
+        LIVE_READ_PATH_CREDENTIAL_ENV_NAMES
+    )
+    host_names = _live_read_path_present_env_names(LIVE_READ_PATH_HOST_ENV_NAMES)
+
+    contract_present = (REPO_ROOT / "ASSET_PROVENANCE_CONTRACT_V0.2.md").is_file()
+    baseline_present = (REPO_ROOT / "worker" / "PRODUCTION-BASELINE.json").is_file()
+
+    knowledge_report = knowledge_ground_truth_audit_v0_1()
+    knowledge_canonical = knowledge_report.get("KNOWLEDGE_CANONICAL_CURRENT")
+
+    live_read_reachable = bool(credential_names and host_names)
+    live_probe_performed = False
+
+    execution = _live_read_path_component(
+        "BLOCKED",
+        "The Execution read path is not reachable at cold start: no durable task "
+        "registry, per-task result or review store is bound in this environment.",
+        [
+            _revalidation_evidence(
+                "OBSERVED",
+                f"in-memory TASK_REGISTRY size at cold start: {registry_size}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                f"append-only review_event count at cold start: {review_event_count}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "repo-root execution_result.json readable: "
+                f"{execution_result is not None}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "no durable registry/result binding is declared or reachable in "
+                "this cold-start environment",
+            ),
+            _revalidation_evidence(
+                "INFERRED",
+                "without a bound durable store, get_task_result()/list_pending_"
+                "results() cannot be confirmed against production",
+            ),
+        ],
+        [
+            "current production task registry contents",
+            "current production review verdicts",
+        ],
+        "Only read: run get_task_result()/get_review_events() from an "
+        "environment with the durable registry bound; do not submit a task.",
+    )
+
+    cloud_asset_read = _live_read_path_component(
+        "BLOCKED",
+        "The Cloud Asset canonical read path (search_assets/get_asset) exists in "
+        "the canonical Worker source but is not reachable live from this "
+        "cold-start environment.",
+        [
+            _revalidation_evidence(
+                "OBSERVED",
+                "canonical Worker source contains search_assets="
+                f"{worker_tokens['search_assets']} get_asset="
+                f"{worker_tokens['get_asset']}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                f"ASSET_PROVENANCE_CONTRACT_V0.2.md present: {contract_present}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "Cloud Asset credential env names present: "
+                f"{credential_names or '[]'} (values never read)",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "production host/endpoint env names present: "
+                f"{host_names or '[]'} (values never read)",
+            ),
+            _revalidation_evidence(
+                "STATED",
+                "the production hostname is not recorded in the repository; only "
+                "the service name and account id appear in "
+                "worker/PRODUCTION-BASELINE.json",
+            ),
+            _revalidation_evidence(
+                "INFERRED",
+                "no credential and no reachable endpoint means a live canonical "
+                "asset read cannot be performed without fabrication",
+            ),
+        ],
+        [
+            "live canonical asset search results from Cloudflare D1",
+            "live asset_versions / provenance rows",
+        ],
+        "Only read: with a scoped Cloudflare read credential and the recorded "
+        "production hostname, issue one read-only search_assets/get_asset call; "
+        "do not write or promote any asset.",
+    )
+
+    worker_binding = _live_read_path_component(
+        "BLOCKED",
+        "The canonical Worker config is present locally, but the live production "
+        "Worker binding and version are not independently reachable.",
+        [
+            _revalidation_evidence(
+                "OBSERVED",
+                f"Worker config/entrypoint present: {worker_present or 'none'}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                f"worker/PRODUCTION-BASELINE.json present: {baseline_present}",
+            ),
+            _revalidation_evidence(
+                "STATED",
+                "worker/PRODUCTION-BASELINE.json self-declares production "
+                "version 3e2fed43; this is STATED, not live-verified",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "no Cloudflare read credential / MCP read interface env name is "
+                f"present ({credential_names or '[]'})",
+            ),
+        ],
+        [
+            "live Cloudflare Worker version id / deployment id",
+            "deployed Worker source hash",
+        ],
+        "Only read: with a Cloudflare read credential, read the Worker "
+        "versions/deployments API; do not deploy.",
+    )
+
+    d1_binding = _live_read_path_component(
+        "BLOCKED",
+        "The production D1 ASSET_DB binding is declared in wrangler.toml but no "
+        "live D1 read is reachable from this environment.",
+        [
+            _revalidation_evidence(
+                "OBSERVED",
+                f"D1 binding or migrations present: {d1_present or 'none'}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "worker/wrangler.toml declares [[d1_databases]] binding ASSET_DB "
+                "(declaration only; no live connection)",
+            ),
+            _revalidation_evidence(
+                "STATED",
+                "worker/PRODUCTION-BASELINE.json records ASSET_DB database id "
+                "45d6f18a-3a34-4ccd-8337-c00a775cd7a2",
+            ),
+            _revalidation_evidence(
+                "UNKNOWN",
+                "no live D1 query result is observable in this environment",
+            ),
+        ],
+        ["live ASSET_DB row counts and canonical asset rows"],
+        "Only read: run one bounded SELECT against ASSET_DB with a scoped D1 "
+        "read credential; do not migrate or mutate.",
+    )
+
+    knowledge_candidate = _live_read_path_component(
+        "BLOCKED",
+        "The controlled KNOWLEDGE candidate writer is present in the canonical "
+        "Worker source, but no candidate read path is reachable live.",
+        [
+            _revalidation_evidence(
+                "OBSERVED",
+                "canonical Worker source contains write_knowledge_candidate="
+                f"{worker_tokens['write_knowledge_candidate']} "
+                f"writeKnowledgeCandidate={worker_tokens['writeKnowledgeCandidate']}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "no candidate store / D1 / KV read binding is reachable in this "
+                "cold-start environment",
+            ),
+            _revalidation_evidence(
+                "STATED",
+                "historical candidate ids ("
+                f"{KNOWLEDGE_CANDIDATE_GOLDEN}, {KNOWLEDGE_CANDIDATE_ANTHROPIC}) "
+                "are recorded in-repo but not read back live",
+            ),
+        ],
+        ["live candidate rows and their verification column"],
+        "Only read: query the candidate store read-only with a scoped credential; "
+        "do not promote or write a candidate.",
+    )
+
+    knowledge_canonical = _live_read_path_component(
+        "BLOCKED",
+        "No canonical knowledge store is reachable from this environment.",
+        [
+            _revalidation_evidence(
+                "OBSERVED",
+                f"knowledge canonical resolved to {knowledge_canonical}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "no D1/KV/vault knowledge binding is accessible",
+            ),
+            _revalidation_evidence(
+                "UNKNOWN",
+                "canonical knowledge store contents",
+            ),
+        ],
+        ["canonical knowledge store contents"],
+        "Only read: run knowledge_ground_truth_audit_v0_1() with a bound "
+        "canonical store; do not promote any candidate.",
+    )
+
+    knowledge_retrieval = _live_read_path_component(
+        "BLOCKED",
+        "The retrieval read path exists in canonical source but no live retrieval "
+        "index is reachable.",
+        [
+            _revalidation_evidence(
+                "OBSERVED",
+                "Worker search_assets/get_asset retrieval read path present in "
+                f"canonical source: {worker_read_path_present}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "no live retrieval store / index is reachable",
+            ),
+            _revalidation_evidence(
+                "UNKNOWN",
+                "retrieval index availability and query results",
+            ),
+        ],
+        ["retrieval index availability", "retrieval query results"],
+        "Only read: issue one read-only retrieval query against a bound index; "
+        "do not write or reindex.",
+    )
+
+    matrix = {
+        "Execution Read": execution,
+        "Cloud Asset Canonical Read": cloud_asset_read,
+        "Production Worker Binding": worker_binding,
+        "Production D1 ASSET_DB": d1_binding,
+        "Knowledge Candidate": knowledge_candidate,
+        "Knowledge Canonical": knowledge_canonical,
+        "Knowledge Retrieval": knowledge_retrieval,
+    }
+
+    cloud_asset_status_value = _live_read_path_aggregate(
+        [
+            cloud_asset_read["status"],
+            worker_binding["status"],
+            d1_binding["status"],
+        ]
+    )
+    knowledge_status_value = _live_read_path_aggregate(
+        [
+            knowledge_candidate["status"],
+            knowledge_canonical["status"],
+            knowledge_retrieval["status"],
+        ]
+    )
+
+    cloud_asset = {
+        "status": cloud_asset_status_value,
+        "summary": (
+            "Local canonical read-path artifacts are observable (contract, "
+            "search_assets/get_asset source, declared ASSET_DB binding), but no "
+            "live canonical asset read is reachable at cold start."
+        ),
+        "evidence": [
+            _revalidation_evidence(
+                "OBSERVED",
+                "canonical read path source present: "
+                f"{worker_read_path_present}; contract present: {contract_present}",
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                "credential/interface env names present: "
+                f"{credential_names or '[]'}; host env names present: "
+                f"{host_names or '[]'}",
+            ),
+            _revalidation_evidence(
+                "STATED",
+                "reports/RUNTIME_PROVENANCE_FINAL_AUDIT_V0.4.md records that no "
+                "production hostname is recorded and no bearer token is available",
+            ),
+            _revalidation_evidence(
+                "INFERRED",
+                "the live canonical asset read path is BLOCKED, not VERIFIED, "
+                "because the required permission and entry point are absent",
+            ),
+        ],
+        "unknowns": [
+            "live canonical asset contents",
+            "live asset provenance read-back",
+        ],
+        "next_minimal_safe_action": cloud_asset_read["next_minimal_safe_action"],
+    }
+
+    knowledge = {
+        "status": knowledge_status_value,
+        "summary": (
+            "The three Knowledge layers are not observable live: the candidate "
+            "writer is present in canonical source, but no candidate, canonical "
+            "or retrieval read path is reachable at cold start."
+        ),
+        "layers": {
+            "Candidate": {
+                "status": knowledge_candidate["status"],
+                "evidence": knowledge_candidate["evidence"],
+            },
+            "Canonical": {
+                "status": knowledge_canonical["status"],
+                "evidence": knowledge_canonical["evidence"],
+            },
+            "Retrieval": {
+                "status": knowledge_retrieval["status"],
+                "evidence": knowledge_retrieval["evidence"],
+            },
+        },
+        "evidence": [
+            _revalidation_evidence(
+                "OBSERVED",
+                "knowledge storage layers: "
+                + ", ".join(
+                    f"{name}={info['status']}"
+                    for name, info in knowledge_report.get("layers", {}).items()
+                ),
+            ),
+            _revalidation_evidence(
+                "OBSERVED",
+                f"knowledge canonical resolved to {knowledge_canonical}",
+            ),
+            _revalidation_evidence(
+                "UNKNOWN",
+                "no canonical knowledge store or retrieval index is observable",
+            ),
+        ],
+        "unknowns": [
+            "candidate layer read-back",
+            "canonical knowledge store contents",
+            "retrieval index availability and query results",
+        ],
+        "next_minimal_safe_action": (
+            "Only read: run the existing knowledge_ground_truth_audit_v0_1() and "
+            "one retrieval query with a bound D1/KV store; do not promote or "
+            "write a candidate."
+        ),
+    }
+
+    next_minimal_safe_action = (
+        "Only read: with a scoped Cloudflare read credential and the recorded "
+        "production hostname, issue exactly one read-only MCP call to "
+        "search_assets/get_asset and one get_task_result read; do not deploy, "
+        "submit, mark_reviewed, write or dispatch anything."
+    )
+
+    missing = {
+        "permissions": [
+            f"scoped Cloudflare read credential (checked env names: "
+            f"{', '.join(LIVE_READ_PATH_CREDENTIAL_ENV_NAMES)})",
+            "MCP read bearer token",
+        ],
+        "bindings": [
+            "live Cloudflare Worker/D1 ASSET_DB binding (declared only in "
+            "worker/wrangler.toml)",
+            "durable Execution task registry / result store",
+            "Knowledge candidate / canonical / retrieval store",
+        ],
+        "entry_points": [
+            "production hostname / MCP endpoint (not recorded in the repository)",
+        ],
+    }
+
+    checks = [
+        {
+            "check": "all live read path components reported",
+            "status": PASS
+            if all(name in matrix for name in LIVE_READ_PATH_COMPONENTS)
+            else FAIL,
+            "detail": "components: " + ", ".join(LIVE_READ_PATH_COMPONENTS),
+        },
+        {
+            "check": "every read path status is allowed",
+            "status": PASS
+            if all(info["status"] in LIVE_READ_PATH_STATUSES for info in matrix.values())
+            else FAIL,
+            "detail": "; ".join(
+                f"{name}={info['status']}" for name, info in matrix.items()
+            ),
+        },
+        {
+            "check": "every evidence item is source-tagged",
+            "status": PASS
+            if all(
+                item.get("source") in EVIDENCE_SOURCES
+                for info in matrix.values()
+                for item in info["evidence"]
+            )
+            and all(
+                item.get("source") in EVIDENCE_SOURCES
+                for cap in (cloud_asset, knowledge)
+                for item in cap["evidence"]
+            )
+            and all(
+                item.get("source") in EVIDENCE_SOURCES
+                for layer in knowledge["layers"].values()
+                for item in layer["evidence"]
+            )
+            else FAIL,
+            "detail": "evidence sources: " + ", ".join(EVIDENCE_SOURCES),
+        },
+        {
+            "check": "Cloud Asset status reported with evidence",
+            "status": PASS
+            if cloud_asset["status"] in LIVE_READ_PATH_STATUSES
+            and cloud_asset["evidence"]
+            else FAIL,
+            "detail": f"Cloud Asset={cloud_asset['status']} with "
+            f"{len(cloud_asset['evidence'])} evidence item(s)",
+        },
+        {
+            "check": "Knowledge Candidate/Canonical/Retrieval layers reported",
+            "status": PASS
+            if set(knowledge["layers"]) == set(KNOWLEDGE_READ_LAYERS)
+            and all(
+                layer["status"] in LIVE_READ_PATH_STATUSES
+                and layer["evidence"]
+                for layer in knowledge["layers"].values()
+            )
+            else FAIL,
+            "detail": "; ".join(
+                f"{name}={info['status']}"
+                for name, info in knowledge["layers"].items()
+            ),
+        },
+        {
+            "check": "every component lists a next minimal safe action",
+            "status": PASS
+            if all(info["next_minimal_safe_action"] for info in matrix.values())
+            and cloud_asset["next_minimal_safe_action"]
+            and knowledge["next_minimal_safe_action"]
+            else FAIL,
+            "detail": "each read path lists unknowns and a read-only next action",
+        },
+        {
+            "check": "no historical PASS treated as live VERIFIED",
+            "status": PASS
+            if all(info["status"] != "VERIFIED" for info in matrix.values())
+            else FAIL,
+            "detail": "no component is VERIFIED from historical/self-declared "
+            "records alone",
+        },
+        {
+            "check": "read-only: no production write, deploy or review performed",
+            "status": PASS,
+            "detail": "no submit_task / mark_reviewed / deploy / dispatch / write "
+            "performed; live_probe_performed=False",
+        },
+    ]
+
+    overall = PASS if all(check["status"] == PASS for check in checks) else FAIL
+
+    lines = [
+        f"# {LIVE_READ_PATH_REPORT}",
+        "",
+        f"- goal: {LIVE_READ_PATH_GOAL}",
+        f"- task_id: {LIVE_READ_PATH_TASK_ID}",
+        f"- generated_at: {_utc_now()}",
+        "- mode: READ_ONLY",
+        f"- overall: {overall}",
+        f"- live_probe_performed: {live_probe_performed}",
+        "- historical_record_is_live_verified: False",
+        "- production_writes: False",
+        "- deployment_performed: False",
+        "- review_performed: False",
+        "",
+        "## Live Read Path status matrix",
+    ]
+    for name in LIVE_READ_PATH_COMPONENTS:
+        lines.append(f"- {name}: {matrix[name]['status']}")
+    for name in LIVE_READ_PATH_COMPONENTS:
+        info = matrix[name]
+        lines += ["", f"## {name} [{info['status']}]", f"- {info['summary']}"]
+        for item in info["evidence"]:
+            lines.append(f"- ({item['source']}) {item['detail']}")
+        lines.append("- unknowns:")
+        for unknown in info["unknowns"]:
+            lines.append(f"  - {unknown}")
+        lines.append(
+            f"- next_minimal_safe_action: {info['next_minimal_safe_action']}"
+        )
+    lines += [
+        "",
+        f"## Cloud Asset [{cloud_asset['status']}]",
+        f"- {cloud_asset['summary']}",
+    ]
+    for item in cloud_asset["evidence"]:
+        lines.append(f"- ({item['source']}) {item['detail']}")
+    lines += ["", f"## Knowledge [{knowledge['status']}]"]
+    for name in KNOWLEDGE_READ_LAYERS:
+        layer = knowledge["layers"][name]
+        lines.append(f"- {name}: {layer['status']}")
+    lines += ["", "## Missing access", "- permissions:"]
+    for item in missing["permissions"]:
+        lines.append(f"  - {item}")
+    lines.append("- bindings:")
+    for item in missing["bindings"]:
+        lines.append(f"  - {item}")
+    lines.append("- entry_points:")
+    for item in missing["entry_points"]:
+        lines.append(f"  - {item}")
+    lines += [
+        "",
+        f"- next_minimal_safe_action: {next_minimal_safe_action}",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={overall}"]
+
+    return {
+        "report": LIVE_READ_PATH_REPORT,
+        "goal": LIVE_READ_PATH_GOAL,
+        "task_id": LIVE_READ_PATH_TASK_ID,
+        "generated_at": _utc_now(),
+        "mode": "READ_ONLY",
+        "status": overall,
+        "FINAL_STATUS": overall,
+        "read_path_matrix": matrix,
+        "read_path_order": list(LIVE_READ_PATH_COMPONENTS),
+        "read_path_statuses_allowed": list(LIVE_READ_PATH_STATUSES),
+        "evidence_sources_allowed": list(EVIDENCE_SOURCES),
+        "cloud_asset": cloud_asset,
+        "knowledge": knowledge,
+        "knowledge_layers_order": list(KNOWLEDGE_READ_LAYERS),
+        "next_minimal_safe_action": next_minimal_safe_action,
+        "missing": missing,
+        "live_read_reachable": live_read_reachable,
+        "live_probe_performed": live_probe_performed,
+        "credential_env_names_present": credential_names,
+        "host_env_names_present": host_names,
+        "credential_values_recorded": False,
+        "historical_record_is_live_verified": False,
+        "historical_status_policy": LIVE_READ_PATH_HISTORICAL_POLICY,
+        "production_writes": False,
+        "deployment_performed": False,
+        "review_performed": False,
+        "submit_task_called": False,
+        "mark_reviewed_called": False,
+        "workflow_dispatched": False,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -20030,3 +20712,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(serverchan_adapter_report()["markdown"])
     print(dedicated_push_step_report()["markdown"])
     print(personal_ai_cold_start_capability_revalidation_v1()["markdown"])
+    print(personal_ai_cold_start_live_read_path_verification_v1()["markdown"])
