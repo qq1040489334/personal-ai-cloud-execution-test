@@ -5,7 +5,8 @@
     "Use the read-only Cloud Asset Read connector as the canonical source; never write Cloudflare Canonical.",
     "Render the three production assets into the Chinese vault layout: 00 知识首页.md, AI 架构/<two notes>, 工作流/<one note>, and _System/Mirror Index.md under Cloudflare Canonical Mirror.",
     "Apply the reviewed Chinese translation override only while the asset content_hash matches the reviewed hash; otherwise render safe fallback content from the canonical record so stale translations cannot survive.",
-    "Keep machine-verification fields in YAML frontmatter and out of the rendered body, and keep the mirror index idempotent and partial-sync preserving.",
+    "Localize source-faithfully: translate only the pinned Canonical summary, principles, source assessment, confidence, and review policy, without adding recommendations or broader claims. The local-execution note is an architecture pattern and must not claim local execution is the universal default.",
+    "Keep machine-verification fields in YAML frontmatter and out of the rendered body, preserving the exact Canonical provenance, confidence, and review_policy; render any localized confidence only in the human body. Keep the mirror index idempotent and partial-sync preserving.",
     "Only migrate legacy flat asset_id.md notes after ownership checks and successful new-note read-back; never touch unmanaged files or path collisions.",
     "Do not write Cloudflare Canonical, restore PersonOS or Knowledge Curator, add Inbox behavior, add automatic Cloudflare writes, or create bidirectional sync.",
     "Keep code, focused tests, operator documentation, and this complete expected_files list within the task scope."
@@ -21,6 +22,8 @@
     "The exporter deterministically renders the three named Canonical records into the specified Chinese Obsidian layout without changing any Canonical record.",
     "Every note preserves asset_id, version, canonical_version, content_hash, category, provenance, confidence, and review_policy in machine-readable metadata and passes filesystem read-back checks.",
     "The Chinese home page links to all three notes; note wikilinks resolve; the mirror index maps each asset_id to the correct path and keeps entries for assets omitted from a partial sync.",
+    "The Chinese body copy is a source-faithful translation of the pinned Canonical summary, principles, source assessment, confidence, and review policy, and the local-execution note preserves that local execution is not universally mandatory.",
+    "A hash mismatch disables every localized field, including source assessment and confidence, and renders safe fallback content from the current Canonical record.",
     "Repeat sync of identical asset content leaves managed notes, home page, and index unchanged; updated Canonical content invalidates the matching localized override and renders safe fallback content.",
     "Legacy flat notes are migrated only after ownership checks and successful new-note read-back; unmanaged files and path collisions remain untouched.",
     "Focused tests pass; a code-only cloud run does not claim live Vault synchronization from fixture tests alone."

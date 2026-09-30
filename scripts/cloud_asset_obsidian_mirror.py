@@ -52,6 +52,12 @@ EXTRA_ORDER = ("source_assessment",)
 # Reviewed Chinese presentation overrides. Each entry applies only while the
 # asset content_hash still matches the reviewed hash, so a Canonical change
 # invalidates the translation and forces the safe canonical fallback.
+#
+# The body copy is a source-faithful presentation translation only. It must not
+# add recommendations, assumptions, or broader claims that are absent from the
+# pinned Canonical record. In particular the local-execution note is an
+# architecture pattern: local execution is appropriate when an environment
+# requires it but is not universally mandatory.
 TRANSLATIONS: dict[str, dict[str, Any]] = {
     "knowledge-architecture-local-execution-shared-intelligence": {
         "reviewed_hash": "11be28739a7d4a24dc80af494fb38e7e94f9be01d35d7a04c3d7fce9ad002e64",
@@ -59,15 +65,23 @@ TRANSLATIONS: dict[str, dict[str, Any]] = {
         "folder": "AI 架构",
         "tags": ["AI 架构", "本地执行", "共享智能", "架构模式"],
         "core_conclusion": (
-            "把智能能力的主要执行放在本地环境，可以保留对数据与运行时环境的控制；"
-            "同时通过一个受控的共享层，把经过审阅的规范化知识沉淀下来，供不同场景复用。"
+            "对于 AI 协作系统，应将共享智能/管理能力与依赖具体环境的执行分离。"
+            "共享服务可承载可复用知识、策略和模型访问；依赖用户文件、浏览器会话、应用或凭据的执行，"
+            "应交给实际拥有相应环境的本地/用户执行器。把它视为一种架构模式，"
+            "不表示所有任务都必须在本地执行。"
         ),
         "practice_points": [
-            "默认在本地完成推理与数据处理，避免把未审阅的数据直接送出。",
-            "共享层只接收经过来源核对与冲突检查的规范化知识。",
-            "Cloudflare Canonical 保持为唯一权威来源，派生镜像只读且不得反向写入。",
+            "将长期共享知识和协调能力与可替换执行器分离。",
+            "需要本地浏览器、文件、应用或登录状态的任务，路由给实际拥有该环境的执行器。",
+            "远程 Agent 的能力取决于实际授予的工具、挂载、凭据和执行环境，不要把本地执行视为普遍必需。",
         ],
-        "review_condition": "当主要架构文档、执行环境假设或共享边界发生变化时重新审阅。",
+        "source_assessment": (
+            "来源于所提供的视频拆解，并对照公开的 DeepSeek Harness 文档进行规范化；"
+            "官方文档确认了开发者预览以及模型/工具任务执行，"
+            "但并未将该视频中的完整团队服务器架构确立为官方功能。"
+        ),
+        "confidence_display": "中高",
+        "review_condition": "如果执行架构或 DeepSeek Harness 一手文档发生重大变化，重新审查。",
         "links": [
             "knowledge-architecture-scoped-knowledge-layers",
             "knowledge-workflow-auditable-task-contract",
@@ -78,13 +92,23 @@ TRANSLATIONS: dict[str, dict[str, Any]] = {
         "title": "按范围隔离的知识分层模型",
         "folder": "AI 架构",
         "tags": ["AI 架构", "知识分层", "范围隔离", "边界"],
-        "core_conclusion": "知识按作用范围分层，并在每一层维护独立的边界与可见性，减少跨范围污染和越权引用。",
+        "core_conclusion": (
+            "按作用范围与生命周期组织协作式 AI 知识，而不是放进一个未加区分的统一存储。"
+            "概念上的范围包括规范/共享的操作知识、可复用的经验、私有/个人上下文，以及检索/索引层；"
+            "确切的名称与权限遵循系统的规范数据模型。"
+        ),
         "practice_points": [
-            "为每一层知识明确适用范围、责任方与生命周期。",
-            "跨层引用必须显式声明，并经过审阅后再进入上层知识。",
-            "保持单一权威来源，派生层只读，避免出现第二份事实来源。",
+            "按作用范围与生命周期区分知识，而不是使用单一的统一存储。",
+            "将规范/共享的操作知识与可复用经验、私有/个人上下文以及检索/索引层分开。",
+            "每层的确切名称、适用范围与权限都遵循系统的规范数据模型。",
+            "跨层引用或提升必须显式声明并经过审阅，保持各层边界清晰。",
         ],
-        "review_condition": "当分层边界、范围定义或可见性规则调整时重新审阅。",
+        "source_assessment": (
+            "该四层方案是在视频中观察到的；没有一手来源证据表明它是 Harness 的原生功能，"
+            "因此将其作为可复用模式而非产品事实保留。"
+        ),
+        "confidence_display": "中",
+        "review_condition": "当规范知识分类发生变化时，合并或修订该模型。",
         "links": [
             "knowledge-architecture-local-execution-shared-intelligence",
             "knowledge-workflow-auditable-task-contract",
@@ -100,11 +124,17 @@ TRANSLATIONS: dict[str, dict[str, Any]] = {
             "使 AI 执行过程可验证、可追溯、可审计。"
         ),
         "practice_points": [
-            "每个任务都写清目标、验收条件和允许修改的文件范围。",
-            "执行后保留测试结果与证据，并区分代码层验证与真实系统操作。",
-            "只在授权范围内改动，遇到阻塞时如实报告而不是绕过约束。",
+            "用持久化的任务对象绑定目标、上下文与权限。",
+            "记录日志与证据，使执行过程可追溯。",
+            "产出制品与结果，并经过复核。",
+            "沉淀可复用的本地/云端任务契约。",
         ],
-        "review_condition": "当任务契约格式、验收方式或审计要求变化时重新审阅。",
+        "source_assessment": (
+            "受视频中的任务卡工作流启发，并未被验证为 Harness 的原生功能，"
+            "但与现有的 Personal AI Execution V2 保持一致。"
+        ),
+        "confidence_display": "高",
+        "review_condition": "当规范执行合同发生变化时重新审查。",
         "links": [
             "knowledge-architecture-local-execution-shared-intelligence",
             "knowledge-architecture-scoped-knowledge-layers",
@@ -187,13 +217,22 @@ def _title(asset: dict[str, Any]) -> str:
     )
 
 
-def _extra_sections(content: dict[str, Any]) -> list[tuple[str, Any]]:
+def _extra_sections(
+    content: dict[str, Any], overrides: dict[str, Any] | None = None
+) -> list[tuple[str, Any]]:
     if not isinstance(content, dict):
         return []
+    overrides = overrides or {}
     handled = {"summary", "principles", "review_policy", "title", "category", "confidence"}
-    keys = [key for key in EXTRA_ORDER if key in content]
-    keys += sorted(key for key in content if key not in handled and key not in EXTRA_ORDER)
-    return [(CONTENT_LABELS.get(key, key.replace("_", " ").capitalize()), content[key]) for key in keys]
+    keys = [key for key in EXTRA_ORDER if key in content or key in overrides]
+    keys += sorted(
+        key for key in content if key not in handled and key not in EXTRA_ORDER and key not in overrides
+    )
+    keys += sorted(key for key in overrides if key not in handled and key not in EXTRA_ORDER and key not in content)
+    return [
+        (CONTENT_LABELS.get(key, key.replace("_", " ").capitalize()), overrides.get(key, content.get(key)))
+        for key in keys
+    ]
 
 
 def _presentation(asset: dict[str, Any]) -> dict[str, Any]:
@@ -207,6 +246,11 @@ def _presentation(asset: dict[str, Any]) -> dict[str, Any]:
             target = TRANSLATIONS.get(target_id)
             if target:
                 links.append(f"{target['folder']}/{target['title']}")
+        overrides = {
+            key: translation[key]
+            for key in ("source_assessment",)
+            if translation.get(key) not in (None, "", [])
+        }
         return {
             "title": translation["title"],
             "folder": translation["folder"],
@@ -214,7 +258,8 @@ def _presentation(asset: dict[str, Any]) -> dict[str, Any]:
             "core": translation.get("core_conclusion"),
             "points": list(translation.get("practice_points", [])),
             "review": translation.get("review_condition") or content.get("review_policy"),
-            "extra": _extra_sections(content),
+            "extra": _extra_sections(content, overrides=overrides),
+            "confidence_display": translation.get("confidence_display") or content.get("confidence"),
             "links": links,
             "localized": True,
             "reviewed_hash": translation["reviewed_hash"],
@@ -228,6 +273,7 @@ def _presentation(asset: dict[str, Any]) -> dict[str, Any]:
         "points": content.get("principles") or [],
         "review": content.get("review_policy"),
         "extra": _extra_sections(content),
+        "confidence_display": content.get("confidence"),
         "links": [],
         "localized": False,
         "reviewed_hash": None,
@@ -278,7 +324,7 @@ def _value(value: Any) -> str:
     return str(value)
 
 
-def _source_rows(asset: dict[str, Any]) -> list[str]:
+def _source_rows(asset: dict[str, Any], presentation: dict[str, Any]) -> list[str]:
     provenance = asset.get("provenance") or {}
     source = provenance.get("source") if isinstance(provenance.get("source"), dict) else {}
     promotion = provenance.get("promotion") if isinstance(provenance.get("promotion"), dict) else {}
@@ -293,7 +339,7 @@ def _source_rows(asset: dict[str, Any]) -> list[str]:
     ):
         if value is not None and value != "":
             rows.append(f"- **{label}：** {value}")
-    confidence = _content(asset).get("confidence")
+    confidence = presentation.get("confidence_display", _content(asset).get("confidence"))
     if confidence is not None and confidence != "":
         rows.append(f"- **置信度：** {confidence}")
     return rows
@@ -305,7 +351,7 @@ def _body(asset: dict[str, Any], presentation: dict[str, Any]) -> str:
         sections.append("## 核心结论\n\n" + _value(presentation["core"]))
     if presentation["points"]:
         sections.append("## 实践要点\n\n" + _value(presentation["points"]))
-    source_rows = _source_rows(asset)
+    source_rows = _source_rows(asset, presentation)
     if source_rows:
         sections.append("## 来源与置信度\n\n" + "\n".join(source_rows))
     for label, value in presentation["extra"]:

@@ -31,11 +31,21 @@ Chinese titles. `00 知识首页.md` links to every mirrored note, and
   `content_hash`, `category`, `provenance`, `confidence`, and `review_policy`.
   These fields stay out of the rendered body.
 
-The Chinese presentation text is a reviewed translation keyed by the reviewed
-`content_hash`. It only applies while the Canonical `content_hash` still matches
-that reviewed hash. When Canonical changes, the override is invalidated and the
-exporter falls back to a safe rendering of the canonical content, so stale
-translations cannot survive a Canonical update.
+The Chinese presentation text is a source-faithful, hash-pinned translation of
+the Canonical summary, principles, source assessment, confidence, and review
+policy. It translates only what the Canonical record already says and must not
+add recommendations, assumptions, or broader claims that are not in that record.
+For example, the local-execution note is presented as an architecture pattern:
+local execution is appropriate when an environment requires it, but it is not
+universally mandatory.
+
+Each override is keyed by the reviewed `content_hash` and applies only while the
+Canonical `content_hash` still matches that reviewed hash. When Canonical
+changes, the override is invalidated and the exporter falls back to a safe
+rendering of the current Canonical content, so stale translations cannot survive
+a Canonical update. The translated `confidence` is shown only in the human body;
+the YAML `confidence`, `provenance`, and `review_policy` fields keep the exact
+Canonical values for machine verification.
 
 ## Standard flow
 

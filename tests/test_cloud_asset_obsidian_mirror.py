@@ -35,29 +35,74 @@ PRODUCTION_CONTENT = {
     "knowledge-architecture-local-execution-shared-intelligence": {
         "category": "architecture_pattern",
         "title": "Local Execution and Shared Intelligence Architecture",
-        "summary": "Run intelligence locally and share only reviewed knowledge.",
-        "principles": ["Keep execution local.", "Publish only reviewed knowledge."],
-        "source_assessment": "Retained as a general architecture pattern.",
+        "summary": (
+            "For AI collaboration systems, separate shared intelligence and management "
+            "capabilities from environment-dependent execution. Shared services can host "
+            "reusable knowledge, policy, and model access, while execution that depends on "
+            "user files, browser sessions, apps, or credentials is handled by the local or "
+            "user executor that actually owns that environment. Treat it as an architecture "
+            "pattern; local execution is not universally required."
+        ),
+        "principles": [
+            "Separate long-term shared knowledge and coordination capabilities from replaceable executors.",
+            "Route tasks that need a local browser, files, apps, or login state to the executor that actually owns that environment.",
+            "A remote Agent's capability depends on the tools, mounts, credentials, and execution environment actually granted; do not treat local execution as universally mandatory.",
+        ],
+        "source_assessment": (
+            "Derived from the supplied video breakdown and normalized against public DeepSeek "
+            "Harness documentation. Official docs confirm developer preview and model/tool task "
+            "execution, but do not establish the video's full team-server architecture as an "
+            "official feature."
+        ),
         "confidence": "medium-high",
-        "review_policy": "Re-review if the architecture document changes.",
+        "review_policy": (
+            "Re-review if the execution architecture or DeepSeek Harness primary documentation "
+            "changes significantly."
+        ),
     },
     "knowledge-architecture-scoped-knowledge-layers": {
         "category": "architecture_pattern",
         "title": "Scoped Knowledge Layers",
-        "summary": "Isolate knowledge by scope and keep explicit boundaries.",
-        "principles": ["Define scope per layer.", "Review cross-layer references."],
-        "source_assessment": "Retained as a general architecture pattern.",
+        "summary": (
+            "Organize collaborative AI knowledge by scope and lifecycle rather than one "
+            "undifferentiated store. Conceptual scopes include canonical/shared operating "
+            "knowledge, reusable experience, private/personal context, and a retrieval/index "
+            "layer; exact names and permissions follow the system's canonical data model."
+        ),
+        "principles": [
+            "Organize knowledge by scope and lifecycle rather than a single undifferentiated store.",
+            "Separate canonical/shared operating knowledge from reusable experience, private/personal context, and the retrieval/index layer.",
+            "Exact names, scopes, and permissions follow the system's canonical data model.",
+            "Cross-layer references and promotions must be explicit and reviewed, keeping layer boundaries clear.",
+        ],
+        "source_assessment": (
+            "The four-layer scheme was observed in the video. No primary-source evidence "
+            "establishes it as native Harness functionality, so it is retained as a reusable "
+            "pattern rather than product fact."
+        ),
         "confidence": "medium",
-        "review_policy": "Re-review if the scope model changes.",
+        "review_policy": "Merge or revise this model when the canonical knowledge taxonomy changes.",
     },
     "knowledge-workflow-auditable-task-contract": {
         "category": "workflow",
         "title": "Auditable Task Contract",
-        "summary": "Use a structured task contract with acceptance criteria.",
-        "principles": ["Declare scope and acceptance.", "Keep test evidence."],
-        "source_assessment": "Retained as a general workflow pattern.",
+        "summary": (
+            "Use a structured task contract as the entry point, explicitly declaring the "
+            "objective, acceptance criteria, and allowed change scope so AI execution is "
+            "verifiable, traceable, and auditable."
+        ),
+        "principles": [
+            "Use a persistent task object binding objective, context, and permissions.",
+            "Keep logs and evidence so execution remains traceable.",
+            "Produce artifacts and a result, and require review.",
+            "Capture reusable local/cloud task contracts.",
+        ],
+        "source_assessment": (
+            "Inspired by the video's task-card workflow and not verified as native Harness "
+            "functionality, but aligned with the existing Personal AI Execution V2."
+        ),
         "confidence": "high",
-        "review_policy": "Re-review if the contract format changes.",
+        "review_policy": "Re-review when the canonical execution contract changes.",
     },
 }
 
@@ -247,6 +292,126 @@ def test_stale_hash_invalidates_localized_override(tmp_path):
     fields, _ = _frontmatter(text)
     assert fields["localization_applied"] is False
     assert fields["content_hash"] == "0" * 64
+
+
+def test_architecture_note_preserves_local_execution_nuance():
+    text = render_asset_markdown(
+        make_asset("knowledge-architecture-local-execution-shared-intelligence")
+    )
+    assert "把它视为一种架构模式，不表示所有任务都必须在本地执行" in text
+    assert "应交给实际拥有相应环境的本地/用户执行器" in text
+    assert "不要把本地执行视为普遍必需" in text
+    assert "默认在本地完成推理与数据处理" not in text
+    assert "本地是默认" not in text
+
+
+def test_localized_principles_are_faithful_for_all_three_assets():
+    expected = {
+        "knowledge-architecture-local-execution-shared-intelligence": [
+            "将长期共享知识和协调能力与可替换执行器分离",
+            "路由给实际拥有该环境的执行器",
+            "不要把本地执行视为普遍必需",
+        ],
+        "knowledge-architecture-scoped-knowledge-layers": [
+            "按作用范围与生命周期区分知识",
+            "规范/共享的操作知识",
+            "检索/索引层",
+            "遵循系统的规范数据模型",
+        ],
+        "knowledge-workflow-auditable-task-contract": [
+            "持久化的任务对象绑定目标、上下文与权限",
+            "记录日志与证据",
+            "产出制品与结果",
+            "可复用的本地/云端任务契约",
+        ],
+    }
+    for asset_id, phrases in expected.items():
+        text = render_asset_markdown(make_asset(asset_id))
+        for phrase in phrases:
+            assert phrase in text, (asset_id, phrase)
+
+
+def test_localized_source_assessment_confidence_and_review_are_chinese(tmp_path):
+    vault = tmp_path / "Vault"
+    vault.mkdir()
+    sync_assets(production_assets(), vault)
+    mirror = vault / MIRROR_DIRECTORY
+    expectations = {
+        "knowledge-architecture-local-execution-shared-intelligence": {
+            "assessment": ("来源于所提供的视频拆解", "DeepSeek Harness"),
+            "confidence": "中高",
+            "review": "如果执行架构或 DeepSeek Harness 一手文档发生重大变化",
+        },
+        "knowledge-architecture-scoped-knowledge-layers": {
+            "assessment": ("四层方案是在视频中观察到的", "可复用模式而非产品事实"),
+            "confidence": "中",
+            "review": "当规范知识分类发生变化时",
+        },
+        "knowledge-workflow-auditable-task-contract": {
+            "assessment": ("任务卡工作流", "Personal AI Execution V2"),
+            "confidence": "高",
+            "review": "当规范执行合同发生变化时",
+        },
+    }
+    for asset_id, checks in expectations.items():
+        text = (mirror / EXPECTED_PATHS[asset_id]).read_text(encoding="utf-8")
+        for needle in (*checks["assessment"], checks["review"]):
+            assert needle in text, (asset_id, needle)
+        assert f"**置信度：** {checks['confidence']}" in text
+        assert "Retained as a general" not in text
+
+
+def test_yaml_keeps_canonical_machine_values_while_body_is_localized(tmp_path):
+    vault = tmp_path / "Vault"
+    vault.mkdir()
+    sync_assets(production_assets(), vault)
+    mirror = vault / MIRROR_DIRECTORY
+    for asset_id, relative in EXPECTED_PATHS.items():
+        fields, body = _frontmatter((mirror / relative).read_text(encoding="utf-8"))
+        canonical = PRODUCTION_CONTENT[asset_id]
+        assert fields["confidence"] == canonical["confidence"]
+        assert fields["review_policy"] == canonical["review_policy"]
+        assert fields["provenance"] == make_asset(asset_id)["provenance"]
+        assert fields["localization_applied"] is True
+        assert f"**置信度：** {canonical['confidence']}" not in body
+
+
+def test_stale_hash_disables_every_localized_field(tmp_path):
+    for asset_id in EXPECTED_PATHS:
+        vault = tmp_path / asset_id
+        vault.mkdir()
+        sync_assets([make_asset(asset_id)], vault)
+        mirror = vault / MIRROR_DIRECTORY
+        stale = make_asset(
+            asset_id,
+            content_hash="f" * 64,
+            version="9.0",
+            canonical_version=9,
+            content_overrides={
+                "title": "Fresh Canonical Title",
+                "summary": "Fresh canonical summary.",
+                "source_assessment": "Fresh canonical source assessment.",
+                "confidence": "low",
+            },
+        )
+        result = sync_assets([stale], vault)
+        assert result["assets"][0]["localization_applied"] is False
+        notes = managed_notes(mirror, asset_id)
+        assert len(notes) == 1
+        text = notes[0].read_text(encoding="utf-8")
+        localized = TRANSLATIONS[asset_id]
+        assert localized["title"] not in text
+        for point in localized["practice_points"]:
+            assert point not in text
+        assert localized["source_assessment"] not in text
+        assert f"**置信度：** {localized['confidence_display']}" not in text
+        assert "Fresh canonical summary." in text
+        assert "Fresh canonical source assessment." in text
+        assert "**置信度：** low" in text
+        fields, _ = _frontmatter(text)
+        assert fields["confidence"] == "low"
+        assert fields["localization_applied"] is False
+        assert fields["content_hash"] == "f" * 64
 
 
 def test_partial_sync_preserves_index_and_other_notes(tmp_path):
