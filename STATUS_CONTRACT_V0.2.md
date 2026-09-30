@@ -124,7 +124,7 @@ commits.
   Worker status function, review gate and write-back.
 - `tests/test_task_registry_reconciliation.py`: fail-closed ambiguous
   self-report coverage.
-- Full regression suite: `404 passed`.
+- Full regression suite: `790 passed`.
 
 Command: `python -m pytest -q`
 
@@ -150,7 +150,7 @@ Command: `python -m pytest -q`
 ## 11. Commit / evidence
 
 - Implementation commit: `0c3ac20392bf86bfecb68cbaadd77a7a2a398665`
-- Verification: `python -m pytest -q` -> `404 passed`
+- Verification: `python -m pytest -q` -> `790 passed`
 - Status matrix: sections 3 and 7 above.
 
 ## Verdict: PASS
