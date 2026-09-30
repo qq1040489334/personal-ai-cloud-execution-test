@@ -17,6 +17,7 @@ from scripts.cloud_asset_obsidian_mirror import (  # noqa: E402
     MIRROR_DIRECTORY,
     TRANSLATIONS,
     _frontmatter,
+    _presentation,
     _read_managed,
     render_asset_markdown,
     sync_assets,
@@ -110,6 +111,75 @@ EXPECTED_PATHS = {
     "knowledge-architecture-local-execution-shared-intelligence": "AI 架构/本地执行与共享智能架构.md",
     "knowledge-architecture-scoped-knowledge-layers": "AI 架构/按范围隔离的知识分层模型.md",
     "knowledge-workflow-auditable-task-contract": "工作流/可审计的 AI 任务契约.md",
+}
+
+# Exact reviewed Chinese presentation text for each pinned hash. These strings are
+# the acceptance oracle: the rendered note must contain every one of them and no
+# additional core claim or principle beyond this list.
+EXPECTED_LOCALIZED = {
+    "knowledge-architecture-local-execution-shared-intelligence": {
+        "title": "本地执行与共享智能架构",
+        "core": (
+            "对于 AI 协作系统，应将共享智能/管理能力与依赖具体环境的执行分离。"
+            "共享服务可承载可复用知识、策略和模型访问；依赖用户文件、浏览器会话、应用或凭据的执行，"
+            "应交给实际拥有相应环境的本地/用户执行器。把它视为一种架构模式，"
+            "不表示所有任务都必须在本地执行。"
+        ),
+        "points": [
+            "将长期共享知识和协调能力与可替换执行器分离。",
+            "需要本地浏览器、文件、应用或登录状态的任务，路由给实际拥有该环境的执行器。",
+            "远程 Agent 的能力取决于实际授予的工具、挂载、凭据和执行环境；不要把本地执行视为普遍必需。",
+        ],
+        "assessment": (
+            "基于提供的抖音视频拆解整理，并对照当前公开的 DeepSeek Harness 文档做了规范化。"
+            "官方资料确认 Harness 处于开发者预览阶段，支持模型/工具任务执行；"
+            "但未证明视频所述整套团队服务器架构是 Harness 官方功能。"
+        ),
+        "confidence": "中高",
+        "review": "如果执行架构或 DeepSeek Harness 一手文档发生重大变化，重新审查。",
+    },
+    "knowledge-architecture-scoped-knowledge-layers": {
+        "title": "按范围隔离的知识分层模型",
+        "core": (
+            "按范围和生命周期组织协作式 AI 知识，而不是把所有上下文放在一个未区分的存储中。"
+            "可用的概念范围包括规范/共享的操作知识、可复用经验、私有/个人上下文以及检索/索引层。"
+            "具体层名称和权限应遵循系统的 Canonical 数据模型。"
+        ),
+        "points": [
+            "将长期规范知识与低置信度经验/候选区分开。",
+            "对私有/个人上下文实施访问控制，并与共享组织知识区分。",
+            "将检索/索引视为访问机制，而不是额外的事实来源。",
+            "信息只有经过来源、价值和冲突审查后才能晋升。",
+        ],
+        "assessment": (
+            "视频拆解中观察到四层组织方式。"
+            "没有一手来源证据证明该精确四层方案是 DeepSeek Harness 原生功能，"
+            "因此将其保留为可复用的设计模式，而非产品事实。"
+        ),
+        "confidence": "中",
+        "review": "当规范知识分类发生变化时，合并或修订该模型。",
+    },
+    "knowledge-workflow-auditable-task-contract": {
+        "title": "可审计的 AI 任务契约",
+        "core": (
+            "将重要 AI 工作表示为持久化任务对象，而不只是临时聊天。"
+            "一项任务对象绑定目标、上下文、权限、执行证据/日志、产物、结果和复核状态，"
+            "以支持交接、追溯和可靠的闭环复核。"
+        ),
+        "points": [
+            "聊天可以发起工作，但持久的执行状态应存放在任务/执行系统中。",
+            "将产物和证据关联到生成它的任务。",
+            "不能只凭 Agent 的叙述就标记任务完成；适用时核验输出或做回读。",
+            "任务执行合同应可在本地和云端执行器之间复用。",
+        ],
+        "assessment": (
+            "受提供的视频中任务卡工作流启发。"
+            "没有一手来源证据证明所述团队任务卡系统是 DeepSeek Harness 原生功能。"
+            "保留的知识是一般工作流模式，并与现有 Personal AI Execution V2 设计一致。"
+        ),
+        "confidence": "高",
+        "review": "当规范执行合同发生变化时重新审查。",
+    },
 }
 
 
@@ -305,30 +375,46 @@ def test_architecture_note_preserves_local_execution_nuance():
     assert "本地是默认" not in text
 
 
-def test_localized_principles_are_faithful_for_all_three_assets():
-    expected = {
-        "knowledge-architecture-local-execution-shared-intelligence": [
-            "将长期共享知识和协调能力与可替换执行器分离",
-            "路由给实际拥有该环境的执行器",
-            "不要把本地执行视为普遍必需",
-        ],
-        "knowledge-architecture-scoped-knowledge-layers": [
-            "按作用范围与生命周期区分知识",
-            "规范/共享的操作知识",
-            "检索/索引层",
-            "遵循系统的规范数据模型",
-        ],
-        "knowledge-workflow-auditable-task-contract": [
-            "持久化的任务对象绑定目标、上下文与权限",
-            "记录日志与证据",
-            "产出制品与结果",
-            "可复用的本地/云端任务契约",
-        ],
-    }
-    for asset_id, phrases in expected.items():
+def test_localized_core_and_principles_exactly_match_reviewed_copy():
+    for asset_id, expected in EXPECTED_LOCALIZED.items():
+        presentation = _presentation(make_asset(asset_id))
+        assert presentation["localized"] is True
+        assert presentation["title"] == expected["title"]
+        assert presentation["core"] == expected["core"]
+        assert presentation["points"] == expected["points"]
+        assert len(presentation["points"]) == len(expected["points"])
+
+
+def test_rendered_notes_contain_exact_copy_without_omission_or_addition():
+    for asset_id, expected in EXPECTED_LOCALIZED.items():
         text = render_asset_markdown(make_asset(asset_id))
-        for phrase in phrases:
-            assert phrase in text, (asset_id, phrase)
+        assert expected["core"] in text
+        assert expected["assessment"] in text
+        assert expected["review"] in text
+        points_section = text.split("## 实践要点\n\n", 1)[1].split("\n\n", 1)[0]
+        rendered_points = [
+            line[2:] for line in points_section.splitlines() if line.startswith("- ")
+        ]
+        assert rendered_points == expected["points"]
+
+
+def test_user_critical_limitations_are_verbatim():
+    scoped = render_asset_markdown(
+        make_asset("knowledge-architecture-scoped-knowledge-layers")
+    )
+    assert "将检索/索引视为访问机制，而不是额外的事实来源。" in scoped
+    assert "信息只有经过来源、价值和冲突审查后才能晋升。" in scoped
+
+    contract = render_asset_markdown(
+        make_asset("knowledge-workflow-auditable-task-contract")
+    )
+    assert "不能只凭 Agent 的叙述就标记任务完成；适用时核验输出或做回读。" in contract
+
+    architecture = render_asset_markdown(
+        make_asset("knowledge-architecture-local-execution-shared-intelligence")
+    )
+    assert "不表示所有任务都必须在本地执行。" in architecture
+    assert "不要把本地执行视为普遍必需。" in architecture
 
 
 def test_localized_source_assessment_confidence_and_review_are_chinese(tmp_path):
@@ -336,26 +422,9 @@ def test_localized_source_assessment_confidence_and_review_are_chinese(tmp_path)
     vault.mkdir()
     sync_assets(production_assets(), vault)
     mirror = vault / MIRROR_DIRECTORY
-    expectations = {
-        "knowledge-architecture-local-execution-shared-intelligence": {
-            "assessment": ("来源于所提供的视频拆解", "DeepSeek Harness"),
-            "confidence": "中高",
-            "review": "如果执行架构或 DeepSeek Harness 一手文档发生重大变化",
-        },
-        "knowledge-architecture-scoped-knowledge-layers": {
-            "assessment": ("四层方案是在视频中观察到的", "可复用模式而非产品事实"),
-            "confidence": "中",
-            "review": "当规范知识分类发生变化时",
-        },
-        "knowledge-workflow-auditable-task-contract": {
-            "assessment": ("任务卡工作流", "Personal AI Execution V2"),
-            "confidence": "高",
-            "review": "当规范执行合同发生变化时",
-        },
-    }
-    for asset_id, checks in expectations.items():
+    for asset_id, checks in EXPECTED_LOCALIZED.items():
         text = (mirror / EXPECTED_PATHS[asset_id]).read_text(encoding="utf-8")
-        for needle in (*checks["assessment"], checks["review"]):
+        for needle in (checks["assessment"], checks["review"]):
             assert needle in text, (asset_id, needle)
         assert f"**置信度：** {checks['confidence']}" in text
         assert "Retained as a general" not in text

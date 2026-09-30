@@ -33,11 +33,16 @@ Chinese titles. `00 知识首页.md` links to every mirrored note, and
 
 The Chinese presentation text is a source-faithful, hash-pinned translation of
 the Canonical summary, principles, source assessment, confidence, and review
-policy. It translates only what the Canonical record already says and must not
-add recommendations, assumptions, or broader claims that are not in that record.
-For example, the local-execution note is presented as an architecture pattern:
-local execution is appropriate when an environment requires it, but it is not
-universally mandatory.
+policy. It translates only what the Canonical record already says: every
+Canonical principle is preserved exactly, with nothing summarized, omitted, or
+added, so the presentation never introduces recommendations, assumptions, or
+broader claims that are not in that record. For example, the local-execution
+note is presented as an architecture pattern: local execution is appropriate
+when an environment requires it, but it is not universally mandatory; the
+scoped-knowledge note keeps indexes as access mechanisms rather than additional
+sources of truth and keeps review before promotion; and the task-contract note
+keeps that completion is not inferred from an Agent narrative alone and that
+outputs or read-back are verified when applicable.
 
 Each override is keyed by the reviewed `content_hash` and applies only while the
 Canonical `content_hash` still matches that reviewed hash. When Canonical
