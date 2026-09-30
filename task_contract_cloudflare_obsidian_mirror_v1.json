@@ -1,0 +1,24 @@
+{
+  "task_id": "cloudflare-canonical-obsidian-mirror-v1",
+  "goal": "Add a deterministic one-way Cloud Asset KNOWLEDGE to Obsidian mirror adapter and verify live canonical records by local Vault read-back.",
+  "instructions": [
+    "Use the read-only Cloud Asset Read connector as the canonical source.",
+    "Only write derived Markdown notes under the local Vault's Cloudflare Canonical Mirror directory.",
+    "Do not write Cloudflare Canonical, restore PersonOS or Knowledge Curator, add Inbox behavior, or create bidirectional sync.",
+    "Keep code, focused tests, operator documentation, and this complete expected_files list within the task scope."
+  ],
+  "risk_level": "LOW",
+  "expected_files": [
+    "docs/cloudflare-obsidian-mirror.md",
+    "scripts/cloud_asset_obsidian_mirror.py",
+    "task_contract_cloudflare_obsidian_mirror_v1.json",
+    "tests/test_cloud_asset_obsidian_mirror.py"
+  ],
+  "acceptance": [
+    "The renderer is deterministic and the writer is idempotent by asset ID, version, and content hash.",
+    "A new canonical version updates the same note path.",
+    "Unmanaged notes and unsafe asset IDs are not overwritten.",
+    "Three production Cloud Asset KNOWLEDGE records are written to a real Obsidian Vault and independently read back with matching asset ID, versions, hash, and canonical content.",
+    "The standard future chain is Candidate review and conflict checks, Cloudflare Canonical write/read-back, then one-way Obsidian mirror sync/read-back."
+  ]
+}
