@@ -1,9 +1,5 @@
-var __defProp = Object.defineProperty;
-var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
 // src/index.js
-var __defProp2 = Object.defineProperty;
-var __name2 = /* @__PURE__ */ __name((target, value) => __defProp2(target, "name", { value, configurable: true }), "__name");
 var u8 = Uint8Array;
 var u16 = Uint16Array;
 var i32 = Int32Array;
@@ -79,7 +75,7 @@ var fdeb = new u8([
   0
 ]);
 var clim = new u8([16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]);
-var freb = /* @__PURE__ */ __name2(function(eb, start) {
+var freb = function(eb, start) {
   var b = new u16(31);
   for (var i2 = 0; i2 < 31; ++i2) {
     b[i2] = start += 1 << eb[i2 - 1];
@@ -91,7 +87,7 @@ var freb = /* @__PURE__ */ __name2(function(eb, start) {
     }
   }
   return { b, r };
-}, "freb");
+};
 var _a = freb(fleb, 2);
 var fl = _a.b;
 var revfl = _a.r;
@@ -108,7 +104,7 @@ for (i = 0; i < 32768; ++i) {
 }
 var x;
 var i;
-var hMap = /* @__PURE__ */ __name2((function(cd, mb, r) {
+var hMap = (function(cd, mb, r) {
   var s = cd.length;
   var i2 = 0;
   var l = new u16(mb);
@@ -143,7 +139,7 @@ var hMap = /* @__PURE__ */ __name2((function(cd, mb, r) {
     }
   }
   return co;
-}), "hMap");
+});
 var flt = new u8(288);
 for (i = 0; i < 144; ++i)
   flt[i] = 8;
@@ -163,32 +159,32 @@ for (i = 0; i < 32; ++i)
 var i;
 var flrm = /* @__PURE__ */ hMap(flt, 9, 1);
 var fdrm = /* @__PURE__ */ hMap(fdt, 5, 1);
-var max = /* @__PURE__ */ __name2(function(a) {
+var max = function(a) {
   var m = a[0];
   for (var i2 = 1; i2 < a.length; ++i2) {
     if (a[i2] > m)
       m = a[i2];
   }
   return m;
-}, "max");
-var bits = /* @__PURE__ */ __name2(function(d, p, m) {
+};
+var bits = function(d, p, m) {
   var o = p / 8 | 0;
   return (d[o] | d[o + 1] << 8) >> (p & 7) & m;
-}, "bits");
-var bits16 = /* @__PURE__ */ __name2(function(d, p) {
+};
+var bits16 = function(d, p) {
   var o = p / 8 | 0;
   return (d[o] | d[o + 1] << 8 | d[o + 2] << 16) >> (p & 7);
-}, "bits16");
-var shft = /* @__PURE__ */ __name2(function(p) {
+};
+var shft = function(p) {
   return (p + 7) / 8 | 0;
-}, "shft");
-var slc = /* @__PURE__ */ __name2(function(v, s, e) {
+};
+var slc = function(v, s, e) {
   if (s == null || s < 0)
     s = 0;
   if (e == null || e > v.length)
     e = v.length;
   return new u8(v.subarray(s, e));
-}, "slc");
+};
 var ec = [
   "unexpected EOF",
   "invalid block type",
@@ -207,7 +203,7 @@ var ec = [
   "invalid zip data"
   // determined by unknown compression method
 ];
-var err = /* @__PURE__ */ __name2(function(ind, msg, nt) {
+var err = function(ind, msg, nt) {
   var e = new Error(msg || ec[ind]);
   e.code = ind;
   if (Error.captureStackTrace)
@@ -215,8 +211,8 @@ var err = /* @__PURE__ */ __name2(function(ind, msg, nt) {
   if (!nt)
     throw e;
   return e;
-}, "err");
-var inflt = /* @__PURE__ */ __name2(function(dat, st, buf, dict) {
+};
+var inflt = function(dat, st, buf, dict) {
   var sl = dat.length, dl = dict ? dict.length : 0;
   if (!sl || st.f && !st.l)
     return buf || new u8(0);
@@ -225,14 +221,14 @@ var inflt = /* @__PURE__ */ __name2(function(dat, st, buf, dict) {
   var noSt = st.i;
   if (noBuf)
     buf = new u8(sl * 3);
-  var cbuf = /* @__PURE__ */ __name2(function(l2) {
+  var cbuf = function(l2) {
     var bl = buf.length;
     if (l2 > bl) {
       var nbuf = new u8(Math.max(bl * 2, l2));
       nbuf.set(buf);
       buf = nbuf;
     }
-  }, "cbuf");
+  };
   var final = st.f || 0, pos = st.p || 0, bt = st.b || 0, lm = st.l, dm = st.d, lbt = st.m, dbt = st.n;
   var tbts = sl * 8;
   do {
@@ -356,22 +352,20 @@ var inflt = /* @__PURE__ */ __name2(function(dat, st, buf, dict) {
       final = 1, st.m = lbt, st.d = dm, st.n = dbt;
   } while (!final);
   return bt != buf.length && noBuf ? slc(buf, 0, bt) : buf.subarray(0, bt);
-}, "inflt");
+};
 var et = /* @__PURE__ */ new u8(0);
-var b2 = /* @__PURE__ */ __name2(function(d, b) {
+var b2 = function(d, b) {
   return d[b] | d[b + 1] << 8;
-}, "b2");
-var b4 = /* @__PURE__ */ __name2(function(d, b) {
+};
+var b4 = function(d, b) {
   return (d[b] | d[b + 1] << 8 | d[b + 2] << 16 | d[b + 3] << 24) >>> 0;
-}, "b4");
-var b8 = /* @__PURE__ */ __name2(function(d, b) {
+};
+var b8 = function(d, b) {
   return b4(d, b) + b4(d, b + 4) * 4294967296;
-}, "b8");
+};
 function inflateSync(data, opts) {
   return inflt(data, { i: 2 }, opts && opts.out, opts && opts.dictionary);
 }
-__name(inflateSync, "inflateSync");
-__name2(inflateSync, "inflateSync");
 var td = typeof TextDecoder != "undefined" && /* @__PURE__ */ new TextDecoder();
 var tds = 0;
 try {
@@ -379,7 +373,7 @@ try {
   tds = 1;
 } catch (e) {
 }
-var dutf8 = /* @__PURE__ */ __name2(function(d) {
+var dutf8 = function(d) {
   for (var r = "", i2 = 0; ; ) {
     var c = d[i2++];
     var eb = (c > 127) + (c > 223) + (c > 239);
@@ -394,7 +388,7 @@ var dutf8 = /* @__PURE__ */ __name2(function(d) {
     else
       r += String.fromCharCode((c & 15) << 12 | (d[i2++] & 63) << 6 | d[i2++] & 63);
   }
-}, "dutf8");
+};
 function strFromU8(dat, latin1) {
   if (latin1) {
     var r = "";
@@ -410,17 +404,15 @@ function strFromU8(dat, latin1) {
     return s;
   }
 }
-__name(strFromU8, "strFromU8");
-__name2(strFromU8, "strFromU8");
-var slzh = /* @__PURE__ */ __name2(function(d, b) {
+var slzh = function(d, b) {
   return b + 30 + b2(d, b + 26) + b2(d, b + 28);
-}, "slzh");
-var zh = /* @__PURE__ */ __name2(function(d, b, z) {
+};
+var zh = function(d, b, z) {
   var fnl = b2(d, b + 28), efl = b2(d, b + 30), fn = strFromU8(d.subarray(b + 46, b + 46 + fnl), !(b2(d, b + 8) & 2048)), es = b + 46 + fnl;
   var _a2 = z64hs(d, es, efl, z, b4(d, b + 20), b4(d, b + 24), b4(d, b + 42)), sc = _a2[0], su = _a2[1], off = _a2[2];
   return [b2(d, b + 10), sc, su, fn, es + efl + b2(d, b + 32), off];
-}, "zh");
-var z64hs = /* @__PURE__ */ __name2(function(d, b, l, z, sc, su, off) {
+};
+var z64hs = function(d, b, l, z, sc, su, off) {
   var nsc = sc == 4294967295, nsu = su == 4294967295, noff = off == 4294967295, e = b + l;
   var nf = nsc + nsu + noff;
   if (z && nf) {
@@ -438,7 +430,7 @@ var z64hs = /* @__PURE__ */ __name2(function(d, b, l, z, sc, su, off) {
       err(13);
   }
   return [sc, su, off, 0];
-}, "z64hs");
+};
 function unzipSync(data, opts) {
   var files = {};
   var e = data.length - 22;
@@ -480,8 +472,6 @@ function unzipSync(data, opts) {
   }
   return files;
 }
-__name(unzipSync, "unzipSync");
-__name2(unzipSync, "unzipSync");
 var API = "https://api.github.com";
 var EVENT_TYPE = "gpt_task";
 var RESULT_FILENAME = "execution_result.json";
@@ -557,33 +547,23 @@ function corsHeaders() {
     "Access-Control-Max-Age": "86400"
   };
 }
-__name(corsHeaders, "corsHeaders");
-__name2(corsHeaders, "corsHeaders");
 function json(body, status, extra = {}) {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "Content-Type": "application/json", ...extra }
   });
 }
-__name(json, "json");
-__name2(json, "json");
 function originOf(request) {
   return new URL(request.url).origin;
 }
-__name(originOf, "originOf");
-__name2(originOf, "originOf");
 function bytesToB64url(bytes) {
   let bin = "";
   for (const b of bytes) bin += String.fromCharCode(b);
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
-__name(bytesToB64url, "bytesToB64url");
-__name2(bytesToB64url, "bytesToB64url");
 function b64urlEncode(str) {
   return bytesToB64url(new TextEncoder().encode(str));
 }
-__name(b64urlEncode, "b64urlEncode");
-__name2(b64urlEncode, "b64urlEncode");
 function b64urlDecode(str) {
   const pad = str.length % 4 === 0 ? "" : "=".repeat(4 - str.length % 4);
   const b64 = str.replace(/-/g, "+").replace(/_/g, "/") + pad;
@@ -592,8 +572,6 @@ function b64urlDecode(str) {
   for (let i2 = 0; i2 < bin.length; i2++) bytes[i2] = bin.charCodeAt(i2);
   return new TextDecoder().decode(bytes);
 }
-__name(b64urlDecode, "b64urlDecode");
-__name2(b64urlDecode, "b64urlDecode");
 async function hmacKey(secret) {
   return crypto.subtle.importKey(
     "raw",
@@ -603,16 +581,12 @@ async function hmacKey(secret) {
     ["sign", "verify"]
   );
 }
-__name(hmacKey, "hmacKey");
-__name2(hmacKey, "hmacKey");
 async function signPayload(payload, secret) {
   const body = b64urlEncode(JSON.stringify(payload));
   const key = await hmacKey(secret);
   const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
   return `${body}.${bytesToB64url(new Uint8Array(sig))}`;
 }
-__name(signPayload, "signPayload");
-__name2(signPayload, "signPayload");
 async function verifyPayload(token, secret) {
   if (typeof token !== "string" || !token.includes(".")) return null;
   const [body, sig] = token.split(".");
@@ -632,14 +606,10 @@ async function verifyPayload(token, secret) {
     return null;
   }
 }
-__name(verifyPayload, "verifyPayload");
-__name2(verifyPayload, "verifyPayload");
 async function sha256B64url(text) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   return bytesToB64url(new Uint8Array(digest));
 }
-__name(sha256B64url, "sha256B64url");
-__name2(sha256B64url, "sha256B64url");
 function timingSafeEqual(a, b) {
   const ab = new TextEncoder().encode(a);
   const bb = new TextEncoder().encode(b);
@@ -648,35 +618,23 @@ function timingSafeEqual(a, b) {
   for (let i2 = 0; i2 < ab.length; i2++) diff |= ab[i2] ^ bb[i2];
   return diff === 0;
 }
-__name(timingSafeEqual, "timingSafeEqual");
-__name2(timingSafeEqual, "timingSafeEqual");
 function nowSec() {
   return Math.floor(Date.now() / 1e3);
 }
-__name(nowSec, "nowSec");
-__name2(nowSec, "nowSec");
 function normalizeScopes(value) {
   const requested = String(value || "").split(/\s+/).filter(Boolean);
   const scopes = [...new Set(requested.filter((scope) => scope === SCOPE || scope === ASSET_READ_SCOPE))];
   return scopes.length ? scopes : [SCOPE];
 }
-__name(normalizeScopes, "normalizeScopes");
-__name2(normalizeScopes, "normalizeScopes");
 function scopeString(value) {
   return normalizeScopes(value).join(" ");
 }
-__name(scopeString, "scopeString");
-__name2(scopeString, "scopeString");
 function hasReadScope(auth) {
   return Boolean(auth && auth.scopes && (auth.scopes.includes(ASSET_READ_SCOPE) || auth.scopes.includes(SCOPE)));
 }
-__name(hasReadScope, "hasReadScope");
-__name2(hasReadScope, "hasReadScope");
 function hasWriteScope(auth) {
   return Boolean(auth && auth.scopes && auth.scopes.includes(SCOPE));
 }
-__name(hasWriteScope, "hasWriteScope");
-__name2(hasWriteScope, "hasWriteScope");
 function protectedResourceMetadata(origin) {
   return {
     resource: origin,
@@ -686,8 +644,6 @@ function protectedResourceMetadata(origin) {
     resource_documentation: `${origin}/`
   };
 }
-__name(protectedResourceMetadata, "protectedResourceMetadata");
-__name2(protectedResourceMetadata, "protectedResourceMetadata");
 function authorizationServerMetadata(origin) {
   return {
     issuer: origin,
@@ -702,8 +658,6 @@ function authorizationServerMetadata(origin) {
     authorization_response_iss_parameter_supported: false
   };
 }
-__name(authorizationServerMetadata, "authorizationServerMetadata");
-__name2(authorizationServerMetadata, "authorizationServerMetadata");
 async function registerClient(request, env, origin) {
   let body = {};
   try {
@@ -728,8 +682,6 @@ async function registerClient(request, env, origin) {
     201
   );
 }
-__name(registerClient, "registerClient");
-__name2(registerClient, "registerClient");
 async function resolveRedirectUris(clientId, env) {
   if (!clientId) return [];
   if (clientId.startsWith("https://")) {
@@ -745,15 +697,11 @@ async function resolveRedirectUris(clientId, env) {
   const payload = await verifyPayload(clientId, env.OAUTH_SIGNING_KEY);
   return payload && Array.isArray(payload.redirect_uris) ? payload.redirect_uris : [];
 }
-__name(resolveRedirectUris, "resolveRedirectUris");
-__name2(resolveRedirectUris, "resolveRedirectUris");
 function redirectAllowed(registered, redirectUri) {
   if (!redirectUri) return false;
   if (redirectUri === CHATGPT_REDIRECT || redirectUri.startsWith(CHATGPT_REDIRECT_PREFIX)) return true;
   return registered.includes(redirectUri);
 }
-__name(redirectAllowed, "redirectAllowed");
-__name2(redirectAllowed, "redirectAllowed");
 function consentPage(params, error) {
   const hidden = Object.entries(params).map(([k, v]) => `<input type="hidden" name="${k}" value="${String(v).replace(/"/g, "&quot;")}">`).join("");
   const message = error ? `<p style="color:#b00">${error}</p>` : "";
@@ -769,8 +717,6 @@ ${hidden}
 </form>
 </body></html>`;
 }
-__name(consentPage, "consentPage");
-__name2(consentPage, "consentPage");
 async function authorizeGet(request, env) {
   const url = new URL(request.url);
   const p = Object.fromEntries(url.searchParams);
@@ -785,8 +731,6 @@ async function authorizeGet(request, env) {
   }
   return new Response(consentPage(p), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
-__name(authorizeGet, "authorizeGet");
-__name2(authorizeGet, "authorizeGet");
 async function authorizePost(request, env) {
   const form = await request.formData();
   const p = Object.fromEntries(form.entries());
@@ -816,8 +760,6 @@ async function authorizePost(request, env) {
   if (p.state) target.searchParams.set("state", p.state);
   return Response.redirect(target.toString(), 302);
 }
-__name(authorizePost, "authorizePost");
-__name2(authorizePost, "authorizePost");
 async function tokenEndpoint(request, env) {
   let form;
   try {
@@ -847,8 +789,6 @@ async function tokenEndpoint(request, env) {
   }
   return json({ error: "unsupported_grant_type" }, 400);
 }
-__name(tokenEndpoint, "tokenEndpoint");
-__name2(tokenEndpoint, "tokenEndpoint");
 async function issueTokens(env, scope) {
   scope = scopeString(scope);
   const access = await signPayload(
@@ -867,8 +807,6 @@ async function issueTokens(env, scope) {
     scope
   };
 }
-__name(issueTokens, "issueTokens");
-__name2(issueTokens, "issueTokens");
 async function mcpAuthorized(request, env) {
   const header = request.headers.get("Authorization") || "";
   if (!header.startsWith("Bearer ")) return false;
@@ -879,8 +817,6 @@ async function mcpAuthorized(request, env) {
   const payload = await verifyPayload(presented, env.OAUTH_SIGNING_KEY);
   return payload && payload.kind === "access" ? { scopes: normalizeScopes(payload.scope), kind: "oauth", payload } : false;
 }
-__name(mcpAuthorized, "mcpAuthorized");
-__name2(mcpAuthorized, "mcpAuthorized");
 function unauthorized(origin) {
   return json(
     { error: "UNAUTHORIZED" },
@@ -890,13 +826,9 @@ function unauthorized(origin) {
     }
   );
 }
-__name(unauthorized, "unauthorized");
-__name2(unauthorized, "unauthorized");
 function newTaskId() {
   return `cf-${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
 }
-__name(newTaskId, "newTaskId");
-__name2(newTaskId, "newTaskId");
 function buildContract(goal, instructions, acceptance, expectedFiles, lineage) {
   const expected_files = expectedFiles === void 0 ? [...ALLOWLIST] : Array.isArray(expectedFiles) ? expectedFiles.map(String) : [];
   const contract = {
@@ -913,8 +845,6 @@ function buildContract(goal, instructions, acceptance, expectedFiles, lineage) {
   if (source.parent_task_id) contract.parent_task_id = String(source.parent_task_id);
   return contract;
 }
-__name(buildContract, "buildContract");
-__name2(buildContract, "buildContract");
 function validateContract(contract) {
   const errors = [];
   if (!contract.goal.trim()) errors.push("goal must be non-empty");
@@ -937,8 +867,6 @@ function validateContract(contract) {
   }
   return errors;
 }
-__name(validateContract, "validateContract");
-__name2(validateContract, "validateContract");
 function ghHeaders(env) {
   return {
     Authorization: `Bearer ${env.GITHUB_TOKEN}`,
@@ -948,7 +876,6 @@ function ghHeaders(env) {
     "Content-Type": "application/json"
   };
 }
-__name(ghHeaders, "ghHeaders");
 function safeGithubResponseBody(raw) {
   return String(raw || "")
     .slice(0, 512)
@@ -956,7 +883,6 @@ function safeGithubResponseBody(raw) {
     .replace(/github_pat_[A-Za-z0-9_]+/gi, "[REDACTED]")
     .replace(/("?(?:token|secret|password|authorization)"?\s*:\s*")([^"\\]*)"/gi, "$1[REDACTED]\"");
 }
-__name(safeGithubResponseBody, "safeGithubResponseBody");
 async function dispatchTask(env, contract) {
   const res = await fetch(`${API}/repos/${env.GITHUB_REPO}/dispatches`, {
     method: "POST",
@@ -971,8 +897,6 @@ async function dispatchTask(env, contract) {
     bodySafe
   };
 }
-__name(dispatchTask, "dispatchTask");
-__name2(dispatchTask, "dispatchTask");
 var DISPATCH_MARKER_PREFIX = "dispatch:";
 var DISPATCH_STATE_PENDING = "PENDING";
 var DISPATCH_STATE_DISPATCHED = "DISPATCHED";
@@ -987,8 +911,6 @@ var DISPATCH_REASON_FAILED = "DISPATCH_FAILED";
 function dispatchMarkerKey(parentTaskId) {
   return `${DISPATCH_MARKER_PREFIX}${parentTaskId}`;
 }
-__name(dispatchMarkerKey, "dispatchMarkerKey");
-__name2(dispatchMarkerKey, "dispatchMarkerKey");
 async function readDispatchMarker(env, parentTaskId) {
   if (!env.ASSET_DB) return null;
   try {
@@ -999,8 +921,6 @@ async function readDispatchMarker(env, parentTaskId) {
     return null;
   }
 }
-__name(readDispatchMarker, "readDispatchMarker");
-__name2(readDispatchMarker, "readDispatchMarker");
 async function claimDispatchMarker(env, parentTaskId, childTaskId, verdict, reviewTimestamp, reviewNote, options) {
   if (!env.ASSET_DB) return { status: "unavailable", claimed: false };
   const opts = options && typeof options === "object" ? options : {};
@@ -1027,8 +947,6 @@ async function claimDispatchMarker(env, parentTaskId, childTaskId, verdict, revi
     return { status: "unavailable", claimed: false, claim_key: claimKey };
   }
 }
-__name(claimDispatchMarker, "claimDispatchMarker");
-__name2(claimDispatchMarker, "claimDispatchMarker");
 async function finalizeDispatchMarker(env, parentTaskId, patch, options) {
   if (!env.ASSET_DB) return;
   const opts = options && typeof options === "object" ? options : {};
@@ -1049,8 +967,6 @@ async function finalizeDispatchMarker(env, parentTaskId, patch, options) {
   } catch {
   }
 }
-__name(finalizeDispatchMarker, "finalizeDispatchMarker");
-__name2(finalizeDispatchMarker, "finalizeDispatchMarker");
 function buildApprovedChildContract(approvedNextTask, parentLineage) {
   const inherited = parentLineage && typeof parentLineage === "object" ? parentLineage : {};
   const contract = buildContract(
@@ -1066,8 +982,6 @@ function buildApprovedChildContract(approvedNextTask, parentLineage) {
   );
   return { contract, errors: validateContract(contract) };
 }
-__name(buildApprovedChildContract, "buildApprovedChildContract");
-__name2(buildApprovedChildContract, "buildApprovedChildContract");
 async function dispatchApprovedChild(env, parentTaskId, verdict, approvedNextTask, reviewTimestamp, reviewNote) {
   const base = {
     parent_task_id: String(parentTaskId),
@@ -1194,8 +1108,6 @@ async function dispatchApprovedChild(env, parentTaskId, verdict, approvedNextTas
     dispatched_at: dispatchedAt
   };
 }
-__name(dispatchApprovedChild, "dispatchApprovedChild");
-__name2(dispatchApprovedChild, "dispatchApprovedChild");
 function reviewDispatchAudit(taskId, verdict, timestamp, dispatch) {
   return {
     parent_task_id: String(taskId),
@@ -1208,8 +1120,6 @@ function reviewDispatchAudit(taskId, verdict, timestamp, dispatch) {
     reason: dispatch.reason ?? null
   };
 }
-__name(reviewDispatchAudit, "reviewDispatchAudit");
-__name2(reviewDispatchAudit, "reviewDispatchAudit");
 async function findArtifact(env, name) {
   const res = await fetch(
     `${API}/repos/${env.GITHUB_REPO}/actions/artifacts?name=${encodeURIComponent(name)}`,
@@ -1222,8 +1132,6 @@ async function findArtifact(env, name) {
   artifacts.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
   return artifacts[0];
 }
-__name(findArtifact, "findArtifact");
-__name2(findArtifact, "findArtifact");
 async function downloadArtifactJson(env, artifactId) {
   const url = `${API}/repos/${env.GITHUB_REPO}/actions/artifacts/${artifactId}/zip`;
   let res = await fetch(url, { headers: ghHeaders(env), redirect: "manual" });
@@ -1238,8 +1146,6 @@ async function downloadArtifactJson(env, artifactId) {
   if (!name) throw new Error(`${RESULT_FILENAME} not found in artifact`);
   return JSON.parse(new TextDecoder().decode(files[name]));
 }
-__name(downloadArtifactJson, "downloadArtifactJson");
-__name2(downloadArtifactJson, "downloadArtifactJson");
 async function getArtifactWorkflowRun(env, artifact) {
   const runId = artifact?.workflow_run?.id;
   if (!runId) throw new Error("artifact missing workflow_run.id");
@@ -1258,22 +1164,16 @@ async function getArtifactWorkflowRun(env, artifact) {
     completed_at: run.completed_at ?? null
   };
 }
-__name(getArtifactWorkflowRun, "getArtifactWorkflowRun");
-__name2(getArtifactWorkflowRun, "getArtifactWorkflowRun");
 function canonicalWorkflowStatus(conclusion) {
   const key = String(conclusion == null ? "" : conclusion).trim().toLowerCase();
   return WORKFLOW_CONCLUSION_STATUS[key] || EXECUTION_STATUS_BLOCKED;
 }
-__name(canonicalWorkflowStatus, "canonicalWorkflowStatus");
-__name2(canonicalWorkflowStatus, "canonicalWorkflowStatus");
 function normalizeSelfReportedStatus(rawStatus) {
   const text = String(rawStatus == null ? "" : rawStatus).trim().toLowerCase();
   if (SELF_REPORTED_FAILURE_STATUSES.includes(text)) return EXECUTION_STATUS_FAIL;
   if (SELF_REPORTED_SUCCESS_STATUSES.includes(text)) return EXECUTION_STATUS_PASS;
   return EXECUTION_STATUS_BLOCKED;
 }
-__name(normalizeSelfReportedStatus, "normalizeSelfReportedStatus");
-__name2(normalizeSelfReportedStatus, "normalizeSelfReportedStatus");
 function verifiedResultStatus(rawStatus, run) {
   if (!run || run.status !== "completed") return EXECUTION_STATUS_PENDING;
   const canonical = canonicalWorkflowStatus(run.conclusion);
@@ -1281,8 +1181,6 @@ function verifiedResultStatus(rawStatus, run) {
   const self = normalizeSelfReportedStatus(rawStatus);
   return self === EXECUTION_STATUS_FAIL ? EXECUTION_STATUS_FAIL : EXECUTION_STATUS_PASS;
 }
-__name(verifiedResultStatus, "verifiedResultStatus");
-__name2(verifiedResultStatus, "verifiedResultStatus");
 var REG_PREFIX = "task:";
 var BLOCKED_AFTER_MS = 15 * 60 * 1e3;
 var TASK_DISPATCH_CONFIRM_GRACE_MS = 15 * 60 * 1e3;
@@ -1310,8 +1208,6 @@ var DISPATCH_REASON_RETRY_FAILED = "RETRY_DISPATCH_FAILED";
 function retryDispatchKey(taskId, attempt) {
   return `${RETRY_DISPATCH_PREFIX}${taskId}:${attempt}`;
 }
-__name(retryDispatchKey, "retryDispatchKey");
-__name2(retryDispatchKey, "retryDispatchKey");
 var LINEAGE_PROJECT_FIELD = "project_id";
 var LINEAGE_ROOT_FIELD = "root_task_id";
 var LINEAGE_PARENT_FIELD = "parent_task_id";
@@ -1325,8 +1221,6 @@ function taskDispatchConfirmed(options) {
   const status = opts.runStatus == null ? "" : String(opts.runStatus).trim().toLowerCase();
   return status === "in_progress" || status === "completed";
 }
-__name(taskDispatchConfirmed, "taskDispatchConfirmed");
-__name2(taskDispatchConfirmed, "taskDispatchConfirmed");
 function classifyTaskDispatchLiveness(task, options) {
   const opts = options && typeof options === "object" ? options : {};
   const now = opts.now == null ? Date.now() : Number(opts.now);
@@ -1392,8 +1286,6 @@ function classifyTaskDispatchLiveness(task, options) {
     reason
   };
 }
-__name(classifyTaskDispatchLiveness, "classifyTaskDispatchLiveness");
-__name2(classifyTaskDispatchLiveness, "classifyTaskDispatchLiveness");
 function planTaskDispatchRetry(task, options) {
   const report = classifyTaskDispatchLiveness(task, options);
   const taskId = String(task && task.task_id || "");
@@ -1413,13 +1305,9 @@ function planTaskDispatchRetry(task, options) {
     reason: report.reason
   };
 }
-__name(planTaskDispatchRetry, "planTaskDispatchRetry");
-__name2(planTaskDispatchRetry, "planTaskDispatchRetry");
 function regKey(taskId) {
   return `${REG_PREFIX}${taskId}`;
 }
-__name(regKey, "regKey");
-__name2(regKey, "regKey");
 function resolveLineage(record, index) {
   const taskId = String(record && record.task_id || "");
   const projectId = record && record.project_id;
@@ -1438,8 +1326,6 @@ function resolveLineage(record, index) {
   }
   return { kind: LINEAGE_KIND_ROOT, key: taskId };
 }
-__name(resolveLineage, "resolveLineage");
-__name2(resolveLineage, "resolveLineage");
 function lineageInScope(record, scope, index) {
   if (!scope) return true;
   const projectId = scope.project_id;
@@ -1449,8 +1335,6 @@ function lineageInScope(record, scope, index) {
   if (projectId) return resolved.kind === LINEAGE_KIND_PROJECT && resolved.key === String(projectId);
   return resolved.kind === LINEAGE_KIND_ROOT && resolved.key === String(rootTaskId);
 }
-__name(lineageInScope, "lineageInScope");
-__name2(lineageInScope, "lineageInScope");
 async function recordTask(env, contract, options) {
   if (!env.TASK_REGISTRY) return;
   const opts = options && typeof options === "object" ? options : {};
@@ -1479,22 +1363,16 @@ async function recordTask(env, contract, options) {
     metadata: meta
   });
 }
-__name(recordTask, "recordTask");
-__name2(recordTask, "recordTask");
 async function listTasks(env) {
   if (!env.TASK_REGISTRY) return [];
   const listed = await env.TASK_REGISTRY.list({ prefix: REG_PREFIX });
   return listed.keys.map((k) => ({ task_id: k.name.slice(REG_PREFIX.length), ...k.metadata || {} }));
 }
-__name(listTasks, "listTasks");
-__name2(listTasks, "listTasks");
 async function saveTask(env, entry) {
   if (!env.TASK_REGISTRY) return;
   const { task_id, dispatch_contract, dispatch_events, ...meta } = entry;
   await env.TASK_REGISTRY.put(regKey(task_id), JSON.stringify(entry), { metadata: meta });
 }
-__name(saveTask, "saveTask");
-__name2(saveTask, "saveTask");
 async function updateDispatchLease(env, taskId, patch) {
   if (!env.TASK_REGISTRY) return null;
   let current = null;
@@ -1517,14 +1395,10 @@ async function updateDispatchLease(env, taskId, patch) {
   await saveTask(env, updated);
   return updated;
 }
-__name(updateDispatchLease, "updateDispatchLease");
-__name2(updateDispatchLease, "updateDispatchLease");
 async function readTask(env, taskId) {
   if (!env.TASK_REGISTRY) return null;
   return env.TASK_REGISTRY.get(regKey(taskId), "json");
 }
-__name(readTask, "readTask");
-__name2(readTask, "readTask");
 async function persistTerminalExecution(env, taskId, patch) {
   if (!env.TASK_REGISTRY) return;
   try {
@@ -1534,8 +1408,6 @@ async function persistTerminalExecution(env, taskId, patch) {
   } catch {
   }
 }
-__name(persistTerminalExecution, "persistTerminalExecution");
-__name2(persistTerminalExecution, "persistTerminalExecution");
 async function listPendingResults(env, scope) {
   const tasks = await listTasks(env);
   const index = /* @__PURE__ */ new Map();
@@ -1669,8 +1541,6 @@ async function listPendingResults(env, scope) {
   }
   return report;
 }
-__name(listPendingResults, "listPendingResults");
-__name2(listPendingResults, "listPendingResults");
 var REVIEW_VERDICTS = ["PASS", "FAIL", "BLOCKED"];
 async function toolMarkReviewed(env, args) {
   if (!env.TASK_REGISTRY) return { isError: true, text: "TASK_REGISTRY_UNAVAILABLE" };
@@ -1770,8 +1640,6 @@ async function toolMarkReviewed(env, args) {
   };
   return { isError: false, text: JSON.stringify(result), structuredContent: result };
 }
-__name(toolMarkReviewed, "toolMarkReviewed");
-__name2(toolMarkReviewed, "toolMarkReviewed");
 async function gatherDispatchEvidence(env, taskId) {
   const evidence = { hasArtifact: false, runStatus: null, runConclusion: null };
   try {
@@ -1786,8 +1654,6 @@ async function gatherDispatchEvidence(env, taskId) {
   }
   return evidence;
 }
-__name(gatherDispatchEvidence, "gatherDispatchEvidence");
-__name2(gatherDispatchEvidence, "gatherDispatchEvidence");
 async function toolPlanDispatchRetry(env, args) {
   if (!env.TASK_REGISTRY) return { isError: true, text: "TASK_REGISTRY_UNAVAILABLE" };
   const taskId = String(args.task_id ?? "").trim();
@@ -1798,8 +1664,6 @@ async function toolPlanDispatchRetry(env, args) {
   const plan = planTaskDispatchRetry(task, evidence);
   return { isError: false, text: JSON.stringify(plan), structuredContent: plan };
 }
-__name(toolPlanDispatchRetry, "toolPlanDispatchRetry");
-__name2(toolPlanDispatchRetry, "toolPlanDispatchRetry");
 async function retryDispatchTask(env, args) {
   const input = args && typeof args === "object" ? args : {};
   const taskId = String(input.task_id ?? "").trim();
@@ -1982,8 +1846,6 @@ async function retryDispatchTask(env, args) {
   };
   return { isError: false, text: JSON.stringify(result2), structuredContent: result2 };
 }
-__name(retryDispatchTask, "retryDispatchTask");
-__name2(retryDispatchTask, "retryDispatchTask");
 async function toolSubmitTask(env, args) {
   const contract = buildContract(args.goal, args.instructions, args.acceptance, args.expected_files, {
     project_id: args.project_id,
@@ -2064,8 +1926,6 @@ async function toolSubmitTask(env, args) {
     })
   };
 }
-__name(toolSubmitTask, "toolSubmitTask");
-__name2(toolSubmitTask, "toolSubmitTask");
 function normalizeLineageScope(args) {
   const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   const raw = input.scope && typeof input.scope === "object" && !Array.isArray(input.scope) ? input.scope : {};
@@ -2076,8 +1936,6 @@ function normalizeLineageScope(args) {
   if (rootTaskId != null && String(rootTaskId)) scope.root_task_id = String(rootTaskId);
   return Object.keys(scope).length ? scope : null;
 }
-__name(normalizeLineageScope, "normalizeLineageScope");
-__name2(normalizeLineageScope, "normalizeLineageScope");
 var ACTIVE_PROJECT_ENV = "PERSONAL_AI_ACTIVE_PROJECT_ID";
 var DEFAULT_ACTIVE_PROJECT_ID = "cloud-assets-activation";
 var SUPERVISOR_ACTIVE_PROJECT_ENV = "PERSONAL_AI_SUPERVISOR_ACTIVE_PROJECT";
@@ -2090,8 +1948,6 @@ function supervisorActiveProjectEnabled(env, args) {
   if (raw == null) return false;
   return FALSEY_CONFIG.indexOf(String(raw).trim().toLowerCase()) === -1;
 }
-__name(supervisorActiveProjectEnabled, "supervisorActiveProjectEnabled");
-__name2(supervisorActiveProjectEnabled, "supervisorActiveProjectEnabled");
 function activeProjectScope(env, args) {
   const explicit = normalizeLineageScope(args);
   if (explicit) return explicit;
@@ -2100,8 +1956,6 @@ function activeProjectScope(env, args) {
   const projectId = configured || DEFAULT_ACTIVE_PROJECT_ID;
   return projectId ? { project_id: projectId } : null;
 }
-__name(activeProjectScope, "activeProjectScope");
-__name2(activeProjectScope, "activeProjectScope");
 async function toolListPendingResults(env, args) {
   try {
     const scope = activeProjectScope(env, args);
@@ -2110,8 +1964,6 @@ async function toolListPendingResults(env, args) {
     return { isError: true, text: `REGISTRY_READ_FAILED: ${err2.message}` };
   }
 }
-__name(toolListPendingResults, "toolListPendingResults");
-__name2(toolListPendingResults, "toolListPendingResults");
 function buildTaskResult(taskId, data, artifact, run) {
   const raw = data && typeof data === "object" && !Array.isArray(data) ? data : {};
   const executionStatus = data ? verifiedResultStatus(raw.status, run) : EXECUTION_STATUS_PENDING;
@@ -2148,8 +2000,6 @@ function buildTaskResult(taskId, data, artifact, run) {
   if (raw.summary !== void 0) result.summary = raw.summary;
   return result;
 }
-__name(buildTaskResult, "buildTaskResult");
-__name2(buildTaskResult, "buildTaskResult");
 async function finalizeTaskResult(env, taskId, result) {
   let registry = null;
   if (env.TASK_REGISTRY) {
@@ -2178,8 +2028,6 @@ async function finalizeTaskResult(env, taskId, result) {
   }
   return result;
 }
-__name(finalizeTaskResult, "finalizeTaskResult");
-__name2(finalizeTaskResult, "finalizeTaskResult");
 async function toolGetTaskResult(env, args) {
   const taskId = String(args.task_id ?? "");
   if (!taskId) return { isError: true, text: "INVALID_INPUT: task_id required" };
@@ -2209,14 +2057,10 @@ async function toolGetTaskResult(env, args) {
   const result = await finalizeTaskResult(env, taskId, buildTaskResult(taskId, data, artifact, run));
   return { isError: false, text: JSON.stringify(result), structuredContent: result };
 }
-__name(toolGetTaskResult, "toolGetTaskResult");
-__name2(toolGetTaskResult, "toolGetTaskResult");
 function assetSubtype(row, content) {
   if (content && typeof content.subtype === "string" && content.subtype.trim()) return content.subtype.trim();
   return ASSET_SUBTYPE_SCHEMA[String(row.schema_version || "")] || null;
 }
-__name(assetSubtype, "assetSubtype");
-__name2(assetSubtype, "assetSubtype");
 var BLOCKED_READ_KEY = /(?:^|_)(?:path|source_db|decrypted_dir|media_root|key|token|secret|credential|password|authorization|database|db_path|raw_metadata)(?:$|_)/i;
 function safeAssetRead(value, key = "", depth = 0) {
   if (depth > 12) return null;
@@ -2236,8 +2080,6 @@ function safeAssetRead(value, key = "", depth = 0) {
   }
   return value;
 }
-__name(safeAssetRead, "safeAssetRead");
-__name2(safeAssetRead, "safeAssetRead");
 function parseAssetJson(value) {
   try {
     return JSON.parse(String(value));
@@ -2245,8 +2087,6 @@ function parseAssetJson(value) {
     return String(value);
   }
 }
-__name(parseAssetJson, "parseAssetJson");
-__name2(parseAssetJson, "parseAssetJson");
 var ASSET_PROVENANCE_CONTRACT = "PERSONAL_AI_ASSET_PROVENANCE_V0.2";
 var PROVENANCE_STATUS_VERIFIED = "VERIFIED";
 var PROVENANCE_STATUS_INCOMPLETE = "INCOMPLETE";
@@ -2310,8 +2150,6 @@ function provLookup(mapping, path) {
   }
   return current;
 }
-__name(provLookup, "provLookup");
-__name2(provLookup, "provLookup");
 function provMeaningful(value) {
   if (value === null || value === void 0) return false;
   if (typeof value === "string") return value.trim().length > 0;
@@ -2319,8 +2157,6 @@ function provMeaningful(value) {
   if (typeof value === "object") return Object.keys(value).length > 0;
   return true;
 }
-__name(provMeaningful, "provMeaningful");
-__name2(provMeaningful, "provMeaningful");
 function provResolve(provenance, field) {
   const aliases = PROVENANCE_FIELD_ALIASES[field] || [];
   for (const alias of aliases) {
@@ -2329,8 +2165,6 @@ function provResolve(provenance, field) {
   }
   return null;
 }
-__name(provResolve, "provResolve");
-__name2(provResolve, "provResolve");
 function normalizeProvenanceHash(value) {
   let text = String(value).trim().toLowerCase();
   for (const prefix of PROVENANCE_HASH_PREFIXES) {
@@ -2341,8 +2175,6 @@ function normalizeProvenanceHash(value) {
   }
   return text.replace(/\s+/g, "");
 }
-__name(normalizeProvenanceHash, "normalizeProvenanceHash");
-__name2(normalizeProvenanceHash, "normalizeProvenanceHash");
 function provenanceExpectedHashes(provenance, verification) {
   const expected = [];
   for (const source of [provLookup(provenance, "verification"), verification]) {
@@ -2353,8 +2185,6 @@ function provenanceExpectedHashes(provenance, verification) {
   }
   return expected;
 }
-__name(provenanceExpectedHashes, "provenanceExpectedHashes");
-__name2(provenanceExpectedHashes, "provenanceExpectedHashes");
 function provenanceExplicitMatch(provenance, verification) {
   for (const source of [provLookup(provenance, "verification"), verification]) {
     if (source && typeof source === "object" && !Array.isArray(source) && "content_hash_matches" in source) {
@@ -2363,8 +2193,6 @@ function provenanceExplicitMatch(provenance, verification) {
   }
   return null;
 }
-__name(provenanceExplicitMatch, "provenanceExplicitMatch");
-__name2(provenanceExplicitMatch, "provenanceExplicitMatch");
 function evaluateAssetProvenance(provenance, options) {
   const opts = options || {};
   const source = provenance && typeof provenance === "object" && !Array.isArray(provenance) ? provenance : {};
@@ -2444,8 +2272,6 @@ function evaluateAssetProvenance(provenance, options) {
     reason
   };
 }
-__name(evaluateAssetProvenance, "evaluateAssetProvenance");
-__name2(evaluateAssetProvenance, "evaluateAssetProvenance");
 function readAssetMetadata(row) {
   const parsed = parseAssetJson(row.content);
   const provenance = safeAssetRead(parseAssetJson(row.provenance));
@@ -2471,8 +2297,6 @@ function readAssetMetadata(row) {
     provenance_lineage: completeness.lineage
   };
 }
-__name(readAssetMetadata, "readAssetMetadata");
-__name2(readAssetMetadata, "readAssetMetadata");
 async function toolSearchAssets(env, args) {
   if (!env.ASSET_DB) return { isError: true, text: "ASSET_READ_UNAVAILABLE" };
   const typeInput = String(args.asset_type ?? "").trim().toUpperCase();
@@ -2487,8 +2311,6 @@ async function toolSearchAssets(env, args) {
   const assets = (result.results || []).map(readAssetMetadata).filter((asset) => !subtype || asset.subtype === subtype).slice(0, limit);
   return { isError: false, text: JSON.stringify({ assets }), structuredContent: { assets } };
 }
-__name(toolSearchAssets, "toolSearchAssets");
-__name2(toolSearchAssets, "toolSearchAssets");
 async function toolGetAsset(env, args) {
   if (!env.ASSET_DB) return { isError: true, text: "ASSET_READ_UNAVAILABLE" };
   const assetId = String(args.asset_id ?? "").trim();
@@ -2522,8 +2344,6 @@ async function toolGetAsset(env, args) {
   };
   return { isError: false, text: JSON.stringify(result), structuredContent: result };
 }
-__name(toolGetAsset, "toolGetAsset");
-__name2(toolGetAsset, "toolGetAsset");
 var KNOWLEDGE_WRITE_CONTRACT = "PERSONAL_AI_KNOWLEDGE_CANDIDATE_WRITER_V0.1";
 var KNOWLEDGE_ASSET_TYPE = "KNOWLEDGE";
 var KNOWLEDGE_WRITE_LIMITS = { title: 300 };
@@ -2535,16 +2355,12 @@ function canonicalKnowledgeContent(content) {
   if (typeof content === "string") return content;
   return JSON.stringify(content);
 }
-__name(canonicalKnowledgeContent, "canonicalKnowledgeContent");
-__name2(canonicalKnowledgeContent, "canonicalKnowledgeContent");
 async function sha256Hex(text) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   let hex = "";
   for (const byte of new Uint8Array(digest)) hex += byte.toString(16).padStart(2, "0");
   return hex;
 }
-__name(sha256Hex, "sha256Hex");
-__name2(sha256Hex, "sha256Hex");
 function buildKnowledgeProvenance(input) {
   const nowIso = (/* @__PURE__ */ new Date()).toISOString();
   const capturedAt = String(input.captured_at ?? nowIso);
@@ -2582,8 +2398,6 @@ function buildKnowledgeProvenance(input) {
     superseded_by: input.superseded_by ?? null
   };
 }
-__name(buildKnowledgeProvenance, "buildKnowledgeProvenance");
-__name2(buildKnowledgeProvenance, "buildKnowledgeProvenance");
 async function verifyKnowledgeVersion(db, assetId, expectedVersion, expectedHash, expectedContent) {
   let row;
   try {
@@ -2610,8 +2424,6 @@ async function verifyKnowledgeVersion(db, assetId, expectedVersion, expectedHash
   if (evaluation.status !== PROVENANCE_STATUS_VERIFIED || evaluation.verified !== true) return false;
   return true;
 }
-__name(verifyKnowledgeVersion, "verifyKnowledgeVersion");
-__name2(verifyKnowledgeVersion, "verifyKnowledgeVersion");
 async function writeKnowledgeCandidate(env, args) {
   const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
@@ -2710,8 +2522,6 @@ async function writeKnowledgeCandidate(env, args) {
   };
   return { isError: false, text: JSON.stringify(result), structuredContent: result };
 }
-__name(writeKnowledgeCandidate, "writeKnowledgeCandidate");
-__name2(writeKnowledgeCandidate, "writeKnowledgeCandidate");
 async function toolWriteKnowledgeCandidate(env, args) {
   try {
     return await writeKnowledgeCandidate(env, args);
@@ -2719,8 +2529,191 @@ async function toolWriteKnowledgeCandidate(env, args) {
     return { isError: true, text: `KNOWLEDGE_WRITE_FAILED: ${err2?.message || "unknown"}` };
   }
 }
-__name(toolWriteKnowledgeCandidate, "toolWriteKnowledgeCandidate");
-__name2(toolWriteKnowledgeCandidate, "toolWriteKnowledgeCandidate");
+var DECISION_WRITE_CONTRACT = "PERSONAL_AI_DECISION_WRITER_V0.1";
+var DECISION_INGESTION_CONTRACT = "PERSONAL_AI_DECISION_INGESTION_V0.1";
+var DECISION_ASSET_TYPE = "DECISION";
+var DECISION_WRITE_STATUS = "accepted";
+var DECISION_HASH_RE = /^[0-9a-f]{64}$/;
+var DECISION_DISPATCH_OUTCOMES = ["PENDING", "DISPATCHED", "FAILED"];
+var DECISION_REQUIRED_FIELDS = ["review_verdict", "dispatch_outcome", "promotion_decision", "user_choice", "user_outcome"];
+var DECISION_INSERT_SQL = "INSERT INTO asset_versions (asset_id, version, content, content_hash, provenance, verification, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+var DECISION_VERIFY_SQL = "SELECT a.asset_id AS asset_id, a.asset_type AS asset_type, a.current_version AS asset_version, a.content_hash AS asset_content_hash, a.status AS asset_status, v.version AS version_version, v.content AS version_content, v.content_hash AS version_content_hash, v.created_by AS version_created_by, v.provenance AS version_provenance, v.verification AS version_verification FROM assets a JOIN asset_versions v ON v.asset_id = a.asset_id AND v.version = a.current_version WHERE a.asset_id = ?";
+function normalizeDecision(input) {
+const src = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+const missing = DECISION_REQUIRED_FIELDS.filter((key) => src[key] === null || src[key] === void 0 || typeof src[key] === "string" && !src[key].trim());
+const invalid = [];
+const verdict = src.review_verdict == null ? null : String(src.review_verdict).trim().toUpperCase();
+if (verdict !== null && !REVIEW_VERDICTS.includes(verdict)) invalid.push("review_verdict");
+const dispatch = src.dispatch_outcome == null ? null : String(src.dispatch_outcome).trim().toUpperCase();
+if (dispatch !== null && !DECISION_DISPATCH_OUTCOMES.includes(dispatch)) invalid.push("dispatch_outcome");
+const complete = missing.length === 0 && invalid.length === 0;
+return { contract: DECISION_INGESTION_CONTRACT, status: complete ? "VERIFIED" : "INCOMPLETE", complete, verified: complete, missing, invalid, record: { review_verdict: verdict, dispatch_outcome: dispatch } };
+}
+function canonicalDecisionContent(content) {
+const sorted = (value) => {
+if (value === null || typeof value !== "object") return JSON.stringify(value);
+if (Array.isArray(value)) return "[" + value.map(sorted).join(",") + "]";
+return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + sorted(value[key])).join(",") + "}";
+};
+return typeof content === "string" ? content : sorted(content);
+}
+function buildDecisionProvenance(input) {
+const now = (/* @__PURE__ */ new Date()).toISOString();
+const capturedAt = String(input.captured_at ?? now);
+const promotedAt = String(input.promoted_at ?? now);
+const sourceVersion = String(input.source_version ?? "v1");
+return {
+source: { identity: String(input.evidence_ref), location: String(input.source_location ?? "cloud://decision-registry") },
+source_version: sourceVersion,
+content_version: String(input.content_version ?? sourceVersion),
+canonical_version: input.canonical_version,
+content_hash: input.content_hash,
+verification: {
+method: "recompute_content_hash",
+evidence: { checked_by: "decision_ingestion_writer", recomputed: input.content_hash, verified_at: promotedAt },
+verified_at: promotedAt,
+expected_content_hash: input.content_hash,
+content_hash_matches: true
+},
+promotion: { decision: String(input.promotion_decision), event_id: String(input.promotion_event), decided_at: String(input.decided_at), actor: String(input.actor ?? "cloud-agent") },
+captured_at: capturedAt,
+promoted_at: promotedAt,
+supersedes: Array.isArray(input.supersedes) ? input.supersedes.slice() : [],
+superseded_by: null
+};
+}
+async function verifyDecisionVersion(db, assetId, expectedVersion, expectedHash, expectedContent) {
+let row;
+try {
+row = await db.prepare(DECISION_VERIFY_SQL).bind(assetId).first();
+} catch {
+return false;
+}
+if (!row) return false;
+if (String(row.asset_type) !== DECISION_ASSET_TYPE) return false;
+if (Number(row.asset_version) !== Number(expectedVersion)) return false;
+if (Number(row.version_version) !== Number(expectedVersion)) return false;
+if (String(row.asset_content_hash) !== String(expectedHash)) return false;
+if (String(row.version_content_hash) !== String(expectedHash)) return false;
+if (expectedContent !== void 0 && String(row.version_content) !== String(expectedContent)) return false;
+if (String(row.asset_status) !== DECISION_WRITE_STATUS) return false;
+const createdBy = row.version_created_by == null ? "" : String(row.version_created_by).trim();
+if (!createdBy) return false;
+const evaluation = evaluateAssetProvenance(parseAssetJson(row.version_provenance), { content_hash: expectedHash, canonical_version: expectedVersion, verification: parseAssetJson(row.version_verification) });
+if (evaluation.status !== PROVENANCE_STATUS_VERIFIED || evaluation.verified !== true) return false;
+return true;
+}
+async function writeDecisionRecord(env, args) {
+if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
+if (args === null || typeof args !== "object" || Array.isArray(args)) return { isError: true, text: "INVALID_INPUT" };
+const input = args;
+if (input.asset_type != null && String(input.asset_type).trim().toUpperCase() !== DECISION_ASSET_TYPE) return { isError: true, text: "INVALID_ASSET_TYPE" };
+const suppliedAssetId = input.asset_id == null ? "" : String(input.asset_id).trim();
+let decisionId = String(input.decision_id ?? "").trim();
+if (suppliedAssetId) {
+if (!suppliedAssetId.startsWith("decision:")) return { isError: true, text: "INVALID_ASSET_ID" };
+const fromAsset = suppliedAssetId.slice("decision:".length);
+if (decisionId && decisionId !== fromAsset) return { isError: true, text: "INVALID_ASSET_ID" };
+if (!decisionId) decisionId = fromAsset;
+}
+if (!decisionId) decisionId = String(input.task_id ?? "").trim();
+const assetId = "decision:" + decisionId;
+if (!decisionId || !ASSET_ID_RE.test(decisionId) || !ASSET_ID_RE.test(assetId)) return { isError: true, text: "INVALID_ASSET_ID" };
+const taskId = String(input.task_id ?? "").trim();
+if (!taskId) return { isError: true, text: "INVALID_TASK_ID" };
+if (input.review_verdict != null && !REVIEW_VERDICTS.includes(String(input.review_verdict).trim().toUpperCase())) return { isError: true, text: "INVALID_REVIEW_VERDICT" };
+if (input.dispatch_outcome != null && !DECISION_DISPATCH_OUTCOMES.includes(String(input.dispatch_outcome).trim().toUpperCase())) return { isError: true, text: "INVALID_DISPATCH_OUTCOME" };
+if (!input.promotion_decision || !input.promotion_event) return { isError: true, text: "INVALID_PROMOTION" };
+const agentRecommendation = String(input.agent_recommendation ?? "").trim();
+if (!agentRecommendation) return { isError: true, text: "INVALID_AGENT_RECOMMENDATION" };
+const userChoice = input.user_choice == null ? "" : String(input.user_choice);
+if (!userChoice.trim()) return { isError: true, text: "INVALID_USER_CHOICE" };
+const userOutcome = input.user_outcome == null ? "" : String(input.user_outcome);
+if (!userOutcome.trim()) return { isError: true, text: "INVALID_USER_OUTCOME" };
+const derivedOverride = userChoice.trim() !== agentRecommendation;
+const overrideReason = input.override_reason == null ? "" : String(input.override_reason).trim();
+if (derivedOverride && !overrideReason) return { isError: true, text: "INVALID_OVERRIDE_REASON" };
+if (input.user_override !== void 0 && input.user_override !== null && Boolean(input.user_override) !== derivedOverride) return { isError: true, text: "INVALID_OVERRIDE" };
+const decidedAt = String(input.decided_at ?? "").trim();
+if (!decidedAt || Number.isNaN(Date.parse(decidedAt))) return { isError: true, text: "INVALID_DECIDED_AT" };
+const evidenceRef = String(input.evidence_ref ?? "").trim();
+if (!evidenceRef) return { isError: true, text: "INVALID_EVIDENCE_REF" };
+const normalized = normalizeDecision(input);
+if (normalized.status !== "VERIFIED" || normalized.verified !== true) return { isError: true, text: "INCOMPLETE_DECISION" };
+const content = {
+decision_id: decisionId,
+task_id: taskId,
+review_verdict: normalized.record.review_verdict,
+dispatch_outcome: normalized.record.dispatch_outcome,
+promotion_decision: String(input.promotion_decision),
+promotion_event: String(input.promotion_event),
+agent_recommendation: agentRecommendation,
+user_choice: userChoice,
+user_outcome: userOutcome,
+user_override: derivedOverride,
+override_reason: derivedOverride ? overrideReason : null,
+outcome_feedback: input.outcome_feedback == null ? null : input.outcome_feedback,
+evidence_ref: evidenceRef,
+decided_at: decidedAt
+};
+const canonicalContent = canonicalDecisionContent(content);
+const contentHash = await sha256Hex(canonicalContent);
+if (!DECISION_HASH_RE.test(contentHash)) return { isError: true, text: "ASSET_WRITE_FAILED" };
+const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+const db = env.ASSET_DB;
+let existing;
+try {
+existing = await db.prepare("SELECT asset_id, current_version, content_hash, updated_at FROM assets WHERE asset_id = ?").bind(assetId).first();
+} catch {
+return { isError: true, text: "ASSET_WRITE_FAILED" };
+}
+const schemaVersion = String(input.schema_version ?? "v0.1");
+const title = String(input.title ?? "").trim() || `Decision ${decisionId}`;
+if (existing && normalizeProvenanceHash(existing.content_hash) === contentHash) {
+const currentVersion = Number(existing.current_version) || 1;
+const present = await verifyDecisionVersion(db, assetId, currentVersion, contentHash, canonicalContent);
+if (!present) return { isError: true, text: "ASSET_WRITE_FAILED" };
+const replay = {
+contract: DECISION_WRITE_CONTRACT, asset_id: assetId, asset_type: DECISION_ASSET_TYPE, schema_version: schemaVersion, title,
+status: "IDEMPOTENT", created: false, idempotent: true, version: currentVersion, previous_version: currentVersion > 1 ? currentVersion - 1 : null,
+content_hash: contentHash, provenance_status: PROVENANCE_STATUS_VERIFIED, provenance_verified: true, promotion_event: String(input.promotion_event),
+supersedes: [], user_override: derivedOverride, user_choice: userChoice, agent_recommendation: agentRecommendation, updated_at: existing.updated_at ?? nowIso
+};
+return { isError: false, text: JSON.stringify(replay), structuredContent: replay };
+}
+const previousVersion = existing ? Number(existing.current_version) || 0 : 0;
+const version = previousVersion + 1;
+const callerSupersedes = Array.isArray(input.supersedes) ? input.supersedes.slice() : [];
+const supersedes = previousVersion > 0 ? [...callerSupersedes, String(previousVersion)] : callerSupersedes;
+const createdBy = String(input.created_by ?? input.actor ?? "cloud-agent").trim() || "cloud-agent";
+const provenance = buildDecisionProvenance({ ...input, actor: createdBy, canonical_version: version, content_hash: contentHash, supersedes });
+const verification = provenance.verification;
+const assetWrite = existing ? db.prepare("UPDATE assets SET schema_version = ?, title = ?, status = ?, current_version = ?, content_hash = ?, updated_at = ? WHERE asset_id = ?").bind(schemaVersion, title, DECISION_WRITE_STATUS, version, contentHash, nowIso, assetId) : db.prepare("INSERT INTO assets (asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(assetId, DECISION_ASSET_TYPE, schemaVersion, title, DECISION_WRITE_STATUS, version, contentHash, nowIso, nowIso);
+const versionWrite = db.prepare(DECISION_INSERT_SQL).bind(assetId, version, canonicalContent, contentHash, JSON.stringify(provenance), JSON.stringify(verification), createdBy, nowIso);
+if (typeof db.batch !== "function") return { isError: true, text: "ASSET_WRITE_FAILED" };
+try {
+await db.batch([assetWrite, versionWrite]);
+} catch {
+return { isError: true, text: "ASSET_WRITE_FAILED" };
+}
+const persisted = await verifyDecisionVersion(db, assetId, version, contentHash, canonicalContent);
+if (!persisted) return { isError: true, text: "ASSET_WRITE_FAILED" };
+const result = {
+contract: DECISION_WRITE_CONTRACT, asset_id: assetId, asset_type: DECISION_ASSET_TYPE, schema_version: schemaVersion, title,
+status: "WRITTEN", created: !existing, idempotent: false, version, previous_version: previousVersion > 0 ? previousVersion : null,
+content_hash: contentHash, provenance_status: PROVENANCE_STATUS_VERIFIED, provenance_verified: true, promotion_event: provenance.promotion.event_id,
+supersedes: provenance.supersedes, user_override: derivedOverride, user_choice: userChoice, agent_recommendation: agentRecommendation, updated_at: nowIso
+};
+return { isError: false, text: JSON.stringify(result), structuredContent: result };
+}
+async function toolWriteDecisionRecord(env, args) {
+try {
+return await writeDecisionRecord(env, args);
+} catch {
+return { isError: true, text: "ASSET_WRITE_FAILED" };
+}
+}
+
 var TOOLS = [
   {
     name: "submit_task",
@@ -2936,6 +2929,20 @@ var TOOLS = [
       },
       additionalProperties: true
     }
+  },
+  {
+    name: "write_decision_record",
+    description: "Controlled canonical writer for a normalized VERIFIED DECISION record. Write only; never used for non-DECISION assets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        asset_type: { type: "string", enum: ["DECISION"] },
+        review_verdict: { type: "string", enum: REVIEW_VERDICTS }
+      },
+      additionalProperties: true,
+      required: []
+    },
+    outputSchema: { type: "object", additionalProperties: true }
   }
 ];
 async function handleMcp(request, env, cors, auth) {
@@ -2947,8 +2954,8 @@ async function handleMcp(request, env, cors, auth) {
   }
   const { id = null, method, params = {} } = message || {};
   if (method && method.startsWith("notifications/")) return new Response(null, { status: 202, headers: cors });
-  const ok = /* @__PURE__ */ __name2((result) => json({ jsonrpc: "2.0", id, result }, 200, cors), "ok");
-  const fail = /* @__PURE__ */ __name2((code, message2) => json({ jsonrpc: "2.0", id, error: { code, message: message2 } }, 200, cors), "fail");
+  const ok = (result) => json({ jsonrpc: "2.0", id, result }, 200, cors);
+  const fail = (code, message2) => json({ jsonrpc: "2.0", id, error: { code, message: message2 } }, 200, cors);
   switch (method) {
     case "initialize":
       return ok({
@@ -2991,6 +2998,9 @@ async function handleMcp(request, env, cors, auth) {
       } else if (name === "write_knowledge_candidate") {
         if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolWriteKnowledgeCandidate(env, args);
+      } else if (name === "write_decision_record") {
+        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
+        outcome = await toolWriteDecisionRecord(env, args);
       } else return fail(-32602, `unknown tool: ${name}`);
       const toolResult = { content: [{ type: "text", text: outcome.text }], isError: outcome.isError };
       if (outcome.structuredContent !== void 0) toolResult.structuredContent = outcome.structuredContent;
@@ -3000,8 +3010,6 @@ async function handleMcp(request, env, cors, auth) {
       return fail(-32601, `method not found: ${method}`);
   }
 }
-__name(handleMcp, "handleMcp");
-__name2(handleMcp, "handleMcp");
 var index_default = {
   async fetch(request, env) {
     const cors = corsHeaders();
