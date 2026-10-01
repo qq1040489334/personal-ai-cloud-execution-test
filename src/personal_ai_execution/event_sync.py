@@ -72,9 +72,36 @@ DEFAULT_ACTIVE_PROJECT_ID = "cloud-assets-activation"
 #: Kind emitted for the single bounded next_action of a Supervisor report.
 NEXT_ACTION_REVIEW = "REVIEW_PENDING_RESULT"
 
+#: Optional process config for the live Supervisor/advancement caller. This is
+#: the caller-level switch that makes the existing caller request active-project
+#: scoped pending results without changing the unscoped compatibility surface
+#: used by every other caller. Unset (or truthy) means the live caller requests
+#: the configured active-project lineage; a falsey value opts the caller back
+#: into the historical unscoped behavior.
+SUPERVISOR_ACTIVE_PROJECT_ENV = "PERSONAL_AI_SUPERVISOR_ACTIVE_PROJECT"
+
+#: Truthy/falsey spellings accepted by :func:`supervisor_active_project_enabled`.
+_FALSEY_CONFIG = frozenset({"0", "false", "no", "off", ""})
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def supervisor_active_project_enabled(
+    env: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return whether the live Supervisor/advancement caller scopes by default.
+
+    The caller is enabled unless ``PERSONAL_AI_SUPERVISOR_ACTIVE_PROJECT`` is set
+    to a falsey value, so the existing caller path requests active-project scoped
+    pending results by default while an operator can still opt out explicitly.
+    """
+    environ = env if env is not None else os.environ
+    raw = environ.get(SUPERVISOR_ACTIVE_PROJECT_ENV)
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in _FALSEY_CONFIG
 
 
 def active_project_scope(
@@ -665,20 +692,36 @@ class EventSyncRegistry:
         project_id: Any = None,
         root_task_id: Any = None,
         *,
+        active_project: bool | None = None,
         env: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Deterministically select the active-project pending-review backlog.
 
-        This is the Supervisor/advancement consumer entry point. It resolves the
-        active Cloud Assets Activation lineage (overridable with an explicit
+        This is the Supervisor/advancement consumer entry point, and the live
+        caller path requests active-project scope through ``active_project`` or
+        the ``PERSONAL_AI_SUPERVISOR_ACTIVE_PROJECT`` caller config. It resolves
+        the active Cloud Assets Activation lineage (overridable with an explicit
         ``project_id`` / ``root_task_id`` or the ``PERSONAL_AI_ACTIVE_PROJECT_ID``
         environment variable), reads only that lineage's pending results, builds
         advisory recommendations, reports the ``excluded_by_lineage`` audit count
         and returns exactly one bounded ``next_action``. Historical singletons
-        are never selected and never mutated; calling with every source empty
-        falls back to the unscoped list so intentional omission stays compatible.
+        are never selected and never mutated. Passing ``active_project=False``
+        (or a falsey caller config) preserves the historical unscoped behavior
+        for callers that intentionally omit scope.
         """
-        scope = active_project_scope(project_id, root_task_id, env=env)
+        explicit_scope = bool(
+            (str(project_id).strip() if project_id else "")
+            or (str(root_task_id).strip() if root_task_id else "")
+        )
+        if explicit_scope:
+            scope = active_project_scope(project_id, root_task_id, env=env)
+        else:
+            enabled = (
+                supervisor_active_project_enabled(env)
+                if active_project is None
+                else bool(active_project)
+            )
+            scope = active_project_scope(env=env) if enabled else None
         if scope:
             report = self.list_review_recommendations(scope)
         else:
@@ -1088,11 +1131,13 @@ def supervisor_pending_review_report(
     project_id: Any = None,
     root_task_id: Any = None,
     *,
+    active_project: bool | None = None,
     env: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _DEFAULT_REGISTRY.supervisor_pending_review_report(
         project_id,
         root_task_id,
+        active_project=active_project,
         env=env,
     )
 

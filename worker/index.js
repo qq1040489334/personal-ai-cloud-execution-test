@@ -1661,12 +1661,22 @@ __name(normalizeLineageScope, "normalizeLineageScope");
 __name2(normalizeLineageScope, "normalizeLineageScope");
 var ACTIVE_PROJECT_ENV = "PERSONAL_AI_ACTIVE_PROJECT_ID";
 var DEFAULT_ACTIVE_PROJECT_ID = "cloud-assets-activation";
+var SUPERVISOR_ACTIVE_PROJECT_ENV = "PERSONAL_AI_SUPERVISOR_ACTIVE_PROJECT";
+var FALSEY_CONFIG = ["", "0", "false", "no", "off"];
+function supervisorActiveProjectEnabled(env, args) {
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  if (input.active_project === false || input.active_project === "false") return false;
+  if (input.active_project === true || input.active_project === "true") return true;
+  const raw = env ? env[SUPERVISOR_ACTIVE_PROJECT_ENV] : null;
+  if (raw == null) return false;
+  return FALSEY_CONFIG.indexOf(String(raw).trim().toLowerCase()) === -1;
+}
+__name(supervisorActiveProjectEnabled, "supervisorActiveProjectEnabled");
+__name2(supervisorActiveProjectEnabled, "supervisorActiveProjectEnabled");
 function activeProjectScope(env, args) {
   const explicit = normalizeLineageScope(args);
   if (explicit) return explicit;
-  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
-  const requested = input.active_project === true || input.active_project === "true";
-  if (!requested) return null;
+  if (!supervisorActiveProjectEnabled(env, args)) return null;
   const configured = env && env[ACTIVE_PROJECT_ENV] ? String(env[ACTIVE_PROJECT_ENV]).trim() : "";
   const projectId = configured || DEFAULT_ACTIVE_PROJECT_ID;
   return projectId ? { project_id: projectId } : null;
@@ -2336,7 +2346,7 @@ var TOOLS = [
   },
   {
     name: "list_pending_results",
-    description: "List tasks that have finished and await review, plus failed and blocked tasks. Returns buckets pending_review / failed / blocked. Optional project_id / root_task_id lineage scope deterministically restricts the result to one active lineage and reports excluded_by_lineage; unscoped behavior is unchanged. Set active_project=true to scope to the configured active project lineage (PERSONAL_AI_ACTIVE_PROJECT_ID, default cloud-assets-activation).",
+    description: "List tasks that have finished and await review, plus failed and blocked tasks. Returns buckets pending_review / failed / blocked. Optional project_id / root_task_id lineage scope deterministically restricts the result to one active lineage and reports excluded_by_lineage; unscoped behavior is unchanged. Set active_project=true, or configure the live Supervisor/advancement caller with PERSONAL_AI_SUPERVISOR_ACTIVE_PROJECT, to scope to the configured active project lineage (PERSONAL_AI_ACTIVE_PROJECT_ID, default cloud-assets-activation).",
     inputSchema: {
       type: "object",
       properties: {
