@@ -31,8 +31,15 @@ from personal_ai_execution.hermes_orchestration import (
     CLAIM_STATE_IDEMPOTENT,
     CLAIM_STATE_LEASED_ELSEWHERE,
     CLAIM_STATE_NOT_CLAIMABLE,
+    DEPLOY_CREDENTIAL_ENV_VARS,
+    FINAL_STATUS_DEPLOY_PASS,
+    FINAL_STATUS_HERMES_IN_ARCHITECTURE_PASS,
+    FINAL_STATUS_HUMAN_GATE_REQUIRED,
+    FINAL_STATUS_READY_FOR_WINDOWS_FINAL_GOLDEN,
+    FINAL_STATUS_ROLLED_BACK,
     GOLDEN_PATH_BLOCKED,
     GOLDEN_PATH_PARTIAL,
+    HERMES_ADAPTER_PRODUCTION_BASELINE,
     HERMES_RESULT_ADAPTER_DEPLOYMENT_GATE,
     HERMES_RESULT_ADAPTER_VERSION,
     HERMES_RESULT_SOURCE,
@@ -54,6 +61,7 @@ from personal_ai_execution.hermes_orchestration import (
     HermesOrchestrationAdapter,
     acknowledge_task,
     apply_registry_patch,
+    assess_hermes_result_adapter_deploy,
     audit_windows_hermes_transport,
     build_health_handshake,
     build_hermes_result_envelope,
@@ -877,3 +885,119 @@ def test_deployment_gate_separates_code_completion_from_production_deploy():
     assert gate["required_approvals"]
     assert gate["required_before_deploy"]
     assert "no production deploy" in gate["forbidden_in_this_patch"]
+
+
+# =============================================================================
+# HERMES_RESULT_ADAPTER_PRODUCTION_DEPLOY_AND_GOLDEN_V1
+# =============================================================================
+
+_DEPLOY_ENV_NAMES = (
+    "CLOUDFLARE_API_TOKEN",
+    "CF_API_TOKEN",
+    "CLOUDFLARE_API_KEY",
+    "HERMES_TRANSPORT_TOKEN",
+    "HERMES_GATEWAY_TOKEN",
+    "HERMES_TRANSPORT_URL",
+    "HERMES_GATEWAY_URL",
+    "HERMES_A2A_URL",
+)
+
+
+def test_deploy_assessment_is_human_gated_without_credentials():
+    assessment = assess_hermes_result_adapter_deploy(
+        {name: "" for name in _DEPLOY_ENV_NAMES}
+    )
+    assert assessment["final_status"] == FINAL_STATUS_HUMAN_GATE_REQUIRED
+    assert assessment["human_gate_required"] is True
+    assert assessment["deployment_attempted"] is False
+    assert assessment["production_deployed"] is False
+    assert assessment["production_version"] is None
+    assert assessment["missing_dependencies"]
+    assert assessment["canonical_write_performed"] is False
+    assert assessment["second_state_store_created"] is False
+    assert assessment["credential_or_binding_mutated"] is False
+    assert assessment["connection_attempted_to_windows"] is False
+
+
+def test_deploy_assessment_never_fabricates_pass_from_credentials_alone():
+    # Presence of credentials/bindings is NOT deployment evidence: without an
+    # externally observed production version + read-back the honest outcome is
+    # still a Human Gate.
+    env = {
+        "CLOUDFLARE_API_TOKEN": "cf-secret-value",
+        "HERMES_TRANSPORT_TOKEN": "transport-secret-value",
+        "HERMES_TRANSPORT_URL": "https://personal-ai.example",
+    }
+    assessment = assess_hermes_result_adapter_deploy(env)
+    assert assessment["final_status"] == FINAL_STATUS_HUMAN_GATE_REQUIRED
+    assert assessment["production_deployed"] is False
+    assert assessment["deploy_credential_source"] == "CLOUDFLARE_API_TOKEN"
+    assert assessment["transport_credential_source"] == "HERMES_TRANSPORT_TOKEN"
+    assert assessment["transport_endpoint_source"] == "HERMES_TRANSPORT_URL"
+    serialized = json.dumps(assessment)
+    assert "cf-secret-value" not in serialized
+    assert "transport-secret-value" not in serialized
+    assert assessment["secrets_recorded"] is False
+
+
+def test_deploy_assessment_requires_real_read_back_for_windows_ready():
+    assessment = assess_hermes_result_adapter_deploy(
+        {"CLOUDFLARE_API_TOKEN": "x", "HERMES_TRANSPORT_TOKEN": "y"},
+        deployed_production_version="abc12345",
+        production_read_back_ok=True,
+    )
+    assert assessment["final_status"] == FINAL_STATUS_READY_FOR_WINDOWS_FINAL_GOLDEN
+    assert assessment["production_deployed"] is True
+    assert assessment["deployment_attempted"] is True
+    assert assessment["human_gate_required"] is False
+    assert assessment["production_version"] == "abc12345"
+
+
+def test_deploy_assessment_does_not_require_windows_endpoint_inbound():
+    assessment = assess_hermes_result_adapter_deploy(
+        {"CLOUDFLARE_API_TOKEN": "x", "HERMES_TRANSPORT_TOKEN": "y"},
+        deployed_production_version="abc12345",
+        production_read_back_ok=True,
+    )
+    assert assessment["connection_attempted_to_windows"] is False
+    assert assessment["required_auth_scope"] == "hermes.transport"
+    assert assessment["required_endpoints"]
+
+
+def test_deploy_assessment_hermes_in_architecture_requires_real_ingestion():
+    assessment = assess_hermes_result_adapter_deploy(
+        {"CLOUDFLARE_API_TOKEN": "x", "HERMES_TRANSPORT_TOKEN": "y"},
+        deployed_production_version="abc12345",
+        production_read_back_ok=True,
+        windows_result_ingested=True,
+    )
+    assert assessment["final_status"] == FINAL_STATUS_HERMES_IN_ARCHITECTURE_PASS
+    assert assessment["windows_result_ingested"] is True
+
+
+def test_deploy_assessment_rollback_status_and_target_captured():
+    assessment = assess_hermes_result_adapter_deploy(
+        {"CLOUDFLARE_API_TOKEN": "x"}, rolled_back=True
+    )
+    assert assessment["final_status"] == FINAL_STATUS_ROLLED_BACK
+    assert assessment["production_deployed"] is False
+    assert assessment["rollback_target"] == HERMES_ADAPTER_PRODUCTION_BASELINE
+    assert (
+        assessment["rollback_target"]["production_version"]
+        == HERMES_ADAPTER_PRODUCTION_BASELINE["production_version"]
+    )
+    assert assessment["rollback_target"]["source_sha256"]
+
+
+def test_deploy_statuses_are_disjoint_and_include_required_outcomes():
+    allowed = {
+        FINAL_STATUS_DEPLOY_PASS,
+        FINAL_STATUS_READY_FOR_WINDOWS_FINAL_GOLDEN,
+        FINAL_STATUS_HERMES_IN_ARCHITECTURE_PASS,
+        FINAL_STATUS_ROLLED_BACK,
+        FINAL_STATUS_HUMAN_GATE_REQUIRED,
+    }
+    assert len(allowed) == 5
+    assert assess_hermes_result_adapter_deploy(
+        {name: "" for name in _DEPLOY_ENV_NAMES}
+    )["final_status"] in allowed

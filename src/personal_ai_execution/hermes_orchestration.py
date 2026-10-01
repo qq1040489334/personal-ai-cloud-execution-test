@@ -1602,6 +1602,135 @@ HERMES_RESULT_ADAPTER_DEPLOYMENT_GATE = {
 }
 
 
+# --- production deploy / Human Gate assessment -------------------------------
+#
+# This is a *read-only* readiness/status assessor.  It never deploys, never
+# mutates credentials or bindings, and never fabricates a production version.
+# The library cannot itself perform a Cloudflare deploy; an externally observed
+# deployment must be supplied as evidence before any non-gated status is
+# returned.  Absent that evidence the only honest outcome is
+# ``HUMAN_GATE_REQUIRED``.
+
+#: Non-secret identifiers of the captured production rollback target, copied
+#: from ``worker/PRODUCTION-BASELINE.json``.  No secret value is represented.
+HERMES_ADAPTER_PRODUCTION_BASELINE = {
+    "service": "personal-ai-execution-mcp",
+    "environment": "production",
+    "production_version": "3e2fed43",
+    "source_file": "worker/index.js",
+    "source_sha256": "8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1",
+    "rollback_reference": (
+        "Restore Cloudflare version 3e2fed43 if a later deployment fails a "
+        "pre-Golden gate"
+    ),
+}
+
+#: Environment variable *names* that would authorize a Cloudflare production
+#: deploy.  Only presence is ever checked; values are never read or printed.
+DEPLOY_CREDENTIAL_ENV_VARS = (
+    "CLOUDFLARE_API_TOKEN",
+    "CF_API_TOKEN",
+    "CLOUDFLARE_API_KEY",
+)
+
+FINAL_STATUS_DEPLOY_PASS = "DEPLOY_PASS"
+FINAL_STATUS_READY_FOR_WINDOWS_FINAL_GOLDEN = "READY_FOR_WINDOWS_FINAL_GOLDEN"
+FINAL_STATUS_HERMES_IN_ARCHITECTURE_PASS = "HERMES_IN_ARCHITECTURE_PASS"
+FINAL_STATUS_ROLLED_BACK = "ROLLED_BACK"
+FINAL_STATUS_HUMAN_GATE_REQUIRED = "HUMAN_GATE_REQUIRED"
+
+FINAL_STATUSES = (
+    FINAL_STATUS_DEPLOY_PASS,
+    FINAL_STATUS_READY_FOR_WINDOWS_FINAL_GOLDEN,
+    FINAL_STATUS_HERMES_IN_ARCHITECTURE_PASS,
+    FINAL_STATUS_ROLLED_BACK,
+    FINAL_STATUS_HUMAN_GATE_REQUIRED,
+)
+
+
+def assess_hermes_result_adapter_deploy(
+    env: Mapping[str, str] | None = None,
+    *,
+    deployed_production_version: str | None = None,
+    production_read_back_ok: bool = False,
+    windows_result_ingested: bool = False,
+    rolled_back: bool = False,
+) -> dict[str, Any]:
+    """Assess the deploy/Human-Gate status from environment *names* only.
+
+    The assessor never deploys and never reads a secret value.  A non-gated
+    status is only returned when the caller supplies concrete external
+    evidence: an observed ``deployed_production_version`` with a passing
+    production read-back (``READY_FOR_WINDOWS_FINAL_GOLDEN``) or a genuinely
+    ingested Windows Hermes result (``HERMES_IN_ARCHITECTURE_PASS``).  With no
+    such evidence, the honest outcome is ``HUMAN_GATE_REQUIRED``.
+    """
+    environ = os.environ if env is None else env
+    deploy_credential_source = _first_present(environ, DEPLOY_CREDENTIAL_ENV_VARS)
+    transport_credential_source = _first_present(environ, TRANSPORT_CREDENTIAL_ENV_VARS)
+    endpoint_base = None
+    endpoint_source = None
+    for name in TRANSPORT_ENDPOINT_ENV_VARS:
+        value = str(environ.get(name, "")).strip()
+        if value:
+            endpoint_base = value
+            endpoint_source = name
+            break
+
+    if rolled_back:
+        final_status = FINAL_STATUS_ROLLED_BACK
+    elif windows_result_ingested:
+        final_status = FINAL_STATUS_HERMES_IN_ARCHITECTURE_PASS
+    elif deployed_production_version and production_read_back_ok:
+        final_status = FINAL_STATUS_READY_FOR_WINDOWS_FINAL_GOLDEN
+    else:
+        final_status = FINAL_STATUS_HUMAN_GATE_REQUIRED
+
+    missing_dependencies: list[str] = []
+    if not deploy_credential_source:
+        missing_dependencies.append(
+            "cloudflare_deploy_credential:" + "|".join(DEPLOY_CREDENTIAL_ENV_VARS)
+        )
+    if not transport_credential_source:
+        missing_dependencies.append(
+            "hermes_transport_credential:" + "|".join(TRANSPORT_CREDENTIAL_ENV_VARS)
+        )
+    if not endpoint_source:
+        missing_dependencies.append(
+            "hermes_transport_endpoint:" + "|".join(TRANSPORT_ENDPOINT_ENV_VARS)
+        )
+
+    production_deployed = bool(deployed_production_version) and not rolled_back
+    return {
+        "final_status": final_status,
+        "workflow_status": "not_applicable_agent_local",
+        "service": HERMES_ADAPTER_PRODUCTION_BASELINE["service"],
+        "environment": HERMES_ADAPTER_PRODUCTION_BASELINE["environment"],
+        "adapter_version": HERMES_RESULT_ADAPTER_VERSION,
+        "deployment_attempted": bool(deployed_production_version),
+        "production_deployed": production_deployed,
+        "production_version": deployed_production_version,
+        "production_read_back_ok": bool(production_read_back_ok),
+        "windows_result_ingested": bool(windows_result_ingested),
+        "rolled_back": bool(rolled_back),
+        "rollback_target": dict(HERMES_ADAPTER_PRODUCTION_BASELINE),
+        "deploy_credential_source": deploy_credential_source,
+        "transport_credential_source": transport_credential_source,
+        "transport_endpoint_source": endpoint_source,
+        "transport_endpoint_base": endpoint_base,
+        "required_auth_scope": TRANSPORT_REQUIRED_SCOPE,
+        "required_endpoints": list(TRANSPORT_REQUIRED_ENDPOINTS),
+        "missing_dependencies": missing_dependencies,
+        "human_gate_required": final_status == FINAL_STATUS_HUMAN_GATE_REQUIRED,
+        "canonical_write_performed": False,
+        "second_state_store_created": False,
+        "credential_or_binding_mutated": False,
+        "connection_attempted_to_windows": False,
+        "secrets_recorded": False,
+        "assessed_at": _now_utc(),
+    }
+
+
 def _registry_tasks(registry: Any) -> Any:
     """Return the existing task mapping backing ``registry`` or ``None``."""
     if registry is None:
@@ -1828,10 +1957,18 @@ __all__ = [
     "DEFAULT_A2A_BASE_URL",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_POLL_INTERVAL_SECONDS",
+    "DEPLOY_CREDENTIAL_ENV_VARS",
     "EVIDENCE_HASH_FIELDS",
+    "FINAL_STATUSES",
+    "FINAL_STATUS_DEPLOY_PASS",
+    "FINAL_STATUS_HERMES_IN_ARCHITECTURE_PASS",
+    "FINAL_STATUS_HUMAN_GATE_REQUIRED",
+    "FINAL_STATUS_READY_FOR_WINDOWS_FINAL_GOLDEN",
+    "FINAL_STATUS_ROLLED_BACK",
     "GOLDEN_PATH_BLOCKED",
     "GOLDEN_PATH_PASS",
     "GOLDEN_PATH_PARTIAL",
+    "HERMES_ADAPTER_PRODUCTION_BASELINE",
     "HERMES_RESULT_ADAPTER_DEPLOYMENT_GATE",
     "HERMES_RESULT_ADAPTER_VERSION",
     "HERMES_RESULT_SOURCE",
@@ -1870,6 +2007,7 @@ __all__ = [
     "ack_idempotency_key",
     "acknowledge_task",
     "apply_registry_patch",
+    "assess_hermes_result_adapter_deploy",
     "audit_windows_hermes_transport",
     "build_health_handshake",
     "build_hermes_result_envelope",
