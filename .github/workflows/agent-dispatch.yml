@@ -7,8 +7,11 @@ on:
 permissions:
   contents: write
 
+# Isolate execution concurrency by task so a newly accepted task cannot cancel an
+# older queued task before it starts. Publication to main remains fail-closed:
+# the Push step below fetches/rebases and retries only non-fast-forward races.
 concurrency:
-  group: cloud-agent-dispatch-main-writer
+  group: cloud-agent-dispatch-${{ github.event.client_payload.task.task_id || github.run_id }}
   cancel-in-progress: false
 
 jobs:
