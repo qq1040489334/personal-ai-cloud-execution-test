@@ -1001,15 +1001,18 @@ async function readDispatchMarker(env, parentTaskId) {
 }
 __name(readDispatchMarker, "readDispatchMarker");
 __name2(readDispatchMarker, "readDispatchMarker");
-async function claimDispatchMarker(env, parentTaskId, childTaskId, verdict, reviewTimestamp, reviewNote) {
+async function claimDispatchMarker(env, parentTaskId, childTaskId, verdict, reviewTimestamp, reviewNote, options) {
   if (!env.ASSET_DB) return { status: "unavailable", claimed: false };
+  const opts = options && typeof options === "object" ? options : {};
+  const claimKey = opts.claimKey ? String(opts.claimKey) : dispatchMarkerKey(parentTaskId);
+  const markerParent = opts.markerParent != null ? String(opts.markerParent) : parentTaskId;
   const nowIso = (/* @__PURE__ */ new Date()).toISOString();
   try {
     const res = await env.ASSET_DB.prepare(
       "INSERT OR IGNORE INTO task_dispatch_markers (dispatch_key, parent_task_id, review_verdict, review_timestamp, review_note, child_task_id, dispatch_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ).bind(
-      dispatchMarkerKey(parentTaskId),
-      parentTaskId,
+      claimKey,
+      markerParent,
       verdict,
       reviewTimestamp ?? null,
       reviewNote ?? null,
@@ -1019,15 +1022,17 @@ async function claimDispatchMarker(env, parentTaskId, childTaskId, verdict, revi
       nowIso
     ).run();
     const changes = res && res.meta ? Number(res.meta.changes) || 0 : 0;
-    return changes > 0 ? { status: "claimed", claimed: true } : { status: "duplicate", claimed: false };
+    return changes > 0 ? { status: "claimed", claimed: true, claim_key: claimKey } : { status: "duplicate", claimed: false, claim_key: claimKey };
   } catch {
-    return { status: "unavailable", claimed: false };
+    return { status: "unavailable", claimed: false, claim_key: claimKey };
   }
 }
 __name(claimDispatchMarker, "claimDispatchMarker");
 __name2(claimDispatchMarker, "claimDispatchMarker");
-async function finalizeDispatchMarker(env, parentTaskId, patch) {
+async function finalizeDispatchMarker(env, parentTaskId, patch, options) {
   if (!env.ASSET_DB) return;
+  const opts = options && typeof options === "object" ? options : {};
+  const key = opts.claimKey ? String(opts.claimKey) : dispatchMarkerKey(parentTaskId);
   const nowIso = (/* @__PURE__ */ new Date()).toISOString();
   try {
     await env.ASSET_DB.prepare(
@@ -1039,7 +1044,7 @@ async function finalizeDispatchMarker(env, parentTaskId, patch) {
       patch.requestId ?? null,
       patch.dispatchedAt ?? null,
       nowIso,
-      dispatchMarkerKey(parentTaskId)
+      key
     ).run();
   } catch {
   }
@@ -1293,6 +1298,20 @@ var TASK_DISPATCH_ACTION_WAIT = "wait";
 var TASK_DISPATCH_ACTION_RETRY = "retry";
 var TASK_DISPATCH_ACTION_INSPECT = "inspect";
 var TASK_DISPATCH_ACTION_NONE = "none";
+var RETRY_DISPATCH_PREFIX = "retry:";
+var RETRY_DISPATCH_VERDICT = "RETRY";
+var DISPATCH_REASON_REDISPATCHED = "REDISPATCHED";
+var DISPATCH_REASON_RETRY_ALREADY = "ALREADY_RETRIED";
+var DISPATCH_REASON_AUTHORITATIVE = "AUTHORITATIVE_RESULT";
+var DISPATCH_REASON_NOT_RETRYABLE = "NOT_RETRYABLE";
+var DISPATCH_REASON_NO_CONTRACT = "NO_DISPATCH_CONTRACT";
+var DISPATCH_REASON_RETRY_UNAVAILABLE = "RETRY_CLAIM_UNAVAILABLE";
+var DISPATCH_REASON_RETRY_FAILED = "RETRY_DISPATCH_FAILED";
+function retryDispatchKey(taskId, attempt) {
+  return `${RETRY_DISPATCH_PREFIX}${taskId}:${attempt}`;
+}
+__name(retryDispatchKey, "retryDispatchKey");
+__name2(retryDispatchKey, "retryDispatchKey");
 var LINEAGE_PROJECT_FIELD = "project_id";
 var LINEAGE_ROOT_FIELD = "root_task_id";
 var LINEAGE_PARENT_FIELD = "parent_task_id";
@@ -1432,8 +1451,9 @@ function lineageInScope(record, scope, index) {
 }
 __name(lineageInScope, "lineageInScope");
 __name2(lineageInScope, "lineageInScope");
-async function recordTask(env, contract) {
+async function recordTask(env, contract, options) {
   if (!env.TASK_REGISTRY) return;
+  const opts = options && typeof options === "object" ? options : {};
   const nowIso = (/* @__PURE__ */ new Date()).toISOString();
   const meta = {
     status: EXECUTION_STATUS_PENDING,
@@ -1447,15 +1467,15 @@ async function recordTask(env, contract) {
     result_available: false,
     reviewed: false,
     review_verdict: null,
-    dispatch_state: TASK_DISPATCH_STATE_ACCEPTED,
-    dispatch_attempt: 1,
+    dispatch_state: opts.dispatchState || TASK_DISPATCH_STATE_ACCEPTED,
+    dispatch_attempt: Math.max(1, Number(opts.dispatchAttempt) || 1),
     dispatch_accepted_at: nowIso,
     dispatch_confirm_deadline: new Date(Date.now() + TASK_DISPATCH_CONFIRM_GRACE_MS).toISOString()
   };
   if (contract.project_id) meta.project_id = String(contract.project_id);
   if (contract.root_task_id) meta.root_task_id = String(contract.root_task_id);
   if (contract.parent_task_id) meta.parent_task_id = String(contract.parent_task_id);
-  await env.TASK_REGISTRY.put(regKey(contract.task_id), JSON.stringify({ task_id: contract.task_id, ...meta }), {
+  await env.TASK_REGISTRY.put(regKey(contract.task_id), JSON.stringify({ task_id: contract.task_id, ...meta, dispatch_contract: contract }), {
     metadata: meta
   });
 }
@@ -1470,11 +1490,35 @@ __name(listTasks, "listTasks");
 __name2(listTasks, "listTasks");
 async function saveTask(env, entry) {
   if (!env.TASK_REGISTRY) return;
-  const { task_id, ...meta } = entry;
+  const { task_id, dispatch_contract, dispatch_events, ...meta } = entry;
   await env.TASK_REGISTRY.put(regKey(task_id), JSON.stringify(entry), { metadata: meta });
 }
 __name(saveTask, "saveTask");
 __name2(saveTask, "saveTask");
+async function updateDispatchLease(env, taskId, patch) {
+  if (!env.TASK_REGISTRY) return null;
+  let current = null;
+  try {
+    current = await readTask(env, taskId);
+  } catch {
+    current = null;
+  }
+  if (!current) return null;
+  const lease = patch && typeof patch === "object" ? patch : {};
+  const updated = {
+    ...current,
+    task_id: taskId,
+    dispatch_state: lease.dispatchState ?? current.dispatch_state,
+    dispatch_attempt: Math.max(1, Number(lease.dispatchAttempt) || Number(current.dispatch_attempt) || 1),
+    dispatch_accepted_at: lease.acceptedAt ?? current.dispatch_accepted_at,
+    dispatch_confirm_deadline: lease.deadline ?? current.dispatch_confirm_deadline,
+    updated_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  await saveTask(env, updated);
+  return updated;
+}
+__name(updateDispatchLease, "updateDispatchLease");
+__name2(updateDispatchLease, "updateDispatchLease");
 async function readTask(env, taskId) {
   if (!env.TASK_REGISTRY) return null;
   return env.TASK_REGISTRY.get(regKey(taskId), "json");
@@ -1728,13 +1772,8 @@ async function toolMarkReviewed(env, args) {
 }
 __name(toolMarkReviewed, "toolMarkReviewed");
 __name2(toolMarkReviewed, "toolMarkReviewed");
-async function toolPlanDispatchRetry(env, args) {
-  if (!env.TASK_REGISTRY) return { isError: true, text: "TASK_REGISTRY_UNAVAILABLE" };
-  const taskId = String(args.task_id ?? "").trim();
-  if (!taskId) return { isError: true, text: "INVALID_INPUT: task_id required" };
-  const task = await readTask(env, taskId);
-  if (!task) return { isError: true, text: `UNKNOWN_TASK: ${taskId}` };
-  let evidence = { hasArtifact: false, runStatus: null, runConclusion: null };
+async function gatherDispatchEvidence(env, taskId) {
+  const evidence = { hasArtifact: false, runStatus: null, runConclusion: null };
   try {
     const artifact = await findArtifact(env, `execution_result-${taskId}`);
     if (artifact) {
@@ -1745,11 +1784,206 @@ async function toolPlanDispatchRetry(env, args) {
     }
   } catch {
   }
+  return evidence;
+}
+__name(gatherDispatchEvidence, "gatherDispatchEvidence");
+__name2(gatherDispatchEvidence, "gatherDispatchEvidence");
+async function toolPlanDispatchRetry(env, args) {
+  if (!env.TASK_REGISTRY) return { isError: true, text: "TASK_REGISTRY_UNAVAILABLE" };
+  const taskId = String(args.task_id ?? "").trim();
+  if (!taskId) return { isError: true, text: "INVALID_INPUT: task_id required" };
+  const task = await readTask(env, taskId);
+  if (!task) return { isError: true, text: `UNKNOWN_TASK: ${taskId}` };
+  const evidence = await gatherDispatchEvidence(env, taskId);
   const plan = planTaskDispatchRetry(task, evidence);
   return { isError: false, text: JSON.stringify(plan), structuredContent: plan };
 }
 __name(toolPlanDispatchRetry, "toolPlanDispatchRetry");
 __name2(toolPlanDispatchRetry, "toolPlanDispatchRetry");
+async function retryDispatchTask(env, args) {
+  const input = args && typeof args === "object" ? args : {};
+  const taskId = String(input.task_id ?? "").trim();
+  if (!taskId) return { isError: true, text: "INVALID_INPUT: task_id required" };
+  if (!env.TASK_REGISTRY) return { isError: true, text: "TASK_REGISTRY_UNAVAILABLE" };
+  const task = await readTask(env, taskId);
+  if (!task) return { isError: true, text: `UNKNOWN_TASK: ${taskId}` };
+  const authoritative = task.reviewed === true || task.terminal === true || task.result_available === true;
+  if (authoritative) {
+    const result2 = {
+      task_id: taskId,
+      retried: false,
+      dispatched: false,
+      idempotent: false,
+      dispatch_state: TASK_DISPATCH_STATE_CONFIRMED,
+      reason: DISPATCH_REASON_AUTHORITATIVE,
+      execution_status: task.normalized_status ?? task.execution_status ?? task.status ?? null
+    };
+    return { isError: false, text: JSON.stringify(result2), structuredContent: result2 };
+  }
+  const evidence = await gatherDispatchEvidence(env, taskId);
+  const plan = planTaskDispatchRetry(task, evidence);
+  if (!plan.should_retry) {
+    const result2 = {
+      task_id: taskId,
+      retried: false,
+      dispatched: false,
+      idempotent: false,
+      dispatch_state: plan.dispatch_state,
+      recommended_action: plan.recommended_action,
+      reason: DISPATCH_REASON_NOT_RETRYABLE,
+      plan
+    };
+    return { isError: false, text: JSON.stringify(result2), structuredContent: result2 };
+  }
+  const storedContract = task.dispatch_contract;
+  if (storedContract == null || typeof storedContract !== "object" || Array.isArray(storedContract)) {
+    const result2 = {
+      task_id: taskId,
+      retried: false,
+      dispatched: false,
+      idempotent: false,
+      dispatch_state: plan.dispatch_state,
+      recommended_action: plan.recommended_action,
+      reason: DISPATCH_REASON_NO_CONTRACT,
+      errors: ["stored dispatch contract unavailable; refusing to redispatch"]
+    };
+    return { isError: true, text: JSON.stringify(result2), structuredContent: result2 };
+  }
+  const contractErrors = validateContract(storedContract);
+  if (contractErrors.length) {
+    const result2 = {
+      task_id: taskId,
+      retried: false,
+      dispatched: false,
+      idempotent: false,
+      dispatch_state: plan.dispatch_state,
+      recommended_action: plan.recommended_action,
+      reason: DISPATCH_REASON_NO_CONTRACT,
+      errors: contractErrors
+    };
+    return { isError: true, text: JSON.stringify(result2), structuredContent: result2 };
+  }
+  const contract = { ...storedContract, task_id: taskId };
+  const claimKey = plan.idempotency_key || retryDispatchKey(taskId, plan.next_attempt);
+  const claim = await claimDispatchMarker(env, taskId, taskId, RETRY_DISPATCH_VERDICT, null, null, {
+    claimKey,
+    markerParent: claimKey
+  });
+  if (claim.status === "unavailable") {
+    const result2 = {
+      task_id: taskId,
+      retried: false,
+      dispatched: false,
+      idempotent: false,
+      dispatch_state: plan.dispatch_state,
+      recommended_action: plan.recommended_action,
+      reason: DISPATCH_REASON_RETRY_UNAVAILABLE,
+      idempotency_key: plan.idempotency_key
+    };
+    return { isError: true, text: JSON.stringify(result2), structuredContent: result2 };
+  }
+  if (!claim.claimed) {
+    const result2 = {
+      task_id: taskId,
+      retried: false,
+      dispatched: false,
+      idempotent: true,
+      dispatch_state: plan.dispatch_state,
+      recommended_action: plan.recommended_action,
+      reason: DISPATCH_REASON_RETRY_ALREADY,
+      idempotency_key: plan.idempotency_key,
+      next_attempt: plan.next_attempt
+    };
+    return { isError: false, text: JSON.stringify(result2), structuredContent: result2 };
+  }
+  let dispatch;
+  try {
+    dispatch = await dispatchTask(env, contract);
+  } catch (err2) {
+    await finalizeDispatchMarker(env, taskId, {
+      state: DISPATCH_STATE_FAILED,
+      dispatchStatus: "network_error"
+    }, { claimKey: plan.idempotency_key });
+    await updateDispatchLease(env, taskId, {
+      dispatchState: TASK_DISPATCH_STATE_FAILED,
+      dispatchAttempt: plan.next_attempt,
+      acceptedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      deadline: new Date(Date.now() + TASK_DISPATCH_CONFIRM_GRACE_MS).toISOString()
+    });
+    const result2 = {
+      task_id: taskId,
+      retried: false,
+      dispatched: false,
+      idempotent: false,
+      dispatch_state: TASK_DISPATCH_STATE_FAILED,
+      reason: DISPATCH_REASON_RETRY_FAILED,
+      idempotency_key: plan.idempotency_key,
+      next_attempt: plan.next_attempt,
+      dispatch_status: "network_error",
+      error: safeGithubResponseBody(err2?.message || "request failed")
+    };
+    return { isError: true, text: JSON.stringify(result2), structuredContent: result2 };
+  }
+  if (!dispatch.ok) {
+    await finalizeDispatchMarker(env, taskId, {
+      state: DISPATCH_STATE_FAILED,
+      dispatchStatus: "github_rejected",
+      httpStatus: dispatch.status,
+      requestId: dispatch.requestId
+    }, { claimKey: plan.idempotency_key });
+    await updateDispatchLease(env, taskId, {
+      dispatchState: TASK_DISPATCH_STATE_FAILED,
+      dispatchAttempt: plan.next_attempt,
+      acceptedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      deadline: new Date(Date.now() + TASK_DISPATCH_CONFIRM_GRACE_MS).toISOString()
+    });
+    const result2 = {
+      task_id: taskId,
+      retried: false,
+      dispatched: false,
+      idempotent: false,
+      dispatch_state: TASK_DISPATCH_STATE_FAILED,
+      reason: DISPATCH_REASON_RETRY_FAILED,
+      idempotency_key: plan.idempotency_key,
+      next_attempt: plan.next_attempt,
+      dispatch_status: "github_rejected",
+      github_http_status: dispatch.status,
+      github_request_id: dispatch.requestId
+    };
+    return { isError: true, text: JSON.stringify(result2), structuredContent: result2 };
+  }
+  const dispatchedAt = (/* @__PURE__ */ new Date()).toISOString();
+  await finalizeDispatchMarker(env, taskId, {
+    state: DISPATCH_STATE_DISPATCHED,
+    dispatchStatus: "accepted",
+    httpStatus: dispatch.status,
+    requestId: dispatch.requestId,
+    dispatchedAt
+  }, { claimKey: plan.idempotency_key });
+  await updateDispatchLease(env, taskId, {
+    dispatchState: TASK_DISPATCH_STATE_RETRY,
+    dispatchAttempt: plan.next_attempt,
+    acceptedAt: dispatchedAt,
+    deadline: new Date(Date.now() + TASK_DISPATCH_CONFIRM_GRACE_MS).toISOString()
+  });
+  const result2 = {
+    task_id: taskId,
+    retried: true,
+    dispatched: true,
+    idempotent: false,
+    dispatch_state: TASK_DISPATCH_STATE_RETRY,
+    reason: DISPATCH_REASON_REDISPATCHED,
+    idempotency_key: plan.idempotency_key,
+    next_attempt: plan.next_attempt,
+    dispatch_status: "accepted",
+    github_http_status: dispatch.status,
+    github_request_id: dispatch.requestId,
+    dispatched_at: dispatchedAt
+  };
+  return { isError: false, text: JSON.stringify(result2), structuredContent: result2 };
+}
+__name(retryDispatchTask, "retryDispatchTask");
+__name2(retryDispatchTask, "retryDispatchTask");
 async function toolSubmitTask(env, args) {
   const contract = buildContract(args.goal, args.instructions, args.acceptance, args.expected_files, {
     project_id: args.project_id,
@@ -1758,15 +1992,29 @@ async function toolSubmitTask(env, args) {
   });
   const errors = validateContract(contract);
   if (errors.length) return { isError: true, text: `INVALID_TASK: ${errors.join("; ")}` };
+  try {
+    await recordTask(env, contract, {
+      dispatchState: TASK_DISPATCH_STATE_PENDING,
+      dispatchAttempt: 1
+    });
+  } catch {
+  }
   let dispatch;
   try {
     dispatch = await dispatchTask(env, contract);
   } catch (err2) {
+    await updateDispatchLease(env, contract.task_id, {
+      dispatchState: TASK_DISPATCH_STATE_FAILED,
+      dispatchAttempt: 1,
+      acceptedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      deadline: new Date(Date.now() + TASK_DISPATCH_CONFIRM_GRACE_MS).toISOString()
+    });
     return {
       isError: true,
       text: JSON.stringify({
         task_id: contract.task_id,
         status: "dispatch_failed",
+        dispatch_state: TASK_DISPATCH_STATE_FAILED,
         dispatch_status: "network_error",
         github_http_status: null,
         github_request_id: null,
@@ -1776,11 +2024,18 @@ async function toolSubmitTask(env, args) {
     };
   }
   if (!dispatch.ok) {
+    await updateDispatchLease(env, contract.task_id, {
+      dispatchState: TASK_DISPATCH_STATE_FAILED,
+      dispatchAttempt: 1,
+      acceptedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      deadline: new Date(Date.now() + TASK_DISPATCH_CONFIRM_GRACE_MS).toISOString()
+    });
     return {
       isError: true,
       text: JSON.stringify({
         task_id: contract.task_id,
         status: "dispatch_failed",
+        dispatch_state: TASK_DISPATCH_STATE_FAILED,
         dispatch_status: "github_rejected",
         github_http_status: dispatch.status,
         github_request_id: dispatch.requestId,
@@ -1788,10 +2043,12 @@ async function toolSubmitTask(env, args) {
       })
     };
   }
-  try {
-    await recordTask(env, contract);
-  } catch {
-  }
+  await updateDispatchLease(env, contract.task_id, {
+    dispatchState: TASK_DISPATCH_STATE_ACCEPTED,
+    dispatchAttempt: 1,
+    acceptedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    deadline: new Date(Date.now() + TASK_DISPATCH_CONFIRM_GRACE_MS).toISOString()
+  });
   return {
     isError: false,
     text: JSON.stringify({
@@ -1799,6 +2056,7 @@ async function toolSubmitTask(env, args) {
       status: EXECUTION_STATUS_PENDING,
       submitted: true,
       round: 1,
+      dispatch_state: TASK_DISPATCH_STATE_ACCEPTED,
       dispatch_status: "accepted",
       github_http_status: dispatch.status,
       github_request_id: dispatch.requestId,
@@ -2552,6 +2810,29 @@ var TOOLS = [
     }
   },
   {
+    name: "retry_task_dispatch",
+    description: "Bounded, idempotent retry executor for an eligible unconfirmed Cloud Agent task. It consumes the read-only plan_task_redispatch decision, claims the deterministic retry:<task_id>:<attempt> idempotency key through the existing D1 task_dispatch_markers INSERT OR IGNORE before any redispatch, and re-issues the SAME task_id. It never retries an authoritative completed/reviewed task, never fabricates a terminal verdict, never mutates review state, and stops (inspect) once the bounded attempt policy is exhausted.",
+    inputSchema: {
+      type: "object",
+      properties: { task_id: { type: "string" } },
+      required: ["task_id"]
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string" },
+        retried: { type: "boolean" },
+        dispatched: { type: "boolean" },
+        idempotent: { type: "boolean" },
+        dispatch_state: { type: "string" },
+        reason: { type: "string" },
+        idempotency_key: { type: ["string", "null"] },
+        next_attempt: { type: ["number", "null"] }
+      },
+      additionalProperties: true
+    }
+  },
+  {
     name: "mark_reviewed",
     description: "Record a review verdict for a completed task and close its pending review state. On an authoritative terminal PASS, an explicit pre-authorized approved_next_task may be dispatched exactly once as a child gpt_task; the worker never invents next work.",
     inputSchema: {
@@ -2698,6 +2979,9 @@ async function handleMcp(request, env, cors, auth) {
       } else if (name === "plan_task_redispatch") {
         if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolPlanDispatchRetry(env, args);
+      } else if (name === "retry_task_dispatch") {
+        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
+        outcome = await retryDispatchTask(env, args);
       } else if (name === "search_assets") {
         if (!hasReadScope(auth)) return fail(-32001, "asset.read scope required");
         outcome = await toolSearchAssets(env, args);
