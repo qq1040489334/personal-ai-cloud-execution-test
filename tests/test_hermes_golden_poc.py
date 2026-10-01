@@ -33,6 +33,9 @@ from personal_ai_execution.hermes_orchestration import (
     CLAIM_STATE_NOT_CLAIMABLE,
     GOLDEN_PATH_BLOCKED,
     GOLDEN_PATH_PARTIAL,
+    HERMES_RESULT_ADAPTER_DEPLOYMENT_GATE,
+    HERMES_RESULT_ADAPTER_VERSION,
+    HERMES_RESULT_SOURCE,
     RESULT_STATE_ACCEPTED,
     RESULT_STATE_DUPLICATE,
     RESULT_STATE_LEASE_MISMATCH,
@@ -50,19 +53,23 @@ from personal_ai_execution.hermes_orchestration import (
     TRANSPORT_RESULT_PATH,
     HermesOrchestrationAdapter,
     acknowledge_task,
+    apply_registry_patch,
     audit_windows_hermes_transport,
     build_health_handshake,
+    build_hermes_result_envelope,
     build_task_assignment,
     build_task_contract,
     claim_task,
     compute_evidence_hash,
     evaluate_health_handshake,
+    ingest_hermes_result,
     is_transport_claimable,
     normalize_hermes_evidence,
     normalize_to_execution_v2,
     normalize_transport_result,
     plan_result_publication,
     probe_hermes_runtime,
+    registry_record,
     run_hermes_golden_poc,
     validate_result_envelope,
     validate_task_contract,
@@ -673,3 +680,200 @@ def test_transport_flow_is_secret_free_and_no_windows_inbound_required():
     serialized = json.dumps(decision)
     assert "token" not in serialized.lower()
     assert decision["canonical_write_performed"] is False
+
+
+# =============================================================================
+# HERMES_RESULT_ADAPTER_MINIMAL_PATCH_V1
+# =============================================================================
+
+
+def _registered_claimed_task(
+    registry: EventSyncRegistry,
+    task_id: str = "cf-hermes-ingest-001",
+    worker_id: str = "windows-hermes-1",
+) -> dict:
+    """Register a task in the single existing registry and claim a lease."""
+    registry.submit_task(task_id, goal="windows hermes read-back")
+    record = registry_record(registry, task_id)
+    claim = claim_task(record, worker_id)
+    apply_registry_patch(registry, task_id, claim["registry_patch"])
+    return registry_record(registry, task_id)
+
+
+def _hermes_envelope(record: dict, **overrides) -> dict:
+    envelope = build_hermes_result_envelope(
+        task_id=record["task_id"],
+        worker_id=record["transport_owner_worker_id"],
+        lease_id=record["transport_lease_id"],
+        task_state="TASK_STATE_COMPLETED",
+        executor_identity="hermes-native-hand",
+        status="success",
+        tests="7 passed",
+        artifacts=[{"parts": [{"kind": "text", "text": "nonce-ok"}]}],
+        expected_files=[],
+        changed_files=[],
+        finished_at="2026-10-01T00:00:00Z",
+    )
+    envelope.update(overrides)
+    envelope["evidence_hash"] = compute_evidence_hash(envelope)
+    return envelope
+
+
+def test_hermes_result_envelope_definition_and_validation():
+    record, _ = _claimed_record()
+    envelope = _hermes_envelope(record)
+    assert validate_result_envelope(envelope) == []
+    for field in (
+        "task_id",
+        "worker_id",
+        "lease_id",
+        "task_state",
+        "evidence_hash",
+        "artifacts",
+    ):
+        assert field in envelope
+    assert envelope["evidence_hash"].startswith("sha256:")
+    broken = {k: v for k, v in envelope.items() if k != "task_id"}
+    assert any("task_id" in e for e in validate_result_envelope(broken))
+
+
+def test_hermes_result_ingestion_reads_back_via_get_task_result():
+    registry = EventSyncRegistry()
+    task_id = "cf-hermes-ingest-001"
+    record = _registered_claimed_task(registry, task_id)
+    envelope = _hermes_envelope(record)
+
+    decision = ingest_hermes_result(registry, envelope)
+    assert decision["state"] == RESULT_STATE_ACCEPTED
+    assert decision["accepted"] is True
+    assert decision["ingested"] is True
+    assert decision["adapter_version"] == HERMES_RESULT_ADAPTER_VERSION
+    assert decision["canonical_write_performed"] is False
+    assert decision["second_state_store_created"] is False
+
+    read_back = decision["read_back"]
+    assert read_back["task_id"] == task_id
+    assert read_back["status"] == STATUS_PASS
+    assert read_back["terminal"] is True
+    assert read_back["workflow_conclusion"] is None
+    assert read_back["conclusion_authoritative"] is False
+    assert read_back["review_verdict"] is None
+
+    direct = registry.get_task_result(task_id)
+    assert direct["status"] == STATUS_PASS
+    stored = registry_record(registry, task_id)
+    assert stored["evidence"]["task_result"]["source"] == HERMES_RESULT_SOURCE
+    assert stored["evidence"]["hermes_transport"]["evidence_hash"] == envelope[
+        "evidence_hash"
+    ]
+
+    pending = registry.list_pending_results()
+    assert [item["task_id"] for item in pending] == [task_id]
+    reviewed = registry.mark_reviewed(task_id, "PASS")
+    assert reviewed["review_verdict"] == "PASS"
+
+
+def test_hermes_result_ingestion_is_idempotent_for_identical_evidence():
+    registry = EventSyncRegistry()
+    task_id = "cf-hermes-dup-001"
+    record = _registered_claimed_task(registry, task_id)
+    envelope = _hermes_envelope(record)
+
+    first = ingest_hermes_result(registry, envelope)
+    assert first["ingested"] is True
+
+    second = ingest_hermes_result(registry, envelope)
+    assert second["state"] == RESULT_STATE_DUPLICATE
+    assert second["duplicate"] is True
+    assert second["idempotent"] is True
+    assert second["ingested"] is False
+    assert second["registry_patch"] is None
+
+    # Exactly one terminal result for the task; retransmission added no record.
+    pending = registry.list_pending_results()
+    assert [item["task_id"] for item in pending] == [task_id]
+    assert registry.get_task_result(task_id)["status"] == STATUS_PASS
+
+
+def test_hermes_result_ingestion_rejects_conflicting_evidence():
+    registry = EventSyncRegistry()
+    task_id = "cf-hermes-conflict-001"
+    record = _registered_claimed_task(registry, task_id)
+    envelope = _hermes_envelope(record)
+    first = ingest_hermes_result(registry, envelope)
+    assert first["ingested"] is True
+
+    conflicting = _hermes_envelope(record, task_state="TASK_STATE_FAILED")
+    decision = ingest_hermes_result(registry, conflicting)
+    assert decision["state"] == RESULT_STATE_REJECTED
+    assert decision["reason_code"] == "CONFLICTING_DUPLICATE_RESULT"
+    assert decision["ingested"] is False
+    assert registry.get_task_result(task_id)["status"] == STATUS_PASS
+
+
+def test_hermes_result_ingestion_rejects_evidence_hash_mismatch():
+    registry = EventSyncRegistry()
+    task_id = "cf-hermes-hash-001"
+    record = _registered_claimed_task(registry, task_id)
+    envelope = _hermes_envelope(record)
+    envelope["evidence_hash"] = "sha256:" + "0" * 64
+
+    decision = ingest_hermes_result(registry, envelope)
+    assert decision["state"] == RESULT_STATE_REJECTED
+    assert decision["reason_code"] == "EVIDENCE_HASH_MISMATCH"
+    assert decision["ingested"] is False
+    stored = registry_record(registry, task_id)
+    assert not stored.get("result_available")
+    assert registry.get_task_result(task_id)["status"] != STATUS_PASS
+
+
+def test_hermes_result_ingestion_fails_closed_for_unregistered_task():
+    registry = EventSyncRegistry()
+    envelope = build_hermes_result_envelope(
+        task_id="cf-hermes-missing",
+        worker_id="windows-hermes-1",
+        lease_id="lease:not-registered",
+    )
+    decision = ingest_hermes_result(registry, envelope)
+    assert decision["state"] == RESULT_STATE_REJECTED
+    assert decision["reason_code"] == "TASK_NOT_REGISTERED"
+    assert decision["ingested"] is False
+    assert decision["second_state_store_created"] is False
+    assert registry_record(registry, "cf-hermes-missing") is None
+
+
+def test_github_actions_workflow_result_path_remains_intact():
+    registry = EventSyncRegistry()
+    execution_result = {
+        "task_id": "cf-ci-001",
+        "status": "success",
+        "expected_files": ["src/a.py"],
+        "changed_files": ["src/a.py"],
+    }
+    synced = registry.sync_terminal_result("cf-ci-001", execution_result, "success")
+    assert synced["synced"] is True
+    assert synced["status"] == STATUS_PASS
+
+    read = registry.get_task_result("cf-ci-001")
+    assert read["status"] == STATUS_PASS
+    assert read["workflow_conclusion"] == "success"
+    assert read["conclusion_authoritative"] is True
+
+    overridden = registry.sync_terminal_result(
+        "cf-ci-002",
+        {"task_id": "cf-ci-002", "status": "success"},
+        "failure",
+    )
+    assert overridden["status"] == STATUS_FAIL
+    assert overridden["workflow_conclusion"] == "failure"
+
+
+def test_deployment_gate_separates_code_completion_from_production_deploy():
+    gate = HERMES_RESULT_ADAPTER_DEPLOYMENT_GATE
+    assert gate["code_complete"] is True
+    assert gate["tests_pass"] is True
+    assert gate["production_deployed"] is False
+    assert gate["human_gate_required"] is True
+    assert gate["required_approvals"]
+    assert gate["required_before_deploy"]
+    assert "no production deploy" in gate["forbidden_in_this_patch"]

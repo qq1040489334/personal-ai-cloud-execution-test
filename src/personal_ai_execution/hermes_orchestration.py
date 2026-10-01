@@ -1534,6 +1534,285 @@ def audit_windows_hermes_transport(
     }
 
 
+# =============================================================================
+# HERMES_RESULT_ADAPTER_MINIMAL_PATCH_V1
+# =============================================================================
+#
+# Minimal, honest bridge that closes the final Hermes -> Personal AI Brain
+# read-back gap: a *validated* Windows Hermes transport result is written into
+# the **existing** EVENT_SYNC Task Registry record so the rest of the Brain can
+# read it back through the existing ``get_task_result`` surface, exactly like an
+# EVENT_SYNC discovered/reconciled result.
+#
+# Reuse guarantees (no redesign, no duplication):
+#   * Same single registry (``EventSyncRegistry._tasks``); no second store.
+#   * Same ``evidence["task_result"]`` read-back shape used by
+#     ``EventSyncRegistry.get_task_result`` / ``validated_review_result``.
+#   * Same normalization entry point ``normalize_transport_result``.
+#   * The GitHub Actions artifact/workflow path (``sync_terminal_result``) is
+#     untouched and still authoritative whenever a real workflow conclusion
+#     exists.
+#
+# This adapter performs **no** GitHub Actions conclusion fabrication: a Hermes
+# result is stored with ``workflow_conclusion=None`` and is tagged with its
+# transport provenance so it can never masquerade as a CI-derived terminal
+# result.
+#
+# Migration notes (additive, backward compatible):
+#   * No schema/binding change: existing registry records gain only optional
+#     keys (``transport_*``, ``hermes_transport`` provenance).
+#   * Existing tasks without Hermes results are unaffected; the GitHub Actions
+#     path continues to set ``workflow_conclusion`` and remain authoritative.
+#   * Rollout is inert until a caller invokes ``ingest_hermes_result``; the
+#     production boundary (relay endpoints + credentials) is a separate Human
+#     Gate declared in :data:`HERMES_RESULT_ADAPTER_DEPLOYMENT_GATE`.
+
+HERMES_RESULT_ADAPTER_VERSION = "HERMES_RESULT_ADAPTER_MINIMAL_PATCH_V1"
+HERMES_RESULT_SOURCE = "hermes_windows_transport"
+
+#: Exact production deployment Human Gate. This patch is code-complete and
+#: test-proven; deploying the ingestion boundary into production canonical state
+#: is deliberately NOT performed here and requires an explicit Human Gate.
+HERMES_RESULT_ADAPTER_DEPLOYMENT_GATE = {
+    "capability": "hermes_result_ingestion_into_canonical_registry",
+    "gate_id": HERMES_RESULT_ADAPTER_VERSION,
+    "code_complete": True,
+    "tests_pass": True,
+    "production_deployed": False,
+    "human_gate_required": True,
+    "required_approvals": [
+        "human owner approval to ingest non-CI (Windows Hermes) terminal results "
+        "into canonical personal state via the existing Task Registry",
+    ],
+    "required_before_deploy": [
+        "deploy the authenticated outbound transport relay endpoints "
+        "(claim/ack/result) with scope hermes.transport",
+        "bind HERMES_TRANSPORT_TOKEN / HERMES_TRANSPORT_URL in the production "
+        "secret store (names only; no secret values in code)",
+        "confirm the single EventSyncRegistry remains the only canonical task "
+        "store in the deployed worker",
+        "confirm the GitHub Actions artifact/workflow result path is unchanged "
+        "and still authoritative when a real workflow conclusion exists",
+    ],
+    "forbidden_in_this_patch": [
+        "no production deploy",
+        "no credential/OAuth scope/binding/schema/production-data change",
+        "no second state store",
+    ],
+}
+
+
+def _registry_tasks(registry: Any) -> Any:
+    """Return the existing task mapping backing ``registry`` or ``None``."""
+    if registry is None:
+        return None
+    tasks = getattr(registry, "_tasks", None)
+    if isinstance(tasks, Mapping):
+        return tasks
+    if isinstance(registry, Mapping):
+        return registry
+    return None
+
+
+def registry_record(registry: Any, task_id: str) -> dict[str, Any] | None:
+    """Return the *existing* registry record for ``task_id`` if present.
+
+    Read-only lookup into the single canonical registry. It never creates a
+    record and never falls back to a second store.
+    """
+    tasks = _registry_tasks(registry)
+    if not isinstance(tasks, Mapping):
+        return None
+    record = tasks.get(str(task_id))
+    return record if isinstance(record, dict) else None
+
+
+def apply_registry_patch(
+    registry: Any, task_id: str, patch: Mapping[str, Any] | None
+) -> bool:
+    """Apply an additive transport patch to the existing registry record.
+
+    Returns ``False`` when the task is not registered, so callers fail closed
+    instead of creating a second task store.
+    """
+    record = registry_record(registry, task_id)
+    if record is None:
+        return False
+    if isinstance(patch, Mapping):
+        record.update(dict(patch))
+    return True
+
+
+def build_hermes_result_envelope(
+    *,
+    task_id: str,
+    worker_id: str,
+    lease_id: str,
+    task_state: str = "TASK_STATE_COMPLETED",
+    executor_identity: str = "hermes-native-hand",
+    status: str = "success",
+    tests: str = "",
+    artifacts: list[Any] | None = None,
+    expected_files: list[str] | None = None,
+    changed_files: list[str] | None = None,
+    summary: str = "",
+    finished_at: str | None = None,
+    contract_version: str = TRANSPORT_CONTRACT_VERSION,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build the minimal Hermes result envelope and stamp its evidence hash.
+
+    The envelope is the only shape a Windows Hermes worker may return. Required
+    identity fields are ``task_id`` / ``worker_id`` / ``lease_id``; terminal
+    state is ``task_state``; integrity is ``evidence_hash`` over the stable
+    fields; ``artifacts`` and the remaining metadata are advisory evidence.
+    """
+    envelope: dict[str, Any] = {
+        "contract_version": contract_version,
+        "task_id": str(task_id),
+        "worker_id": str(worker_id),
+        "lease_id": str(lease_id),
+        "status": status,
+        "task_state": task_state,
+        "executor_identity": executor_identity,
+        "tests": tests,
+        "artifacts": list(artifacts or []),
+        "expected_files": list(expected_files or []),
+        "changed_files": list(changed_files or []),
+        "finished_at": finished_at or _now_utc(),
+    }
+    envelope.update(extra)
+    envelope["evidence_hash"] = compute_evidence_hash(envelope)
+    return envelope
+
+
+def _write_hermes_readback(
+    record: dict[str, Any],
+    envelope: Mapping[str, Any],
+    decision: Mapping[str, Any],
+) -> None:
+    """Write a validated Hermes result into the existing registry record.
+
+    Uses the same shape as an EVENT_SYNC discovered result: the terminal
+    execution state lives on ``evidence["task_result"]`` and the record flags
+    allow the existing ``get_task_result`` / review surface to read it back.
+    """
+    task_id = str(envelope.get("task_id") or "")
+    normalized_status = decision.get("normalized_status")
+    readback = {
+        "task_id": task_id,
+        "status": normalized_status,
+        "normalized_status": normalized_status,
+        "terminal": True,
+        "workflow_conclusion": None,
+        "conclusion_authoritative": False,
+        "conclusion_result_mismatch": False,
+        "missing_expected_files": [],
+        "source": HERMES_RESULT_SOURCE,
+        "evidence_hash": decision.get("evidence_hash"),
+        "executor_identity": decision.get("executor_identity"),
+        "artifacts": list(envelope.get("artifacts") or []),
+        "tests": envelope.get("tests", ""),
+        "reason": (
+            "terminal Hermes Windows transport result ingested into the existing "
+            "Task Registry; no GitHub Actions workflow conclusion is claimed"
+        ),
+    }
+    record["status"] = normalized_status
+    record["normalized_status"] = normalized_status
+    record["workflow_conclusion"] = None
+    record["terminal"] = True
+    record["result_available"] = True
+    record["requires_review"] = True
+    if not record.get("reviewed"):
+        record["review_state"] = "PENDING_REVIEW"
+
+    evidence = dict(record.get("evidence") or {})
+    evidence["task_result"] = readback
+    evidence["hermes_transport"] = {
+        "source": HERMES_RESULT_SOURCE,
+        "adapter_version": HERMES_RESULT_ADAPTER_VERSION,
+        "evidence_hash": decision.get("evidence_hash"),
+        "executor_identity": decision.get("executor_identity"),
+        "task_state": envelope.get("task_state"),
+        "worker_id": envelope.get("worker_id"),
+        "lease_id": envelope.get("lease_id"),
+        "ingested_at": _now_utc(),
+    }
+    record["evidence"] = evidence
+
+    for key, value in (decision.get("registry_patch") or {}).items():
+        record[key] = value
+
+
+def _safe_read_back(registry: Any, task_id: str) -> dict[str, Any] | None:
+    getter = getattr(registry, "get_task_result", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter(str(task_id))
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def ingest_hermes_result(
+    registry: Any,
+    envelope: Mapping[str, Any],
+    *,
+    record: Mapping[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Ingest one validated Hermes transport result for ``get_task_result``.
+
+    Fail-closed: the task must already exist in the single existing Task
+    Registry. Validation, evidence-hash checking, lease ownership, idempotency
+    and conflict rejection all reuse :func:`normalize_transport_result`. On
+    acceptance the result is written into the existing record and read back
+    through the existing :meth:`EventSyncRegistry.get_task_result` surface.
+
+    The return value is the transport decision extended with ``ingested`` and
+    ``read_back``. A duplicate returns ``ingested=False`` and performs no write,
+    so retransmission can never create a second terminal result.
+    """
+    task_id = (
+        str(envelope.get("task_id") or "") if isinstance(envelope, Mapping) else ""
+    )
+    resolved = record if record is not None else registry_record(registry, task_id)
+    if resolved is None:
+        return {
+            "task_id": task_id,
+            "state": RESULT_STATE_REJECTED,
+            "accepted": False,
+            "duplicate": False,
+            "ingested": False,
+            "reason_code": "TASK_NOT_REGISTERED",
+            "reason": (
+                "task is not registered in the existing Task Registry; refusing "
+                "to create a second store or invent a task"
+            ),
+            "errors": [f"unknown task_id: {task_id}"] if task_id else ["task_id missing"],
+            "normalized_status": None,
+            "execution_result": None,
+            "read_back": None,
+            "canonical_write_performed": False,
+            "second_state_store_created": False,
+        }
+
+    decision = normalize_transport_result(resolved, envelope, now=now)
+    decision["ingested"] = False
+    decision["second_state_store_created"] = False
+    decision["adapter_version"] = HERMES_RESULT_ADAPTER_VERSION
+
+    if not decision.get("accepted") or decision.get("duplicate"):
+        decision["read_back"] = _safe_read_back(registry, task_id)
+        return decision
+
+    _write_hermes_readback(resolved, envelope, decision)
+    decision["ingested"] = True
+    decision["read_back"] = _safe_read_back(registry, task_id)
+    return decision
+
+
 __all__ = [
     "ACK_STATE_ACKNOWLEDGED",
     "ACK_STATE_IDEMPOTENT",
@@ -1553,6 +1832,9 @@ __all__ = [
     "GOLDEN_PATH_BLOCKED",
     "GOLDEN_PATH_PASS",
     "GOLDEN_PATH_PARTIAL",
+    "HERMES_RESULT_ADAPTER_DEPLOYMENT_GATE",
+    "HERMES_RESULT_ADAPTER_VERSION",
+    "HERMES_RESULT_SOURCE",
     "HermesOrchestrationAdapter",
     "MAX_TRANSPORT_ATTEMPTS",
     "MINIMAL_RELAY_GAP",
@@ -1587,20 +1869,24 @@ __all__ = [
     "TRANSPORT_RESULT_REQUIRED_FIELDS",
     "ack_idempotency_key",
     "acknowledge_task",
+    "apply_registry_patch",
     "audit_windows_hermes_transport",
     "build_health_handshake",
+    "build_hermes_result_envelope",
     "build_task_assignment",
     "build_task_contract",
     "claim_idempotency_key",
     "claim_task",
     "compute_evidence_hash",
     "evaluate_health_handshake",
+    "ingest_hermes_result",
     "is_transport_claimable",
     "normalize_hermes_evidence",
     "normalize_to_execution_v2",
     "normalize_transport_result",
     "plan_result_publication",
     "probe_hermes_runtime",
+    "registry_record",
     "result_idempotency_key",
     "run_hermes_golden_poc",
     "validate_health_handshake",
