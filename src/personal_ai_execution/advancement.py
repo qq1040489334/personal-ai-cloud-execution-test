@@ -49,6 +49,11 @@ DISPATCH_REASON_FAILED = "DISPATCH_FAILED"
 FORBIDDEN_EXPECTED_PREFIXES = (".github/workflows/",)
 FORBIDDEN_EXPECTED_SUBSTRINGS = ("secret", "token", "credential", ".env", ".pem", ".key")
 
+#: Optional lineage fields inherited by an approved child from its parent.
+_LINEAGE_PROJECT_FIELD = "project_id"
+_LINEAGE_ROOT_FIELD = "root_task_id"
+_LINEAGE_PARENT_FIELD = "parent_task_id"
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -120,6 +125,14 @@ def normalize_approved_next_task(
     }
     if normalized_expected is not None:
         contract["expected_files"] = normalized_expected
+    for field in (
+        _LINEAGE_PROJECT_FIELD,
+        _LINEAGE_ROOT_FIELD,
+        _LINEAGE_PARENT_FIELD,
+    ):
+        lineage_value = value.get(field)
+        if lineage_value:
+            contract[field] = str(lineage_value)
     return contract, []
 
 
@@ -198,6 +211,17 @@ def dispatch_approved_child(
     record["review_dispatch"] = audit
 
     child = {**contract, "task_id": child_task_id, "parent_task_id": str(task_id)}
+    # Deterministic lineage inheritance: an explicit child lineage wins, else the
+    # parent's project/root lineage is inherited, else the parent becomes the root
+    # of this child's singleton lineage. A child is never left unlineaged.
+    for field in (_LINEAGE_PROJECT_FIELD, _LINEAGE_ROOT_FIELD):
+        if not child.get(field):
+            inherited = record.get(field)
+            if inherited:
+                child[field] = str(inherited)
+    if not child.get(_LINEAGE_ROOT_FIELD):
+        parent_root = record.get(_LINEAGE_ROOT_FIELD)
+        child[_LINEAGE_ROOT_FIELD] = str(parent_root or task_id)
     try:
         outcome = dispatcher(child)
     except Exception as exc:  # noqa: BLE001 - fail closed on any dispatcher error

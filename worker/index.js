@@ -897,9 +897,9 @@ function newTaskId() {
 }
 __name(newTaskId, "newTaskId");
 __name2(newTaskId, "newTaskId");
-function buildContract(goal, instructions, acceptance, expectedFiles) {
+function buildContract(goal, instructions, acceptance, expectedFiles, lineage) {
   const expected_files = expectedFiles === void 0 ? [...ALLOWLIST] : Array.isArray(expectedFiles) ? expectedFiles.map(String) : [];
-  return {
+  const contract = {
     task_id: newTaskId(),
     goal: String(goal ?? ""),
     instructions: Array.isArray(instructions) ? instructions.map(String) : [],
@@ -907,6 +907,11 @@ function buildContract(goal, instructions, acceptance, expectedFiles) {
     expected_files,
     acceptance: Array.isArray(acceptance) ? acceptance.map(String) : []
   };
+  const source = lineage && typeof lineage === "object" ? lineage : {};
+  if (source.project_id) contract.project_id = String(source.project_id);
+  if (source.root_task_id) contract.root_task_id = String(source.root_task_id);
+  if (source.parent_task_id) contract.parent_task_id = String(source.parent_task_id);
+  return contract;
 }
 __name(buildContract, "buildContract");
 __name2(buildContract, "buildContract");
@@ -1041,12 +1046,18 @@ async function finalizeDispatchMarker(env, parentTaskId, patch) {
 }
 __name(finalizeDispatchMarker, "finalizeDispatchMarker");
 __name2(finalizeDispatchMarker, "finalizeDispatchMarker");
-function buildApprovedChildContract(approvedNextTask) {
+function buildApprovedChildContract(approvedNextTask, parentLineage) {
+  const inherited = parentLineage && typeof parentLineage === "object" ? parentLineage : {};
   const contract = buildContract(
     approvedNextTask.goal,
     approvedNextTask.instructions,
     approvedNextTask.acceptance,
-    approvedNextTask.expected_files
+    approvedNextTask.expected_files,
+    {
+      project_id: approvedNextTask.project_id || inherited.project_id,
+      root_task_id: approvedNextTask.root_task_id || inherited.root_task_id,
+      parent_task_id: inherited.parent_task_id
+    }
   );
   return { contract, errors: validateContract(contract) };
 }
@@ -1082,7 +1093,18 @@ async function dispatchApprovedChild(env, parentTaskId, verdict, approvedNextTas
       reason: DISPATCH_REASON_ALREADY
     };
   }
-  const { contract, errors } = buildApprovedChildContract(approvedNextTask);
+  let parentRecord = null;
+  try {
+    parentRecord = await readTask(env, parentTaskId);
+  } catch {
+    parentRecord = null;
+  }
+  const parentLineage = {
+    project_id: parentRecord && parentRecord.project_id ? String(parentRecord.project_id) : null,
+    root_task_id: parentRecord && parentRecord.root_task_id ? String(parentRecord.root_task_id) : String(parentTaskId),
+    parent_task_id: String(parentTaskId)
+  };
+  const { contract, errors } = buildApprovedChildContract(approvedNextTask, parentLineage);
   if (errors.length) {
     return { ...base, attempted: true, reason: DISPATCH_REASON_INVALID, errors };
   }
@@ -1258,11 +1280,48 @@ __name(verifiedResultStatus, "verifiedResultStatus");
 __name2(verifiedResultStatus, "verifiedResultStatus");
 var REG_PREFIX = "task:";
 var BLOCKED_AFTER_MS = 15 * 60 * 1e3;
+var LINEAGE_PROJECT_FIELD = "project_id";
+var LINEAGE_ROOT_FIELD = "root_task_id";
+var LINEAGE_PARENT_FIELD = "parent_task_id";
+var LINEAGE_KIND_PROJECT = "project";
+var LINEAGE_KIND_ROOT = "root";
+var MAX_LINEAGE_WALK = 64;
 function regKey(taskId) {
   return `${REG_PREFIX}${taskId}`;
 }
 __name(regKey, "regKey");
 __name2(regKey, "regKey");
+function resolveLineage(record, index) {
+  const taskId = String(record && record.task_id || "");
+  const projectId = record && record.project_id;
+  if (projectId) return { kind: LINEAGE_KIND_PROJECT, key: String(projectId) };
+  const root = record && record.root_task_id;
+  if (root) return { kind: LINEAGE_KIND_ROOT, key: String(root) };
+  let parent = record && record.parent_task_id;
+  const seen = /* @__PURE__ */ new Set();
+  while (parent && !seen.has(String(parent)) && seen.size < MAX_LINEAGE_WALK) {
+    seen.add(String(parent));
+    const ancestor = index.get(String(parent));
+    if (!ancestor) break;
+    if (ancestor.root_task_id) return { kind: LINEAGE_KIND_ROOT, key: String(ancestor.root_task_id) };
+    if (ancestor.project_id) return { kind: LINEAGE_KIND_PROJECT, key: String(ancestor.project_id) };
+    parent = ancestor.parent_task_id;
+  }
+  return { kind: LINEAGE_KIND_ROOT, key: taskId };
+}
+__name(resolveLineage, "resolveLineage");
+__name2(resolveLineage, "resolveLineage");
+function lineageInScope(record, scope, index) {
+  if (!scope) return true;
+  const projectId = scope.project_id;
+  const rootTaskId = scope.root_task_id;
+  if (!projectId && !rootTaskId) return true;
+  const resolved = resolveLineage(record, index);
+  if (projectId) return resolved.kind === LINEAGE_KIND_PROJECT && resolved.key === String(projectId);
+  return resolved.kind === LINEAGE_KIND_ROOT && resolved.key === String(rootTaskId);
+}
+__name(lineageInScope, "lineageInScope");
+__name2(lineageInScope, "lineageInScope");
 async function recordTask(env, contract) {
   if (!env.TASK_REGISTRY) return;
   const nowIso = (/* @__PURE__ */ new Date()).toISOString();
@@ -1279,6 +1338,9 @@ async function recordTask(env, contract) {
     reviewed: false,
     review_verdict: null
   };
+  if (contract.project_id) meta.project_id = String(contract.project_id);
+  if (contract.root_task_id) meta.root_task_id = String(contract.root_task_id);
+  if (contract.parent_task_id) meta.parent_task_id = String(contract.parent_task_id);
   await env.TASK_REGISTRY.put(regKey(contract.task_id), JSON.stringify({ task_id: contract.task_id, ...meta }), {
     metadata: meta
   });
@@ -1316,14 +1378,21 @@ async function persistTerminalExecution(env, taskId, patch) {
 }
 __name(persistTerminalExecution, "persistTerminalExecution");
 __name2(persistTerminalExecution, "persistTerminalExecution");
-async function listPendingResults(env) {
+async function listPendingResults(env, scope) {
   const tasks = await listTasks(env);
+  const index = /* @__PURE__ */ new Map();
+  for (const task of tasks) index.set(String(task.task_id), task);
   const now = Date.now();
   const pending = [];
   const pending_review = [];
   const failed = [];
   const blocked = [];
+  let excluded_by_lineage = 0;
   for (const task of tasks) {
+    if (!lineageInScope(task, scope, index)) {
+      excluded_by_lineage += 1;
+      continue;
+    }
     let status = task.normalized_status || task.status || EXECUTION_STATUS_PENDING;
     let resultAvailable = Boolean(task.result_available);
     let updatedAt = task.updated_at || task.created_at || "";
@@ -1366,6 +1435,10 @@ async function listPendingResults(env) {
       requires_review: resultAvailable && task.reviewed !== true,
       recommended_action: resultAvailable ? "review" : "wait"
     };
+    if (task.project_id) entry.project_id = String(task.project_id);
+    if (task.root_task_id) entry.root_task_id = String(task.root_task_id);
+    if (task.parent_task_id) entry.parent_task_id = String(task.parent_task_id);
+    entry.lineage = resolveLineage(task, index);
     if (resultAvailable && task.reviewed !== true) {
       pending.push(entry);
       pending_review.push(entry);
@@ -1394,7 +1467,7 @@ async function listPendingResults(env) {
       });
     }
   }
-  return {
+  const report = {
     pending,
     pending_review,
     failed,
@@ -1407,6 +1480,11 @@ async function listPendingResults(env) {
       total: tasks.length
     }
   };
+  if (scope) {
+    report.scope = scope;
+    report.excluded_by_lineage = excluded_by_lineage;
+  }
+  return report;
 }
 __name(listPendingResults, "listPendingResults");
 __name2(listPendingResults, "listPendingResults");
@@ -1512,7 +1590,11 @@ async function toolMarkReviewed(env, args) {
 __name(toolMarkReviewed, "toolMarkReviewed");
 __name2(toolMarkReviewed, "toolMarkReviewed");
 async function toolSubmitTask(env, args) {
-  const contract = buildContract(args.goal, args.instructions, args.acceptance, args.expected_files);
+  const contract = buildContract(args.goal, args.instructions, args.acceptance, args.expected_files, {
+    project_id: args.project_id,
+    root_task_id: args.root_task_id,
+    parent_task_id: args.parent_task_id
+  });
   const errors = validateContract(contract);
   if (errors.length) return { isError: true, text: `INVALID_TASK: ${errors.join("; ")}` };
   let dispatch;
@@ -1565,9 +1647,22 @@ async function toolSubmitTask(env, args) {
 }
 __name(toolSubmitTask, "toolSubmitTask");
 __name2(toolSubmitTask, "toolSubmitTask");
-async function toolListPendingResults(env, _args) {
+function normalizeLineageScope(args) {
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const raw = input.scope && typeof input.scope === "object" && !Array.isArray(input.scope) ? input.scope : {};
+  const projectId = raw.project_id ?? input.project_id;
+  const rootTaskId = raw.root_task_id ?? input.root_task_id;
+  const scope = {};
+  if (projectId != null && String(projectId)) scope.project_id = String(projectId);
+  if (rootTaskId != null && String(rootTaskId)) scope.root_task_id = String(rootTaskId);
+  return Object.keys(scope).length ? scope : null;
+}
+__name(normalizeLineageScope, "normalizeLineageScope");
+__name2(normalizeLineageScope, "normalizeLineageScope");
+async function toolListPendingResults(env, args) {
   try {
-    return { isError: false, text: JSON.stringify(await listPendingResults(env)) };
+    const scope = normalizeLineageScope(args);
+    return { isError: false, text: JSON.stringify(await listPendingResults(env, scope)) };
   } catch (err2) {
     return { isError: true, text: `REGISTRY_READ_FAILED: ${err2.message}` };
   }
@@ -2193,7 +2288,10 @@ var TOOLS = [
         goal: { type: "string" },
         instructions: { type: "array", items: { type: "string" } },
         acceptance: { type: "array", items: { type: "string" } },
-        expected_files: { type: "array", items: { type: "string" } }
+        expected_files: { type: "array", items: { type: "string" } },
+        project_id: { type: ["string", "null"], description: "Optional active-project lineage id." },
+        root_task_id: { type: ["string", "null"], description: "Optional lineage root task id." },
+        parent_task_id: { type: ["string", "null"], description: "Optional immediate parent task id." }
       },
       required: ["goal", "instructions", "acceptance"]
     }
@@ -2224,8 +2322,23 @@ var TOOLS = [
   },
   {
     name: "list_pending_results",
-    description: "List tasks that have finished and await review, plus failed and blocked tasks. Returns buckets pending_review / failed / blocked.",
-    inputSchema: { type: "object", properties: {}, required: [] }
+    description: "List tasks that have finished and await review, plus failed and blocked tasks. Returns buckets pending_review / failed / blocked. Optional project_id / root_task_id lineage scope deterministically restricts the result to one active lineage and reports excluded_by_lineage; unscoped behavior is unchanged.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: ["string", "null"], description: "Optional active-project lineage id to scope the listing." },
+        root_task_id: { type: ["string", "null"], description: "Optional lineage root task id to scope the listing." },
+        scope: {
+          type: ["object", "null"],
+          properties: {
+            project_id: { type: ["string", "null"] },
+            root_task_id: { type: ["string", "null"] }
+          },
+          additionalProperties: false
+        }
+      },
+      required: []
+    }
   },
   {
     name: "mark_reviewed",
@@ -2242,7 +2355,9 @@ var TOOLS = [
             goal: { type: "string" },
             instructions: { type: "array", items: { type: "string" } },
             acceptance: { type: "array", items: { type: "string" } },
-            expected_files: { type: "array", items: { type: "string" } }
+            expected_files: { type: "array", items: { type: "string" } },
+            project_id: { type: ["string", "null"] },
+            root_task_id: { type: ["string", "null"] }
           },
           required: ["goal", "instructions", "acceptance"]
         }

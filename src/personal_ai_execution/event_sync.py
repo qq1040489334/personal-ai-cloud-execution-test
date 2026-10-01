@@ -47,9 +47,80 @@ ELIGIBLE_REASON_CODE = "ELIGIBLE"
 #: Fixed task id used by the golden EVENT_SYNC discovery path.
 GOLDEN_TASK_ID = "cf-0564e6c347b8"
 
+#: Optional, additive lineage metadata fields on a canonical registry record.
+LINEAGE_PROJECT_FIELD = "project_id"
+LINEAGE_ROOT_FIELD = "root_task_id"
+LINEAGE_PARENT_FIELD = "parent_task_id"
+
+#: Lineage kind returned by :func:`resolve_lineage`.
+LINEAGE_KIND_PROJECT = "project"
+LINEAGE_KIND_ROOT = "root"
+
+#: Hard bound on parent-chain walking so a cyclic chain can never loop forever.
+MAX_LINEAGE_WALK = 64
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def resolve_lineage(
+    record: Mapping[str, Any], index: Mapping[str, Any]
+) -> tuple[str, str]:
+    """Resolve a record to a single deterministic lineage key, fail-closed.
+
+    Resolution precedence is ``project_id`` -> ``root_task_id`` -> walk the
+    ``parent_task_id`` chain -> singleton lineage of the record's own task id.
+    The walk is bounded and cycle-aware, and an unknown parent stops the walk so
+    a record can never be cross-associated with an unrelated project.
+    """
+    task_id = str(record.get("task_id") or "")
+    project_id = record.get(LINEAGE_PROJECT_FIELD)
+    if project_id:
+        return LINEAGE_KIND_PROJECT, str(project_id)
+    root = record.get(LINEAGE_ROOT_FIELD)
+    if root:
+        return LINEAGE_KIND_ROOT, str(root)
+
+    parent = record.get(LINEAGE_PARENT_FIELD)
+    seen: set[str] = set()
+    while parent and str(parent) not in seen and len(seen) < MAX_LINEAGE_WALK:
+        seen.add(str(parent))
+        ancestor = index.get(str(parent))
+        if not isinstance(ancestor, Mapping):
+            break  # unknown parent -> stop, fail closed
+        ancestor_root = ancestor.get(LINEAGE_ROOT_FIELD)
+        if ancestor_root:
+            return LINEAGE_KIND_ROOT, str(ancestor_root)
+        ancestor_project = ancestor.get(LINEAGE_PROJECT_FIELD)
+        if ancestor_project:
+            return LINEAGE_KIND_PROJECT, str(ancestor_project)
+        parent = ancestor.get(LINEAGE_PARENT_FIELD)
+    return LINEAGE_KIND_ROOT, task_id
+
+
+def lineage_in_scope(
+    record: Mapping[str, Any],
+    scope: Mapping[str, Any] | None,
+    index: Mapping[str, Any],
+) -> bool:
+    """Return ``True`` when ``record`` belongs to the requested lineage scope.
+
+    ``scope is None`` (or an empty scope) selects everything, preserving the
+    historical unscoped behavior. A scope with ``project_id`` or
+    ``root_task_id`` selects exactly the records whose resolved lineage key
+    matches; everything else is excluded without mutation.
+    """
+    if not scope:
+        return True
+    project_id = scope.get(LINEAGE_PROJECT_FIELD)
+    root_task_id = scope.get(LINEAGE_ROOT_FIELD)
+    if not project_id and not root_task_id:
+        return True
+    kind, key = resolve_lineage(record, index)
+    if project_id:
+        return kind == LINEAGE_KIND_PROJECT and key == str(project_id)
+    return kind == LINEAGE_KIND_ROOT and key == str(root_task_id)
 
 
 def _normalized_status(value: Any) -> str:
@@ -356,13 +427,28 @@ class EventSyncRegistry:
             },
         )
 
-    def list_pending_results(self) -> list[dict[str, Any]]:
+    def list_pending_results(
+        self, scope: Mapping[str, Any] | None = None
+    ) -> Any:
         """Return every terminal, unreviewed task awaiting human review.
 
         Discovery needs no manual ``get_task_result`` call: EVENT_SYNC stores the
         normalized status on the registry record itself.
+
+        With no ``scope`` the return value is the historical list, unchanged.
+        With an explicit lineage ``scope`` (``{"project_id": ...}`` or
+        ``{"root_task_id": ...}``) the return value is a report mapping whose
+        ``pending``/``pending_review`` entries are restricted to the requested
+        lineage and whose ``excluded_by_lineage`` count proves that unrelated
+        historical backlog was excluded, never mutated or hidden.
         """
+        index = {
+            str(record.get("task_id")): record
+            for record in self._tasks.values()
+            if record.get("task_id")
+        }
         pending: list[dict[str, Any]] = []
+        excluded = 0
         for record in self._tasks.values():
             if not record.get("terminal") or not record.get("result_available"):
                 continue
@@ -370,11 +456,24 @@ class EventSyncRegistry:
                 continue
             if record.get("reviewed"):
                 continue
+            if not lineage_in_scope(record, scope, index):
+                excluded += 1
+                continue
             item = dict(record)
             item["review_state"] = PENDING_REVIEW
+            kind, key = resolve_lineage(record, index)
+            item["lineage"] = {"kind": kind, "key": key}
             pending.append(item)
         pending.sort(key=lambda item: item["task_id"])
-        return pending
+        if not scope:
+            return pending
+        return {
+            "pending": pending,
+            "pending_review": pending,
+            "scope": dict(scope),
+            "excluded_by_lineage": excluded,
+            "counts": {"pending_review": len(pending), "excluded_by_lineage": excluded},
+        }
 
     def mark_reviewed(
         self,
@@ -752,13 +851,23 @@ class EventSyncRegistry:
         created = record is None
         if record is None:
             base_goal = ""
+            lineage: dict[str, Any] = {}
             if isinstance(execution_result, Mapping):
                 base_goal = str(execution_result.get("summary", "")).strip()
+                for field in (
+                    LINEAGE_PROJECT_FIELD,
+                    LINEAGE_ROOT_FIELD,
+                    LINEAGE_PARENT_FIELD,
+                ):
+                    value = execution_result.get(field)
+                    if value:
+                        lineage[field] = value
             self.submit_task(
                 task_id,
                 goal=base_goal,
                 status=canonical["status"],
                 requires_review=True,
+                **lineage,
             )
             record = self._tasks[task_id]
 
@@ -838,8 +947,10 @@ def get_task_result(task_id: str) -> dict[str, Any]:
     return _DEFAULT_REGISTRY.get_task_result(task_id)
 
 
-def list_pending_results() -> list[dict[str, Any]]:
-    return _DEFAULT_REGISTRY.list_pending_results()
+def list_pending_results(
+    scope: Mapping[str, Any] | None = None,
+) -> Any:
+    return _DEFAULT_REGISTRY.list_pending_results(scope)
 
 
 def mark_reviewed(*args: Any, **kwargs: Any) -> dict[str, Any]:
