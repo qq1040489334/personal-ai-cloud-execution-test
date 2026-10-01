@@ -30,12 +30,16 @@ from .advancement import (
     normalize_approved_next_task,
 )
 from .event_sync import (
+    ACTIVE_PROJECT_ENV,
+    DEFAULT_ACTIVE_PROJECT_ID,
     ELIGIBLE_REASON_CODE,
     GOLDEN_TASK_ID,
+    NEXT_ACTION_REVIEW,
     PENDING_REVIEW,
     RECONCILE_ACTION,
     REVIEWED_STATE,
     EventSyncRegistry,
+    active_project_scope,
     audit_historical_tasks,
     default_registry,
     get_reconciliation_events,
@@ -49,6 +53,7 @@ from .event_sync import (
     reset_default_registry,
     review_eligibility,
     submit_task,
+    supervisor_pending_review_report,
     sync_terminal_result,
     validated_review_result,
 )
@@ -129,12 +134,14 @@ from .status_contract import (
 )
 
 __all__ = [
+    "ACTIVE_PROJECT_ENV",
     "ADVISORY_LIFECYCLE_STATUSES",
     "ALREADY_SYNCED",
     "APPROVED_NEXT_TASK_FIELD",
     "BLOCKED",
     "BLOCKED_AWAITING_INSPECTION",
     "COMPLETED_WITH_RESULT",
+    "DEFAULT_ACTIVE_PROJECT_ID",
     "DISPATCH_ACTION",
     "DISPATCH_REASON_ALREADY",
     "DISPATCH_REASON_DISPATCHED",
@@ -156,6 +163,7 @@ __all__ = [
     "GOLDEN_TASK_ID",
     "IN_PROGRESS",
     "LEGACY_ORPHAN",
+    "NEXT_ACTION_REVIEW",
     "NON_TERMINAL_STATUSES",
     "OPTIONAL_PROVENANCE_FIELDS",
     "PASS",
@@ -185,6 +193,7 @@ __all__ = [
     "TERMINAL_STATUSES",
     "WORKFLOW_CONCLUSION_TO_STATUS",
     "EventSyncRegistry",
+    "active_project_scope",
     "advancement",
     "audit_historical_tasks",
     "build_provenance",
@@ -233,6 +242,7 @@ __all__ = [
     "status_contract",
     "status_matrix",
     "submit_task",
+    "supervisor_pending_review_report",
     "sync_terminal_result",
     "validated_review_result",
     "workflow_conclusion",

@@ -1659,9 +1659,23 @@ function normalizeLineageScope(args) {
 }
 __name(normalizeLineageScope, "normalizeLineageScope");
 __name2(normalizeLineageScope, "normalizeLineageScope");
+var ACTIVE_PROJECT_ENV = "PERSONAL_AI_ACTIVE_PROJECT_ID";
+var DEFAULT_ACTIVE_PROJECT_ID = "cloud-assets-activation";
+function activeProjectScope(env, args) {
+  const explicit = normalizeLineageScope(args);
+  if (explicit) return explicit;
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const requested = input.active_project === true || input.active_project === "true";
+  if (!requested) return null;
+  const configured = env && env[ACTIVE_PROJECT_ENV] ? String(env[ACTIVE_PROJECT_ENV]).trim() : "";
+  const projectId = configured || DEFAULT_ACTIVE_PROJECT_ID;
+  return projectId ? { project_id: projectId } : null;
+}
+__name(activeProjectScope, "activeProjectScope");
+__name2(activeProjectScope, "activeProjectScope");
 async function toolListPendingResults(env, args) {
   try {
-    const scope = normalizeLineageScope(args);
+    const scope = activeProjectScope(env, args);
     return { isError: false, text: JSON.stringify(await listPendingResults(env, scope)) };
   } catch (err2) {
     return { isError: true, text: `REGISTRY_READ_FAILED: ${err2.message}` };
@@ -2322,12 +2336,13 @@ var TOOLS = [
   },
   {
     name: "list_pending_results",
-    description: "List tasks that have finished and await review, plus failed and blocked tasks. Returns buckets pending_review / failed / blocked. Optional project_id / root_task_id lineage scope deterministically restricts the result to one active lineage and reports excluded_by_lineage; unscoped behavior is unchanged.",
+    description: "List tasks that have finished and await review, plus failed and blocked tasks. Returns buckets pending_review / failed / blocked. Optional project_id / root_task_id lineage scope deterministically restricts the result to one active lineage and reports excluded_by_lineage; unscoped behavior is unchanged. Set active_project=true to scope to the configured active project lineage (PERSONAL_AI_ACTIVE_PROJECT_ID, default cloud-assets-activation).",
     inputSchema: {
       type: "object",
       properties: {
         project_id: { type: ["string", "null"], description: "Optional active-project lineage id to scope the listing." },
         root_task_id: { type: ["string", "null"], description: "Optional lineage root task id to scope the listing." },
+        active_project: { type: ["boolean", "null"], description: "When true and no explicit scope is supplied, scope to the configured active project lineage." },
         scope: {
           type: ["object", "null"],
           properties: {

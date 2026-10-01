@@ -25,6 +25,7 @@ dispatched.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
@@ -59,9 +60,51 @@ LINEAGE_KIND_ROOT = "root"
 #: Hard bound on parent-chain walking so a cyclic chain can never loop forever.
 MAX_LINEAGE_WALK = 64
 
+#: Process-configurable active-project override for Supervisor consumers. This
+#: reuses the existing environment configuration mechanism so the active project
+#: is configurable instead of being permanently hard-coded.
+ACTIVE_PROJECT_ENV = "PERSONAL_AI_ACTIVE_PROJECT_ID"
+
+#: Default active-project lineage (Cloud Assets Activation) used only when a
+#: consumer passes no explicit scope and ``ACTIVE_PROJECT_ENV`` is unset.
+DEFAULT_ACTIVE_PROJECT_ID = "cloud-assets-activation"
+
+#: Kind emitted for the single bounded next_action of a Supervisor report.
+NEXT_ACTION_REVIEW = "REVIEW_PENDING_RESULT"
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def active_project_scope(
+    project_id: Any = None,
+    root_task_id: Any = None,
+    *,
+    env: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Resolve the active-project lineage scope for a Supervisor consumer.
+
+    Precedence is: an explicit ``project_id`` / ``root_task_id`` argument, then
+    the ``PERSONAL_AI_ACTIVE_PROJECT_ID`` environment override, then the Cloud
+    Assets Activation default. ``None`` is returned only when every source is
+    empty, so a caller that intentionally omits scope keeps the historical
+    unscoped behavior.
+    """
+    explicit_project = str(project_id).strip() if project_id else ""
+    explicit_root = str(root_task_id).strip() if root_task_id else ""
+    if explicit_root and not explicit_project:
+        return {LINEAGE_ROOT_FIELD: explicit_root}
+    if explicit_project:
+        return {LINEAGE_PROJECT_FIELD: explicit_project}
+    environ = env if env is not None else os.environ
+    configured = str(environ.get(ACTIVE_PROJECT_ENV) or "").strip()
+    if configured:
+        return {LINEAGE_PROJECT_FIELD: configured}
+    default = str(DEFAULT_ACTIVE_PROJECT_ID or "").strip()
+    if default:
+        return {LINEAGE_PROJECT_FIELD: default}
+    return None
 
 
 def resolve_lineage(
@@ -587,12 +630,86 @@ class EventSyncRegistry:
             raise KeyError(f"unknown task_id: {task_id}")
         return _review_assistant.build_review_recommendation(record)
 
-    def list_review_recommendations(self) -> list[dict[str, Any]]:
-        """Return recommendations for every pending-review task, in order."""
-        return [
-            _review_assistant.build_review_recommendation(record)
-            for record in self.list_pending_results()
-        ]
+    def list_review_recommendations(
+        self, scope: Mapping[str, Any] | None = None
+    ) -> Any:
+        """Return recommendations for pending-review tasks, in order.
+
+        With no ``scope`` the return value is the historical list of advisory
+        recommendations, unchanged. With an explicit lineage ``scope`` the return
+        value is an audit report whose ``recommendations`` are restricted to the
+        requested lineage and whose ``excluded_by_lineage`` count proves the
+        unrelated historical backlog was excluded, never mutated.
+        """
+        pending_report = self.list_pending_results(scope)
+        if not scope:
+            return [
+                _review_assistant.build_review_recommendation(record)
+                for record in pending_report
+            ]
+        records = pending_report["pending"]
+        return {
+            "recommendations": [
+                _review_assistant.build_review_recommendation(record)
+                for record in records
+            ],
+            "pending": records,
+            "pending_review": records,
+            "scope": dict(scope),
+            "excluded_by_lineage": pending_report["excluded_by_lineage"],
+            "counts": dict(pending_report["counts"]),
+        }
+
+    def supervisor_pending_review_report(
+        self,
+        project_id: Any = None,
+        root_task_id: Any = None,
+        *,
+        env: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Deterministically select the active-project pending-review backlog.
+
+        This is the Supervisor/advancement consumer entry point. It resolves the
+        active Cloud Assets Activation lineage (overridable with an explicit
+        ``project_id`` / ``root_task_id`` or the ``PERSONAL_AI_ACTIVE_PROJECT_ID``
+        environment variable), reads only that lineage's pending results, builds
+        advisory recommendations, reports the ``excluded_by_lineage`` audit count
+        and returns exactly one bounded ``next_action``. Historical singletons
+        are never selected and never mutated; calling with every source empty
+        falls back to the unscoped list so intentional omission stays compatible.
+        """
+        scope = active_project_scope(project_id, root_task_id, env=env)
+        if scope:
+            report = self.list_review_recommendations(scope)
+        else:
+            pending = self.list_pending_results()
+            report = {
+                "recommendations": [
+                    _review_assistant.build_review_recommendation(record)
+                    for record in pending
+                ],
+                "pending": pending,
+                "pending_review": pending,
+                "scope": None,
+                "excluded_by_lineage": 0,
+                "counts": {
+                    "pending_review": len(pending),
+                    "excluded_by_lineage": 0,
+                },
+            }
+        recommendations = report["recommendations"]
+        selected = recommendations[0] if recommendations else None
+        report["next_action"] = (
+            {
+                "kind": NEXT_ACTION_REVIEW,
+                "task_id": selected["task_id"],
+                "recommendation": selected["verdict"],
+                "requires_human_review": selected["requires_human_review"],
+            }
+            if selected
+            else None
+        )
+        return report
 
     def get_review_events(self, task_id: str | None = None) -> list[dict[str, Any]]:
         if task_id is None:
@@ -961,8 +1078,23 @@ def recommend_review(task_id: str) -> dict[str, Any]:
     return _DEFAULT_REGISTRY.recommend_review(task_id)
 
 
-def list_review_recommendations() -> list[dict[str, Any]]:
-    return _DEFAULT_REGISTRY.list_review_recommendations()
+def list_review_recommendations(
+    scope: Mapping[str, Any] | None = None,
+) -> Any:
+    return _DEFAULT_REGISTRY.list_review_recommendations(scope)
+
+
+def supervisor_pending_review_report(
+    project_id: Any = None,
+    root_task_id: Any = None,
+    *,
+    env: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return _DEFAULT_REGISTRY.supervisor_pending_review_report(
+        project_id,
+        root_task_id,
+        env=env,
+    )
 
 
 def get_review_events(task_id: str | None = None) -> list[dict[str, Any]]:
