@@ -1280,12 +1280,122 @@ __name(verifiedResultStatus, "verifiedResultStatus");
 __name2(verifiedResultStatus, "verifiedResultStatus");
 var REG_PREFIX = "task:";
 var BLOCKED_AFTER_MS = 15 * 60 * 1e3;
+var TASK_DISPATCH_CONFIRM_GRACE_MS = 15 * 60 * 1e3;
+var TASK_DISPATCH_MAX_ATTEMPTS = 3;
+var TASK_DISPATCH_STATE_PENDING = "PENDING_DISPATCH";
+var TASK_DISPATCH_STATE_ACCEPTED = "ACCEPTED";
+var TASK_DISPATCH_STATE_CONFIRMED = "CONFIRMED";
+var TASK_DISPATCH_STATE_UNCONFIRMED = "UNCONFIRMED";
+var TASK_DISPATCH_STATE_RETRY = "RETRY_DISPATCHED";
+var TASK_DISPATCH_STATE_FAILED = "DISPATCH_FAILED";
+var TASK_DISPATCH_STATE_EXHAUSTED = "EXHAUSTED";
+var TASK_DISPATCH_ACTION_WAIT = "wait";
+var TASK_DISPATCH_ACTION_RETRY = "retry";
+var TASK_DISPATCH_ACTION_INSPECT = "inspect";
+var TASK_DISPATCH_ACTION_NONE = "none";
 var LINEAGE_PROJECT_FIELD = "project_id";
 var LINEAGE_ROOT_FIELD = "root_task_id";
 var LINEAGE_PARENT_FIELD = "parent_task_id";
 var LINEAGE_KIND_PROJECT = "project";
 var LINEAGE_KIND_ROOT = "root";
 var MAX_LINEAGE_WALK = 64;
+function taskDispatchConfirmed(options) {
+  const opts = options && typeof options === "object" ? options : {};
+  if (opts.hasArtifact === true) return true;
+  if (opts.runConclusion != null && String(opts.runConclusion).trim()) return true;
+  const status = opts.runStatus == null ? "" : String(opts.runStatus).trim().toLowerCase();
+  return status === "in_progress" || status === "completed";
+}
+__name(taskDispatchConfirmed, "taskDispatchConfirmed");
+__name2(taskDispatchConfirmed, "taskDispatchConfirmed");
+function classifyTaskDispatchLiveness(task, options) {
+  const opts = options && typeof options === "object" ? options : {};
+  const now = opts.now == null ? Date.now() : Number(opts.now);
+  const graceMs = opts.graceMs == null ? TASK_DISPATCH_CONFIRM_GRACE_MS : Number(opts.graceMs);
+  const maxAttempts = Math.max(1, Number(opts.maxAttempts) || TASK_DISPATCH_MAX_ATTEMPTS);
+  const taskId = String(task && task.task_id || "");
+  const attempt = Math.max(1, Number(task && task.dispatch_attempt) || 1);
+  const acceptedRaw = task && (task.dispatch_accepted_at || task.dispatch_at || task.created_at || task.updated_at);
+  const acceptedAt = acceptedRaw ? Date.parse(acceptedRaw) || null : null;
+  const deadlineRaw = task && task.dispatch_confirm_deadline;
+  const deadline = deadlineRaw ? Date.parse(deadlineRaw) || null : acceptedAt == null ? null : acceptedAt + graceMs;
+  const leaseExpired = deadline != null && now > deadline;
+  const confirmed = taskDispatchConfirmed(opts);
+  const authoritative = Boolean(task && (task.reviewed === true || task.terminal === true || task.result_available === true));
+  const recordedState = String(task && task.dispatch_state || "").trim().toUpperCase();
+  let state;
+  let action;
+  let retryable;
+  let reason;
+  if (authoritative) {
+    state = TASK_DISPATCH_STATE_CONFIRMED;
+    action = TASK_DISPATCH_ACTION_NONE;
+    retryable = false;
+    reason = "authoritative result or review already recorded";
+  } else if (recordedState === TASK_DISPATCH_STATE_FAILED) {
+    retryable = attempt < maxAttempts;
+    state = TASK_DISPATCH_STATE_FAILED;
+    action = retryable ? TASK_DISPATCH_ACTION_RETRY : TASK_DISPATCH_ACTION_INSPECT;
+    reason = "dispatch HTTP call failed" + (retryable ? "; retryable" : "; attempts exhausted");
+  } else if (confirmed) {
+    state = TASK_DISPATCH_STATE_CONFIRMED;
+    const runStatus = opts.runStatus == null ? "" : String(opts.runStatus).trim().toLowerCase();
+    action = runStatus === "in_progress" ? TASK_DISPATCH_ACTION_WAIT : TASK_DISPATCH_ACTION_NONE;
+    retryable = false;
+    reason = "job-start evidence observed; awaiting authoritative result";
+  } else if (!leaseExpired) {
+    state = recordedState === TASK_DISPATCH_STATE_PENDING || recordedState === TASK_DISPATCH_STATE_RETRY ? recordedState : TASK_DISPATCH_STATE_ACCEPTED;
+    action = TASK_DISPATCH_ACTION_WAIT;
+    retryable = false;
+    reason = "dispatch lease active; awaiting job start";
+  } else if (attempt >= maxAttempts) {
+    state = TASK_DISPATCH_STATE_EXHAUSTED;
+    action = TASK_DISPATCH_ACTION_INSPECT;
+    retryable = false;
+    reason = "dispatch accepted but no job started before the deadline and attempts are exhausted";
+  } else {
+    state = TASK_DISPATCH_STATE_UNCONFIRMED;
+    action = TASK_DISPATCH_ACTION_RETRY;
+    retryable = true;
+    reason = "dispatch accepted but no job started before the deadline (queued run cancelled before job start)";
+  }
+  return {
+    task_id: taskId,
+    dispatch_state: state,
+    recommended_action: action,
+    retryable,
+    confirmed,
+    lease_expired: leaseExpired,
+    attempt,
+    max_attempts: maxAttempts,
+    dispatch_accepted_at: acceptedAt == null ? null : new Date(acceptedAt).toISOString(),
+    dispatch_confirm_deadline: deadline == null ? null : new Date(deadline).toISOString(),
+    reason
+  };
+}
+__name(classifyTaskDispatchLiveness, "classifyTaskDispatchLiveness");
+__name2(classifyTaskDispatchLiveness, "classifyTaskDispatchLiveness");
+function planTaskDispatchRetry(task, options) {
+  const report = classifyTaskDispatchLiveness(task, options);
+  const taskId = String(task && task.task_id || "");
+  const attempt = Number(report.attempt) || 1;
+  const shouldRetry = report.recommended_action === TASK_DISPATCH_ACTION_RETRY;
+  const nextAttempt = shouldRetry ? attempt + 1 : attempt;
+  return {
+    task_id: taskId,
+    should_retry: shouldRetry,
+    same_task_id: true,
+    next_attempt: nextAttempt,
+    idempotency_key: shouldRetry && taskId ? `retry:${taskId}:${nextAttempt}` : null,
+    retry_claim_scope: shouldRetry ? "task_dispatch_markers" : null,
+    dispatch_state: report.dispatch_state,
+    recommended_action: report.recommended_action,
+    retryable: report.retryable,
+    reason: report.reason
+  };
+}
+__name(planTaskDispatchRetry, "planTaskDispatchRetry");
+__name2(planTaskDispatchRetry, "planTaskDispatchRetry");
 function regKey(taskId) {
   return `${REG_PREFIX}${taskId}`;
 }
@@ -1336,7 +1446,11 @@ async function recordTask(env, contract) {
     updated_at: nowIso,
     result_available: false,
     reviewed: false,
-    review_verdict: null
+    review_verdict: null,
+    dispatch_state: TASK_DISPATCH_STATE_ACCEPTED,
+    dispatch_attempt: 1,
+    dispatch_accepted_at: nowIso,
+    dispatch_confirm_deadline: new Date(Date.now() + TASK_DISPATCH_CONFIRM_GRACE_MS).toISOString()
   };
   if (contract.project_id) meta.project_id = String(contract.project_id);
   if (contract.root_task_id) meta.root_task_id = String(contract.root_task_id);
@@ -1387,6 +1501,7 @@ async function listPendingResults(env, scope) {
   const pending_review = [];
   const failed = [];
   const blocked = [];
+  const unconfirmed = [];
   let excluded_by_lineage = 0;
   for (const task of tasks) {
     if (!lineageInScope(task, scope, index)) {
@@ -1398,6 +1513,7 @@ async function listPendingResults(env, scope) {
     let updatedAt = task.updated_at || task.created_at || "";
     let completedAt = task.completed_at || "";
     let workflowConclusion = task.workflow_conclusion || null;
+    const jobEvidence = { hasArtifact: false, runStatus: null, runConclusion: null };
     if (!resultAvailable || !task.workflow_verified) {
       try {
         const artifact = await findArtifact(env, `execution_result-${task.task_id}`);
@@ -1409,13 +1525,21 @@ async function listPendingResults(env, scope) {
           resultAvailable = run.status === "completed";
           updatedAt = run.updated_at || updatedAt;
           completedAt = run.completed_at || (resultAvailable ? updatedAt : "");
+          jobEvidence.hasArtifact = true;
+          jobEvidence.runStatus = run.status ?? null;
+          jobEvidence.runConclusion = run.conclusion ?? null;
         } else if (task.result_available) {
           status = EXECUTION_STATUS_PENDING;
           resultAvailable = false;
         }
       } catch {
-        status = task.result_available ? EXECUTION_STATUS_PENDING : task.status || EXECUTION_STATUS_PENDING;
-        resultAvailable = false;
+        if (task.result_available && task.workflow_verified) {
+          status = task.normalized_status || task.status || EXECUTION_STATUS_PENDING;
+          resultAvailable = true;
+        } else {
+          status = task.result_available ? EXECUTION_STATUS_PENDING : task.status || EXECUTION_STATUS_PENDING;
+          resultAvailable = false;
+        }
       }
     }
     const terminal = resultAvailable && TERMINAL_EXECUTION_STATUSES.includes(status);
@@ -1443,8 +1567,21 @@ async function listPendingResults(env, scope) {
       pending.push(entry);
       pending_review.push(entry);
       if (status === EXECUTION_STATUS_FAIL) failed.push(entry);
-    } else {
-      if (!resultAvailable) {
+    } else if (!resultAvailable) {
+      const liveness = classifyTaskDispatchLiveness(task, {
+        now,
+        hasArtifact: jobEvidence.hasArtifact,
+        runStatus: jobEvidence.runStatus,
+        runConclusion: jobEvidence.runConclusion
+      });
+      entry.dispatch_state = liveness.dispatch_state;
+      entry.dispatch_attempt = liveness.attempt;
+      entry.dispatch_confirm_deadline = liveness.dispatch_confirm_deadline;
+      entry.retryable = liveness.retryable;
+      entry.recommended_action = liveness.recommended_action;
+      if (liveness.recommended_action === TASK_DISPATCH_ACTION_RETRY) {
+        unconfirmed.push(entry);
+      } else {
         const created = Date.parse(task.created_at || "") || now;
         if (now - created > BLOCKED_AFTER_MS) {
           entry.recommended_action = "inspect";
@@ -1472,11 +1609,13 @@ async function listPendingResults(env, scope) {
     pending_review,
     failed,
     blocked,
+    unconfirmed,
     counts: {
       pending: pending.length,
       pending_review: pending_review.length,
       failed: failed.length,
       blocked: blocked.length,
+      unconfirmed: unconfirmed.length,
       total: tasks.length
     }
   };
@@ -1589,6 +1728,28 @@ async function toolMarkReviewed(env, args) {
 }
 __name(toolMarkReviewed, "toolMarkReviewed");
 __name2(toolMarkReviewed, "toolMarkReviewed");
+async function toolPlanDispatchRetry(env, args) {
+  if (!env.TASK_REGISTRY) return { isError: true, text: "TASK_REGISTRY_UNAVAILABLE" };
+  const taskId = String(args.task_id ?? "").trim();
+  if (!taskId) return { isError: true, text: "INVALID_INPUT: task_id required" };
+  const task = await readTask(env, taskId);
+  if (!task) return { isError: true, text: `UNKNOWN_TASK: ${taskId}` };
+  let evidence = { hasArtifact: false, runStatus: null, runConclusion: null };
+  try {
+    const artifact = await findArtifact(env, `execution_result-${taskId}`);
+    if (artifact) {
+      evidence.hasArtifact = true;
+      const run = await getArtifactWorkflowRun(env, artifact);
+      evidence.runStatus = run.status ?? null;
+      evidence.runConclusion = run.conclusion ?? null;
+    }
+  } catch {
+  }
+  const plan = planTaskDispatchRetry(task, evidence);
+  return { isError: false, text: JSON.stringify(plan), structuredContent: plan };
+}
+__name(toolPlanDispatchRetry, "toolPlanDispatchRetry");
+__name2(toolPlanDispatchRetry, "toolPlanDispatchRetry");
 async function toolSubmitTask(env, args) {
   const contract = buildContract(args.goal, args.instructions, args.acceptance, args.expected_files, {
     project_id: args.project_id,
@@ -2366,6 +2527,31 @@ var TOOLS = [
     }
   },
   {
+    name: "plan_task_redispatch",
+    description: "Return an idempotent, deduplicated re-dispatch plan for an accepted Cloud Agent task whose queued run never started a job. Reuses the same task_id and a deterministic retry:<task_id>:<attempt> idempotency key. Read-only: it plans but never dispatches, so single-writer safety is preserved.",
+    inputSchema: {
+      type: "object",
+      properties: { task_id: { type: "string" } },
+      required: ["task_id"]
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string" },
+        should_retry: { type: "boolean" },
+        same_task_id: { type: "boolean" },
+        next_attempt: { type: "number" },
+        idempotency_key: { type: ["string", "null"] },
+        retry_claim_scope: { type: ["string", "null"] },
+        dispatch_state: { type: "string" },
+        recommended_action: { type: "string" },
+        retryable: { type: "boolean" },
+        reason: { type: "string" }
+      },
+      additionalProperties: true
+    }
+  },
+  {
     name: "mark_reviewed",
     description: "Record a review verdict for a completed task and close its pending review state. On an authoritative terminal PASS, an explicit pre-authorized approved_next_task may be dispatched exactly once as a child gpt_task; the worker never invents next work.",
     inputSchema: {
@@ -2509,6 +2695,9 @@ async function handleMcp(request, env, cors, auth) {
       } else if (name === "mark_reviewed") {
         if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolMarkReviewed(env, args);
+      } else if (name === "plan_task_redispatch") {
+        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
+        outcome = await toolPlanDispatchRetry(env, args);
       } else if (name === "search_assets") {
         if (!hasReadScope(auth)) return fail(-32001, "asset.read scope required");
         outcome = await toolSearchAssets(env, args);

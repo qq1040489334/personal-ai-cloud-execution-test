@@ -26,10 +26,11 @@ dispatched.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 
 from . import advancement as _advancement
+from . import dispatch_reconciliation as _dispatch_reconciliation
 from . import reconciliation as _reconciliation
 from . import result_normalization as _normalization
 from . import review_assistant as _review_assistant
@@ -320,6 +321,7 @@ class EventSyncRegistry:
         self._review_events: list[dict[str, Any]] = []
         self._sync_events: list[dict[str, Any]] = []
         self._reconciliation_events: list[dict[str, Any]] = []
+        self._dispatch_events: list[dict[str, Any]] = []
 
     # -- contract-preserved surface -------------------------------------
     def submit_task(
@@ -754,6 +756,166 @@ class EventSyncRegistry:
         )
         return report
 
+    # -- CLOUD_AGENT_QUEUED_RUN_CANCELLATION_FIX_V0.1 --------------------
+    def dispatch_liveness_report(
+        self,
+        evidence: Mapping[str, Mapping[str, Any]] | None = None,
+        *,
+        now: datetime | None = None,
+        grace_seconds: int = (
+            _dispatch_reconciliation.DEFAULT_DISPATCH_CONFIRM_GRACE_SECONDS
+        ),
+        max_attempts: int = _dispatch_reconciliation.MAX_DISPATCH_ATTEMPTS,
+    ) -> dict[str, Any]:
+        """Classify every record's dispatch liveness without mutating state.
+
+        ``evidence`` maps a ``task_id`` to the observed job-start evidence
+        (``has_artifact`` / ``run_status`` / ``run_conclusion``). A record that
+        has an accepted dispatch but no evidence past its lease deadline is
+        surfaced as ``UNCONFIRMED`` (``recommended_action == "retry"``) or
+        ``EXHAUSTED`` (``inspect``) instead of remaining silently ``PENDING``.
+        """
+        observed = dict(evidence or {})
+        items: list[dict[str, Any]] = []
+        buckets: dict[str, list[dict[str, Any]]] = {
+            "unconfirmed": [],
+            "retryable": [],
+            "inspect": [],
+            "waiting": [],
+            "confirmed": [],
+        }
+        for record in sorted(
+            self._tasks.values(), key=lambda item: str(item.get("task_id"))
+        ):
+            task_id = str(record.get("task_id") or "")
+            item_evidence = observed.get(task_id) or {}
+            if not isinstance(item_evidence, Mapping):
+                item_evidence = {}
+            report = _dispatch_reconciliation.classify_dispatch_liveness(
+                record,
+                has_artifact=bool(item_evidence.get("has_artifact")),
+                run_status=item_evidence.get("run_status"),
+                run_conclusion=item_evidence.get("run_conclusion"),
+                now=now,
+                grace_seconds=grace_seconds,
+                max_attempts=max_attempts,
+            )
+            report["permanently_pending"] = (
+                _dispatch_reconciliation.is_permanently_pending(report)
+            )
+            items.append(report)
+            state = report["dispatch_state"]
+            action = report["recommended_action"]
+            if state == _dispatch_reconciliation.TASK_DISPATCH_STATE_UNCONFIRMED:
+                buckets["unconfirmed"].append(report)
+            if action == _dispatch_reconciliation.ACTION_RETRY:
+                buckets["retryable"].append(report)
+            elif action == _dispatch_reconciliation.ACTION_INSPECT:
+                buckets["inspect"].append(report)
+            elif action == _dispatch_reconciliation.ACTION_WAIT:
+                buckets["waiting"].append(report)
+            else:
+                buckets["confirmed"].append(report)
+        return {
+            "items": items,
+            "unconfirmed": buckets["unconfirmed"],
+            "retryable": buckets["retryable"],
+            "inspect": buckets["inspect"],
+            "waiting": buckets["waiting"],
+            "confirmed": buckets["confirmed"],
+            "counts": {
+                "total": len(items),
+                "unconfirmed": len(buckets["unconfirmed"]),
+                "retryable": len(buckets["retryable"]),
+                "inspect": len(buckets["inspect"]),
+                "waiting": len(buckets["waiting"]),
+                "confirmed": len(buckets["confirmed"]),
+            },
+        }
+
+    def plan_task_redispatch(
+        self,
+        task_id: str,
+        *,
+        evidence: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+        grace_seconds: int = (
+            _dispatch_reconciliation.DEFAULT_DISPATCH_CONFIRM_GRACE_SECONDS
+        ),
+        max_attempts: int = _dispatch_reconciliation.MAX_DISPATCH_ATTEMPTS,
+    ) -> dict[str, Any]:
+        """Return the idempotent, deduplicated re-dispatch plan for one task."""
+        record = self._tasks.get(str(task_id))
+        if record is None:
+            raise KeyError(f"unknown task_id: {task_id}")
+        observed = evidence if isinstance(evidence, Mapping) else {}
+        return _dispatch_reconciliation.plan_dispatch_retry(
+            record,
+            has_artifact=bool(observed.get("has_artifact")),
+            run_status=observed.get("run_status"),
+            run_conclusion=observed.get("run_conclusion"),
+            now=now,
+            grace_seconds=grace_seconds,
+            max_attempts=max_attempts,
+        )
+
+    def mark_dispatch_retried(
+        self,
+        task_id: str,
+        *,
+        timestamp: datetime | None = None,
+        grace_seconds: int = (
+            _dispatch_reconciliation.DEFAULT_DISPATCH_CONFIRM_GRACE_SECONDS
+        ),
+    ) -> dict[str, Any]:
+        """Record that a deduplicated retry was dispatched for ``task_id``.
+
+        This only updates registry metadata (attempt counter + a fresh bounded
+        lease); it never changes execution status, review state, or results. It
+        is additive and append-only so a retry can never fabricate a terminal
+        outcome.
+        """
+        record = self._tasks.get(str(task_id))
+        if record is None:
+            raise KeyError(f"unknown task_id: {task_id}")
+        current = timestamp or _reconciliation.utc_now()
+        attempt = int(record.get("dispatch_attempt") or 1) + 1
+        record["dispatch_attempt"] = attempt
+        record["dispatch_state"] = _dispatch_reconciliation.TASK_DISPATCH_STATE_RETRY
+        record["dispatch_accepted_at"] = current.isoformat()
+        record["dispatch_confirm_deadline"] = (
+            current + timedelta(seconds=grace_seconds)
+        ).isoformat()
+        record["updated_at"] = current.isoformat()
+        event = {
+            "task_id": str(task_id),
+            "action": "dispatch_retry",
+            "attempt": attempt,
+            "dispatch_state": _dispatch_reconciliation.TASK_DISPATCH_STATE_RETRY,
+            "timestamp": current.isoformat(),
+        }
+        record.setdefault("dispatch_events", []).append(event)
+        self._dispatch_events.append(event)
+        return {
+            "task_id": str(task_id),
+            "dispatch_attempt": attempt,
+            "dispatch_state": _dispatch_reconciliation.TASK_DISPATCH_STATE_RETRY,
+            "dispatch_confirm_deadline": record["dispatch_confirm_deadline"],
+            "dispatch_event": event,
+        }
+
+    def get_dispatch_events(
+        self, task_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return the append-only dispatch liveness / retry audit trail."""
+        if task_id is None:
+            return [dict(event) for event in self._dispatch_events]
+        return [
+            dict(event)
+            for event in self._dispatch_events
+            if event.get("task_id") == str(task_id)
+        ]
+
     def get_review_events(self, task_id: str | None = None) -> list[dict[str, Any]]:
         if task_id is None:
             return [dict(event) for event in self._review_events]
@@ -1152,6 +1314,22 @@ def get_sync_events(task_id: str | None = None) -> list[dict[str, Any]]:
 
 def get_reconciliation_events(task_id: str | None = None) -> list[dict[str, Any]]:
     return _DEFAULT_REGISTRY.get_reconciliation_events(task_id)
+
+
+def dispatch_liveness_report(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    return _DEFAULT_REGISTRY.dispatch_liveness_report(*args, **kwargs)
+
+
+def plan_task_redispatch(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    return _DEFAULT_REGISTRY.plan_task_redispatch(*args, **kwargs)
+
+
+def mark_dispatch_retried(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    return _DEFAULT_REGISTRY.mark_dispatch_retried(*args, **kwargs)
+
+
+def get_dispatch_events(task_id: str | None = None) -> list[dict[str, Any]]:
+    return _DEFAULT_REGISTRY.get_dispatch_events(task_id)
 
 
 def audit_historical_tasks(*args: Any, **kwargs: Any) -> dict[str, Any]:
