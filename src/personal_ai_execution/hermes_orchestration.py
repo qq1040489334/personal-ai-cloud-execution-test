@@ -32,6 +32,7 @@ Honesty rules enforced by this module:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -40,6 +41,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 
 from .result_normalization import (
@@ -747,17 +749,818 @@ def normalize_to_execution_v2(
     )
 
 
+# =============================================================================
+# WINDOWS_HERMES_TRANSPORT_CONTRACT_V1
+# =============================================================================
+#
+# The real Hermes runtime already lives on the user's Windows machine.  It must
+# never be publicly exposed and no second Hermes is deployed in the cloud.  The
+# only new boundary is an *outbound* Windows worker that polls the existing
+# Personal AI cloud surface, claims one task under a lease, acknowledges it, and
+# returns a normalized result.
+#
+# This section defines the cloud-side contract only: envelope builders,
+# fail-closed validators, a pure claim/lease/ack/result state machine, and an
+# explicit audit of the existing Execution V2 surfaces.  It creates **no**
+# canonical store, performs **no** canonical write, and deploys **no** relay.
+# The one genuinely missing production capability (an authenticated,
+# atomic claim/lease/ack relay endpoint that can accept a Windows transport
+# result as authoritative terminal evidence) is reported as an exact minimal gap
+# requiring a later Human Gate.
+#
+# Responsibility split is unchanged:
+#   * GPT/Brain plans and owns personal context.
+#   * Windows Hermes only orchestrates (outbound).
+#   * Cloudflare Canonical remains personal state.
+
+TRANSPORT_CONTRACT_VERSION = "WINDOWS_HERMES_TRANSPORT_CONTRACT_V1"
+TRANSPORT_RELAY_ID = "personal-ai-hermes-relay"
+
+#: Base path of the minimal relay endpoint. This endpoint is *specified* here
+#: but deliberately not deployed by this module.
+TRANSPORT_RELAY_BASE_PATH = "/hermes/transport/v1"
+TRANSPORT_HEALTH_PATH = TRANSPORT_RELAY_BASE_PATH + "/health"
+TRANSPORT_CLAIM_PATH = TRANSPORT_RELAY_BASE_PATH + "/tasks/claim"
+TRANSPORT_ACK_PATH = TRANSPORT_RELAY_BASE_PATH + "/tasks/{task_id}/ack"
+TRANSPORT_RESULT_PATH = TRANSPORT_RELAY_BASE_PATH + "/tasks/{task_id}/result"
+
+TRANSPORT_REQUIRED_ENDPOINTS = (
+    TRANSPORT_HEALTH_PATH,
+    TRANSPORT_CLAIM_PATH,
+    TRANSPORT_ACK_PATH,
+    TRANSPORT_RESULT_PATH,
+)
+
+#: Credential *source* (environment variable name) for the Windows transport
+#: bearer token. Only the name is ever reported; the value is never read here.
+TRANSPORT_CREDENTIAL_ENV_VARS = ("HERMES_TRANSPORT_TOKEN", "HERMES_GATEWAY_TOKEN")
+#: Optional environment variable naming the relay base URL (never a secret).
+TRANSPORT_ENDPOINT_ENV_VARS = (
+    "HERMES_TRANSPORT_URL",
+    "HERMES_GATEWAY_URL",
+)
+TRANSPORT_AUTH_SCHEME = "bearer"
+TRANSPORT_REQUIRED_SCOPE = "hermes.transport"
+
+#: Windows always initiates; the cloud never dials the Windows machine.
+TRANSPORT_DIRECTION = "windows_outbound_poll"
+
+DEFAULT_LEASE_SECONDS = 15 * 60
+DEFAULT_POLL_INTERVAL_SECONDS = 5
+MAX_TRANSPORT_ATTEMPTS = 5
+
+#: Cloud-side claim decisions.
+CLAIM_STATE_CLAIMED = "CLAIMED"
+CLAIM_STATE_IDEMPOTENT = "IDEMPOTENT"
+CLAIM_STATE_LEASED_ELSEWHERE = "LEASED_ELSEWHERE"
+CLAIM_STATE_NOT_CLAIMABLE = "NOT_CLAIMABLE"
+
+#: Acknowledgement decisions.
+ACK_STATE_ACKNOWLEDGED = "ACKNOWLEDGED"
+ACK_STATE_IDEMPOTENT = "IDEMPOTENT"
+ACK_STATE_LEASE_MISMATCH = "LEASE_MISMATCH"
+
+#: Result-return decisions.
+RESULT_STATE_ACCEPTED = "ACCEPTED"
+RESULT_STATE_DUPLICATE = "DUPLICATE"
+RESULT_STATE_REJECTED = "REJECTED"
+RESULT_STATE_LEASE_MISMATCH = "LEASE_MISMATCH"
+
+#: Stable result fields hashed to form the evidence hash. Volatile transport
+#: metadata (timestamps other than the terminal ``finished_at``, retries, HTTP
+#: headers) is deliberately excluded so retransmission is idempotent.
+EVIDENCE_HASH_FIELDS = (
+    "task_id",
+    "task_state",
+    "executor_identity",
+    "status",
+    "tests",
+    "artifacts",
+    "expected_files",
+    "changed_files",
+    "finished_at",
+)
+
+TRANSPORT_HEALTH_REQUIRED_FIELDS = ("worker_id", "contract_version")
+TRANSPORT_CLAIM_REQUIRED_FIELDS = ("worker_id", "contract_version")
+TRANSPORT_ACK_REQUIRED_FIELDS = ("task_id", "worker_id", "lease_id")
+TRANSPORT_RESULT_REQUIRED_FIELDS = (
+    "task_id",
+    "worker_id",
+    "lease_id",
+    "contract_version",
+    "status",
+    "task_state",
+    "evidence_hash",
+)
+
+#: Executor states that may be returned through the transport.
+_NON_TERMINAL_REJECTION_STATES = frozenset({"TASK_STATE_WORKING", "WORKING", "SUBMITTED"})
+
+#: The exact minimal production capability that does not yet exist. This is
+#: reported, never silently deployed.
+MINIMAL_RELAY_GAP = {
+    "capability": "authenticated_outbound_task_relay",
+    "human_gate_required": True,
+    "production_deployed": False,
+    "why_existing_surface_insufficient": (
+        "Execution V2 already registers tasks and publishes GitHub-Actions-derived "
+        "terminal results (EventSyncRegistry.sync_terminal_result requires a workflow "
+        "conclusion) and exposes inbound MCP read tools (list_pending_results, "
+        "get_task_result). It has no atomic, authenticated claim/lease/ack endpoint "
+        "for an outbound Windows worker and no path to accept a Windows transport "
+        "result as authoritative terminal evidence."
+    ),
+    "required_endpoints": list(TRANSPORT_REQUIRED_ENDPOINTS),
+    "required_auth": {
+        "scheme": TRANSPORT_AUTH_SCHEME,
+        "scope": TRANSPORT_REQUIRED_SCOPE,
+        "credential_source_type": "environment_variable_name_only",
+        "credential_env_vars": list(TRANSPORT_CREDENTIAL_ENV_VARS),
+    },
+    "required_lease": {
+        "default_lease_seconds": DEFAULT_LEASE_SECONDS,
+        "max_attempts": MAX_TRANSPORT_ATTEMPTS,
+        "ownership_field": "transport_owner_worker_id",
+    },
+    "do_not_deploy": True,
+}
+
+
+def _parse_transport_timestamp(value: Any):
+    """Parse an ISO-8601 timestamp, assuming UTC when no offset is supplied."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _transport_now(now: datetime | None = None) -> datetime:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current
+
+
+# --- idempotency + evidence hash ---------------------------------------------
+
+
+def claim_idempotency_key(task_id: str, worker_id: str) -> str:
+    """Deterministic key so a repeated claim converges on one lease."""
+    return f"hermes-claim:{task_id}:{worker_id}"
+
+
+def ack_idempotency_key(task_id: str, lease_id: str) -> str:
+    """Deterministic key so a repeated acknowledgement is a no-op."""
+    return f"hermes-ack:{task_id}:{lease_id}"
+
+
+def result_idempotency_key(task_id: str, evidence_hash: str) -> str:
+    """Deterministic key so a retransmitted result is deduplicated."""
+    return f"hermes-result:{task_id}:{evidence_hash}"
+
+
+def compute_evidence_hash(payload: Mapping[str, Any] | None) -> str:
+    """Return a stable ``sha256:`` hash over the stable result fields.
+
+    Only :data:`EVIDENCE_HASH_FIELDS` are hashed, so adding transport metadata
+    to a retransmitted result cannot change its evidence hash.
+    """
+    material: dict[str, Any] = {}
+    if isinstance(payload, Mapping):
+        for field in EVIDENCE_HASH_FIELDS:
+            if field in payload:
+                material[field] = payload[field]
+    blob = json.dumps(
+        material, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+    )
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+# --- health / readiness handshake --------------------------------------------
+
+
+def build_health_handshake(
+    worker_id: str,
+    *,
+    capabilities: list[str] | None = None,
+    runtime_evidence: list[dict[str, Any]] | None = None,
+    contract_version: str = TRANSPORT_CONTRACT_VERSION,
+) -> dict[str, Any]:
+    """Build the outbound health/readiness handshake a Windows worker sends."""
+    return {
+        "worker_id": str(worker_id),
+        "contract_version": contract_version,
+        "direction": TRANSPORT_DIRECTION,
+        "capabilities": list(capabilities or ["hermes.orchestrate"]),
+        "runtime_evidence": list(runtime_evidence or []),
+        "sent_at": _now_utc(),
+    }
+
+
+def validate_health_handshake(handshake: Any) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(handshake, Mapping):
+        return ["handshake is not a JSON object"]
+    for field in TRANSPORT_HEALTH_REQUIRED_FIELDS:
+        if not str(handshake.get(field) or "").strip():
+            errors.append(f"missing field: {field}")
+    version = str(handshake.get("contract_version") or "")
+    if version and version != TRANSPORT_CONTRACT_VERSION:
+        errors.append(
+            f"contract_version mismatch: {version} != {TRANSPORT_CONTRACT_VERSION}"
+        )
+    return errors
+
+
+def evaluate_health_handshake(
+    handshake: Any, *, env: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Cloud-side readiness response. Never returns a credential value."""
+    environ = os.environ if env is None else env
+    errors = validate_health_handshake(handshake)
+    if errors:
+        return {
+            "ready": False,
+            "worker_id": (
+                str(handshake.get("worker_id")) if isinstance(handshake, Mapping) else None
+            ),
+            "relay_contract_version": TRANSPORT_CONTRACT_VERSION,
+            "errors": errors,
+            "ready_at": _now_utc(),
+        }
+    endpoint_base = None
+    endpoint_source = None
+    for name in TRANSPORT_ENDPOINT_ENV_VARS:
+        value = str(environ.get(name, "")).strip()
+        if value:
+            endpoint_base = value
+            endpoint_source = name
+            break
+    return {
+        "ready": True,
+        "worker_id": str(handshake.get("worker_id")),
+        "relay_contract_version": TRANSPORT_CONTRACT_VERSION,
+        "relay_id": TRANSPORT_RELAY_ID,
+        "direction": TRANSPORT_DIRECTION,
+        "endpoints": {
+            "health": TRANSPORT_HEALTH_PATH,
+            "claim": TRANSPORT_CLAIM_PATH,
+            "ack": TRANSPORT_ACK_PATH,
+            "result": TRANSPORT_RESULT_PATH,
+        },
+        "endpoint_base": endpoint_base,
+        "endpoint_source": endpoint_source,
+        "auth": {
+            "scheme": TRANSPORT_AUTH_SCHEME,
+            "scope": TRANSPORT_REQUIRED_SCOPE,
+            "credential_source": _first_present(environ, TRANSPORT_CREDENTIAL_ENV_VARS),
+        },
+        "poll_interval_seconds": DEFAULT_POLL_INTERVAL_SECONDS,
+        "task_contract_fields": list(REQUIRED_CONTRACT_FIELDS),
+        "result_contract_fields": list(TRANSPORT_RESULT_REQUIRED_FIELDS),
+        "ready_at": _now_utc(),
+    }
+
+
+def _first_present(env: Mapping[str, str], names: tuple[str, ...]) -> str | None:
+    for name in names:
+        if str(env.get(name, "")).strip():
+            return name
+    return None
+
+
+# --- claim / lease -----------------------------------------------------------
+
+
+def is_transport_claimable(
+    record: Mapping[str, Any],
+    *,
+    worker_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Fail-closed claimability assessment for one existing registry record.
+
+    This reads an existing Execution V2 task record; it never creates a second
+    store. A terminal/reviewed task is never claimable, and a live lease owned by
+    another worker is held.
+    """
+    current = _transport_now(now)
+    task_id = str(record.get("task_id") or "")
+    if not task_id:
+        return {"claimable": False, "reason_code": "TASK_ID_MISSING", "reason": "no task_id"}
+    if record.get("reviewed") or record.get("terminal") or record.get("result_available"):
+        return {
+            "claimable": False,
+            "reason_code": "TASK_TERMINAL",
+            "reason": "task already has an authoritative terminal result",
+        }
+    expiry = _parse_transport_timestamp(record.get("transport_lease_expires_at"))
+    owner = str(record.get("transport_owner_worker_id") or "")
+    if expiry is not None and current <= expiry and owner:
+        if owner == str(worker_id):
+            return {
+                "claimable": True,
+                "idempotent": True,
+                "reason_code": "LEASE_OWNED",
+                "reason": "active lease already owned by this worker",
+            }
+        return {
+            "claimable": False,
+            "reason_code": "LEASE_HELD",
+            "reason": f"active lease held by {owner}",
+        }
+    return {"claimable": True, "idempotent": False, "reason_code": "CLAIMABLE", "reason": "no active lease"}
+
+
+def claim_task(
+    record: Mapping[str, Any],
+    worker_id: str,
+    *,
+    now: datetime | None = None,
+    lease_seconds: int = DEFAULT_LEASE_SECONDS,
+) -> dict[str, Any]:
+    """Return an idempotent claim/lease decision for one task record.
+
+    Pure: it computes the next lease and the registry patch a relay would apply,
+    but performs no write. A reclaim after expiry increments the bounded attempt.
+    """
+    current = _transport_now(now)
+    task_id = str(record.get("task_id") or "")
+    assessment = is_transport_claimable(record, worker_id=worker_id, now=current)
+    base: dict[str, Any] = {
+        "task_id": task_id,
+        "worker_id": str(worker_id),
+        "idempotency_key": claim_idempotency_key(task_id, str(worker_id)),
+        "claimed": False,
+        "state": CLAIM_STATE_NOT_CLAIMABLE,
+        "lease_id": None,
+        "owner_worker_id": None,
+        "lease_expires_at": None,
+        "attempt": None,
+        "reason_code": assessment["reason_code"],
+        "reason": assessment["reason"],
+        "registry_patch": None,
+    }
+    if not assessment["claimable"]:
+        if assessment["reason_code"] == "LEASE_HELD":
+            base["state"] = CLAIM_STATE_LEASED_ELSEWHERE
+        return base
+
+    try:
+        previous_attempt = max(0, int(record.get("transport_attempt") or 0))
+    except (TypeError, ValueError):
+        previous_attempt = 0
+
+    if assessment.get("idempotent"):
+        attempt = max(1, previous_attempt)
+        lease_id = str(record.get("transport_lease_id") or "")
+        expiry = _parse_transport_timestamp(record.get("transport_lease_expires_at"))
+        base.update(
+            {
+                "claimed": True,
+                "state": CLAIM_STATE_IDEMPOTENT,
+                "lease_id": lease_id,
+                "owner_worker_id": str(worker_id),
+                "lease_expires_at": expiry.isoformat() if expiry else None,
+                "attempt": attempt,
+            }
+        )
+        return base
+
+    attempt = previous_attempt + 1
+    lease_id = f"lease:{task_id}:{attempt}:{worker_id}"
+    expiry = current + timedelta(seconds=max(1, int(lease_seconds)))
+    base.update(
+        {
+            "claimed": True,
+            "state": CLAIM_STATE_CLAIMED,
+            "lease_id": lease_id,
+            "owner_worker_id": str(worker_id),
+            "lease_expires_at": expiry.isoformat(),
+            "attempt": attempt,
+            "registry_patch": {
+                "transport_lease_id": lease_id,
+                "transport_owner_worker_id": str(worker_id),
+                "transport_lease_expires_at": expiry.isoformat(),
+                "transport_attempt": attempt,
+                "transport_claimed_at": current.isoformat(),
+            },
+        }
+    )
+    return base
+
+
+def build_task_assignment(contract: Mapping[str, Any], claim: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the assignment payload the relay returns to a claiming worker."""
+    return {
+        "contract_version": TRANSPORT_CONTRACT_VERSION,
+        "task_contract": dict(contract),
+        "lease_id": claim.get("lease_id"),
+        "owner_worker_id": claim.get("owner_worker_id"),
+        "lease_expires_at": claim.get("lease_expires_at"),
+        "attempt": claim.get("attempt"),
+        "claim_idempotency_key": claim.get("idempotency_key"),
+    }
+
+
+def acknowledge_task(
+    record: Mapping[str, Any],
+    *,
+    task_id: str,
+    worker_id: str,
+    lease_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Validate/record an acknowledgement for a held lease. Pure decision."""
+    current = _transport_now(now)
+    if (
+        str(record.get("task_id") or "") != str(task_id)
+        or str(record.get("transport_lease_id") or "") != str(lease_id)
+        or str(record.get("transport_owner_worker_id") or "") != str(worker_id)
+    ):
+        return {
+            "task_id": str(task_id),
+            "state": ACK_STATE_LEASE_MISMATCH,
+            "acknowledged": False,
+            "idempotent": False,
+            "reason": "lease/task/worker does not match the active transport lease",
+        }
+    if record.get("transport_acked_at"):
+        return {
+            "task_id": str(task_id),
+            "state": ACK_STATE_IDEMPOTENT,
+            "acknowledged": True,
+            "idempotent": True,
+            "acked_at": record.get("transport_acked_at"),
+            "idempotency_key": ack_idempotency_key(task_id, lease_id),
+            "registry_patch": None,
+        }
+    return {
+        "task_id": str(task_id),
+        "state": ACK_STATE_ACKNOWLEDGED,
+        "acknowledged": True,
+        "idempotent": False,
+        "acked_at": current.isoformat(),
+        "idempotency_key": ack_idempotency_key(task_id, lease_id),
+        "registry_patch": {"transport_acked_at": current.isoformat()},
+    }
+
+
+# --- result return -----------------------------------------------------------
+
+
+def validate_result_envelope(envelope: Any) -> list[str]:
+    """Fail-closed validation of a Windows transport result envelope."""
+    errors: list[str] = []
+    if not isinstance(envelope, Mapping):
+        return ["result envelope is not a JSON object"]
+    for field in TRANSPORT_RESULT_REQUIRED_FIELDS:
+        if not str(envelope.get(field) or "").strip():
+            errors.append(f"missing field: {field}")
+    version = str(envelope.get("contract_version") or "")
+    if version and version != TRANSPORT_CONTRACT_VERSION:
+        errors.append(
+            f"contract_version mismatch: {version} != {TRANSPORT_CONTRACT_VERSION}"
+        )
+    task_state = str(envelope.get("task_state") or "").upper()
+    if task_state and task_state in _NON_TERMINAL_REJECTION_STATES:
+        errors.append(f"task_state is not terminal: {task_state}")
+    elif task_state and task_state not in TERMINAL_TASK_STATES:
+        errors.append(f"unknown terminal task_state: {task_state}")
+    return errors
+
+
+def _execution_status_for_transport(
+    task_state: str | None, executor_identity: str | None
+) -> str:
+    state = str(task_state or "").upper()
+    if state in COMPLETED_TASK_STATES:
+        return STATUS_FAIL if _is_codex(executor_identity) else STATUS_PASS
+    if state in {"TASK_STATE_FAILED", "FAILED", "TASK_STATE_REJECTED", "REJECTED"}:
+        return STATUS_FAIL
+    if state in {"TASK_STATE_CANCELED", "CANCELED"}:
+        return STATUS_BLOCKED
+    return STATUS_PARTIAL
+
+
+def normalize_transport_result(
+    record: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Normalize one Windows transport result, idempotently and fail-closed.
+
+    The decision is pure; the returned ``registry_patch`` is the additive record
+    update a relay would apply to the *existing* task record. No second store is
+    created and no canonical write is performed here.
+    """
+    current = _transport_now(now)
+    task_id = str(envelope.get("task_id") or "")
+    errors = validate_result_envelope(envelope)
+
+    def rejected(reason_code: str, reason: str) -> dict[str, Any]:
+        return {
+            "task_id": task_id,
+            "state": RESULT_STATE_REJECTED,
+            "accepted": False,
+            "duplicate": False,
+            "idempotent": False,
+            "reason_code": reason_code,
+            "reason": reason,
+            "errors": errors,
+            "normalized_status": None,
+            "execution_result": None,
+            "event_sync_accepts": False,
+            "registry_patch": None,
+            "canonical_write_performed": False,
+        }
+
+    if errors:
+        return rejected("INVALID_RESULT", "result envelope failed validation")
+
+    expected_hash = compute_evidence_hash(envelope)
+    declared_hash = str(envelope.get("evidence_hash") or "")
+    if declared_hash != expected_hash:
+        return rejected(
+            "EVIDENCE_HASH_MISMATCH",
+            "declared evidence_hash does not match the stable result fields",
+        )
+
+    if (
+        str(record.get("task_id") or "") != task_id
+        or str(record.get("transport_lease_id") or "") != str(envelope.get("lease_id") or "")
+        or str(record.get("transport_owner_worker_id") or "") != str(envelope.get("worker_id") or "")
+    ):
+        return {
+            "task_id": task_id,
+            "state": RESULT_STATE_LEASE_MISMATCH,
+            "accepted": False,
+            "duplicate": False,
+            "idempotent": False,
+            "reason_code": "LEASE_MISMATCH",
+            "reason": "result lease/worker does not match the active transport lease",
+            "errors": [],
+            "normalized_status": None,
+            "execution_result": None,
+            "event_sync_accepts": False,
+            "registry_patch": None,
+            "canonical_write_performed": False,
+        }
+
+    existing_hash = str(record.get("transport_result_evidence_hash") or "")
+    if existing_hash:
+        if existing_hash == declared_hash:
+            return {
+                "task_id": task_id,
+                "state": RESULT_STATE_DUPLICATE,
+                "accepted": True,
+                "duplicate": True,
+                "idempotent": True,
+                "reason_code": "DUPLICATE_RESULT",
+                "reason": "identical result already recorded; retransmission ignored",
+                "errors": [],
+                "normalized_status": record.get("transport_result_status"),
+                "execution_result": record.get("execution_result_json"),
+                "evidence_hash": declared_hash,
+                "idempotency_key": result_idempotency_key(task_id, declared_hash),
+                "event_sync_accepts": False,
+                "registry_patch": None,
+                "canonical_write_performed": False,
+            }
+        return rejected(
+            "CONFLICTING_DUPLICATE_RESULT",
+            "a different result is already recorded for this task/lease",
+        )
+
+    normalized_status = _execution_status_for_transport(
+        envelope.get("task_state"), envelope.get("executor_identity")
+    )
+    execution_result = {
+        "task_id": task_id,
+        "status": normalized_status,
+        "tests": envelope.get("tests", ""),
+        "expected_files": list(envelope.get("expected_files") or []),
+        "changed_files": list(envelope.get("changed_files") or []),
+        "summary": envelope.get("summary", ""),
+    }
+    # The Windows transport cannot supply a GitHub Actions workflow conclusion.
+    # Existing EVENT_SYNC refuses a result with no conclusion, so this is exactly
+    # the minimal relay capability that must be gated rather than faked.
+    event_sync_accepts = bool(
+        str(envelope.get("workflow_conclusion") or "").strip()
+    )
+    return {
+        "task_id": task_id,
+        "state": RESULT_STATE_ACCEPTED,
+        "accepted": True,
+        "duplicate": False,
+        "idempotent": False,
+        "reason_code": "ACCEPTED",
+        "reason": "terminal Windows transport result validated and normalized",
+        "errors": [],
+        "normalized_status": normalized_status,
+        "executor_identity": envelope.get("executor_identity"),
+        "evidence_hash": declared_hash,
+        "idempotency_key": result_idempotency_key(task_id, declared_hash),
+        "execution_result": execution_result,
+        "event_sync_accepts": event_sync_accepts,
+        "event_sync_reason": (
+            "existing EVENT_SYNC requires a workflow conclusion; a Windows "
+            "transport result carries none, so publication is a minimal relay "
+            "capability requiring a Human Gate"
+        ),
+        "registry_patch": {
+            "transport_result_evidence_hash": declared_hash,
+            "transport_result_status": normalized_status,
+            "transport_result_returned_at": current.isoformat(),
+            "execution_result_json": execution_result,
+        },
+        "canonical_write_performed": False,
+    }
+
+
+def plan_result_publication(
+    record: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+    *,
+    registry: Any | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Combine normalization with the existing registry to expose the gap.
+
+    Reuses ``EventSyncRegistry.sync_terminal_result`` (if a registry is supplied)
+    to demonstrate that the existing surface does not accept a Windows transport
+    result that lacks a workflow conclusion -- reporting the exact minimal relay
+    gap rather than silently deploying a new authority path.
+    """
+    decision = dict(normalize_transport_result(record, envelope, now=now))
+    registry_report = None
+    if registry is not None and hasattr(registry, "sync_terminal_result"):
+        try:
+            registry_report = registry.sync_terminal_result(
+                str(envelope.get("task_id") or ""),
+                decision.get("execution_result"),
+                None,
+            )
+        except (KeyError, ValueError, TypeError) as exc:  # pragma: no cover - defensive
+            registry_report = {"synced": False, "error": f"{type(exc).__name__}: {exc}"}
+    if registry_report is not None:
+        decision["event_sync_accepts"] = bool(registry_report.get("synced"))
+        if not registry_report.get("synced"):
+            decision["event_sync_reason"] = registry_report.get("reason")
+    decision["minimal_gap"] = dict(MINIMAL_RELAY_GAP) if not decision.get(
+        "event_sync_accepts"
+    ) else None
+    return decision
+
+
+# --- integration inputs & audit ----------------------------------------------
+
+
+def windows_hermes_integration_inputs(
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Exact inputs the Windows local agent needs. Secret values are never read."""
+    environ = os.environ if env is None else env
+    endpoint_base = None
+    endpoint_source = None
+    for name in TRANSPORT_ENDPOINT_ENV_VARS:
+        value = str(environ.get(name, "")).strip()
+        if value:
+            endpoint_base = value
+            endpoint_source = name
+            break
+    return {
+        "contract_version": TRANSPORT_CONTRACT_VERSION,
+        "direction": TRANSPORT_DIRECTION,
+        "endpoint_shape": {
+            "base_path": TRANSPORT_RELAY_BASE_PATH,
+            "health": TRANSPORT_HEALTH_PATH,
+            "claim": TRANSPORT_CLAIM_PATH,
+            "ack": TRANSPORT_ACK_PATH,
+            "result": TRANSPORT_RESULT_PATH,
+            "method": "POST",
+            "content_type": "application/json",
+            "configured_base": endpoint_base,
+            "configured_base_source": endpoint_source,
+        },
+        "auth_expectation": {
+            "scheme": TRANSPORT_AUTH_SCHEME,
+            "scope": TRANSPORT_REQUIRED_SCOPE,
+            "credential_source_type": "environment_variable_name_only",
+            "credential_source": _first_present(environ, TRANSPORT_CREDENTIAL_ENV_VARS),
+            "credential_env_vars": list(TRANSPORT_CREDENTIAL_ENV_VARS),
+        },
+        "task_contract_fields": list(REQUIRED_CONTRACT_FIELDS),
+        "result_contract_fields": list(TRANSPORT_RESULT_REQUIRED_FIELDS),
+        "health_handshake": {
+            "required_fields": list(TRANSPORT_HEALTH_REQUIRED_FIELDS),
+            "endpoint": TRANSPORT_HEALTH_PATH,
+        },
+        "lease": {
+            "default_lease_seconds": DEFAULT_LEASE_SECONDS,
+            "max_attempts": MAX_TRANSPORT_ATTEMPTS,
+            "poll_interval_seconds": DEFAULT_POLL_INTERVAL_SECONDS,
+        },
+        "no_public_windows_endpoint": True,
+        "cloud_deploys_second_hermes": False,
+    }
+
+
+def audit_windows_hermes_transport(
+    registry: Mapping[str, Any] | Any | None = None,
+) -> dict[str, Any]:
+    """Audit existing Execution V2 surfaces for the Windows transport boundary.
+
+    Reuse-first: identifies which existing surfaces already satisfy part of the
+    contract, and reports the exact minimal relay capability that is missing. It
+    never deploys a relay, mutates credentials/bindings, or writes canonically.
+    """
+    if registry is None:
+        try:
+            from .event_sync import default_registry
+
+            registry = default_registry()
+        except Exception:  # pragma: no cover - defensive
+            registry = None
+
+    def has(method: str) -> bool:
+        return registry is not None and callable(getattr(registry, method, None))
+
+    reused: list[str] = []
+    if has("submit_task") and has("get_task_result"):
+        reused.append("task_registry")
+    if callable(globals().get("normalize_result")):
+        reused.append("result_normalization")
+    if has("sync_terminal_result"):
+        reused.append("event_sync_terminal_publication")
+    if has("dispatch_liveness_report") and has("plan_task_redispatch"):
+        reused.append("dispatch_lease_liveness")
+
+    missing = list(TRANSPORT_REQUIRED_ENDPOINTS)
+
+    return {
+        "contract_version": TRANSPORT_CONTRACT_VERSION,
+        "direction": TRANSPORT_DIRECTION,
+        "reused_existing_surfaces": reused,
+        "reused_surface_notes": {
+            "task_registry": (
+                "Existing EventSyncRegistry records tasks and holds additive "
+                "transport lease/ack/result metadata; no second store is created."
+            ),
+            "result_normalization": (
+                "Existing result_normalization.normalize_result is the single "
+                "normalization entry point reused by the transport."
+            ),
+        },
+        "missing_relay_capabilities": missing,
+        "minimal_gap": dict(MINIMAL_RELAY_GAP),
+        "human_gate_required": True,
+        "production_deployed": False,
+        "canonical_write_performed": False,
+        "second_state_store_created": False,
+        "credential_or_binding_mutated": False,
+        "connection_attempted_to_windows": False,
+    }
+
+
 __all__ = [
+    "ACK_STATE_ACKNOWLEDGED",
+    "ACK_STATE_IDEMPOTENT",
+    "ACK_STATE_LEASE_MISMATCH",
     "AGENT_CARD_PATH",
+    "CLAIM_STATE_CLAIMED",
+    "CLAIM_STATE_IDEMPOTENT",
+    "CLAIM_STATE_LEASED_ELSEWHERE",
+    "CLAIM_STATE_NOT_CLAIMABLE",
     "CODEX_MARKERS",
     "COMPLETED_TASK_STATES",
     "CREDENTIAL_ENV_VARS",
     "DEFAULT_A2A_BASE_URL",
+    "DEFAULT_LEASE_SECONDS",
+    "DEFAULT_POLL_INTERVAL_SECONDS",
+    "EVIDENCE_HASH_FIELDS",
     "GOLDEN_PATH_BLOCKED",
     "GOLDEN_PATH_PASS",
     "GOLDEN_PATH_PARTIAL",
     "HermesOrchestrationAdapter",
+    "MAX_TRANSPORT_ATTEMPTS",
+    "MINIMAL_RELAY_GAP",
     "REQUIRED_CONTRACT_FIELDS",
+    "RESULT_STATE_ACCEPTED",
+    "RESULT_STATE_DUPLICATE",
+    "RESULT_STATE_LEASE_MISMATCH",
+    "RESULT_STATE_REJECTED",
     "RUNTIME_ENDPOINT_ENV_VARS",
     "RUNTIME_EXECUTABLES",
     "STATUS_BLOCKED",
@@ -765,10 +1568,43 @@ __all__ = [
     "STATUS_PARTIAL",
     "STATUS_PASS",
     "TERMINAL_TASK_STATES",
+    "TRANSPORT_ACK_PATH",
+    "TRANSPORT_ACK_REQUIRED_FIELDS",
+    "TRANSPORT_AUTH_SCHEME",
+    "TRANSPORT_CLAIM_PATH",
+    "TRANSPORT_CLAIM_REQUIRED_FIELDS",
+    "TRANSPORT_CONTRACT_VERSION",
+    "TRANSPORT_CREDENTIAL_ENV_VARS",
+    "TRANSPORT_DIRECTION",
+    "TRANSPORT_ENDPOINT_ENV_VARS",
+    "TRANSPORT_HEALTH_PATH",
+    "TRANSPORT_HEALTH_REQUIRED_FIELDS",
+    "TRANSPORT_RELAY_BASE_PATH",
+    "TRANSPORT_RELAY_ID",
+    "TRANSPORT_REQUIRED_ENDPOINTS",
+    "TRANSPORT_REQUIRED_SCOPE",
+    "TRANSPORT_RESULT_PATH",
+    "TRANSPORT_RESULT_REQUIRED_FIELDS",
+    "ack_idempotency_key",
+    "acknowledge_task",
+    "audit_windows_hermes_transport",
+    "build_health_handshake",
+    "build_task_assignment",
     "build_task_contract",
+    "claim_idempotency_key",
+    "claim_task",
+    "compute_evidence_hash",
+    "evaluate_health_handshake",
+    "is_transport_claimable",
     "normalize_hermes_evidence",
     "normalize_to_execution_v2",
+    "normalize_transport_result",
+    "plan_result_publication",
     "probe_hermes_runtime",
+    "result_idempotency_key",
     "run_hermes_golden_poc",
+    "validate_health_handshake",
+    "validate_result_envelope",
     "validate_task_contract",
+    "windows_hermes_integration_inputs",
 ]
