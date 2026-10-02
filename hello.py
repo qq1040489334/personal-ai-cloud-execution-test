@@ -23224,6 +23224,911 @@ def personal_ai_cloud_asset_routing_v0_1() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_REALITY_CANDIDATE_WRITER_SPEC_V0.1  (task cf-6d5411d23fec)
+#
+# Specification + executable test contract for the single controlled
+# persistence boundary between an already ROUTED, value-filtered REALITY
+# candidate and the EXISTING canonical Cloud Asset path
+# (``assets`` / ``asset_versions`` written by ``worker/index.js``).
+#
+# Design constraints honoured by this spec:
+#   * specification + deterministic tests only; it never writes a canonical
+#     asset, never deploys and never mutates a credential;
+#   * it does NOT introduce a second store, queue, inbox, curator or generic
+#     agent framework -- it reuses the routing contract, the
+#     PERSONAL_AI_ASSET_PROVENANCE_V0.2 contract and the existing Worker
+#     candidate writers (``writeKnowledgeCandidate`` / ``writeSkillCandidate``
+#     / ``writeDecisionRecord``);
+#   * REALITY is explicitly the SOURCE / provenance identity, NOT the target
+#     canonical asset. Only KNOWLEDGE / SKILL / DECISION are writable targets,
+#     so no unnecessary REALITY writer is invented;
+#   * PREPARE is proven zero-mutation; EXECUTE is fail-closed behind the
+#     Human Gate and is not implemented here.
+# ---------------------------------------------------------------------------
+REALITY_WRITER_GOAL = "REALITY_CANDIDATE_WRITER_SPEC_V0.1"
+REALITY_WRITER_TASK_ID = "cf-6d5411d23fec"
+REALITY_WRITER_CONTRACT_VERSION = "PERSONAL_AI_REALITY_CANDIDATE_WRITER_SPEC_V0.1"
+REALITY_WRITER_REPORT = "PERSONAL_AI_REALITY_CANDIDATE_WRITER_SPEC_V0_1_REPORT"
+REALITY_WRITER_FIXTURE_AT = CLOUD_ASSET_ROUTING_FIXTURE_AT
+
+REALITY_WRITER_SOURCE_ASSET_TYPE = "REALITY"
+REALITY_WRITER_REALITY_ROLE = "SOURCE_PROVENANCE"
+REALITY_WRITER_TARGET_ASSET_TYPES = (ROUTE_KNOWLEDGE, ROUTE_SKILL, ROUTE_DECISION)
+REALITY_WRITER_STORE = "ASSET_DB:assets/asset_versions"
+REALITY_WRITER_HUMAN_GATE = "HUMAN_GATE_REALITY_CANDIDATE_CANONICAL_WRITE_V0.1"
+
+WRITER_PHASE_PREPARE = "PREPARE"
+WRITER_PHASE_EXECUTE = "EXECUTE"
+WRITER_STATUS_PREPARED = "PREPARED"
+WRITER_STATUS_IDEMPOTENT = "IDEMPOTENT"
+WRITER_STATUS_QUARANTINED = "QUARANTINED"
+WRITER_STATUS_BLOCKED = "BLOCKED"
+REALITY_WRITER_STATUSES = (
+    WRITER_STATUS_PREPARED,
+    WRITER_STATUS_IDEMPOTENT,
+    WRITER_STATUS_QUARANTINED,
+    WRITER_STATUS_BLOCKED,
+)
+
+REALITY_WRITER_ENTRYPOINTS = {
+    ROUTE_KNOWLEDGE: "writeKnowledgeCandidate",
+    ROUTE_SKILL: "writeSkillCandidate",
+    ROUTE_DECISION: "writeDecisionRecord",
+}
+REALITY_WRITER_CONTRACTS = {
+    ROUTE_KNOWLEDGE: "PERSONAL_AI_KNOWLEDGE_CANDIDATE_WRITER_V0.1",
+    ROUTE_SKILL: "PERSONAL_AI_SKILL_CANDIDATE_WRITER_V0.1",
+    ROUTE_DECISION: "PERSONAL_AI_DECISION_WRITER_V0.1",
+}
+REALITY_WRITER_ACCEPTED_INPUT_FIELDS = (
+    "candidate_id",
+    "message_id",
+    "source_identity",
+    "classification",
+    "confidence",
+    "content",
+    "content_hash",
+    "provenance",
+    "captured_at",
+)
+REALITY_WRITER_FAIL_CLOSED_CONDITIONS = (
+    "candidate is not a mapping",
+    "value filter verdict is not ROUTED",
+    "a required candidate field is missing",
+    "provenance is not VERIFIED under PERSONAL_AI_ASSET_PROVENANCE_V0.2",
+    "content hash is not a 64-character lowercase sha256",
+    "classification does not map to an allowed target asset type",
+    "target would be REALITY (REALITY is source/provenance only)",
+    "decision sub-route is incomplete",
+)
+REALITY_WRITER_SPEC_SECTIONS = (
+    "Accepted input contract",
+    "Allowed target asset types",
+    "REALITY is source/provenance, never a target",
+    "Provenance requirements",
+    "Idempotency and replay",
+    "Versioning and hash behavior",
+    "Quarantine / fail-closed conditions",
+    "PREPARE vs EXECUTE semantics",
+    "Audit evidence",
+    "Human Gate boundary",
+)
+REALITY_WRITER_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _reality_writer_hash(obj: object) -> str:
+    """Deterministic sha256 over canonical JSON (same intent hash contract)."""
+    return _cloud_asset_routing_hash(obj)
+
+
+def _reality_writer_allowed_target(target: object) -> bool:
+    """Return True only for the existing canonical writable asset types."""
+    return target in REALITY_WRITER_TARGET_ASSET_TYPES
+
+
+def prepare_reality_candidate_write(
+    candidate: object, *, existing_asset: object = None
+) -> dict:
+    """Build a PREPARE plan for an already ROUTED REALITY candidate.
+
+    The plan is a pure value object: it never touches ``ASSET_DB`` and
+    ``phase_prepare_mutated_canonical`` / ``canonical_write_performed`` stay
+    ``False``. Anything that is not a mapping, is not ROUTED by the existing
+    value filter, has unverified provenance or maps to a disallowed target is
+    QUARANTINED with no ``write_request`` (fail-closed).
+
+    ``existing_asset`` is an optional *read-only* view of the current canonical
+    pointer (``current_version`` + ``content_hash``). It only informs version
+    planning and replay detection, mirroring the existing Worker writer rule:
+    identical content hash -> idempotent replay (no new version); otherwise the
+    proposed version is ``current_version + 1`` (1 when absent).
+    """
+    provenance, _decision = _cloud_asset_canonical_components()
+    routing = route_cloud_asset_candidate(candidate)
+
+    plan = {
+        "contract": REALITY_WRITER_CONTRACT_VERSION,
+        "goal": REALITY_WRITER_GOAL,
+        "phase": WRITER_PHASE_PREPARE,
+        "status": WRITER_STATUS_QUARANTINED,
+        "candidate_id": routing["candidate_id"],
+        "message_id": routing["message_id"],
+        "source_identity": routing["source_identity"],
+        "reality_role": REALITY_WRITER_REALITY_ROLE,
+        "source_asset_type": REALITY_WRITER_SOURCE_ASSET_TYPE,
+        "target": routing["target"],
+        "target_asset_type": None,
+        "allowed_target_asset_types": list(REALITY_WRITER_TARGET_ASSET_TYPES),
+        "reused_canonical_writer": None,
+        "canonical_store": REALITY_WRITER_STORE,
+        "provenance_contract": provenance.PROVENANCE_CONTRACT_VERSION,
+        "provenance_status": None,
+        "content_hash": None,
+        "intent_hash": None,
+        "idempotency_key": None,
+        "version_policy": "existing.current_version + 1 (1 when absent)",
+        "proposed_version": None,
+        "reasons": list(routing["reasons"]),
+        "quarantine_target": ROUTE_QUARANTINE,
+        "phase_prepare_mutated_canonical": False,
+        "executed": False,
+        "canonical_write_enabled": False,
+        "canonical_write_performed": False,
+        "requires_human_gate": True,
+        "human_gate": REALITY_WRITER_HUMAN_GATE,
+        "human_gate_authorized": False,
+        "write_request": None,
+        "audit_evidence": {},
+    }
+
+    target = routing["target"]
+    if not (
+        routing["status"] == ROUTING_STATUS_ROUTED and routing["routed"] is True
+    ):
+        return plan
+    if not _reality_writer_allowed_target(target):
+        plan["reasons"].append(
+            "target is not an allowed canonical asset type: " + str(target)
+        )
+        return plan
+    if not isinstance(candidate, _AssetMapping):
+        plan["reasons"].append("candidate is not a mapping")
+        return plan
+
+    evaluation = provenance.evaluate_provenance(
+        candidate.get("provenance"), content_hash=candidate.get("content_hash")
+    )
+    plan["provenance_status"] = evaluation["status"]
+    if evaluation["status"] != provenance.STATUS_VERIFIED:
+        plan["reasons"].append(
+            "provenance not verified: " + evaluation["reason"]
+        )
+        return plan
+
+    content_hash = _cloud_asset_content_hash(candidate.get("content"))
+    if not isinstance(content_hash, str) or not REALITY_WRITER_HASH_RE.match(
+        content_hash
+    ):
+        plan["reasons"].append(
+            "content hash is not a 64-character lowercase sha256"
+        )
+        return plan
+    plan["content_hash"] = content_hash
+
+    current_version = 0
+    replay = False
+    if isinstance(existing_asset, _AssetMapping):
+        raw_version = existing_asset.get("current_version")
+        if (
+            isinstance(raw_version, int)
+            and not isinstance(raw_version, bool)
+            and raw_version >= 0
+        ):
+            current_version = raw_version
+        existing_hash = existing_asset.get("content_hash")
+        if isinstance(existing_hash, str) and existing_hash.strip():
+            if existing_hash.strip().lower() == content_hash:
+                replay = True
+
+    version = current_version if replay else current_version + 1
+    writer_contract = REALITY_WRITER_CONTRACTS[target]
+    write_request = {
+        "phase": WRITER_PHASE_PREPARE,
+        "executed": False,
+        "canonical_writer": REALITY_WRITER_ENTRYPOINTS[target],
+        "canonical_writer_contract": writer_contract,
+        "canonical_store": REALITY_WRITER_STORE,
+        "asset_id": target.lower() + ":" + str(routing["candidate_id"]),
+        "asset_type": target,
+        "content_hash": content_hash,
+        "candidate_id": routing["candidate_id"],
+        "message_id": routing["message_id"],
+        "source_identity": routing["source_identity"],
+        "reality_role": REALITY_WRITER_REALITY_ROLE,
+        "provenance_contract": provenance.PROVENANCE_CONTRACT_VERSION,
+        "idempotency_key": (
+            target.lower()
+            + ":"
+            + str(routing["candidate_id"])
+            + ":"
+            + content_hash
+        ),
+        "proposed_version": version,
+        "supersedes": [current_version]
+        if (current_version > 0 and not replay)
+        else [],
+        "canonical_write_enabled": False,
+    }
+    intent_hash = _reality_writer_hash(write_request)
+    write_request["intent_hash"] = intent_hash
+
+    plan.update(
+        {
+            "status": (
+                WRITER_STATUS_IDEMPOTENT if replay else WRITER_STATUS_PREPARED
+            ),
+            "target_asset_type": target,
+            "reused_canonical_writer": REALITY_WRITER_ENTRYPOINTS[target],
+            "proposed_version": version,
+            "intent_hash": intent_hash,
+            "idempotency_key": write_request["idempotency_key"],
+            "write_request": write_request,
+            "audit_evidence": {
+                "provenance_contract": provenance.PROVENANCE_CONTRACT_VERSION,
+                "provenance_status": evaluation["status"],
+                "provenance_verified": evaluation["verified"],
+                "content_hash": content_hash,
+                "intent_hash": intent_hash,
+                "idempotency_key": write_request["idempotency_key"],
+                "reused_writer": REALITY_WRITER_ENTRYPOINTS[target],
+                "reused_writer_contract": writer_contract,
+                "canonical_store": REALITY_WRITER_STORE,
+                "source_identity": routing["source_identity"],
+                "message_id": routing["message_id"],
+                "replay": replay,
+                "version_policy": plan["version_policy"],
+            },
+        }
+    )
+    return plan
+
+
+def replay_reality_candidate_write(plan: object, ledger: dict) -> dict:
+    """Simulated idempotent admission ledger (never writes canonical data).
+
+    A repeated ``intent_hash`` returns ``IDEMPOTENT`` with the recorded version
+    and performs no version increment, proving the replay contract without any
+    canonical mutation.
+    """
+    result = {
+        "contract": REALITY_WRITER_CONTRACT_VERSION,
+        "phase": WRITER_PHASE_PREPARE,
+        "status": WRITER_STATUS_QUARANTINED,
+        "intent_hash": None,
+        "idempotency_key": None,
+        "version": None,
+        "idempotent": False,
+        "canonical_write_enabled": False,
+        "canonical_write_performed": False,
+        "reason": None,
+    }
+    if (
+        not isinstance(plan, _AssetMapping)
+        or plan.get("phase") != WRITER_PHASE_PREPARE
+        or plan.get("status")
+        not in (WRITER_STATUS_PREPARED, WRITER_STATUS_IDEMPOTENT)
+        or not isinstance(plan.get("write_request"), _AssetMapping)
+    ):
+        result["reason"] = "plan is not a prepared write request; replay refused"
+        return result
+    if not isinstance(ledger, dict):
+        result["reason"] = "ledger must be an in-memory dict"
+        return result
+    key = plan.get("intent_hash")
+    result["intent_hash"] = key
+    result["idempotency_key"] = plan.get("idempotency_key")
+    if key in ledger:
+        result["status"] = WRITER_STATUS_IDEMPOTENT
+        result["idempotent"] = True
+        result["version"] = ledger[key]["version"]
+        result["reason"] = (
+            "intent already admitted; replay returns the recorded version "
+            "without a new write"
+        )
+        return result
+    result["status"] = WRITER_STATUS_PREPARED
+    result["version"] = plan.get("proposed_version")
+    result["reason"] = "intent admitted for the first time (simulated)"
+    ledger[key] = {"version": plan.get("proposed_version")}
+    return result
+
+
+def execute_reality_candidate_write(
+    plan: object, *, human_gate_authorized: bool = False
+) -> dict:
+    """EXECUTE is fail-closed behind the Human Gate and never writes here.
+
+    Without authorization it returns ``BLOCKED``. Even with authorization this
+    specification-only boundary does not perform a canonical write: execution is
+    delegated to the existing canonical writer only after the Human Gate is
+    crossed in a later, separately authorized task.
+    """
+    result = {
+        "contract": REALITY_WRITER_CONTRACT_VERSION,
+        "phase": WRITER_PHASE_EXECUTE,
+        "status": WRITER_STATUS_BLOCKED,
+        "candidate_id": None,
+        "message_id": None,
+        "source_identity": None,
+        "target_asset_type": None,
+        "intent_hash": None,
+        "canonical_write_enabled": False,
+        "canonical_write_performed": False,
+        "requires_human_gate": True,
+        "human_gate": REALITY_WRITER_HUMAN_GATE,
+        "human_gate_authorized": bool(human_gate_authorized),
+        "reason": None,
+    }
+    if (
+        not isinstance(plan, _AssetMapping)
+        or plan.get("phase") != WRITER_PHASE_PREPARE
+    ):
+        result["status"] = WRITER_STATUS_QUARANTINED
+        result["reason"] = "plan is not a PREPARE plan; EXECUTE refused"
+        return result
+    result["candidate_id"] = plan.get("candidate_id")
+    result["message_id"] = plan.get("message_id")
+    result["source_identity"] = plan.get("source_identity")
+    result["target_asset_type"] = plan.get("target_asset_type")
+    result["intent_hash"] = plan.get("intent_hash")
+    if (
+        plan.get("status")
+        not in (WRITER_STATUS_PREPARED, WRITER_STATUS_IDEMPOTENT)
+        or plan.get("write_request") is None
+    ):
+        result["status"] = WRITER_STATUS_QUARANTINED
+        result["reason"] = "plan has no prepared write request; EXECUTE refused"
+        return result
+    if not human_gate_authorized:
+        result["reason"] = (
+            "blocked: " + REALITY_WRITER_HUMAN_GATE + " is not authorized"
+        )
+        return result
+    result["reason"] = (
+        "specification-only boundary: canonical execution is delegated to the "
+        "existing writer after Human Gate approval and is intentionally not "
+        "implemented or performed here"
+    )
+    return result
+
+
+def _reality_writer_spec_paragraphs() -> dict:
+    return {
+        "Accepted input contract": [
+            "Input is exactly the mapping already consumed by "
+            "PERSONAL_AI_CLOUD_ASSET_ROUTING_V0.1: "
+            + ", ".join(REALITY_WRITER_ACCEPTED_INPUT_FIELDS)
+            + ".",
+            "The candidate MUST first pass route_cloud_asset_candidate with "
+            "status ROUTED (value filter floor "
+            f"{VALUE_FILTER_MIN_CONFIDENCE}); otherwise the write boundary "
+            "refuses.",
+            "The input mapping is immutable: PREPARE never mutates the candidate.",
+        ],
+        "Allowed target asset types": [
+            "Writable canonical targets: "
+            + ", ".join(REALITY_WRITER_TARGET_ASSET_TYPES)
+            + " (assets.asset_type).",
+            "Each target maps 1:1 to an existing Worker entry point: "
+            + ", ".join(
+                REALITY_WRITER_ENTRYPOINTS[t]
+                for t in REALITY_WRITER_TARGET_ASSET_TYPES
+            )
+            + ".",
+            "No new asset type, table, store, queue, inbox or curator is added.",
+        ],
+        "REALITY is source/provenance, never a target": [
+            "REALITY is the source identity "
+            "(source_identity = 'reality:<candidate_id>') and the provenance "
+            "origin; reality_role = " + REALITY_WRITER_REALITY_ROLE + ".",
+            "REALITY is NOT an allowed canonical target asset type; the writer "
+            "never creates a REALITY asset, so no unnecessary REALITY writer is "
+            "specified.",
+            "REALITY evidence is carried by "
+            "PERSONAL_AI_ASSET_PROVENANCE_V0.2 and promoted into the target "
+            "asset's provenance record.",
+        ],
+        "Provenance requirements": [
+            "Provenance MUST evaluate VERIFIED under "
+            "PERSONAL_AI_ASSET_PROVENANCE_V0.2 with a matching content hash.",
+            "DECISION candidates additionally reuse "
+            "PERSONAL_AI_DECISION_INGESTION_V0.1 through the routing value "
+            "filter.",
+            "source_identity, message_id and content_hash are preserved on the "
+            "plan and the write request.",
+        ],
+        "Idempotency and replay": [
+            "The intent_hash is the sha256 over the canonical JSON write "
+            "request; an identical candidate yields an identical intent_hash.",
+            "Replay of an already admitted intent_hash returns IDEMPOTENT with "
+            "the recorded version and creates no duplicate version.",
+            "The idempotency_key is "
+            "'<asset_type>:<candidate_id>:<content_hash>' and mirrors the "
+            "existing writer's identical-content rule.",
+        ],
+        "Versioning and hash behavior": [
+            "content_hash is the sha256 of the canonicalized content, stored as "
+            "64-character lowercase hex (no prefix), exactly as the existing "
+            "assets.content_hash / asset_versions.content_hash convention.",
+            "version_policy = existing.current_version + 1 (1 when absent).",
+            "When existing content_hash already equals the new content_hash the "
+            "plan is IDEMPOTENT and the version does not advance.",
+        ],
+        "Quarantine / fail-closed conditions": [
+            "Fail-closed conditions: "
+            + "; ".join(REALITY_WRITER_FAIL_CLOSED_CONDITIONS)
+            + ".",
+            "A quarantined candidate yields no write_request and never reaches a "
+            "canonical target.",
+        ],
+        "PREPARE vs EXECUTE semantics": [
+            "PREPARE is deterministic, in-memory and provably zero-mutation "
+            "(phase_prepare_mutated_canonical = False, "
+            "canonical_write_performed = False).",
+            "EXECUTE is fail-closed: without Human Gate authorization it returns "
+            "BLOCKED; even with authorization this specification performs no "
+            "canonical write and delegates to the existing writer.",
+        ],
+        "Audit evidence": [
+            "Every prepared plan carries audit_evidence with the provenance "
+            "contract/status, content_hash, intent_hash, idempotency_key, the "
+            "reused writer and its contract, and the canonical store.",
+            "The audit evidence is deterministic and reproducible from the "
+            "input candidate alone.",
+        ],
+        "Human Gate boundary": [
+            "Gate: " + REALITY_WRITER_HUMAN_GATE + ".",
+            "Everything up to and including PREPARE (this spec and tests) is "
+            "reversible, non-production repository work and does not cross the "
+            "gate.",
+            "Exactly one action crosses the gate: executing the existing "
+            "canonical writer against the production ASSET_DB "
+            "(assets / asset_versions).",
+        ],
+    }
+
+
+def personal_ai_reality_candidate_writer_spec_v0_1() -> dict:
+    """Deterministic, read-only report for the controlled writer boundary."""
+    provenance, decision = _cloud_asset_canonical_components()
+
+    decision_input = decision.build_decision(
+        task_id=REALITY_WRITER_TASK_ID,
+        review_verdict="PASS",
+        dispatch_outcome="DISPATCHED",
+        promotion_decision="PROMOTE",
+        user_choice="PROMOTE",
+        user_outcome="GOLDEN_PENDING",
+        promotion_event="reality-writer-fixture",
+        decided_at=REALITY_WRITER_FIXTURE_AT,
+    )
+
+    knowledge = _cloud_asset_fixture_candidate(
+        "cand-knowledge", "msg-1", "knowledge", 0.9, {"text": "reusable tip"}
+    )
+    skill = _cloud_asset_fixture_candidate(
+        "cand-skill", "msg-2", "skill", 0.8, {"steps": ["a", "b"]}
+    )
+    decision_candidate = _cloud_asset_fixture_candidate(
+        "cand-decision",
+        "msg-3",
+        "decision",
+        0.7,
+        {"decision": "PROMOTE"},
+        decision=decision_input,
+    )
+    low = _cloud_asset_fixture_candidate(
+        "cand-low", "msg-4", "knowledge", 0.2, {"text": "maybe"}
+    )
+    missing_message = _cloud_asset_fixture_candidate(
+        "cand-missing-message", "msg-5", "knowledge", 0.9, {"text": "x"}
+    )
+    missing_message["message_id"] = None
+    incomplete_provenance = _cloud_asset_fixture_candidate(
+        "cand-incomplete-provenance",
+        "msg-6",
+        "knowledge",
+        0.9,
+        {"text": "y"},
+        provenance={"promotion": {"decision": "PROMOTE"}},
+    )
+    unknown = _cloud_asset_fixture_candidate(
+        "cand-unknown", "msg-7", "opinion", 0.9, {"text": "z"}
+    )
+    incomplete_decision = _cloud_asset_fixture_candidate(
+        "cand-incomplete-decision",
+        "msg-8",
+        "decision",
+        0.9,
+        {"decision": "PROMOTE"},
+        decision={"review_verdict": "PASS"},
+    )
+
+    positive = [
+        ("routed knowledge candidate prepares KNOWLEDGE write", knowledge, ROUTE_KNOWLEDGE),
+        ("routed skill candidate prepares SKILL write", skill, ROUTE_SKILL),
+        ("routed decision candidate prepares DECISION write", decision_candidate, ROUTE_DECISION),
+    ]
+    negative = [
+        ("low-confidence candidate quarantined", low),
+        ("missing message id quarantined", missing_message),
+        ("incomplete provenance quarantined", incomplete_provenance),
+        ("unknown classification quarantined", unknown),
+        ("incomplete decision quarantined", incomplete_decision),
+        ("malformed candidate quarantined", "not-a-candidate"),
+    ]
+
+    cases = []
+    for name, candidate, expected_target in positive:
+        plan = prepare_reality_candidate_write(candidate)
+        cases.append(
+            {
+                "case": name,
+                "expected_status": WRITER_STATUS_PREPARED,
+                "expected_target": expected_target,
+                "plan": plan,
+                "matched": bool(
+                    plan["status"] == WRITER_STATUS_PREPARED
+                    and plan["target_asset_type"] == expected_target
+                    and plan["write_request"] is not None
+                ),
+            }
+        )
+    for name, candidate in negative:
+        plan = prepare_reality_candidate_write(candidate)
+        cases.append(
+            {
+                "case": name,
+                "expected_status": WRITER_STATUS_QUARANTINED,
+                "expected_target": ROUTE_QUARANTINE,
+                "plan": plan,
+                "matched": bool(
+                    plan["status"] == WRITER_STATUS_QUARANTINED
+                    and plan["write_request"] is None
+                ),
+            }
+        )
+
+    replay_first = prepare_reality_candidate_write(knowledge)
+    replay_again = prepare_reality_candidate_write(
+        _cloud_asset_fixture_candidate(
+            "cand-knowledge", "msg-1", "knowledge", 0.9, {"text": "reusable tip"}
+        )
+    )
+    existing_same = prepare_reality_candidate_write(
+        knowledge,
+        existing_asset={
+            "current_version": 3,
+            "content_hash": replay_first["content_hash"],
+        },
+    )
+    existing_new = prepare_reality_candidate_write(
+        knowledge,
+        existing_asset={"current_version": 3, "content_hash": "0" * 64},
+    )
+    ledger: dict = {}
+    admit_first = replay_reality_candidate_write(replay_first, ledger)
+    admit_replay = replay_reality_candidate_write(replay_again, ledger)
+
+    exec_blocked = execute_reality_candidate_write(replay_first)
+    exec_authorized = execute_reality_candidate_write(
+        replay_first, human_gate_authorized=True
+    )
+
+    identity_preserved = all(
+        (
+            not isinstance(case["plan"]["candidate_id"], str)
+            or case["plan"]["candidate_id"] is None
+            or case["plan"]["source_identity"]
+            == "reality:" + str(case["plan"]["candidate_id"])
+        )
+        for case in cases
+    )
+
+    checks = [
+        {
+            "check": "every allowed canonical target is reachable through PREPARE",
+            "status": PASS
+            if sorted(
+                case["plan"]["target_asset_type"]
+                for case in cases
+                if case["plan"]["status"] == WRITER_STATUS_PREPARED
+            )
+            == sorted(REALITY_WRITER_TARGET_ASSET_TYPES)
+            else FAIL,
+            "detail": "prepared targets: "
+            + ", ".join(
+                sorted(
+                    case["plan"]["target_asset_type"]
+                    for case in cases
+                    if case["plan"]["status"] == WRITER_STATUS_PREPARED
+                )
+            ),
+        },
+        {
+            "check": "every writer case matches its expected verdict",
+            "status": PASS if all(case["matched"] for case in cases) else FAIL,
+            "detail": f"{sum(case['matched'] for case in cases)}/{len(cases)} cases matched",
+        },
+        {
+            "check": "malformed/uncertain/unverified candidates fail closed",
+            "status": PASS
+            if all(
+                case["plan"]["status"] == WRITER_STATUS_QUARANTINED
+                and case["plan"]["write_request"] is None
+                for case in cases
+                if case["expected_status"] == WRITER_STATUS_QUARANTINED
+            )
+            else FAIL,
+            "detail": "quarantined candidates never produce a write request",
+        },
+        {
+            "check": "PREPARE performs zero canonical mutation",
+            "status": PASS
+            if all(
+                case["plan"]["phase_prepare_mutated_canonical"] is False
+                and case["plan"]["canonical_write_performed"] is False
+                and case["plan"]["canonical_write_enabled"] is False
+                for case in cases
+            )
+            else FAIL,
+            "detail": "PREPARE is deterministic and in-memory only",
+        },
+        {
+            "check": "replay is idempotent by contract",
+            "status": PASS
+            if replay_first["intent_hash"] == replay_again["intent_hash"]
+            and admit_first["status"] == WRITER_STATUS_PREPARED
+            and admit_replay["status"] == WRITER_STATUS_IDEMPOTENT
+            and admit_replay["idempotent"] is True
+            and admit_replay["version"] == admit_first["version"]
+            else FAIL,
+            "detail": "identical intent hash replays without a new version",
+        },
+        {
+            "check": "identity, provenance and version policy preserved",
+            "status": PASS
+            if identity_preserved
+            and replay_first["audit_evidence"]["provenance_contract"]
+            == provenance.PROVENANCE_CONTRACT_VERSION
+            and existing_same["status"] == WRITER_STATUS_IDEMPOTENT
+            and existing_same["proposed_version"] == 3
+            and existing_new["status"] == WRITER_STATUS_PREPARED
+            and existing_new["proposed_version"] == 4
+            else FAIL,
+            "detail": "same content hash is idempotent; different hash advances the version",
+        },
+        {
+            "check": "REALITY is source/provenance, never a canonical target",
+            "status": PASS
+            if REALITY_WRITER_SOURCE_ASSET_TYPE not in REALITY_WRITER_TARGET_ASSET_TYPES
+            and REALITY_WRITER_REALITY_ROLE == "SOURCE_PROVENANCE"
+            else FAIL,
+            "detail": "writable targets: "
+            + ", ".join(REALITY_WRITER_TARGET_ASSET_TYPES),
+        },
+        {
+            "check": "EXECUTE is fail-closed behind the Human Gate",
+            "status": PASS
+            if exec_blocked["status"] == WRITER_STATUS_BLOCKED
+            and exec_blocked["canonical_write_performed"] is False
+            and exec_authorized["status"] == WRITER_STATUS_BLOCKED
+            and exec_authorized["canonical_write_performed"] is False
+            else FAIL,
+            "detail": "no EXECUTE path performs a canonical write in this spec",
+        },
+        {
+            "check": "existing canonical contracts/writers are reused not duplicated",
+            "status": PASS
+            if provenance.PROVENANCE_CONTRACT_VERSION
+            == "PERSONAL_AI_ASSET_PROVENANCE_V0.2"
+            and all(
+                entry in REALITY_WRITER_ENTRYPOINTS.values()
+                for entry in (
+                    "writeKnowledgeCandidate",
+                    "writeSkillCandidate",
+                    "writeDecisionRecord",
+                )
+            )
+            else FAIL,
+            "detail": "reuses ASSET_PROVENANCE_V0.2 and the existing Worker writers",
+        },
+        {
+            "check": "no production write / deploy / credential change",
+            "status": PASS,
+            "detail": "specification + deterministic fixtures only; no canonical write or external call",
+        },
+    ]
+
+    overall = PASS if all(check["status"] == PASS for check in checks) else FAIL
+
+    next_action = {
+        "title": "REALITY_CANDIDATE_WRITER_IMPLEMENTATION_V0.1",
+        "goal": (
+            "Implement the reversible PREPARE/EXECUTE adapter that delegates a "
+            "ROUTED candidate to the existing canonical writer behind the "
+            "disabled flag, without performing any production canonical write."
+        ),
+        "rationale": (
+            "The persistence boundary is now specified and test-proven; the next "
+            "bounded step is the reversible adapter implementation. The actual "
+            "canonical write into the production ASSET_DB is the single action "
+            "that crosses the Human Gate and remains unauthorized."
+        ),
+        "production_writes": False,
+        "cloud_only": True,
+        "requires_human_gate": True,
+        "crosses_human_gate": False,
+        "human_gate": REALITY_WRITER_HUMAN_GATE,
+        "reversible": True,
+    }
+
+    paragraphs = _reality_writer_spec_paragraphs()
+
+    lines = [
+        f"# {REALITY_WRITER_REPORT}",
+        "",
+        f"- goal: {REALITY_WRITER_GOAL}",
+        f"- task_id: {REALITY_WRITER_TASK_ID}",
+        f"- generated_at: {_utc_now()}",
+        f"- contract: {REALITY_WRITER_CONTRACT_VERSION}",
+        "- mode: READ_ONLY (specification + tests only)",
+        f"- overall: {overall}",
+        "- source_asset_type: " + REALITY_WRITER_SOURCE_ASSET_TYPE,
+        "- reality_role: " + REALITY_WRITER_REALITY_ROLE,
+        "- allowed_target_asset_types: "
+        + ", ".join(REALITY_WRITER_TARGET_ASSET_TYPES),
+        "- provenance_contract: " + provenance.PROVENANCE_CONTRACT_VERSION,
+        "- canonical_store: " + REALITY_WRITER_STORE,
+        "- human_gate: " + REALITY_WRITER_HUMAN_GATE,
+        "- canonical_write_enabled: False",
+        "- canonical_write_performed: False",
+        "- production_writes: False",
+        "- deployment_performed: False",
+        "- credential_changes: False",
+        "",
+    ]
+    for section in REALITY_WRITER_SPEC_SECTIONS:
+        lines.append("## " + section)
+        for paragraph in paragraphs[section]:
+            lines.append("- " + paragraph)
+        lines.append("")
+
+    lines.append("## Value-filter -> writer cases")
+    for case in cases:
+        plan = case["plan"]
+        lines.append(
+            f"- [{plan['status']}] {case['case']} -> "
+            f"{plan['target']}"
+            + ("" if case["matched"] else " (MISMATCH)")
+        )
+        if plan["reasons"]:
+            lines.append("  - reasons: " + "; ".join(plan["reasons"]))
+        if plan["write_request"] is not None:
+            lines.append(
+                "  - prepare_asset_id: " + plan["write_request"]["asset_id"]
+            )
+            lines.append(
+                "  - reused_writer: " + plan["reused_canonical_writer"]
+            )
+            lines.append("  - intent_hash: " + plan["intent_hash"])
+    lines += [
+        "",
+        "## Idempotency / replay",
+        f"- same_intent_hash: {replay_first['intent_hash'] == replay_again['intent_hash']}",
+        f"- first_admission: {admit_first['status']} v{admit_first['version']}",
+        f"- replay: {admit_replay['status']} v{admit_replay['version']}",
+        f"- existing_same_hash: {existing_same['status']} v{existing_same['proposed_version']}",
+        f"- existing_new_hash: {existing_new['status']} v{existing_new['proposed_version']}",
+        "",
+        "## EXECUTE gate",
+        f"- execute_without_gate: {exec_blocked['status']}",
+        f"- execute_with_gate: {exec_authorized['status']}",
+        "- canonical_write_performed: False",
+        "",
+        "## Reused canonical components",
+        f"- provenance: {provenance.PROVENANCE_CONTRACT_VERSION}",
+        f"- decision: {decision.DECISION_CONTRACT_VERSION}",
+        "- writers: "
+        + ", ".join(
+            REALITY_WRITER_ENTRYPOINTS[t] for t in REALITY_WRITER_TARGET_ASSET_TYPES
+        ),
+        "- writer contracts: "
+        + ", ".join(
+            REALITY_WRITER_CONTRACTS[t] for t in REALITY_WRITER_TARGET_ASSET_TYPES
+        ),
+        "",
+        "## Next action (exactly one)",
+        f"- title: {next_action['title']}",
+        f"- cloud_only: {next_action['cloud_only']}",
+        f"- requires_human_gate: {next_action['requires_human_gate']}",
+        f"- crosses_human_gate: {next_action['crosses_human_gate']}",
+        f"- production_writes: {next_action['production_writes']}",
+        f"- reversible: {next_action['reversible']}",
+        f"- rationale: {next_action['rationale']}",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={overall}"]
+
+    return {
+        "report": REALITY_WRITER_REPORT,
+        "goal": REALITY_WRITER_GOAL,
+        "task_id": REALITY_WRITER_TASK_ID,
+        "contract": REALITY_WRITER_CONTRACT_VERSION,
+        "generated_at": _utc_now(),
+        "mode": "READ_ONLY",
+        "status": overall,
+        "FINAL_STATUS": overall,
+        "overall": overall,
+        "source_asset_type": REALITY_WRITER_SOURCE_ASSET_TYPE,
+        "reality_role": REALITY_WRITER_REALITY_ROLE,
+        "allowed_target_asset_types": list(REALITY_WRITER_TARGET_ASSET_TYPES),
+        "human_gate": REALITY_WRITER_HUMAN_GATE,
+        "provenance_contract": provenance.PROVENANCE_CONTRACT_VERSION,
+        "canonical_store": REALITY_WRITER_STORE,
+        "spec_sections": list(REALITY_WRITER_SPEC_SECTIONS),
+        "accepted_input_fields": list(REALITY_WRITER_ACCEPTED_INPUT_FIELDS),
+        "fail_closed_conditions": list(REALITY_WRITER_FAIL_CLOSED_CONDITIONS),
+        "canonical_writer_entrypoints": dict(REALITY_WRITER_ENTRYPOINTS),
+        "canonical_writer_contracts": dict(REALITY_WRITER_CONTRACTS),
+        "cases": cases,
+        "idempotency": {
+            "same_intent_hash": replay_first["intent_hash"]
+            == replay_again["intent_hash"],
+            "first_admission": admit_first,
+            "replay_admission": admit_replay,
+            "existing_same_hash": existing_same["status"],
+            "existing_same_version": existing_same["proposed_version"],
+            "existing_new_hash": existing_new["status"],
+            "existing_new_version": existing_new["proposed_version"],
+        },
+        "execute": {
+            "without_gate": exec_blocked,
+            "with_gate": exec_authorized,
+        },
+        "reused_components": {
+            "provenance": provenance.PROVENANCE_CONTRACT_VERSION,
+            "decision": decision.DECISION_CONTRACT_VERSION,
+            "routing": CLOUD_ASSET_ROUTING_CONTRACT_VERSION,
+            "writers": {
+                t: REALITY_WRITER_ENTRYPOINTS[t]
+                for t in REALITY_WRITER_TARGET_ASSET_TYPES
+            },
+        },
+        "next_action": next_action,
+        "next_action_count": 1,
+        "canonical_write_enabled": False,
+        "canonical_write_performed": False,
+        "canonical_reality_write_performed": False,
+        "production_writes": False,
+        "deployment_performed": False,
+        "credential_changes": False,
+        "oauth_mutation": False,
+        "d1_schema_changed": False,
+        "mark_reviewed_called": False,
+        "submit_task_called": False,
+        "workflow_dispatched": False,
+        "personos_resurrected": False,
+        "second_state_store": False,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -23258,3 +24163,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(personal_ai_cloud_assets_activation_v1()["markdown"])
     print(personal_ai_auth_closure_v0_1()["markdown"])
     print(personal_ai_cloud_asset_routing_v0_1()["markdown"])
+    print(personal_ai_reality_candidate_writer_spec_v0_1()["markdown"])

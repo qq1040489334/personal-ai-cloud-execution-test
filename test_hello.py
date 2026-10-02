@@ -8884,3 +8884,274 @@ def test_cloud_asset_routing_markdown_and_main_entrypoint() -> None:
 
     source = pathlib.Path(hello_module.__file__).read_text(encoding="utf-8")
     assert 'personal_ai_cloud_asset_routing_v0_1()["markdown"]' in source
+
+
+def _writer_decision_input() -> dict:
+    return {
+        "task_id": hello_module.REALITY_WRITER_TASK_ID,
+        "review_verdict": "PASS",
+        "review_dispatch": {"dispatch_state": "DISPATCHED"},
+        "promotion": {"decision": "PROMOTE", "event_id": "routing-fixture"},
+        "user_choice": "PROMOTE",
+        "user_outcome": "GOLDEN_PENDING",
+    }
+
+
+def test_reality_candidate_writer_spec_report_passes_and_is_read_only() -> None:
+    report = hello_module.personal_ai_reality_candidate_writer_spec_v0_1()
+    assert report["status"] == "PASS"
+    assert report["overall"] == "PASS"
+    assert report["FINAL_STATUS"] == "PASS"
+    assert report["task_id"] == "cf-6d5411d23fec"
+    assert report["contract"] == (
+        "PERSONAL_AI_REALITY_CANDIDATE_WRITER_SPEC_V0.1"
+    )
+    assert report["human_gate"] == (
+        "HUMAN_GATE_REALITY_CANDIDATE_CANONICAL_WRITE_V0.1"
+    )
+    for flag in (
+        "canonical_write_enabled",
+        "canonical_write_performed",
+        "canonical_reality_write_performed",
+        "production_writes",
+        "deployment_performed",
+        "credential_changes",
+        "oauth_mutation",
+        "d1_schema_changed",
+        "mark_reviewed_called",
+        "submit_task_called",
+        "workflow_dispatched",
+        "personos_resurrected",
+        "second_state_store",
+    ):
+        assert report[flag] is False, flag
+    assert report["next_action_count"] == 1
+    assert report["next_action"]["production_writes"] is False
+    assert report["next_action"]["requires_human_gate"] is True
+    assert report["next_action"]["reversible"] is True
+    assert report["next_action"]["crosses_human_gate"] is False
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+
+
+def test_reality_candidate_writer_spec_documents_required_sections() -> None:
+    report = hello_module.personal_ai_reality_candidate_writer_spec_v0_1()
+    expected = {
+        "Accepted input contract",
+        "Allowed target asset types",
+        "REALITY is source/provenance, never a target",
+        "Provenance requirements",
+        "Idempotency and replay",
+        "Versioning and hash behavior",
+        "Quarantine / fail-closed conditions",
+        "PREPARE vs EXECUTE semantics",
+        "Audit evidence",
+        "Human Gate boundary",
+    }
+    assert set(report["spec_sections"]) == expected
+    for section in expected:
+        assert ("## " + section) in report["markdown"]
+    assert report["allowed_target_asset_types"] == [
+        "KNOWLEDGE",
+        "SKILL",
+        "DECISION",
+    ]
+    assert report["source_asset_type"] == "REALITY"
+    assert report["reality_role"] == "SOURCE_PROVENANCE"
+    assert (
+        report["source_asset_type"] not in report["allowed_target_asset_types"]
+    )
+
+
+def test_reality_candidate_writer_prepare_routed_targets() -> None:
+    cases = {
+        "knowledge": _routing_candidate(classification="knowledge"),
+        "skill": _routing_candidate(classification="skill"),
+        "decision": _routing_candidate(
+            classification="decision",
+            content={"decision": "PROMOTE"},
+            decision=_writer_decision_input(),
+        ),
+    }
+    expected_writer = {
+        "knowledge": "writeKnowledgeCandidate",
+        "skill": "writeSkillCandidate",
+        "decision": "writeDecisionRecord",
+    }
+    for kind, candidate in cases.items():
+        plan = hello_module.prepare_reality_candidate_write(candidate)
+        assert plan["status"] == "PREPARED", plan["reasons"]
+        assert plan["phase"] == "PREPARE"
+        assert plan["target_asset_type"] == kind.upper()
+        assert plan["target_asset_type"] in (
+            hello_module.REALITY_WRITER_TARGET_ASSET_TYPES
+        )
+        assert plan["reality_role"] == "SOURCE_PROVENANCE"
+        assert plan["source_asset_type"] == "REALITY"
+        assert plan["reused_canonical_writer"] == expected_writer[kind]
+        assert plan["executed"] is False
+        assert plan["canonical_write_enabled"] is False
+        assert plan["canonical_write_performed"] is False
+        assert plan["phase_prepare_mutated_canonical"] is False
+        assert plan["requires_human_gate"] is True
+        request = plan["write_request"]
+        assert request is not None
+        assert request["executed"] is False
+        assert request["asset_type"] == kind.upper()
+        assert request["canonical_write_enabled"] is False
+        assert len(request["content_hash"]) == 64
+        assert len(request["intent_hash"]) == 64
+        assert request["intent_hash"] == plan["intent_hash"]
+
+
+def test_reality_candidate_writer_prepare_zero_mutation_and_fail_closed() -> None:
+    low = _routing_candidate(confidence=0.2)
+    missing_message = _routing_candidate()
+    missing_message["message_id"] = None
+    bad_provenance = _routing_candidate()
+    bad_provenance["provenance"] = {"promotion": {"decision": "PROMOTE"}}
+    unknown = _routing_candidate(classification="opinion")
+    incomplete_decision = _routing_candidate(
+        classification="decision", decision={"review_verdict": "PASS"}
+    )
+    for candidate in (
+        low,
+        missing_message,
+        bad_provenance,
+        unknown,
+        incomplete_decision,
+        "not-a-candidate",
+    ):
+        plan = hello_module.prepare_reality_candidate_write(candidate)
+        assert plan["status"] == "QUARANTINED"
+        assert plan["write_request"] is None
+        assert plan["reused_canonical_writer"] is None
+        assert plan["canonical_write_performed"] is False
+        assert plan["phase_prepare_mutated_canonical"] is False
+        assert plan["reasons"]
+
+
+def test_reality_candidate_writer_replay_is_idempotent() -> None:
+    candidate = _routing_candidate(candidate_id="cand-abc", message_id="msg-abc")
+    first = hello_module.prepare_reality_candidate_write(candidate)
+    again = hello_module.prepare_reality_candidate_write(
+        _routing_candidate(candidate_id="cand-abc", message_id="msg-abc")
+    )
+    assert first["intent_hash"] == again["intent_hash"]
+    assert first["idempotency_key"] == again["idempotency_key"]
+
+    ledger: dict = {}
+    admit = hello_module.replay_reality_candidate_write(first, ledger)
+    replay = hello_module.replay_reality_candidate_write(again, ledger)
+    assert admit["status"] == "PREPARED"
+    assert admit["idempotent"] is False
+    assert replay["status"] == "IDEMPOTENT"
+    assert replay["idempotent"] is True
+    assert replay["version"] == admit["version"]
+    assert replay["canonical_write_performed"] is False
+
+    same_hash = hello_module.prepare_reality_candidate_write(
+        candidate,
+        existing_asset={"current_version": 3, "content_hash": first["content_hash"]},
+    )
+    assert same_hash["status"] == "IDEMPOTENT"
+    assert same_hash["proposed_version"] == 3
+    assert same_hash["write_request"]["supersedes"] == []
+
+    new_hash = hello_module.prepare_reality_candidate_write(
+        candidate,
+        existing_asset={"current_version": 3, "content_hash": "0" * 64},
+    )
+    assert new_hash["status"] == "PREPARED"
+    assert new_hash["proposed_version"] == 4
+    assert new_hash["write_request"]["supersedes"] == [3]
+
+
+def test_reality_candidate_writer_execute_requires_human_gate() -> None:
+    plan = hello_module.prepare_reality_candidate_write(
+        _routing_candidate(candidate_id="cand-gate")
+    )
+    blocked = hello_module.execute_reality_candidate_write(plan)
+    assert blocked["phase"] == "EXECUTE"
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["canonical_write_performed"] is False
+    assert blocked["canonical_write_enabled"] is False
+    assert blocked["requires_human_gate"] is True
+    assert blocked["human_gate_authorized"] is False
+    assert hello_module.REALITY_WRITER_HUMAN_GATE in blocked["reason"]
+
+    authorized = hello_module.execute_reality_candidate_write(
+        plan, human_gate_authorized=True
+    )
+    assert authorized["status"] == "BLOCKED"
+    assert authorized["canonical_write_performed"] is False
+    assert authorized["human_gate_authorized"] is True
+
+    malformed = hello_module.execute_reality_candidate_write("not-a-plan")
+    assert malformed["status"] == "QUARANTINED"
+    assert malformed["canonical_write_performed"] is False
+
+    quarantined = hello_module.prepare_reality_candidate_write(
+        _routing_candidate(confidence=0.1)
+    )
+    refused = hello_module.execute_reality_candidate_write(quarantined)
+    assert refused["status"] == "QUARANTINED"
+
+
+def test_reality_candidate_writer_preserves_identity_and_provenance() -> None:
+    candidate = _routing_candidate(candidate_id="cand-abc", message_id="msg-abc")
+    plan = hello_module.prepare_reality_candidate_write(candidate)
+    assert plan["candidate_id"] == "cand-abc"
+    assert plan["message_id"] == "msg-abc"
+    assert plan["source_identity"] == "reality:cand-abc"
+    evidence = plan["audit_evidence"]
+    assert evidence["provenance_contract"] == (
+        "PERSONAL_AI_ASSET_PROVENANCE_V0.2"
+    )
+    assert evidence["provenance_status"] == "VERIFIED"
+    assert evidence["provenance_verified"] is True
+    assert evidence["message_id"] == "msg-abc"
+    assert evidence["source_identity"] == "reality:cand-abc"
+    assert evidence["intent_hash"] == plan["intent_hash"]
+
+
+def test_reality_candidate_writer_reuses_existing_contracts() -> None:
+    report = hello_module.personal_ai_reality_candidate_writer_spec_v0_1()
+    reused = report["reused_components"]
+    assert reused["provenance"] == "PERSONAL_AI_ASSET_PROVENANCE_V0.2"
+    assert reused["decision"] == "PERSONAL_AI_DECISION_INGESTION_V0.1"
+    assert reused["routing"] == "PERSONAL_AI_CLOUD_ASSET_ROUTING_V0.1"
+    assert reused["writers"] == {
+        "KNOWLEDGE": "writeKnowledgeCandidate",
+        "SKILL": "writeSkillCandidate",
+        "DECISION": "writeDecisionRecord",
+    }
+    assert report["canonical_writer_contracts"]["KNOWLEDGE"] == (
+        "PERSONAL_AI_KNOWLEDGE_CANDIDATE_WRITER_V0.1"
+    )
+    assert report["canonical_writer_contracts"]["SKILL"] == (
+        "PERSONAL_AI_SKILL_CANDIDATE_WRITER_V0.1"
+    )
+    assert report["canonical_writer_contracts"]["DECISION"] == (
+        "PERSONAL_AI_DECISION_WRITER_V0.1"
+    )
+    assert report["fail_closed_conditions"]
+    assert all(report["accepted_input_fields"])
+
+
+def test_reality_candidate_writer_markdown_and_main_entrypoint() -> None:
+    report = hello_module.personal_ai_reality_candidate_writer_spec_v0_1()
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {hello_module.REALITY_WRITER_REPORT}")
+    assert f"- task_id: {hello_module.REALITY_WRITER_TASK_ID}" in markdown
+    assert f"FINAL_STATUS={report['status']}" in markdown
+    assert "## Idempotency / replay" in markdown
+    assert "## EXECUTE gate" in markdown
+    assert "## Next action (exactly one)" in markdown
+    assert "canonical_write_performed: False" in markdown
+    assert "reality_role: SOURCE_PROVENANCE" in markdown
+
+    source = pathlib.Path(hello_module.__file__).read_text(encoding="utf-8")
+    assert 'personal_ai_reality_candidate_writer_spec_v0_1()["markdown"]' in source
