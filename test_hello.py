@@ -8716,3 +8716,171 @@ def test_auth_closure_markdown_tokens_and_main_exposure() -> None:
 
     source = pathlib.Path(hello_module.__file__).read_text(encoding="utf-8")
     assert 'personal_ai_auth_closure_v0_1()["markdown"]' in source
+
+
+def _routing_candidate(
+    candidate_id: str = "cand-x",
+    message_id: str = "msg-x",
+    classification: str = "knowledge",
+    confidence: float = 0.9,
+    content: dict | None = None,
+    **extra: object,
+) -> dict:
+    content = content if content is not None else {"text": "x"}
+    content_hash = hello_module._cloud_asset_content_hash(content)
+    candidate = {
+        "candidate_id": candidate_id,
+        "message_id": message_id,
+        "source_identity": "reality:" + candidate_id,
+        "captured_at": hello_module.CLOUD_ASSET_ROUTING_FIXTURE_AT,
+        "classification": classification,
+        "confidence": confidence,
+        "content": content,
+        "content_hash": content_hash,
+        "provenance": hello_module._cloud_asset_fixture_provenance(
+            candidate_id, message_id, content_hash
+        ),
+    }
+    candidate.update(extra)
+    return candidate
+
+
+def test_cloud_asset_routing_report_passes_and_is_read_only() -> None:
+    report = hello_module.personal_ai_cloud_asset_routing_v0_1()
+    assert report["status"] == "PASS"
+    assert report["overall"] == "PASS"
+    assert report["task_id"] == "cf-31e382d8ea64"
+    assert report["contract"] == "PERSONAL_AI_CLOUD_ASSET_ROUTING_V0.1"
+    assert report["routed_targets"] == ["DECISION", "KNOWLEDGE", "SKILL"]
+    assert report["canonical_targets"] == ["KNOWLEDGE", "SKILL", "DECISION"]
+    for flag in (
+        "canonical_write_enabled",
+        "canonical_write_performed",
+        "canonical_reality_write_performed",
+        "production_writes",
+        "deployment_performed",
+        "credential_changes",
+        "oauth_mutation",
+        "d1_schema_changed",
+        "mark_reviewed_called",
+        "submit_task_called",
+        "workflow_dispatched",
+        "personos_resurrected",
+        "second_state_store",
+    ):
+        assert report[flag] is False, flag
+    assert report["next_action_count"] == 1
+    assert report["next_action"]["production_writes"] is False
+    assert report["next_action"]["requires_human_gate"] is True
+
+
+def test_cloud_asset_value_filter_routes_known_domains() -> None:
+    decision_input = {
+        "task_id": "cf-31e382d8ea64",
+        "review_verdict": "PASS",
+        "review_dispatch": {"dispatch_state": "DISPATCHED"},
+        "promotion": {"decision": "PROMOTE", "event_id": "routing-fixture"},
+        "user_choice": "PROMOTE",
+        "user_outcome": "GOLDEN_PENDING",
+    }
+    cases = {
+        "knowledge": _routing_candidate(classification="knowledge"),
+        "skill": _routing_candidate(classification="skill"),
+        "decision": _routing_candidate(
+            classification="decision",
+            content={"decision": "PROMOTE"},
+            decision=decision_input,
+        ),
+    }
+    expected = {
+        "knowledge": "KNOWLEDGE",
+        "skill": "SKILL",
+        "decision": "DECISION",
+    }
+    for kind, candidate in cases.items():
+        routing = hello_module.route_cloud_asset_candidate(candidate)
+        assert routing["status"] == "ROUTED", (kind, routing["reasons"])
+        assert routing["target"] == expected[kind]
+        assert routing["routed"] is True
+        assert routing["canonical_write_enabled"] is False
+        assert routing["canonical_write_performed"] is False
+
+
+def test_cloud_asset_value_filter_quarantines_uncertain_and_malformed() -> None:
+    low = _routing_candidate(confidence=0.2)
+    assert hello_module.route_cloud_asset_candidate(low)["target"] == "QUARANTINE"
+
+    missing_message = _routing_candidate()
+    missing_message["message_id"] = None
+    result = hello_module.route_cloud_asset_candidate(missing_message)
+    assert result["status"] == "QUARANTINED"
+    assert any("message_id" in reason for reason in result["reasons"])
+
+    unknown = _routing_candidate(classification="opinion")
+    result = hello_module.route_cloud_asset_candidate(unknown)
+    assert result["status"] == "QUARANTINED"
+    assert any("classification" in reason for reason in result["reasons"])
+
+    bad_provenance = _routing_candidate()
+    bad_provenance["provenance"] = {"promotion": {"decision": "PROMOTE"}}
+    result = hello_module.route_cloud_asset_candidate(bad_provenance)
+    assert result["status"] == "QUARANTINED"
+    assert result["write_intent"] is None
+
+    incomplete_decision = _routing_candidate(
+        classification="decision", decision={"review_verdict": "PASS"}
+    )
+    result = hello_module.route_cloud_asset_candidate(incomplete_decision)
+    assert result["status"] == "QUARANTINED"
+    assert any("decision route rejected" in reason for reason in result["reasons"])
+
+    malformed = hello_module.route_cloud_asset_candidate("not-a-candidate")
+    assert malformed["status"] == "QUARANTINED"
+    assert malformed["write_intent"] is None
+
+
+def test_cloud_asset_routing_preserves_identity_and_intent_hash() -> None:
+    candidate = _routing_candidate(candidate_id="cand-abc", message_id="msg-abc")
+    routing = hello_module.route_cloud_asset_candidate(candidate)
+    assert routing["candidate_id"] == "cand-abc"
+    assert routing["message_id"] == "msg-abc"
+    assert routing["source_identity"] == "reality:cand-abc"
+    write_intent = routing["write_intent"]
+    assert write_intent["phase"] == "PREPARE"
+    assert write_intent["executed"] is False
+    assert write_intent["asset_id"] == "knowledge:cand-abc"
+    assert write_intent["message_id"] == "msg-abc"
+    assert write_intent["source_identity"] == "reality:cand-abc"
+    assert len(write_intent["intent_hash"]) == 64
+    again = hello_module.route_cloud_asset_candidate(
+        _routing_candidate(candidate_id="cand-abc", message_id="msg-abc")
+    )
+    assert again["write_intent"]["intent_hash"] == write_intent["intent_hash"]
+
+
+def test_cloud_asset_routing_reuses_existing_contracts() -> None:
+    report = hello_module.personal_ai_cloud_asset_routing_v0_1()
+    assert report["reused_components"]["provenance"] == (
+        "PERSONAL_AI_ASSET_PROVENANCE_V0.2"
+    )
+    assert report["reused_components"]["decision"] == (
+        "PERSONAL_AI_DECISION_INGESTION_V0.1"
+    )
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+
+
+def test_cloud_asset_routing_markdown_and_main_entrypoint() -> None:
+    report = hello_module.personal_ai_cloud_asset_routing_v0_1()
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {hello_module.CLOUD_ASSET_ROUTING_REPORT}")
+    assert f"- task_id: {hello_module.CLOUD_ASSET_ROUTING_TASK_ID}" in markdown
+    assert f"FINAL_STATUS={report['status']}" in markdown
+    assert "## Value filter + routing cases" in markdown
+    assert "## Next action (exactly one)" in markdown
+    assert "canonical_write_performed: False" in markdown
+
+    source = pathlib.Path(hello_module.__file__).read_text(encoding="utf-8")
+    assert 'personal_ai_cloud_asset_routing_v0_1()["markdown"]' in source

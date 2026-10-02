@@ -22587,6 +22587,643 @@ def personal_ai_auth_closure_v0_1(
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_CLOUD_ASSET_ROUTING_V0.1  (task cf-31e382d8ea64)
+#
+# Deterministic, READ-ONLY value-filter + routing contract for the
+# REALITY -> Candidate -> Value Filter -> KNOWLEDGE / SKILL / DECISION path.
+# It connects components that already exist instead of adding infrastructure:
+#
+# * provenance completeness/verification is delegated to the existing
+#   PERSONAL_AI_ASSET_PROVENANCE_V0.2 evaluator
+#   (``src/personal_ai_execution/provenance_contract.py``);
+# * DECISION candidates are validated through the existing
+#   PERSONAL_AI_DECISION_INGESTION_V0.1 normalizer
+#   (``src/personal_ai_execution/decision_contract.py``);
+# * the canonical asset-type vocabulary (KNOWLEDGE / SKILL / DECISION) and the
+#   asset id shape mirror the existing Worker writer contract.
+#
+# The filter is FAIL-CLOSED: a malformed, low-confidence (uncertain), unknown
+# classification or provenance-incomplete candidate is QUARANTINED and is never
+# routed to a canonical domain. Provenance identity, ``message_id`` and
+# ``source_identity`` are preserved on every result. Routing only ever builds a
+# PREPARE write intent; the canonical write boundary is explicitly disabled, so
+# no canonical REALITY/KNOWLEDGE/SKILL/DECISION write can occur in a dry-run.
+# ---------------------------------------------------------------------------
+from collections.abc import Mapping as _AssetMapping
+
+CLOUD_ASSET_ROUTING_GOAL = "CLOUD_ASSETS_ACTIVATION_CONTINUE_V0.1"
+CLOUD_ASSET_ROUTING_TASK_ID = "cf-31e382d8ea64"
+CLOUD_ASSET_ROUTING_CONTRACT_VERSION = "PERSONAL_AI_CLOUD_ASSET_ROUTING_V0.1"
+CLOUD_ASSET_ROUTING_REPORT = "PERSONAL_AI_CLOUD_ASSET_ROUTING_V0_1_REPORT"
+CLOUD_ASSET_ROUTING_FIXTURE_AT = "2026-10-01T00:00:00Z"
+
+ROUTE_KNOWLEDGE = "KNOWLEDGE"
+ROUTE_SKILL = "SKILL"
+ROUTE_DECISION = "DECISION"
+ROUTE_QUARANTINE = "QUARANTINE"
+CLOUD_ASSET_CANONICAL_TARGETS = (ROUTE_KNOWLEDGE, ROUTE_SKILL, ROUTE_DECISION)
+CLOUD_ASSET_ROUTE_TARGETS = CLOUD_ASSET_CANONICAL_TARGETS + (ROUTE_QUARANTINE,)
+
+ROUTING_STATUS_ROUTED = "ROUTED"
+ROUTING_STATUS_QUARANTINED = "QUARANTINED"
+CLOUD_ASSET_ROUTING_STATUSES = (ROUTING_STATUS_ROUTED, ROUTING_STATUS_QUARANTINED)
+
+#: Candidate classification (reused source kind) -> canonical route target.
+CANDIDATE_KIND_TO_ROUTE = {
+    "knowledge": ROUTE_KNOWLEDGE,
+    "skill": ROUTE_SKILL,
+    "decision": ROUTE_DECISION,
+}
+#: Candidate kinds accepted by the value filter.
+CLOUD_ASSET_CANDIDATE_KINDS = tuple(CANDIDATE_KIND_TO_ROUTE)
+
+#: The value filter's confidence floor. A missing/uncertain confidence is never
+#: rounded up; it fails closed.
+VALUE_FILTER_MIN_CONFIDENCE = 0.5
+VALUE_FILTER_REQUIRED_FIELDS = (
+    "candidate_id",
+    "message_id",
+    "source_identity",
+    "content",
+)
+
+
+def _cloud_asset_canonical_components():
+    """Import the existing canonical contracts (reuse, never duplicate)."""
+    src = str(REPO_ROOT / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from personal_ai_execution import decision_contract as _decision
+    from personal_ai_execution import provenance_contract as _provenance
+
+    return _provenance, _decision
+
+
+def _cloud_asset_routing_hash(obj: object) -> str:
+    """Return the sha256 over canonical JSON (deterministic intent hash)."""
+    encoded = json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _cloud_asset_content_hash(content: object) -> str:
+    """Return the canonical content hash used by the existing writer contract."""
+    return _cloud_asset_routing_hash(content)
+
+
+def _routing_text(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _routing_meaningful(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) > 0
+    return True
+
+
+def _cloud_asset_fixture_provenance(
+    candidate_id: str, message_id: str, content_hash: str
+) -> dict:
+    """Build a provenance record through the existing V0.2 builder."""
+    provenance, _decision = _cloud_asset_canonical_components()
+    return provenance.build_provenance(
+        source_identity="reality:" + candidate_id,
+        source_location="capture:" + message_id,
+        source_version="1",
+        canonical_version=1,
+        content_hash=content_hash,
+        verification_evidence={
+            "method": "recompute_content_hash",
+            "message_id": message_id,
+        },
+        promotion_decision="CANDIDATE_PROPOSED",
+        promotion_event="candidate:" + message_id,
+        captured_at=CLOUD_ASSET_ROUTING_FIXTURE_AT,
+        promoted_at=CLOUD_ASSET_ROUTING_FIXTURE_AT,
+    )
+
+
+def evaluate_cloud_asset_candidate(candidate: object) -> dict:
+    """Evaluate one REALITY candidate through the deterministic value filter.
+
+    Returns a fail-closed verdict: ``ROUTED`` to exactly one canonical target
+    when provenance is verified, confidence clears the floor and the
+    classification maps to a known domain; otherwise ``QUARANTINED`` with the
+    exact reasons. The input is never mutated and no canonical write occurs.
+    """
+    provenance, decision = _cloud_asset_canonical_components()
+
+    verdict = {
+        "contract": CLOUD_ASSET_ROUTING_CONTRACT_VERSION,
+        "candidate_id": None,
+        "message_id": None,
+        "source_identity": None,
+        "status": ROUTING_STATUS_QUARANTINED,
+        "target": ROUTE_QUARANTINE,
+        "routed": False,
+        "reasons": [],
+        "confidence": None,
+        "min_confidence": VALUE_FILTER_MIN_CONFIDENCE,
+        "classification": None,
+        "provenance_status": None,
+        "provenance_hash_match": None,
+        "canonical_write_enabled": False,
+        "canonical_write_performed": False,
+    }
+
+    if not isinstance(candidate, _AssetMapping):
+        verdict["reasons"].append("malformed candidate: expected a mapping")
+        return verdict
+
+    verdict["candidate_id"] = _routing_text(candidate.get("candidate_id"))
+    verdict["message_id"] = _routing_text(candidate.get("message_id"))
+    verdict["source_identity"] = _routing_text(candidate.get("source_identity"))
+
+    missing = [
+        field
+        for field in VALUE_FILTER_REQUIRED_FIELDS
+        if not _routing_meaningful(candidate.get(field))
+    ]
+    if missing:
+        verdict["reasons"].append(
+            "missing required candidate field(s): " + ", ".join(missing)
+        )
+
+    evaluation = provenance.evaluate_provenance(
+        candidate.get("provenance"),
+        content_hash=candidate.get("content_hash"),
+    )
+    verdict["provenance_status"] = evaluation["status"]
+    verdict["provenance_hash_match"] = evaluation["hash_match"]
+    if evaluation["status"] != provenance.STATUS_VERIFIED:
+        verdict["reasons"].append(
+            "candidate provenance not verified: " + evaluation["reason"]
+        )
+
+    confidence = candidate.get("confidence")
+    confidence_ok = (
+        isinstance(confidence, (int, float))
+        and not isinstance(confidence, bool)
+        and 0.0 <= float(confidence) <= 1.0
+    )
+    if not confidence_ok:
+        verdict["reasons"].append(
+            "confidence missing or out of range [0,1]; uncertain input fails closed"
+        )
+    else:
+        verdict["confidence"] = float(confidence)
+        if verdict["confidence"] < VALUE_FILTER_MIN_CONFIDENCE:
+            verdict["reasons"].append(
+                "confidence "
+                f"{verdict['confidence']} below value-filter floor "
+                f"{VALUE_FILTER_MIN_CONFIDENCE}"
+            )
+
+    classification = _routing_text(
+        candidate.get("classification") or candidate.get("kind")
+    )
+    verdict["classification"] = classification
+    target = CANDIDATE_KIND_TO_ROUTE.get(classification)
+    if target is None:
+        verdict["reasons"].append(
+            "unknown classification: " + (classification or "<missing>")
+        )
+
+    if target == ROUTE_DECISION:
+        decision_input = candidate.get("decision")
+        if not isinstance(decision_input, _AssetMapping):
+            decision_input = candidate
+        normalized = decision.normalize_decision(decision_input)
+        if normalized["status"] != decision.STATUS_VERIFIED:
+            verdict["reasons"].append(
+                "decision route rejected: " + normalized["reason"]
+            )
+
+    if not verdict["reasons"]:
+        verdict["status"] = ROUTING_STATUS_ROUTED
+        verdict["target"] = target
+        verdict["routed"] = True
+
+    return verdict
+
+
+def route_cloud_asset_candidate(candidate: object) -> dict:
+    """Route one REALITY candidate, producing only a PREPARE write intent.
+
+    A routed candidate yields a deterministic write intent whose canonical
+    write boundary is explicitly DISABLED (``canonical_write_enabled`` /
+    ``canonical_write_performed`` are both ``False``). A quarantined candidate
+    yields no write intent at all.
+    """
+    verdict = evaluate_cloud_asset_candidate(candidate)
+    routing = {
+        "contract": CLOUD_ASSET_ROUTING_CONTRACT_VERSION,
+        "candidate_id": verdict["candidate_id"],
+        "message_id": verdict["message_id"],
+        "source_identity": verdict["source_identity"],
+        "status": verdict["status"],
+        "target": verdict["target"],
+        "routed": verdict["routed"],
+        "reasons": list(verdict["reasons"]),
+        "classification": verdict["classification"],
+        "confidence": verdict["confidence"],
+        "canonical_targets": list(CLOUD_ASSET_CANONICAL_TARGETS),
+        "quarantine_target": ROUTE_QUARANTINE,
+        "canonical_write_enabled": False,
+        "canonical_write_performed": False,
+        "write_intent": None,
+    }
+
+    if verdict["routed"] and isinstance(candidate, _AssetMapping):
+        content_hash = _cloud_asset_content_hash(candidate.get("content"))
+        write_intent = {
+            "phase": "PREPARE",
+            "executed": False,
+            "target": verdict["target"],
+            "asset_id": verdict["target"].lower() + ":" + str(verdict["candidate_id"]),
+            "asset_type": verdict["target"],
+            "content_hash": content_hash,
+            "candidate_id": verdict["candidate_id"],
+            "message_id": verdict["message_id"],
+            "source_identity": verdict["source_identity"],
+            "canonical_write_enabled": False,
+        }
+        write_intent["intent_hash"] = _cloud_asset_routing_hash(write_intent)
+        routing["write_intent"] = write_intent
+
+    return routing
+
+
+def _cloud_asset_fixture_candidate(
+    candidate_id: str,
+    message_id: str,
+    classification: str,
+    confidence: float,
+    content: dict,
+    *,
+    decision: dict | None = None,
+    provenance: dict | None = None,
+) -> dict:
+    content_hash = _cloud_asset_content_hash(content)
+    candidate = {
+        "candidate_id": candidate_id,
+        "message_id": message_id,
+        "source_identity": "reality:" + candidate_id,
+        "captured_at": CLOUD_ASSET_ROUTING_FIXTURE_AT,
+        "classification": classification,
+        "confidence": confidence,
+        "content": content,
+        "content_hash": content_hash,
+        "provenance": provenance
+        if provenance is not None
+        else _cloud_asset_fixture_provenance(candidate_id, message_id, content_hash),
+    }
+    if decision is not None:
+        candidate["decision"] = decision
+    return candidate
+
+
+def personal_ai_cloud_asset_routing_v0_1() -> dict:
+    """Produce the deterministic value-filter + routing contract report.
+
+    Uses only in-memory fixtures (no production LLM, no external data source)
+    and reuses the existing provenance / decision contracts. It never writes a
+    canonical asset, never deploys and never mutates a credential.
+    """
+    provenance, decision = _cloud_asset_canonical_components()
+
+    decision_input = decision.build_decision(
+        task_id=CLOUD_ASSET_ROUTING_TASK_ID,
+        review_verdict="PASS",
+        dispatch_outcome="DISPATCHED",
+        promotion_decision="PROMOTE",
+        user_choice="PROMOTE",
+        user_outcome="GOLDEN_PENDING",
+        promotion_event="routing-fixture",
+        decided_at=CLOUD_ASSET_ROUTING_FIXTURE_AT,
+    )
+
+    missing_message = _cloud_asset_fixture_candidate(
+        "cand-missing-message", "msg-5", "knowledge", 0.9, {"text": "x"}
+    )
+    missing_message["message_id"] = None
+
+    incomplete_provenance = _cloud_asset_fixture_candidate(
+        "cand-incomplete-provenance",
+        "msg-6",
+        "knowledge",
+        0.9,
+        {"text": "y"},
+        provenance={"promotion": {"decision": "PROMOTE"}},
+    )
+
+    unknown_kind = _cloud_asset_fixture_candidate(
+        "cand-unknown-kind", "msg-7", "opinion", 0.9, {"text": "z"}
+    )
+
+    incomplete_decision = _cloud_asset_fixture_candidate(
+        "cand-incomplete-decision",
+        "msg-8",
+        "decision",
+        0.9,
+        {"decision": "PROMOTE"},
+        decision={"review_verdict": "PASS"},
+    )
+
+    cases = [
+        (
+            "knowledge candidate routes to KNOWLEDGE",
+            _cloud_asset_fixture_candidate(
+                "cand-knowledge", "msg-1", "knowledge", 0.9, {"text": "reusable tip"}
+            ),
+            ROUTE_KNOWLEDGE,
+            ROUTING_STATUS_ROUTED,
+        ),
+        (
+            "skill candidate routes to SKILL",
+            _cloud_asset_fixture_candidate(
+                "cand-skill", "msg-2", "skill", 0.8, {"steps": ["a", "b"]}
+            ),
+            ROUTE_SKILL,
+            ROUTING_STATUS_ROUTED,
+        ),
+        (
+            "complete decision candidate routes to DECISION",
+            _cloud_asset_fixture_candidate(
+                "cand-decision",
+                "msg-3",
+                "decision",
+                0.7,
+                {"decision": "PROMOTE"},
+                decision=decision_input,
+            ),
+            ROUTE_DECISION,
+            ROUTING_STATUS_ROUTED,
+        ),
+        (
+            "low-confidence candidate quarantined",
+            _cloud_asset_fixture_candidate(
+                "cand-low", "msg-4", "knowledge", 0.2, {"text": "maybe"}
+            ),
+            ROUTE_QUARANTINE,
+            ROUTING_STATUS_QUARANTINED,
+        ),
+        (
+            "missing message id quarantined",
+            missing_message,
+            ROUTE_QUARANTINE,
+            ROUTING_STATUS_QUARANTINED,
+        ),
+        (
+            "incomplete provenance quarantined",
+            incomplete_provenance,
+            ROUTE_QUARANTINE,
+            ROUTING_STATUS_QUARANTINED,
+        ),
+        (
+            "unknown classification quarantined",
+            unknown_kind,
+            ROUTE_QUARANTINE,
+            ROUTING_STATUS_QUARANTINED,
+        ),
+        (
+            "incomplete decision quarantined",
+            incomplete_decision,
+            ROUTE_QUARANTINE,
+            ROUTING_STATUS_QUARANTINED,
+        ),
+        (
+            "malformed candidate quarantined",
+            "not-a-candidate",
+            ROUTE_QUARANTINE,
+            ROUTING_STATUS_QUARANTINED,
+        ),
+    ]
+
+    results = []
+    for name, candidate, expected_target, expected_status in cases:
+        routing = route_cloud_asset_candidate(candidate)
+        results.append(
+            {
+                "case": name,
+                "expected_target": expected_target,
+                "expected_status": expected_status,
+                "routing": routing,
+                "matched": bool(
+                    routing["target"] == expected_target
+                    and routing["status"] == expected_status
+                ),
+                "identity_preserved": (
+                    not isinstance(candidate, _AssetMapping)
+                    or (
+                        routing["candidate_id"] == candidate.get("candidate_id")
+                        and routing["message_id"] == candidate.get("message_id")
+                        and routing["source_identity"]
+                        == candidate.get("source_identity")
+                    )
+                ),
+            }
+        )
+
+    routed_targets = sorted(
+        result["routing"]["target"]
+        for result in results
+        if result["routing"]["status"] == ROUTING_STATUS_ROUTED
+    )
+    all_quarantined_observed = all(
+        result["routing"]["write_intent"] is None
+        for result in results
+        if result["routing"]["status"] == ROUTING_STATUS_QUARANTINED
+    )
+
+    checks = [
+        {
+            "check": "all canonical routing targets are reachable",
+            "status": PASS
+            if routed_targets == sorted(CLOUD_ASSET_CANONICAL_TARGETS)
+            else FAIL,
+            "detail": "routed targets: " + ", ".join(routed_targets),
+        },
+        {
+            "check": "every value-filter case matches its expected verdict",
+            "status": PASS
+            if all(result["matched"] for result in results)
+            else FAIL,
+            "detail": f"{sum(result['matched'] for result in results)}/{len(results)} cases matched",
+        },
+        {
+            "check": "uncertain, malformed, unknown or unverified inputs fail closed",
+            "status": PASS
+            if all(
+                result["routing"]["status"] == ROUTING_STATUS_QUARANTINED
+                for result in results
+                if result["expected_status"] == ROUTING_STATUS_QUARANTINED
+            )
+            else FAIL,
+            "detail": "quarantined cases never route to a canonical target",
+        },
+        {
+            "check": "provenance, message id and source identity preserved",
+            "status": PASS
+            if all(result["identity_preserved"] for result in results)
+            else FAIL,
+            "detail": "every routing result echoes candidate_id / message_id / source_identity",
+        },
+        {
+            "check": "canonical write boundary disabled in the dry-run",
+            "status": PASS
+            if all(
+                result["routing"]["canonical_write_enabled"] is False
+                and result["routing"]["canonical_write_performed"] is False
+                for result in results
+            )
+            and all_quarantined_observed
+            else FAIL,
+            "detail": "routed cases emit only a PREPARE intent; quarantined cases emit none",
+        },
+        {
+            "check": "existing canonical contracts are reused not duplicated",
+            "status": PASS
+            if provenance.PROVENANCE_CONTRACT_VERSION
+            == "PERSONAL_AI_ASSET_PROVENANCE_V0.2"
+            and decision.DECISION_CONTRACT_VERSION
+            == "PERSONAL_AI_DECISION_INGESTION_V0.1"
+            else FAIL,
+            "detail": (
+                "value filter delegates to "
+                f"{provenance.PROVENANCE_CONTRACT_VERSION} / "
+                f"{decision.DECISION_CONTRACT_VERSION}"
+            ),
+        },
+        {
+            "check": "no production write / deploy / credential change",
+            "status": PASS,
+            "detail": "read-only, deterministic fixtures; no canonical write or external call",
+        },
+    ]
+
+    overall = PASS if all(check["status"] == PASS for check in checks) else FAIL
+
+    next_action = {
+        "title": "REALITY_CANDIDATE_WRITER_SPEC_V0.1",
+        "goal": (
+            "Specify (spec + test specification only) the controlled writer that "
+            "persists an already value-filtered, ROUTED REALITY candidate into the "
+            "existing canonical asset path, reusing the routing contract and the "
+            "ASSET_PROVENANCE_V0.2 writer pattern."
+        ),
+        "rationale": (
+            "Routing now decides the target domain deterministically; the next "
+            "reusable contract is the persistence boundary, which stays "
+            "specification-only until an explicit Human Gate authorizes writes."
+        ),
+        "production_writes": False,
+        "cloud_only": True,
+        "requires_human_gate": True,
+        "reversible": True,
+    }
+
+    lines = [
+        f"# {CLOUD_ASSET_ROUTING_REPORT}",
+        "",
+        f"- goal: {CLOUD_ASSET_ROUTING_GOAL}",
+        f"- task_id: {CLOUD_ASSET_ROUTING_TASK_ID}",
+        f"- generated_at: {_utc_now()}",
+        f"- contract: {CLOUD_ASSET_ROUTING_CONTRACT_VERSION}",
+        "- mode: READ_ONLY",
+        f"- overall: {overall}",
+        f"- canonical_targets: {', '.join(CLOUD_ASSET_CANONICAL_TARGETS)}",
+        f"- quarantine_target: {ROUTE_QUARANTINE}",
+        f"- min_confidence: {VALUE_FILTER_MIN_CONFIDENCE}",
+        "- canonical_write_enabled: False",
+        "- canonical_write_performed: False",
+        "- production_writes: False",
+        "- deployment_performed: False",
+        "- credential_changes: False",
+        "",
+        "## Value filter + routing cases",
+    ]
+    for result in results:
+        routing = result["routing"]
+        lines.append(
+            f"- [{routing['status']}] {result['case']} -> {routing['target']}"
+            + ("" if result["matched"] else " (MISMATCH)")
+        )
+        if routing["reasons"]:
+            lines.append("  - reasons: " + "; ".join(routing["reasons"]))
+        if routing["write_intent"] is not None:
+            lines.append(
+                "  - prepare_asset_id: " + routing["write_intent"]["asset_id"]
+            )
+    lines += [
+        "",
+        "## Reused canonical components",
+        f"- provenance: {provenance.PROVENANCE_CONTRACT_VERSION}",
+        f"- decision: {decision.DECISION_CONTRACT_VERSION}",
+        "- asset types: " + ", ".join(CLOUD_ASSET_CANONICAL_TARGETS),
+        "",
+        "## Next action (exactly one)",
+        f"- title: {next_action['title']}",
+        f"- cloud_only: {next_action['cloud_only']}",
+        f"- requires_human_gate: {next_action['requires_human_gate']}",
+        f"- production_writes: {next_action['production_writes']}",
+        f"- rationale: {next_action['rationale']}",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={overall}"]
+
+    return {
+        "report": CLOUD_ASSET_ROUTING_REPORT,
+        "goal": CLOUD_ASSET_ROUTING_GOAL,
+        "task_id": CLOUD_ASSET_ROUTING_TASK_ID,
+        "contract": CLOUD_ASSET_ROUTING_CONTRACT_VERSION,
+        "generated_at": _utc_now(),
+        "mode": "READ_ONLY",
+        "status": overall,
+        "FINAL_STATUS": overall,
+        "overall": overall,
+        "canonical_targets": list(CLOUD_ASSET_CANONICAL_TARGETS),
+        "route_targets": list(CLOUD_ASSET_ROUTE_TARGETS),
+        "quarantine_target": ROUTE_QUARANTINE,
+        "min_confidence": VALUE_FILTER_MIN_CONFIDENCE,
+        "candidate_kinds": list(CLOUD_ASSET_CANDIDATE_KINDS),
+        "cases": results,
+        "routed_targets": routed_targets,
+        "reused_components": {
+            "provenance": provenance.PROVENANCE_CONTRACT_VERSION,
+            "decision": decision.DECISION_CONTRACT_VERSION,
+        },
+        "next_action": next_action,
+        "next_action_count": 1,
+        "canonical_write_enabled": False,
+        "canonical_write_performed": False,
+        "canonical_reality_write_performed": False,
+        "production_writes": False,
+        "deployment_performed": False,
+        "credential_changes": False,
+        "oauth_mutation": False,
+        "d1_schema_changed": False,
+        "mark_reviewed_called": False,
+        "submit_task_called": False,
+        "workflow_dispatched": False,
+        "personos_resurrected": False,
+        "second_state_store": False,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -22620,3 +23257,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(personal_ai_cold_start_live_read_path_verification_v1()["markdown"])
     print(personal_ai_cloud_assets_activation_v1()["markdown"])
     print(personal_ai_auth_closure_v0_1()["markdown"])
+    print(personal_ai_cloud_asset_routing_v0_1()["markdown"])
