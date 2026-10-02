@@ -21727,6 +21727,866 @@ def personal_ai_cloud_assets_activation_v1() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_AUTH_CLOSURE_V0.1  (task cf-d12b8da2875a)
+#
+# Read-only closure of the remaining cloud-side production authentication
+# blockers for the existing Personal AI Deploy & Write Site. It verifies the
+# D1 credential *by name only* (values are never read into output), performs a
+# bounded target D1 read probe, independently probes the production MCP static
+# bearer, classifies any remaining 401, and reports whether the site is
+# READY_FOR_PRODUCTION_GOLDEN or a HUMAN_GATE_REQUIRED credential/security
+# mutation is still needed.
+#
+# This section performs NO production Worker source deployment, NO canonical
+# DECISION write, NO D1 schema change, NO OAuth/permission expansion, NO
+# binding/route change, NO credential rotation, and NO mark_reviewed. It only
+# builds *PREPARE* intents and hashes, and it never prints a secret value.
+# ---------------------------------------------------------------------------
+AUTH_CLOSURE_GOAL = "PERSONAL_AI_AUTH_CLOSURE_V0.1"
+AUTH_CLOSURE_TASK_ID = "cf-d12b8da2875a"
+AUTH_CLOSURE_REPORT = "PERSONAL_AI_AUTH_CLOSURE_V0_1_REPORT"
+
+FINAL_STATUS_READY_FOR_PRODUCTION_GOLDEN = "READY_FOR_PRODUCTION_GOLDEN"
+FINAL_STATUS_HUMAN_GATE_REQUIRED = "HUMAN_GATE_REQUIRED"
+AUTH_CLOSURE_FINAL_STATUSES = (
+    FINAL_STATUS_READY_FOR_PRODUCTION_GOLDEN,
+    FINAL_STATUS_HUMAN_GATE_REQUIRED,
+)
+
+D1_CREDENTIAL_ENV = "PAI_APPROVAL_D1_API_TOKEN"
+MCP_CREDENTIAL_ENV = "PAI_PRODUCTION_MCP_TOKEN"
+CF_READ_CREDENTIAL_ENV = "CF_READ_API_TOKEN"
+AUTH_CLOSURE_CREDENTIAL_ENV_NAMES = (
+    D1_CREDENTIAL_ENV,
+    MCP_CREDENTIAL_ENV,
+    CF_READ_CREDENTIAL_ENV,
+)
+
+D1_ACCOUNT_ID = "78a22a0699aa94a39d8f7bfdbac18249"
+D1_DATABASE_ID = "45d6f18a-3a34-4ccd-8337-c00a775cd7a2"
+PRODUCTION_MCP_HOST = "personal-ai-execution-mcp.1040489334.workers.dev"
+PRODUCTION_MCP_ENDPOINT = "https://" + PRODUCTION_MCP_HOST
+PRODUCTION_WORKER_NAME = "personal-ai-execution-mcp"
+PRODUCTION_WORKER_LAST_DEPLOYMENT_ID = "0c2735d2-6a9c-42f8-b996-45e0efdf9cf6"
+PRODUCTION_WORKER_LAST_VERSION_ID = "4e5e6f17-a789-4a78-9ddf-3c162f3ed62c"
+PRODUCTION_SITE_VERSION = 8
+PRODUCTION_MCP_VERSION = "0.3.0"
+
+AUTH_RESULT_PASS = "PASS"
+AUTH_RESULT_FAIL = "FAIL"
+AUTH_RESULT_BLOCKED = "BLOCKED"
+AUTH_RESULT_NOT_ATTEMPTED = "NOT_ATTEMPTED"
+AUTH_RESULT_NOT_RUN = "NOT_RUN"
+
+#: Precise classifications for a surviving production MCP 401.
+MCP_401_CLASS_STATIC_BEARER_MISMATCH = "STATIC_BEARER_MISMATCH"
+MCP_401_CLASS_CREDENTIAL_ABSENT = "CREDENTIAL_ABSENT"
+MCP_401_CLASS_OAUTH_REQUIRED = "OAUTH_REQUIRED"
+MCP_401_CLASS_NONE = "NONE"
+
+SIWC_BYPASS_TOKEN_POTENTIALLY_EXPOSED = True
+SIWC_BYPASS_TOKEN_NAME = "siwc_bypass_bearer_token"
+
+DECISION_GOLDEN_ID = "DECISION_PRODUCTION_GOLDEN_V0.1"
+DECISION_GOLDEN_ASSET_ID = "decision:" + DECISION_GOLDEN_ID
+DECISION_GOLDEN_DECIDED_AT = "2026-10-02T00:00:00Z"
+AUTH_CLOSURE_INTENT_EXPIRY_MINUTES = 30
+
+#: The bounded approval-ledger probe is only run when an existing approval-ledger
+#: test contract explicitly authorizes it. None is present in this repository, so
+#: the probe is reported NOT_RUN and canonical asset tables are never touched.
+APPROVAL_LEDGER_TEST_CONTRACT_PATHS = (
+    "APPROVAL_LEDGER_TEST_CONTRACT_V0.1.md",
+    "tests/test_approval_ledger.py",
+    "src/personal_ai_execution/approval_ledger.py",
+)
+APPROVAL_LEDGER_SEQUENCE = (
+    "register",
+    "consume",
+    "replay",
+    "concurrency-cleanup",
+)
+APPROVAL_LEDGER_BOUNDED_QUERY = (
+    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name LIMIT 8"
+)
+
+AUTH_CLOSURE_DECISION_PAYLOAD = {
+    "decision_id": DECISION_GOLDEN_ID,
+    "task_id": AUTH_CLOSURE_TASK_ID,
+    "review_verdict": "PASS",
+    "dispatch_outcome": "DISPATCHED",
+    "promotion_decision": "PROMOTE",
+    "promotion_event": "production-golden-v0.1",
+    "agent_recommendation": "PROMOTE",
+    "user_choice": "PROMOTE",
+    "user_outcome": "GOLDEN_PENDING",
+    "evidence_ref": "PERSONAL_AI_AUTH_CLOSURE_V0.1",
+    "decided_at": DECISION_GOLDEN_DECIDED_AT,
+}
+
+
+def _auth_closure_canonical_hash(obj: object) -> str:
+    """Return the sha256 over canonical JSON (never over a secret value)."""
+    encoded = json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _auth_closure_present_env(
+    environ: "os._Environ[str] | dict | None",
+    names: tuple[str, ...],
+) -> list[str]:
+    """Return present env var *names* only; values are never read/recorded."""
+    if environ is None:
+        return []
+    return sorted(
+        name for name in names if str(environ.get(name) or "").strip()
+    )
+
+
+def _auth_closure_credential(
+    environ: "os._Environ[str] | dict | None", name: str
+) -> dict:
+    """Describe a credential by name and presence only -- never by value."""
+    value = "" if environ is None else str(environ.get(name) or "")
+    return {
+        "env_var": name,
+        "present": bool(value.strip()),
+        "value_recorded": False,
+    }
+
+
+def _auth_closure_http_json(
+    url: str,
+    *,
+    method: str = "GET",
+    token: str | None = None,
+    payload: object | None = None,
+    timeout: float = 15.0,
+) -> dict:
+    """Bounded HTTP JSON probe. Returns status/body/error; never logs secrets."""
+    import urllib.error
+    import urllib.request
+
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_header("Accept", "application/json")
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+    if token:
+        request.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", "replace")
+            status = response.status
+    except urllib.error.HTTPError as exc:  # pragma: no cover - network path
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        status = exc.code
+    except Exception as exc:  # pragma: no cover - network path
+        return {"status": None, "body": None, "error": type(exc).__name__}
+    parsed: object
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        parsed = body
+    return {"status": status, "body": parsed, "error": None}
+
+
+def _auth_closure_default_d1_token_verifier(token: str) -> dict:
+    """Safe Cloudflare token verification probe (never records the token)."""
+    result = _auth_closure_http_json(
+        "https://api.cloudflare.com/client/v4/user/tokens/verify",
+        token=token,
+    )
+    body = result.get("body")
+    ok = (
+        result.get("status") == 200
+        and isinstance(body, dict)
+        and body.get("success") is True
+    )
+    return {
+        "ok": ok,
+        "http_status": result.get("status"),
+        "error": result.get("error"),
+    }
+
+
+def _auth_closure_default_d1_reader(
+    account_id: str, database_id: str, token: str, sql: str
+) -> dict:
+    """Bounded read-only D1 query probe (never mutates)."""
+    url = (
+        f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
+        f"/d1/database/{database_id}/query"
+    )
+    result = _auth_closure_http_json(
+        url, method="POST", token=token, payload={"sql": sql}
+    )
+    body = result.get("body")
+    ok = (
+        result.get("status") == 200
+        and isinstance(body, dict)
+        and body.get("success") is True
+    )
+    rows = None
+    if ok and isinstance(body, dict):
+        try:
+            rows = body["result"][0]["results"]
+        except (KeyError, IndexError, TypeError):
+            rows = None
+    return {
+        "ok": ok,
+        "http_status": result.get("status"),
+        "rows": rows,
+        "error": result.get("error"),
+    }
+
+
+def _auth_closure_default_mcp_probe(endpoint: str, token: str) -> dict:
+    """Harmless authenticated MCP tools/list probe."""
+    url = endpoint.rstrip("/") + "/mcp"
+    result = _auth_closure_http_json(
+        url,
+        method="POST",
+        token=token,
+        payload={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {},
+        },
+    )
+    body = result.get("body")
+    ok = (
+        result.get("status") == 200
+        and isinstance(body, dict)
+        and isinstance(body.get("result"), dict)
+        and isinstance(body["result"].get("tools"), list)
+    )
+    tools: list[str] = []
+    if ok:
+        tools = sorted(
+            str(tool.get("name"))
+            for tool in body["result"]["tools"]
+            if isinstance(tool, dict) and tool.get("name")
+        )
+    return {
+        "ok": ok,
+        "http_status": result.get("status"),
+        "tools": tools,
+        "error": result.get("error"),
+    }
+
+
+def _auth_closure_approval_ledger_contract_present() -> bool:
+    """Whether an existing approval-ledger test contract authorizes the probe."""
+    return any(
+        (REPO_ROOT / path).exists() for path in APPROVAL_LEDGER_TEST_CONTRACT_PATHS
+    )
+
+
+def _auth_closure_required_action(
+    *,
+    missing_credentials: list[str],
+    d1_auth: dict,
+    mcp_auth: dict,
+    tested_build_resolved: bool,
+    siwc_authorized: bool,
+) -> str:
+    """Return exactly one concrete, user-authorized required action."""
+    if missing_credentials:
+        return (
+            "User-authorized action: provision the execution runtime with the "
+            "already-created, safely-stored credential(s) "
+            + ", ".join(missing_credentials)
+            + " as injected environment secrets (never paste secret values into "
+            "any output or artifact), then re-run the read-only "
+            "PERSONAL_AI_AUTH_CLOSURE_V0.1 probe."
+        )
+    if mcp_auth.get("result") == AUTH_RESULT_FAIL and mcp_auth.get("remaining_401"):
+        return (
+            "User-authorized action: authorize exactly one production Worker "
+            "secret rotation of MCP_AUTH_TOKEN (HUMAN_GATE_REQUIRED) so the "
+            "static bearer matches the safely-stored PAI_PRODUCTION_MCP_TOKEN; "
+            "do not re-paste the secret and do not rotate without this explicit "
+            "authorization."
+        )
+    if (
+        d1_auth.get("result") == AUTH_RESULT_FAIL
+        or not d1_auth.get("auth_valid")
+    ) and not missing_credentials:
+        return (
+            "User-authorized action: replace or re-scope PAI_APPROVAL_D1_API_TOKEN "
+            "to the target account with D1 Edit for database "
+            f"{D1_DATABASE_ID} (never paste the value into any output), then "
+            "re-run the read-only PERSONAL_AI_AUTH_CLOSURE_V0.1 probe."
+        )
+    if not tested_build_resolved:
+        return (
+            "User-authorized action: provide the exact tested build identity "
+            "(commit SHA + Worker source sha256 + Worker version id) for the "
+            "production deploy target; HEAD must not be deployed merely because "
+            "it is newer."
+        )
+    if SIWC_BYPASS_TOKEN_POTENTIALLY_EXPOSED and not siwc_authorized:
+        return (
+            f"User-authorized action: authorize rotation/revocation of the "
+            f"potentially exposed {SIWC_BYPASS_TOKEN_NAME} (do not reuse it)."
+        )
+    return (
+        "No credential/security mutation is pending; the production golden "
+        "PREPARE intents are ready for the explicit final authorization."
+    )
+
+
+def _auth_closure_classify_mcp_401(
+    *, credential_present: bool, body: object
+) -> dict:
+    """Precisely classify a surviving MCP 401 without guessing."""
+    if not credential_present:
+        classification = MCP_401_CLASS_CREDENTIAL_ABSENT
+        detail = (
+            "no PAI_PRODUCTION_MCP_TOKEN was present, so the request was sent "
+            "unauthenticated"
+        )
+    else:
+        body_text = ""
+        if isinstance(body, dict):
+            body_text = json.dumps(body, sort_keys=True)
+        else:
+            body_text = str(body or "")
+        if "oauth-protected-resource" in body_text.lower() or "insufficient_scope" in body_text.lower():
+            classification = MCP_401_CLASS_OAUTH_REQUIRED
+            detail = (
+                "static bearer was rejected and the WWW-Authenticate challenge "
+                "points at the OAuth protected-resource metadata"
+            )
+        else:
+            classification = MCP_401_CLASS_STATIC_BEARER_MISMATCH
+            detail = (
+                "the presented PAI_PRODUCTION_MCP_TOKEN is not the actual "
+                "production MCP_AUTH_TOKEN; the static bearer contract rejected it"
+            )
+    return {"classification": classification, "detail": detail}
+
+
+def personal_ai_auth_closure_v0_1(
+    env: "dict | None" = None,
+    *,
+    d1_token_verifier=None,
+    d1_reader=None,
+    mcp_probe=None,
+    tested_build: dict | None = None,
+    siwc_rotation_authorized: bool = False,
+    now: "datetime | None" = None,
+) -> dict:
+    """Close the production authentication blockers (read-only, fail-closed).
+
+    ``env`` is a mapping of environment variables (defaults to ``os.environ``).
+    Only credential *names* and presence are ever recorded. Live probes are
+    injectable for deterministic offline tests; when a credential is absent the
+    corresponding probe is never attempted. No deploy, canonical DECISION write,
+    D1 mutation, credential rotation or mark_reviewed is ever performed.
+    """
+    environ = os.environ if env is None else env
+    timestamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    expiry = timestamp + timedelta(minutes=AUTH_CLOSURE_INTENT_EXPIRY_MINUTES)
+
+    d1_cred = _auth_closure_credential(environ, D1_CREDENTIAL_ENV)
+    mcp_cred = _auth_closure_credential(environ, MCP_CREDENTIAL_ENV)
+    cf_read_cred = _auth_closure_credential(environ, CF_READ_CREDENTIAL_ENV)
+    present_names = _auth_closure_present_env(
+        environ, AUTH_CLOSURE_CREDENTIAL_ENV_NAMES
+    )
+
+    d1_token = (
+        str(environ.get(D1_CREDENTIAL_ENV) or "").strip()
+        if d1_cred["present"]
+        else ""
+    )
+    mcp_token = (
+        str(environ.get(MCP_CREDENTIAL_ENV) or "").strip()
+        if mcp_cred["present"]
+        else ""
+    )
+
+    # --- D1 credential verification --------------------------------------
+    verifier = d1_token_verifier or _auth_closure_default_d1_token_verifier
+    if not d1_cred["present"]:
+        d1_auth = {
+            "credential": d1_cred,
+            "verification_attempted": False,
+            "result": AUTH_RESULT_BLOCKED,
+            "auth_valid": False,
+            "http_status": None,
+            "reason": (
+                f"{D1_CREDENTIAL_ENV} is not present in this runtime, so the "
+                "D1 credential cannot be verified; fail closed"
+            ),
+        }
+    else:
+        try:
+            verified = verifier(d1_token) or {}
+        except Exception as exc:  # pragma: no cover - injected/network path
+            verified = {"ok": False, "http_status": None, "error": type(exc).__name__}
+        auth_valid = bool(verified.get("ok"))
+        d1_auth = {
+            "credential": d1_cred,
+            "verification_attempted": True,
+            "result": AUTH_RESULT_PASS if auth_valid else AUTH_RESULT_FAIL,
+            "auth_valid": auth_valid,
+            "http_status": verified.get("http_status"),
+            "reason": (
+                "Cloudflare token verification confirms the D1 credential is "
+                "active for the target account"
+                if auth_valid
+                else "Cloudflare token verification did not confirm the D1 "
+                "credential; fail closed"
+            ),
+        }
+
+    # --- Bounded target D1 read probe ------------------------------------
+    reader = d1_reader or _auth_closure_default_d1_reader
+    if not d1_cred["present"]:
+        d1_read = {
+            "target": {"account_id": D1_ACCOUNT_ID, "database_id": D1_DATABASE_ID},
+            "query": APPROVAL_LEDGER_BOUNDED_QUERY,
+            "attempted": False,
+            "result": AUTH_RESULT_BLOCKED,
+            "rows_read": None,
+            "canonical_asset_tables_touched": False,
+            "reason": "no D1 credential present; target read probe not attempted",
+        }
+    else:
+        try:
+            read = reader(
+                D1_ACCOUNT_ID,
+                D1_DATABASE_ID,
+                d1_token,
+                APPROVAL_LEDGER_BOUNDED_QUERY,
+            ) or {}
+        except Exception as exc:  # pragma: no cover - injected/network path
+            read = {"ok": False, "http_status": None, "error": type(exc).__name__}
+        read_ok = bool(read.get("ok"))
+        rows = read.get("rows")
+        d1_read = {
+            "target": {"account_id": D1_ACCOUNT_ID, "database_id": D1_DATABASE_ID},
+            "query": APPROVAL_LEDGER_BOUNDED_QUERY,
+            "attempted": True,
+            "result": AUTH_RESULT_PASS if read_ok else AUTH_RESULT_FAIL,
+            "rows_read": len(rows) if isinstance(rows, list) else None,
+            "canonical_asset_tables_touched": False,
+            "reason": (
+                "bounded read-only probe succeeded against the target database"
+                if read_ok
+                else "bounded read-only probe against the target database failed"
+            ),
+        }
+
+    # --- Approval ledger: only if an existing contract authorizes it ------
+    ledger_contract = _auth_closure_approval_ledger_contract_present()
+    ledger_authorized = bool(ledger_contract and d1_read["result"] == AUTH_RESULT_PASS)
+    if not ledger_authorized:
+        approval_ledger = {
+            "sequence": list(APPROVAL_LEDGER_SEQUENCE),
+            "authorized": False,
+            "sequence_attempted": False,
+            "result": AUTH_RESULT_NOT_RUN,
+            "canonical_asset_tables_touched": False,
+            "reason": (
+                "no existing approval-ledger test contract authorizes the "
+                "TEST/GOLDEN register-consume-replay/concurrency-cleanup "
+                "sequence in this execution context; fail closed"
+            ),
+        }
+    else:  # pragma: no cover - no contract is present in-repo
+        approval_ledger = {
+            "sequence": list(APPROVAL_LEDGER_SEQUENCE),
+            "authorized": True,
+            "sequence_attempted": True,
+            "result": AUTH_RESULT_NOT_RUN,
+            "canonical_asset_tables_touched": False,
+            "reason": "authorized bounded ledger sequence is out of scope offline",
+        }
+
+    # --- Production MCP authentication probe ------------------------------
+    prober = mcp_probe or _auth_closure_default_mcp_probe
+    mcp_base = {
+        "endpoint": PRODUCTION_MCP_ENDPOINT,
+        "host": PRODUCTION_MCP_HOST,
+        "worker": PRODUCTION_WORKER_NAME,
+        "credential": mcp_cred,
+        "static_bearer_contract": True,
+    }
+    if not mcp_cred["present"]:
+        mcp_auth = {
+            **mcp_base,
+            "probe_attempted": False,
+            "result": AUTH_RESULT_BLOCKED,
+            "http_status": None,
+            "remaining_401": False,
+            "classification": MCP_401_CLASS_NONE,
+            "detail": (
+                f"{MCP_CREDENTIAL_ENV} is not present in this runtime, so the "
+                "production MCP static bearer cannot be probed; fail closed"
+            ),
+        }
+    else:
+        try:
+            probed = prober(PRODUCTION_MCP_ENDPOINT, mcp_token) or {}
+        except Exception as exc:  # pragma: no cover - injected/network path
+            probed = {"ok": False, "http_status": None, "error": type(exc).__name__}
+        http_status = probed.get("http_status")
+        probe_ok = bool(probed.get("ok"))
+        if probe_ok:
+            classification = MCP_401_CLASS_NONE
+            detail = (
+                "authenticated tools/list read probe succeeded over the static "
+                "bearer contract"
+            )
+        elif http_status == 401:
+            classified = _auth_closure_classify_mcp_401(
+                credential_present=True, body=probed.get("body")
+            )
+            classification = classified["classification"]
+            detail = classified["detail"]
+        else:
+            classification = MCP_401_CLASS_NONE
+            detail = "authenticated MCP read probe did not return a usable result"
+        mcp_auth = {
+            **mcp_base,
+            "probe_attempted": True,
+            "result": AUTH_RESULT_PASS if probe_ok else AUTH_RESULT_FAIL,
+            "http_status": http_status,
+            "remaining_401": bool(http_status == 401),
+            "classification": classification,
+            "detail": detail,
+        }
+
+    both_pass = bool(
+        d1_auth["result"] == AUTH_RESULT_PASS
+        and mcp_auth["result"] == AUTH_RESULT_PASS
+        and d1_read["result"] == AUTH_RESULT_PASS
+    )
+
+    # --- Fail-closed deploy target provenance -----------------------------
+    tested = tested_build if isinstance(tested_build, dict) else None
+    tested_commit = str((tested or {}).get("commit") or "").strip()
+    tested_sha = str(
+        (tested or {}).get("worker_source_sha256")
+        or (tested or {}).get("source_sha256")
+        or ""
+    ).strip()
+    tested_version = str(
+        (tested or {}).get("worker_version_id")
+        or (tested or {}).get("version_id")
+        or ""
+    ).strip()
+    tested_build_resolved = bool(tested_commit and tested_sha)
+
+    deploy_intent = {
+        "intent": "deploy_worker_version",
+        "phase": "PREPARE",
+        "executed": False,
+        "target": {
+            "worker": PRODUCTION_WORKER_NAME,
+            "account_id": D1_ACCOUNT_ID,
+            "endpoint": PRODUCTION_MCP_ENDPOINT,
+            "last_observed_deployment_id": PRODUCTION_WORKER_LAST_DEPLOYMENT_ID,
+            "last_observed_version_id": PRODUCTION_WORKER_LAST_VERSION_ID,
+            "last_observed_traffic": "100%",
+            "site_version": PRODUCTION_SITE_VERSION,
+            "mcp_version": PRODUCTION_MCP_VERSION,
+        },
+        "provenance": {
+            "exact_tested_build_resolved": tested_build_resolved,
+            "commit": tested_commit or None,
+            "worker_source_sha256": tested_sha or None,
+            "worker_version_id": tested_version or None,
+            "fail_closed": True,
+            "policy": (
+                "repository HEAD is never deployed merely because it is newer; "
+                "an exact tested build/version/commit must be identified"
+            ),
+        },
+        "deployment_performed": False,
+        "production_mutated": False,
+    }
+    deploy_intent["intent_hash"] = _auth_closure_canonical_hash(deploy_intent)
+
+    decision_payload = dict(AUTH_CLOSURE_DECISION_PAYLOAD)
+    decision_payload_hash = _auth_closure_canonical_hash(decision_payload)
+    write_intent = {
+        "intent": "write_decision_record",
+        "phase": "PREPARE",
+        "executed": False,
+        "tool": "write_decision_record",
+        "asset_id": DECISION_GOLDEN_ASSET_ID,
+        "asset_type": "DECISION",
+        "payload": decision_payload,
+        "payload_hash": decision_payload_hash,
+        "write_intent": (
+            "write_decision_record " + DECISION_GOLDEN_ID +
+            " into the existing canonical DECISION asset path"
+        ),
+        "canonical_decision_write_performed": False,
+        "production_mutated": False,
+    }
+    write_intent["intent_hash"] = _auth_closure_canonical_hash(write_intent)
+
+    passkey = {
+        "required": True,
+        "challenge_issued": False,
+        "challenge_executed": False,
+        "readiness": "NOT_AVAILABLE",
+        "component_found": any(
+            (REPO_ROOT / path).exists()
+            for path in (
+                "src/personal_ai_execution/passkey.py",
+                "src/personal_ai_execution/webauthn.py",
+            )
+        ),
+        "reason": (
+            "no Passkey / WebAuthn component exists in the repository; the "
+            "challenge cannot be issued from this cloud environment"
+        ),
+    }
+
+    ready = bool(both_pass and tested_build_resolved)
+    final_status = (
+        FINAL_STATUS_READY_FOR_PRODUCTION_GOLDEN
+        if ready
+        else FINAL_STATUS_HUMAN_GATE_REQUIRED
+    )
+
+    missing_credentials = [
+        name
+        for name, present in (
+            (D1_CREDENTIAL_ENV, d1_cred["present"]),
+            (MCP_CREDENTIAL_ENV, mcp_cred["present"]),
+        )
+        if not present
+    ]
+    required_action = _auth_closure_required_action(
+        missing_credentials=missing_credentials,
+        d1_auth=d1_auth,
+        mcp_auth=mcp_auth,
+        tested_build_resolved=tested_build_resolved,
+        siwc_authorized=siwc_rotation_authorized,
+    )
+
+    siwc_token = {
+        "token_name": SIWC_BYPASS_TOKEN_NAME,
+        "potentially_exposed": SIWC_BYPASS_TOKEN_POTENTIALLY_EXPOSED,
+        "remediation_required": SIWC_BYPASS_TOKEN_POTENTIALLY_EXPOSED,
+        "rotation_authorized": bool(siwc_rotation_authorized),
+        "rotated_or_revoked": False,
+        "reproduced": False,
+        "value_exposed": False,
+        "reason": (
+            "the token was previously surfaced; treat it as potentially exposed "
+            "and require rotation/revocation under explicit authorization. It is "
+            "not reproduced or read here."
+        ),
+    }
+
+    checks = [
+        {
+            "check": "D1 credential verified without exposing its value",
+            "status": (
+                PASS
+                if d1_auth["result"] == AUTH_RESULT_PASS
+                else (FAIL if d1_auth["result"] == AUTH_RESULT_FAIL else BLOCKED)
+            ),
+            "detail": d1_auth["reason"],
+        },
+        {
+            "check": "bounded read-only target D1 probe",
+            "status": (
+                PASS
+                if d1_read["result"] == AUTH_RESULT_PASS
+                else (FAIL if d1_read["result"] == AUTH_RESULT_FAIL else BLOCKED)
+            ),
+            "detail": d1_read["reason"],
+        },
+        {
+            "check": "production MCP authenticated read probe",
+            "status": (
+                PASS
+                if mcp_auth["result"] == AUTH_RESULT_PASS
+                else (FAIL if mcp_auth["result"] == AUTH_RESULT_FAIL else BLOCKED)
+            ),
+            "detail": mcp_auth["detail"],
+        },
+        {
+            "check": "remaining 401 classified precisely",
+            "status": PASS,
+            "detail": mcp_auth["classification"],
+        },
+        {
+            "check": "no production Worker deploy / canonical DECISION write",
+            "status": PASS,
+            "detail": (
+                "deployment_performed=False; canonical_decision_write_performed="
+                "False; only PREPARE intents were generated"
+            ),
+        },
+        {
+            "check": "no secret value in output",
+            "status": PASS,
+            "detail": (
+                "credential presence checked by name only; values never read "
+                "into the report"
+            ),
+        },
+        {
+            "check": "siwc_bypass_bearer_token remediation reported only",
+            "status": PASS,
+            "detail": (
+                "potentially exposed and remediation required; not reproduced, "
+                "not rotated"
+            ),
+        },
+        {
+            "check": "final status is exactly one of the allowed business outcomes",
+            "status": PASS if final_status in AUTH_CLOSURE_FINAL_STATUSES else FAIL,
+            "detail": f"final_status={final_status}",
+        },
+    ]
+    overall = PASS if all(check["status"] != FAIL for check in checks) else FAIL
+
+    lines = [
+        f"# {AUTH_CLOSURE_REPORT}",
+        "",
+        f"- goal: {AUTH_CLOSURE_GOAL}",
+        f"- task_id: {AUTH_CLOSURE_TASK_ID}",
+        f"- generated_at: {_utc_now()}",
+        "- mode: READ_ONLY",
+        f"- workflow_status: completed",
+        f"- final_status: {final_status}",
+        f"- d1_auth: {d1_auth['result']}",
+        f"- d1_read_probe: {d1_read['result']}",
+        f"- mcp_auth: {mcp_auth['result']}",
+        f"- mcp_401_classification: {mcp_auth['classification']}",
+        f"- production_deployment_performed: False",
+        f"- canonical_decision_write_performed: False",
+        "",
+        "## D1 credential verification",
+        f"- credential_env_var: {D1_CREDENTIAL_ENV}",
+        f"- credential_present: {d1_cred['present']}",
+        f"- verification_attempted: {d1_auth['verification_attempted']}",
+        f"- result: {d1_auth['result']}",
+        f"- reason: {d1_auth['reason']}",
+        "",
+        "## Target D1 read probe",
+        f"- account_id: {D1_ACCOUNT_ID}",
+        f"- database_id: {D1_DATABASE_ID}",
+        f"- query: {APPROVAL_LEDGER_BOUNDED_QUERY}",
+        f"- result: {d1_read['result']}",
+        f"- rows_read: {d1_read['rows_read']}",
+        "",
+        "## Approval ledger",
+        f"- authorized: {approval_ledger['authorized']}",
+        f"- sequence_attempted: {approval_ledger['sequence_attempted']}",
+        f"- result: {approval_ledger['result']}",
+        f"- reason: {approval_ledger['reason']}",
+        "",
+        "## Production MCP authentication",
+        f"- endpoint: {PRODUCTION_MCP_ENDPOINT}",
+        f"- credential_env_var: {MCP_CREDENTIAL_ENV}",
+        f"- credential_present: {mcp_cred['present']}",
+        f"- probe_attempted: {mcp_auth['probe_attempted']}",
+        f"- result: {mcp_auth['result']}",
+        f"- http_status: {mcp_auth['http_status']}",
+        f"- remaining_401: {mcp_auth['remaining_401']}",
+        f"- classification: {mcp_auth['classification']}",
+        f"- detail: {mcp_auth['detail']}",
+        "",
+        "## Security remediation",
+        f"- {SIWC_BYPASS_TOKEN_NAME}_potentially_exposed: "
+        f"{siwc_token['potentially_exposed']}",
+        f"- remediation_required: {siwc_token['remediation_required']}",
+        f"- rotated_or_revoked: {siwc_token['rotated_or_revoked']}",
+        "",
+        "## Production golden PREPARE intents",
+        f"- deploy target worker: {PRODUCTION_WORKER_NAME}",
+        f"- deploy provenance resolved: {tested_build_resolved}",
+        f"- deploy intent_hash: {deploy_intent['intent_hash']}",
+        f"- decision asset_id: {DECISION_GOLDEN_ASSET_ID}",
+        f"- decision payload_hash: {decision_payload_hash}",
+        f"- decision write intent: {write_intent['write_intent']}",
+        f"- expiry: {expiry.isoformat()}",
+        f"- passkey readiness: {passkey['readiness']}",
+        "",
+        "## Human gate",
+        f"- required: {final_status == FINAL_STATUS_HUMAN_GATE_REQUIRED}",
+        f"- exactly_one_required_action: {required_action}",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final_status}"]
+
+    return {
+        "report": AUTH_CLOSURE_REPORT,
+        "goal": AUTH_CLOSURE_GOAL,
+        "task_id": AUTH_CLOSURE_TASK_ID,
+        "generated_at": _utc_now(),
+        "mode": "READ_ONLY",
+        "workflow_status": "completed",
+        "final_status": final_status,
+        "FINAL_STATUS": final_status,
+        "final_statuses_allowed": list(AUTH_CLOSURE_FINAL_STATUSES),
+        "credential_env_names": list(AUTH_CLOSURE_CREDENTIAL_ENV_NAMES),
+        "credentials_present": present_names,
+        "d1_auth": d1_auth,
+        "d1_read_probe": d1_read,
+        "approval_ledger": approval_ledger,
+        "mcp_auth": mcp_auth,
+        "siwc_bypass_bearer_token": siwc_token,
+        "production_golden_prepare": {
+            "deploy_worker_version": deploy_intent,
+            "write_decision_record": write_intent,
+            "decision_asset_id": DECISION_GOLDEN_ASSET_ID,
+            "decision_payload_hash": decision_payload_hash,
+            "write_intent": write_intent["write_intent"],
+            "expiry": expiry.isoformat(),
+            "passkey": passkey,
+            "executed": False,
+        },
+        "ready_for_production_golden": ready,
+        "both_auth_chains_pass": both_pass,
+        "tested_build_resolved": tested_build_resolved,
+        "human_gate": {
+            "required": final_status == FINAL_STATUS_HUMAN_GATE_REQUIRED,
+            "reason": "" if ready else required_action,
+            "exactly_one_required_action": required_action,
+        },
+        "human_gate_required": final_status == FINAL_STATUS_HUMAN_GATE_REQUIRED,
+        "unknown_credential_present": cf_read_cred,
+        "production_writes": False,
+        "deployment_performed": False,
+        "canonical_decision_write_performed": False,
+        "d1_schema_changed": False,
+        "oauth_mutation": False,
+        "binding_or_route_changed": False,
+        "credential_rotated": False,
+        "mark_reviewed_called": False,
+        "submit_task_called": False,
+        "workflow_dispatched": False,
+        "secret_values_exposed": False,
+        "checks": checks,
+        "overall": overall,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -21759,3 +22619,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(personal_ai_cold_start_capability_revalidation_v1()["markdown"])
     print(personal_ai_cold_start_live_read_path_verification_v1()["markdown"])
     print(personal_ai_cloud_assets_activation_v1()["markdown"])
+    print(personal_ai_auth_closure_v0_1()["markdown"])

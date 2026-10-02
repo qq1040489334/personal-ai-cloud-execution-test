@@ -162,6 +162,25 @@ from hello import (
     ACTIVATION_PATH_ORDER,
     ACTIVATION_STATUSES,
     ACTIVATION_EVIDENCE_SOURCES,
+    AUTH_CLOSURE_GOAL,
+    AUTH_CLOSURE_REPORT,
+    AUTH_CLOSURE_TASK_ID,
+    AUTH_CLOSURE_FINAL_STATUSES,
+    AUTH_RESULT_BLOCKED,
+    AUTH_RESULT_PASS,
+    D1_ACCOUNT_ID,
+    D1_CREDENTIAL_ENV,
+    D1_DATABASE_ID,
+    DECISION_GOLDEN_ASSET_ID,
+    FINAL_STATUS_HUMAN_GATE_REQUIRED,
+    FINAL_STATUS_READY_FOR_PRODUCTION_GOLDEN,
+    MCP_401_CLASS_NONE,
+    MCP_401_CLASS_STATIC_BEARER_MISMATCH,
+    MCP_CREDENTIAL_ENV,
+    PRODUCTION_MCP_ENDPOINT,
+    PRODUCTION_WORKER_NAME,
+    SIWC_BYPASS_TOKEN_NAME,
+    personal_ai_auth_closure_v0_1,
     personal_ai_execution_dispatch_live_failure_audit,
     personal_ai_execution_result_exposure_audit_detail_export,
     personal_ai_task_runtime_audit,
@@ -8402,3 +8421,298 @@ def test_activation_markdown_tokens() -> None:
     # Runner entry point must expose the new report.
     source = pathlib.Path(hello_module.__file__).read_text(encoding="utf-8")
     assert 'personal_ai_cloud_assets_activation_v1()["markdown"]' in source
+
+
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_AUTH_CLOSURE_V0.1
+# ---------------------------------------------------------------------------
+AUTH_CLOSURE_FAKE_ENV = {
+    D1_CREDENTIAL_ENV: "fake-d1-token-value",
+    MCP_CREDENTIAL_ENV: "fake-mcp-token-value",
+}
+
+
+def _auth_closure_ok_verifier(token):
+    return {"ok": True, "http_status": 200}
+
+
+def _auth_closure_ok_reader(account_id, database_id, token, sql):
+    return {
+        "ok": True,
+        "http_status": 200,
+        "rows": [{"name": "approval_ledger"}, {"name": "assets"}],
+    }
+
+
+def _auth_closure_ok_mcp(endpoint, token):
+    return {"ok": True, "http_status": 200, "tools": ["write_decision_record"]}
+
+
+def _auth_closure_tested_build():
+    return {
+        "commit": "a" * 40,
+        "worker_source_sha256": "b" * 64,
+        "worker_version_id": "version-under-test",
+    }
+
+
+def test_auth_closure_shape_and_constants() -> None:
+    report = personal_ai_auth_closure_v0_1(env={})
+    assert report["report"] == AUTH_CLOSURE_REPORT
+    assert report["goal"] == AUTH_CLOSURE_GOAL
+    assert report["task_id"] == AUTH_CLOSURE_TASK_ID == "cf-d12b8da2875a"
+    assert report["mode"] == "READ_ONLY"
+    assert report["final_status"] in AUTH_CLOSURE_FINAL_STATUSES
+    assert set(report) >= {
+        "report",
+        "goal",
+        "task_id",
+        "final_status",
+        "d1_auth",
+        "d1_read_probe",
+        "approval_ledger",
+        "mcp_auth",
+        "siwc_bypass_bearer_token",
+        "production_golden_prepare",
+        "ready_for_production_golden",
+        "both_auth_chains_pass",
+        "human_gate",
+        "checks",
+        "overall",
+        "markdown",
+    }
+    assert report["d1_read_probe"]["target"] == {
+        "account_id": D1_ACCOUNT_ID,
+        "database_id": D1_DATABASE_ID,
+    }
+    assert report["mcp_auth"]["endpoint"] == PRODUCTION_MCP_ENDPOINT
+    assert report["mcp_auth"]["worker"] == PRODUCTION_WORKER_NAME
+    assert report["mcp_auth"]["static_bearer_contract"] is True
+
+
+def test_auth_closure_no_credentials_fails_closed() -> None:
+    report = personal_ai_auth_closure_v0_1(env={})
+    assert report["d1_auth"]["result"] == AUTH_RESULT_BLOCKED
+    assert report["d1_auth"]["verification_attempted"] is False
+    assert report["d1_read_probe"]["result"] == AUTH_RESULT_BLOCKED
+    assert report["d1_read_probe"]["attempted"] is False
+    assert report["mcp_auth"]["result"] == AUTH_RESULT_BLOCKED
+    assert report["mcp_auth"]["probe_attempted"] is False
+    assert report["both_auth_chains_pass"] is False
+    assert report["ready_for_production_golden"] is False
+    assert report["final_status"] == FINAL_STATUS_HUMAN_GATE_REQUIRED
+    assert report["human_gate"]["required"] is True
+    assert report["human_gate"]["exactly_one_required_action"]
+    assert D1_CREDENTIAL_ENV in report["human_gate"]["exactly_one_required_action"]
+    assert MCP_CREDENTIAL_ENV in report["human_gate"]["exactly_one_required_action"]
+
+
+def test_auth_closure_never_exposes_secret_values() -> None:
+    env = {
+        D1_CREDENTIAL_ENV: "SUPER_SECRET_D1_VALUE",
+        MCP_CREDENTIAL_ENV: "SUPER_SECRET_MCP_VALUE",
+    }
+    report = personal_ai_auth_closure_v0_1(
+        env,
+        d1_token_verifier=_auth_closure_ok_verifier,
+        d1_reader=_auth_closure_ok_reader,
+        mcp_probe=_auth_closure_ok_mcp,
+        tested_build=_auth_closure_tested_build(),
+    )
+    serialized = json.dumps(report, sort_keys=True)
+    assert "SUPER_SECRET_D1_VALUE" not in serialized
+    assert "SUPER_SECRET_MCP_VALUE" not in serialized
+    assert report["secret_values_exposed"] is False
+    assert report["d1_auth"]["credential"]["present"] is True
+    assert report["d1_auth"]["credential"]["value_recorded"] is False
+    assert report["mcp_auth"]["credential"]["value_recorded"] is False
+
+
+def test_auth_closure_ready_path_with_injected_probes() -> None:
+    report = personal_ai_auth_closure_v0_1(
+        AUTH_CLOSURE_FAKE_ENV,
+        d1_token_verifier=_auth_closure_ok_verifier,
+        d1_reader=_auth_closure_ok_reader,
+        mcp_probe=_auth_closure_ok_mcp,
+        tested_build=_auth_closure_tested_build(),
+    )
+    assert report["d1_auth"]["result"] == AUTH_RESULT_PASS
+    assert report["d1_read_probe"]["result"] == AUTH_RESULT_PASS
+    assert report["mcp_auth"]["result"] == AUTH_RESULT_PASS
+    assert report["both_auth_chains_pass"] is True
+    assert report["tested_build_resolved"] is True
+    assert report["ready_for_production_golden"] is True
+    assert report["final_status"] == FINAL_STATUS_READY_FOR_PRODUCTION_GOLDEN
+
+    prepare = report["production_golden_prepare"]
+    deploy = prepare["deploy_worker_version"]
+    assert deploy["phase"] == "PREPARE"
+    assert deploy["executed"] is False
+    assert deploy["provenance"]["exact_tested_build_resolved"] is True
+    assert deploy["provenance"]["commit"] == "a" * 40
+    assert deploy["provenance"]["worker_source_sha256"] == "b" * 64
+    assert len(deploy["intent_hash"]) == 64
+
+    write = prepare["write_decision_record"]
+    assert write["phase"] == "PREPARE"
+    assert write["executed"] is False
+    assert write["asset_id"] == DECISION_GOLDEN_ASSET_ID
+    assert write["asset_type"] == "DECISION"
+    assert len(write["payload_hash"]) == 64 == len(prepare["decision_payload_hash"])
+    assert write["payload_hash"] == prepare["decision_payload_hash"]
+    assert write["canonical_decision_write_performed"] is False
+    assert prepare["expiry"]
+    assert prepare["executed"] is False
+    assert prepare["passkey"]["required"] is True
+
+
+def test_auth_closure_mcp_401_is_classified() -> None:
+    def mcp_401(endpoint, token):
+        return {"ok": False, "http_status": 401, "body": {"error": "UNAUTHORIZED"}}
+
+    report = personal_ai_auth_closure_v0_1(
+        AUTH_CLOSURE_FAKE_ENV,
+        d1_token_verifier=_auth_closure_ok_verifier,
+        d1_reader=_auth_closure_ok_reader,
+        mcp_probe=mcp_401,
+        tested_build=_auth_closure_tested_build(),
+    )
+    assert report["mcp_auth"]["result"] != AUTH_RESULT_PASS
+    assert report["mcp_auth"]["http_status"] == 401
+    assert report["mcp_auth"]["remaining_401"] is True
+    assert report["mcp_auth"]["classification"] == MCP_401_CLASS_STATIC_BEARER_MISMATCH
+    assert report["final_status"] == FINAL_STATUS_HUMAN_GATE_REQUIRED
+    action = report["human_gate"]["exactly_one_required_action"]
+    assert "MCP_AUTH_TOKEN" in action
+    assert "rotate" in action.lower()
+
+
+def test_auth_closure_oauth_challenge_classification() -> None:
+    def mcp_oauth(endpoint, token):
+        return {
+            "ok": False,
+            "http_status": 401,
+            "body": {
+                "WWW-Authenticate": (
+                    'Bearer resource_metadata="/.well-known/oauth-protected-resource"'
+                )
+            },
+        }
+
+    report = personal_ai_auth_closure_v0_1(
+        AUTH_CLOSURE_FAKE_ENV,
+        d1_token_verifier=_auth_closure_ok_verifier,
+        d1_reader=_auth_closure_ok_reader,
+        mcp_probe=mcp_oauth,
+    )
+    assert report["mcp_auth"]["classification"] == "OAUTH_REQUIRED"
+    assert report["mcp_auth"]["http_status"] == 401
+
+
+def test_auth_closure_pass_without_tested_build_is_human_gate() -> None:
+    report = personal_ai_auth_closure_v0_1(
+        AUTH_CLOSURE_FAKE_ENV,
+        d1_token_verifier=_auth_closure_ok_verifier,
+        d1_reader=_auth_closure_ok_reader,
+        mcp_probe=_auth_closure_ok_mcp,
+        tested_build=None,
+    )
+    assert report["both_auth_chains_pass"] is True
+    assert report["tested_build_resolved"] is False
+    assert report["final_status"] == FINAL_STATUS_HUMAN_GATE_REQUIRED
+    deploy = report["production_golden_prepare"]["deploy_worker_version"]
+    assert deploy["provenance"]["fail_closed"] is True
+    assert deploy["provenance"]["commit"] is None
+    action = report["human_gate"]["exactly_one_required_action"]
+    assert "tested build" in action.lower()
+
+
+def test_auth_closure_siwc_token_reported_not_rotated() -> None:
+    report = personal_ai_auth_closure_v0_1(env={})
+    siwc = report["siwc_bypass_bearer_token"]
+    assert siwc["token_name"] == SIWC_BYPASS_TOKEN_NAME
+    assert siwc["potentially_exposed"] is True
+    assert siwc["remediation_required"] is True
+    assert siwc["rotated_or_revoked"] is False
+    assert siwc["reproduced"] is False
+    assert siwc["value_exposed"] is False
+
+
+def test_auth_closure_approval_ledger_not_authorized() -> None:
+    report = personal_ai_auth_closure_v0_1(
+        AUTH_CLOSURE_FAKE_ENV,
+        d1_token_verifier=_auth_closure_ok_verifier,
+        d1_reader=_auth_closure_ok_reader,
+    )
+    ledger = report["approval_ledger"]
+    assert ledger["authorized"] is False
+    assert ledger["sequence_attempted"] is False
+    assert ledger["result"] == "NOT_RUN"
+    assert ledger["canonical_asset_tables_touched"] is False
+    assert ledger["sequence"] == [
+        "register",
+        "consume",
+        "replay",
+        "concurrency-cleanup",
+    ]
+
+
+def test_auth_closure_no_production_side_effects() -> None:
+    report = personal_ai_auth_closure_v0_1(env={})
+    for flag in (
+        "production_writes",
+        "deployment_performed",
+        "canonical_decision_write_performed",
+        "d1_schema_changed",
+        "oauth_mutation",
+        "binding_or_route_changed",
+        "credential_rotated",
+        "mark_reviewed_called",
+        "submit_task_called",
+        "workflow_dispatched",
+        "secret_values_exposed",
+    ):
+        assert report[flag] is False, flag
+    assert report["d1_read_probe"]["canonical_asset_tables_touched"] is False
+
+
+def test_auth_closure_hashes_are_deterministic() -> None:
+    kwargs = dict(
+        env=AUTH_CLOSURE_FAKE_ENV,
+        d1_token_verifier=_auth_closure_ok_verifier,
+        d1_reader=_auth_closure_ok_reader,
+        mcp_probe=_auth_closure_ok_mcp,
+        tested_build=_auth_closure_tested_build(),
+    )
+    first = personal_ai_auth_closure_v0_1(**kwargs)
+    second = personal_ai_auth_closure_v0_1(**kwargs)
+    assert (
+        first["production_golden_prepare"]["decision_payload_hash"]
+        == second["production_golden_prepare"]["decision_payload_hash"]
+    )
+    assert (
+        first["production_golden_prepare"]["deploy_worker_version"]["intent_hash"]
+        == second["production_golden_prepare"]["deploy_worker_version"]["intent_hash"]
+    )
+    for check in first["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+
+
+def test_auth_closure_markdown_tokens_and_main_exposure() -> None:
+    report = personal_ai_auth_closure_v0_1(env={})
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {AUTH_CLOSURE_REPORT}")
+    assert f"- task_id: {AUTH_CLOSURE_TASK_ID}" in markdown
+    assert f"FINAL_STATUS={report['final_status']}" in markdown
+    assert "## D1 credential verification" in markdown
+    assert "## Production MCP authentication" in markdown
+    assert "## Production golden PREPARE intents" in markdown
+    assert "## Human gate" in markdown
+    assert DECISION_GOLDEN_ASSET_ID in markdown
+    assert "production_deployment_performed: False" in markdown
+    assert "canonical_decision_write_performed: False" in markdown
+
+    source = pathlib.Path(hello_module.__file__).read_text(encoding="utf-8")
+    assert 'personal_ai_auth_closure_v0_1()["markdown"]' in source
