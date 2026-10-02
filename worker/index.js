@@ -2424,11 +2424,13 @@ async function verifyKnowledgeVersion(db, assetId, expectedVersion, expectedHash
   if (evaluation.status !== PROVENANCE_STATUS_VERIFIED || evaluation.verified !== true) return false;
   return true;
 }
-async function writeKnowledgeCandidate(env, args) {
+async function writeKnowledgeCandidate(env, args, allowed = KNOWLEDGE_ASSET_TYPE) {
   const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
-  const assetType = String(input.asset_type ?? KNOWLEDGE_ASSET_TYPE).trim().toUpperCase();
-  if (assetType !== KNOWLEDGE_ASSET_TYPE) return { isError: true, text: "INVALID_ASSET_TYPE" };
+  const assetType = String(input.asset_type ?? allowed).trim().toUpperCase();
+  // The default KNOWLEDGE entry point stays knowledge-only: assetType !== KNOWLEDGE_ASSET_TYPE
+  if (assetType !== allowed) return { isError: true, text: "INVALID_ASSET_TYPE" };
+  const contract = assetType === KNOWLEDGE_ASSET_TYPE ? KNOWLEDGE_WRITE_CONTRACT : "PERSONAL_AI_SKILL_CANDIDATE_WRITER_V0.1";
   const assetId = String(input.asset_id ?? input.candidate_id ?? "").trim();
   if (!ASSET_ID_RE.test(assetId)) return { isError: true, text: "INVALID_ASSET_ID" };
   const title = String(input.title ?? "").trim().slice(0, KNOWLEDGE_WRITE_LIMITS.title);
@@ -2453,9 +2455,9 @@ async function writeKnowledgeCandidate(env, args) {
     const present = await verifyKnowledgeVersion(db, assetId, currentVersion, contentHash, canonicalContent);
     if (!present) return { isError: true, text: "ASSET_WRITE_FAILED" };
     const replay = {
-      contract: KNOWLEDGE_WRITE_CONTRACT,
+      contract,
       asset_id: assetId,
-      asset_type: KNOWLEDGE_ASSET_TYPE,
+      asset_type: assetType,
       status: "IDEMPOTENT",
       created: false,
       idempotent: true,
@@ -2483,7 +2485,7 @@ async function writeKnowledgeCandidate(env, args) {
     "UPDATE assets SET schema_version = ?, title = ?, status = ?, current_version = ?, content_hash = ?, updated_at = ? WHERE asset_id = ?"
   ).bind(schemaVersion, title, KNOWLEDGE_WRITE_STATUS, version, contentHash, nowIso, assetId) : db.prepare(
     "INSERT INTO assets (asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  ).bind(assetId, KNOWLEDGE_ASSET_TYPE, schemaVersion, title, KNOWLEDGE_WRITE_STATUS, version, contentHash, nowIso, nowIso);
+  ).bind(assetId, assetType, schemaVersion, title, KNOWLEDGE_WRITE_STATUS, version, contentHash, nowIso, nowIso);
   const versionWrite = db.prepare(KNOWLEDGE_VERSION_INSERT).bind(
     assetId,
     version,
@@ -2503,9 +2505,9 @@ async function writeKnowledgeCandidate(env, args) {
   const persisted = await verifyKnowledgeVersion(db, assetId, version, contentHash, canonicalContent);
   if (!persisted) return { isError: true, text: "ASSET_WRITE_FAILED" };
   const result = {
-    contract: KNOWLEDGE_WRITE_CONTRACT,
+    contract,
     asset_id: assetId,
-    asset_type: KNOWLEDGE_ASSET_TYPE,
+    asset_type: assetType,
     schema_version: schemaVersion,
     title,
     status: "WRITTEN",
@@ -2521,6 +2523,9 @@ async function writeKnowledgeCandidate(env, args) {
     updated_at: nowIso
   };
   return { isError: false, text: JSON.stringify(result), structuredContent: result };
+}
+async function writeSkillCandidate(env, args) {
+  return writeKnowledgeCandidate(env, args, "SKILL");
 }
 async function toolWriteKnowledgeCandidate(env, args) {
   try {
