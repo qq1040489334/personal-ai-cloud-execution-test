@@ -9155,3 +9155,341 @@ def test_reality_candidate_writer_markdown_and_main_entrypoint() -> None:
 
     source = pathlib.Path(hello_module.__file__).read_text(encoding="utf-8")
     assert 'personal_ai_reality_candidate_writer_spec_v0_1()["markdown"]' in source
+
+
+def _adapter_candidates() -> dict:
+    return {
+        "KNOWLEDGE": _routing_candidate(
+            candidate_id="cand-adapter-k", message_id="msg-adapter-k"
+        ),
+        "SKILL": _routing_candidate(
+            candidate_id="cand-adapter-s",
+            message_id="msg-adapter-s",
+            classification="skill",
+            content={"steps": ["a", "b"]},
+        ),
+        "DECISION": _routing_candidate(
+            candidate_id="cand-adapter-d",
+            message_id="msg-adapter-d",
+            classification="decision",
+            content={"decision": "PROMOTE"},
+            decision=_writer_decision_input(),
+        ),
+    }
+
+
+def test_reality_candidate_writer_adapter_report_passes_and_is_non_production() -> None:
+    report = hello_module.personal_ai_reality_candidate_writer_adapter_v0_1()
+    assert report["status"] == "PASS"
+    assert report["overall"] == "PASS"
+    assert report["FINAL_STATUS"] == "PASS"
+    assert report["task_id"] == "cf-e32660953255"
+    assert report["contract"] == (
+        "PERSONAL_AI_REALITY_CANDIDATE_WRITER_ADAPTER_V0.1"
+    )
+    assert report["spec_contract"] == (
+        "PERSONAL_AI_REALITY_CANDIDATE_WRITER_SPEC_V0.1"
+    )
+    assert report["mode"] == "SIMULATION"
+    assert report["human_gate"] == (
+        "HUMAN_GATE_REALITY_CANDIDATE_CANONICAL_WRITE_V0.1"
+    )
+    assert report["delegated_targets"] == ["DECISION", "KNOWLEDGE", "SKILL"]
+    for flag in (
+        "canonical_write_enabled",
+        "canonical_write_performed",
+        "canonical_reality_write_performed",
+        "production_reached",
+        "network_used",
+        "production_writes",
+        "deployment_performed",
+        "credential_changes",
+        "oauth_mutation",
+        "d1_schema_changed",
+        "site_config_changed",
+        "mark_reviewed_called",
+        "submit_task_called",
+        "workflow_dispatched",
+        "personos_resurrected",
+        "second_state_store",
+    ):
+        assert report[flag] is False, flag
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+
+
+def test_reality_candidate_writer_adapter_prepare_is_zero_mutation() -> None:
+    candidates = _adapter_candidates()
+    adapter = hello_module.RealityCandidateWriterAdapter(
+        {
+            target: hello_module.make_reality_simulation_writer(target)
+            for target in hello_module.REALITY_WRITER_TARGET_ASSET_TYPES
+        }
+    )
+    for target, candidate in candidates.items():
+        first = adapter.prepare(candidate)
+        second = adapter.prepare(
+            hello_module._cloud_asset_fixture_candidate(
+                candidate["candidate_id"],
+                candidate["message_id"],
+                candidate["classification"],
+                candidate["confidence"],
+                candidate["content"],
+                decision=candidate.get("decision"),
+            )
+        )
+        assert first["phase"] == "PREPARE"
+        assert first["status"] == "PREPARED"
+        assert first["phase_prepare_mutated_canonical"] is False
+        assert first["canonical_write_enabled"] is False
+        assert first["canonical_write_performed"] is False
+        assert first["requires_human_gate"] is True
+        assert first["intent_hash"] == second["intent_hash"]
+        assert first["write_request"] is not None
+
+
+def test_reality_candidate_writer_adapter_delegates_three_targets() -> None:
+    candidates = _adapter_candidates()
+    writers = {
+        target: hello_module.make_reality_simulation_writer(target)
+        for target in hello_module.REALITY_WRITER_TARGET_ASSET_TYPES
+    }
+    adapter = hello_module.RealityCandidateWriterAdapter(writers)
+    for target, candidate in candidates.items():
+        plan = adapter.prepare(candidate)
+        outcome = adapter.execute(plan, candidate, human_gate_authorized=True)
+        assert outcome["status"] == "SIMULATED"
+        assert outcome["delegated"] is True
+        assert outcome["target_asset_type"] == target
+        assert outcome["canonical_writer"] == (
+            hello_module.REALITY_WRITER_ENTRYPOINTS[target]
+        )
+        assert outcome["canonical_writer_contract"] == (
+            hello_module.REALITY_WRITER_CONTRACTS[target]
+        )
+        assert outcome["canonical_write_enabled"] is False
+        assert outcome["canonical_write_performed"] is False
+        assert outcome["production_reached"] is False
+        assert outcome["network_used"] is False
+        request = outcome["delegation_request"]
+        assert request is not None
+        assert request["asset_type"] == target
+        assert request["content_hash"] == plan["content_hash"]
+        assert request["intent_hash"] == plan["intent_hash"]
+        assert len(writers[target].calls) == 1
+        assert writers[target].calls[0]["target"] == target
+    assert [call["canonical_writer"] for call in adapter.calls] == [
+        "writeKnowledgeCandidate",
+        "writeSkillCandidate",
+        "writeDecisionRecord",
+    ]
+
+
+def test_reality_candidate_writer_adapter_replay_and_version_intent() -> None:
+    candidate = _routing_candidate(
+        candidate_id="cand-adapter-replay", message_id="msg-adapter-replay"
+    )
+    adapter = hello_module.RealityCandidateWriterAdapter(
+        {
+            "KNOWLEDGE": hello_module.make_reality_simulation_writer("KNOWLEDGE"),
+        }
+    )
+    first = adapter.prepare(candidate)
+    again = adapter.prepare(
+        _routing_candidate(
+            candidate_id="cand-adapter-replay", message_id="msg-adapter-replay"
+        )
+    )
+    assert first["intent_hash"] == again["intent_hash"]
+    assert first["idempotency_key"] == again["idempotency_key"]
+
+    admit = adapter.admit(first)
+    replay = adapter.admit(again)
+    assert admit["status"] == "PREPARED"
+    assert replay["status"] == "IDEMPOTENT"
+    assert replay["idempotent"] is True
+    assert replay["version"] == admit["version"]
+    assert replay["canonical_write_performed"] is False
+
+    same_hash = adapter.prepare(
+        candidate,
+        existing_asset={
+            "current_version": 3,
+            "content_hash": first["content_hash"],
+        },
+    )
+    assert same_hash["status"] == "IDEMPOTENT"
+    assert same_hash["proposed_version"] == 3
+    changed_hash = adapter.prepare(
+        candidate,
+        existing_asset={"current_version": 3, "content_hash": "0" * 64},
+    )
+    assert changed_hash["status"] == "PREPARED"
+    assert changed_hash["proposed_version"] == 4
+    assert changed_hash["write_request"]["supersedes"] == [3]
+
+
+def test_reality_candidate_writer_adapter_fail_closed_and_allowlist() -> None:
+    adapter = hello_module.RealityCandidateWriterAdapter(
+        {
+            "KNOWLEDGE": hello_module.make_reality_simulation_writer("KNOWLEDGE"),
+        }
+    )
+    low = _routing_candidate(confidence=0.2)
+    missing_message = _routing_candidate()
+    missing_message["message_id"] = None
+    bad_provenance = _routing_candidate()
+    bad_provenance["provenance"] = {"promotion": {"decision": "PROMOTE"}}
+    unknown = _routing_candidate(classification="opinion")
+    for candidate in (
+        low,
+        missing_message,
+        bad_provenance,
+        unknown,
+        "not-a-candidate",
+    ):
+        plan = adapter.prepare(candidate)
+        assert plan["status"] == "QUARANTINED"
+        assert plan["write_request"] is None
+        outcome = adapter.execute(plan, candidate, human_gate_authorized=True)
+        assert outcome["status"] == "QUARANTINED"
+        assert outcome["delegated"] is False
+        assert outcome["canonical_write_performed"] is False
+
+    good = _routing_candidate(candidate_id="cand-adapter-allow")
+    plan = adapter.prepare(good)
+    disallowed = dict(plan)
+    disallowed["target_asset_type"] = "REALITY"
+    disallowed["write_request"] = dict(plan["write_request"])
+    disallowed["write_request"]["asset_type"] = "REALITY"
+    refused = adapter.execute(
+        disallowed, good, human_gate_authorized=True
+    )
+    assert refused["status"] == "QUARANTINED"
+    assert refused["delegated"] is False
+    assert "allow" in refused["reasons"][0]
+
+
+def test_reality_candidate_writer_adapter_refuses_production_execution() -> None:
+    candidate = _routing_candidate(candidate_id="cand-adapter-prod")
+    adapter = hello_module.RealityCandidateWriterAdapter(
+        {
+            "KNOWLEDGE": hello_module.make_reality_simulation_writer("KNOWLEDGE"),
+        }
+    )
+    plan = adapter.prepare(candidate)
+
+    blocked = adapter.execute(plan, candidate)
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["delegated"] is False
+    assert blocked["canonical_write_performed"] is False
+    assert blocked["production_reached"] is False
+    assert hello_module.REALITY_WRITER_HUMAN_GATE in blocked["reasons"][-1]
+
+    with pytest.raises(PermissionError):
+        hello_module.RealityCandidateWriterAdapter(production=True)
+
+    with pytest.raises(PermissionError):
+        hello_module.RealityCandidateWriterAdapter(
+            {"KNOWLEDGE": lambda request: None}
+        )
+
+    def _production_writer(request):
+        return {}
+
+    setattr(
+        _production_writer,
+        hello_module.REALITY_ADAPTER_PRODUCTION_ATTR,
+        True,
+    )
+    with pytest.raises(PermissionError):
+        hello_module.RealityCandidateWriterAdapter(
+            {"KNOWLEDGE": _production_writer}
+        )
+    with pytest.raises(PermissionError):
+        hello_module.mark_reality_simulation_writer(_production_writer)
+
+    simulated = hello_module.execute_reality_candidate_write_simulation(
+        plan,
+        candidate,
+        {
+            "KNOWLEDGE": hello_module.make_reality_simulation_writer("KNOWLEDGE"),
+        },
+        human_gate_authorized=True,
+    )
+    assert simulated["status"] == "SIMULATED"
+    assert simulated["production_reached"] is False
+
+
+def test_reality_candidate_writer_adapter_preserves_identity_and_provenance() -> None:
+    candidate = _routing_candidate(
+        candidate_id="cand-adapter-identity", message_id="msg-adapter-identity"
+    )
+    writer = hello_module.make_reality_simulation_writer("KNOWLEDGE")
+    adapter = hello_module.RealityCandidateWriterAdapter({"KNOWLEDGE": writer})
+    plan = adapter.prepare(candidate)
+    assert plan["candidate_id"] == "cand-adapter-identity"
+    assert plan["message_id"] == "msg-adapter-identity"
+    assert plan["source_identity"] == "reality:cand-adapter-identity"
+    evidence = plan["audit_evidence"]
+    assert evidence["provenance_contract"] == (
+        "PERSONAL_AI_ASSET_PROVENANCE_V0.2"
+    )
+    assert evidence["provenance_status"] == "VERIFIED"
+    assert evidence["source_identity"] == "reality:cand-adapter-identity"
+    assert evidence["intent_hash"] == plan["intent_hash"]
+
+    outcome = adapter.execute(plan, candidate, human_gate_authorized=True)
+    request = outcome["delegation_request"]
+    assert request["candidate_id"] == "cand-adapter-identity"
+    assert request["source_identity"] == "reality:cand-adapter-identity"
+    assert request["message_id"] == "msg-adapter-identity"
+    assert request["idempotency_key"] == plan["idempotency_key"]
+    assert request["provenance"] == candidate["provenance"]
+
+
+def test_reality_candidate_writer_adapter_decision_reuses_ingestion_contract() -> None:
+    candidate = _routing_candidate(
+        candidate_id="cand-adapter-dec",
+        message_id="msg-adapter-dec",
+        classification="decision",
+        content={"decision": "PROMOTE"},
+        decision=_writer_decision_input(),
+    )
+    adapter = hello_module.RealityCandidateWriterAdapter(
+        {
+            "DECISION": hello_module.make_reality_simulation_writer("DECISION"),
+        }
+    )
+    plan = adapter.prepare(candidate)
+    outcome = adapter.execute(plan, candidate, human_gate_authorized=True)
+    request = outcome["delegation_request"]
+    assert request["asset_id"].startswith("decision:")
+    assert request["decision_id"]
+    assert request["review_verdict"] == "PASS"
+    assert request["dispatch_outcome"] == "DISPATCHED"
+    assert request["promotion_decision"] == "PROMOTE"
+    assert request["user_choice"] == "PROMOTE"
+    assert request["user_outcome"] == "GOLDEN_PENDING"
+    assert outcome["canonical_writer"] == "writeDecisionRecord"
+
+
+def test_reality_candidate_writer_adapter_markdown_and_main_entrypoint() -> None:
+    report = hello_module.personal_ai_reality_candidate_writer_adapter_v0_1()
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {hello_module.REALITY_ADAPTER_REPORT}")
+    assert f"- task_id: {hello_module.REALITY_ADAPTER_TASK_ID}" in markdown
+    assert f"FINAL_STATUS={report['status']}" in markdown
+    assert "## PREPARE delegation" in markdown
+    assert "## EXECUTE simulation (non-production)" in markdown
+    assert "## Idempotency / replay" in markdown
+    assert "canonical_write_performed: False" in markdown
+    assert "production_reached: False" in markdown
+
+    source = pathlib.Path(hello_module.__file__).read_text(encoding="utf-8")
+    assert (
+        'personal_ai_reality_candidate_writer_adapter_v0_1()["markdown"]'
+        in source
+    )

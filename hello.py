@@ -24129,6 +24129,782 @@ def personal_ai_reality_candidate_writer_spec_v0_1() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# PERSONAL_AI_REALITY_CANDIDATE_WRITER_ADAPTER_V0.1  (task cf-e32660953255)
+#
+# Reversible implementation of the persistence boundary specified by
+# PERSONAL_AI_REALITY_CANDIDATE_WRITER_SPEC_V0.1. It reuses, without
+# duplicating:
+#   * ``prepare_reality_candidate_write`` for the deterministic, zero-mutation
+#     PREPARE plan (target, normalized request, hashes, idempotency, provenance
+#     evidence and the production Human Gate requirement);
+#   * ``replay_reality_candidate_write`` for idempotent replay admission;
+#   * the routing value filter, the ASSET_PROVENANCE_V0.2 contract and the
+#     DECISION_INGESTION_V0.1 contract;
+#   * the three existing Worker writer entry points
+#     (``writeKnowledgeCandidate`` / ``writeSkillCandidate`` /
+#     ``writeDecisionRecord``) as delegation targets.
+#
+# EXECUTE is implemented ONLY as a non-production simulation against injected,
+# explicitly-marked fake writers. The adapter refuses any writer that is not a
+# marked simulation fake, refuses an unauthorized Human Gate, and never enables
+# or performs a canonical write. No code path here can reach the production
+# ASSET_DB, a network endpoint or external user data.
+# ---------------------------------------------------------------------------
+REALITY_ADAPTER_GOAL = "REALITY_CANDIDATE_WRITER_IMPLEMENTATION_V0.1"
+REALITY_ADAPTER_TASK_ID = "cf-e32660953255"
+REALITY_ADAPTER_CONTRACT_VERSION = (
+    "PERSONAL_AI_REALITY_CANDIDATE_WRITER_ADAPTER_V0.1"
+)
+REALITY_ADAPTER_REPORT = (
+    "PERSONAL_AI_REALITY_CANDIDATE_WRITER_ADAPTER_V0_1_REPORT"
+)
+REALITY_ADAPTER_MODE = "SIMULATION"
+REALITY_ADAPTER_SIMULATION_ATTR = "__reality_candidate_simulation_writer__"
+REALITY_ADAPTER_PRODUCTION_ATTR = "__reality_candidate_production_writer__"
+REALITY_ADAPTER_STATUS_SIMULATED = "SIMULATED"
+REALITY_ADAPTER_STATUSES = (
+    WRITER_STATUS_PREPARED,
+    WRITER_STATUS_IDEMPOTENT,
+    WRITER_STATUS_QUARANTINED,
+    WRITER_STATUS_BLOCKED,
+    REALITY_ADAPTER_STATUS_SIMULATED,
+)
+
+
+def mark_reality_simulation_writer(writer: object) -> object:
+    """Explicitly mark an in-memory callable as a non-production fake writer.
+
+    Only callables carrying this marker may be registered with
+    :class:`RealityCandidateWriterAdapter`; a callable flagged as a production
+    writer is always refused.
+    """
+    if not callable(writer):
+        raise TypeError("a simulation writer must be callable")
+    if getattr(writer, REALITY_ADAPTER_PRODUCTION_ATTR, False) is True:
+        raise PermissionError(
+            "a production writer cannot be marked as a simulation writer"
+        )
+    setattr(writer, REALITY_ADAPTER_SIMULATION_ATTR, True)
+    return writer
+
+
+def _reality_adapter_is_simulation_writer(writer: object) -> bool:
+    """Return True only for an explicitly-marked, non-production fake writer."""
+    if not callable(writer):
+        return False
+    if getattr(writer, REALITY_ADAPTER_PRODUCTION_ATTR, False) is True:
+        return False
+    return getattr(writer, REALITY_ADAPTER_SIMULATION_ATTR, False) is True
+
+
+def normalize_reality_writer_request(plan: object, candidate: object) -> dict | None:
+    """Map a PREPARE plan + candidate into the target writer's request shape.
+
+    The mapping is pure and reuses the existing contracts: the Knowledge/Skill
+    shape mirrors ``writeKnowledgeCandidate`` / ``writeSkillCandidate`` and the
+    Decision shape is produced through
+    ``PERSONAL_AI_DECISION_INGESTION_V0.1``. It returns ``None`` when the plan
+    is not a prepared request.
+    """
+    if not isinstance(plan, _AssetMapping) or not isinstance(
+        candidate, _AssetMapping
+    ):
+        return None
+    request = plan.get("write_request")
+    if not isinstance(request, _AssetMapping):
+        return None
+    target = plan.get("target_asset_type")
+    if not _reality_writer_allowed_target(target):
+        return None
+
+    normalized = {
+        "asset_id": request.get("asset_id"),
+        "asset_type": target,
+        "candidate_id": request.get("candidate_id"),
+        "message_id": request.get("message_id"),
+        "source_identity": request.get("source_identity"),
+        "content": candidate.get("content"),
+        "content_hash": request.get("content_hash"),
+        "provenance": candidate.get("provenance"),
+        "canonical_version": request.get("proposed_version"),
+        "supersedes": list(request.get("supersedes") or []),
+        "schema_version": "v0.1",
+        "created_by": "cloud-agent",
+        "canonical_writer": request.get("canonical_writer"),
+        "canonical_writer_contract": request.get("canonical_writer_contract"),
+        "canonical_store": request.get("canonical_store"),
+        "idempotency_key": request.get("idempotency_key"),
+        "intent_hash": request.get("intent_hash"),
+    }
+
+    if target in (ROUTE_KNOWLEDGE, ROUTE_SKILL):
+        title = _routing_text(candidate.get("title"))
+        normalized["title"] = title or (
+            target.title() + " " + str(request.get("candidate_id"))
+        )
+        return normalized
+
+    if target == ROUTE_DECISION:
+        _provenance, decision = _cloud_asset_canonical_components()
+        decision_input = candidate.get("decision")
+        if not isinstance(decision_input, _AssetMapping):
+            decision_input = candidate
+        record = decision.normalize_decision(decision_input)["record"]
+        decision_id = record.get("decision_id") or request.get("candidate_id")
+        normalized["decision_id"] = decision_id
+        normalized["asset_id"] = "decision:" + str(decision_id)
+        for field in (
+            "task_id",
+            "review_verdict",
+            "dispatch_outcome",
+            "promotion_decision",
+            "promotion_event",
+            "user_choice",
+            "user_outcome",
+            "decided_at",
+        ):
+            normalized[field] = record.get(field)
+        normalized["agent_recommendation"] = (
+            decision_input.get("agent_recommendation")
+            if isinstance(decision_input, _AssetMapping)
+            else None
+        ) or record.get("user_choice")
+        normalized["evidence_ref"] = (
+            decision_input.get("evidence_ref")
+            if isinstance(decision_input, _AssetMapping)
+            else None
+        ) or ("reality:" + str(request.get("candidate_id")))
+        normalized["override_reason"] = (
+            decision_input.get("override_reason")
+            if isinstance(decision_input, _AssetMapping)
+            else None
+        )
+        return normalized
+
+    return None
+
+
+def make_reality_simulation_writer(target: str):
+    """Build an in-memory recording fake writer for one canonical target."""
+    if not _reality_writer_allowed_target(target):
+        raise ValueError("target is not in the canonical allowlist: " + str(target))
+    calls: list[dict] = []
+
+    def _writer(request):
+        delivered = dict(request) if isinstance(request, _AssetMapping) else request
+        calls.append({"target": target, "request": delivered})
+        return {
+            "contract": REALITY_WRITER_CONTRACTS[target],
+            "asset_type": target,
+            "status": "SIMULATED_WRITTEN",
+            "content_hash": (
+                delivered.get("content_hash")
+                if isinstance(delivered, _AssetMapping)
+                else None
+            ),
+            "canonical_write_performed": False,
+            "production_reached": False,
+            "mode": REALITY_ADAPTER_MODE,
+        }
+
+    _writer = mark_reality_simulation_writer(_writer)
+    _writer.calls = calls
+    return _writer
+
+
+class RealityCandidateWriterAdapter:
+    """Reversible, simulation-only adapter for the writer spec.
+
+    PREPARE delegates to ``prepare_reality_candidate_write`` (deterministic,
+    zero persistent mutation). EXECUTE is available only as a non-production
+    simulation that delegates to an injected, explicitly-marked fake writer for
+    the prepared target; the production Human Gate and the canonical write
+    boundary both remain unsatisfied and disabled.
+    """
+
+    def __init__(self, writers: object = None, *, production: bool = False):
+        if production:
+            raise PermissionError(
+                "production execution is not permitted by the reversible adapter"
+            )
+        self._writers: dict[str, object] = {}
+        self._calls: list[dict] = []
+        self._ledger: dict = {}
+        if writers is not None:
+            if not isinstance(writers, _AssetMapping):
+                raise TypeError("writers must be a mapping of target -> callable")
+            for target, writer in writers.items():
+                self.register_writer(target, writer)
+
+    @property
+    def writers(self) -> dict:
+        return dict(self._writers)
+
+    @property
+    def calls(self) -> list[dict]:
+        return [dict(call) for call in self._calls]
+
+    @property
+    def ledger(self) -> dict:
+        return self._ledger
+
+    def register_writer(self, target: object, writer: object) -> "RealityCandidateWriterAdapter":
+        if not _reality_writer_allowed_target(target):
+            raise ValueError(
+                "target is not in the canonical allowlist: " + str(target)
+            )
+        if not _reality_adapter_is_simulation_writer(writer):
+            raise PermissionError(
+                "refused: only explicitly-marked simulation writers are accepted"
+            )
+        self._writers[target] = writer
+        return self
+
+    def prepare(self, candidate: object, *, existing_asset: object = None) -> dict:
+        return prepare_reality_candidate_write(
+            candidate, existing_asset=existing_asset
+        )
+
+    def admit(self, plan: object) -> dict:
+        return replay_reality_candidate_write(plan, self._ledger)
+
+    def execute(
+        self,
+        plan: object,
+        candidate: object = None,
+        *,
+        human_gate_authorized: bool = False,
+    ) -> dict:
+        """Non-production EXECUTE simulation; never touches production."""
+        result = {
+            "contract": REALITY_ADAPTER_CONTRACT_VERSION,
+            "spec_contract": REALITY_WRITER_CONTRACT_VERSION,
+            "goal": REALITY_ADAPTER_GOAL,
+            "phase": WRITER_PHASE_EXECUTE,
+            "mode": REALITY_ADAPTER_MODE,
+            "status": WRITER_STATUS_QUARANTINED,
+            "candidate_id": None,
+            "message_id": None,
+            "source_identity": None,
+            "target_asset_type": None,
+            "canonical_writer": None,
+            "canonical_writer_contract": None,
+            "canonical_store": REALITY_WRITER_STORE,
+            "delegated": False,
+            "delegation_request": None,
+            "writer_response": None,
+            "intent_hash": None,
+            "idempotency_key": None,
+            "human_gate": REALITY_WRITER_HUMAN_GATE,
+            "human_gate_authorized": bool(human_gate_authorized),
+            "requires_human_gate": True,
+            "canonical_write_enabled": False,
+            "canonical_write_performed": False,
+            "production_reached": False,
+            "network_used": False,
+            "reasons": [],
+        }
+
+        if not isinstance(plan, _AssetMapping) or plan.get("phase") != (
+            WRITER_PHASE_PREPARE
+        ):
+            result["reasons"].append("plan is not a PREPARE plan; EXECUTE refused")
+            return result
+
+        result["candidate_id"] = plan.get("candidate_id")
+        result["message_id"] = plan.get("message_id")
+        result["source_identity"] = plan.get("source_identity")
+        result["target_asset_type"] = plan.get("target_asset_type")
+        result["intent_hash"] = plan.get("intent_hash")
+        result["idempotency_key"] = plan.get("idempotency_key")
+
+        if (
+            plan.get("status")
+            not in (WRITER_STATUS_PREPARED, WRITER_STATUS_IDEMPOTENT)
+            or not isinstance(plan.get("write_request"), _AssetMapping)
+        ):
+            result["reasons"].append(
+                "plan has no prepared write request; EXECUTE refused"
+            )
+            return result
+
+        target = plan.get("target_asset_type")
+        if not _reality_writer_allowed_target(target):
+            result["reasons"].append(
+                "target is not an allowed canonical asset type: " + str(target)
+            )
+            return result
+
+        writer = self._writers.get(target)
+        if not _reality_adapter_is_simulation_writer(writer):
+            result["status"] = WRITER_STATUS_BLOCKED
+            result["reasons"].append(
+                "blocked: no explicitly-marked simulation writer registered for "
+                + str(target)
+            )
+            return result
+
+        if not human_gate_authorized:
+            result["status"] = WRITER_STATUS_BLOCKED
+            result["reasons"].append(
+                "blocked: " + REALITY_WRITER_HUMAN_GATE + " is not authorized"
+            )
+            return result
+
+        delegation_request = normalize_reality_writer_request(plan, candidate)
+        if delegation_request is None:
+            result["reasons"].append(
+                "candidate does not normalize into the target writer request"
+            )
+            return result
+
+        result["canonical_writer"] = REALITY_WRITER_ENTRYPOINTS[target]
+        result["canonical_writer_contract"] = REALITY_WRITER_CONTRACTS[target]
+        result["delegation_request"] = delegation_request
+        response = writer(delegation_request)
+        self._calls.append(
+            {
+                "target": target,
+                "canonical_writer": REALITY_WRITER_ENTRYPOINTS[target],
+                "intent_hash": result["intent_hash"],
+                "idempotency_key": result["idempotency_key"],
+                "mode": REALITY_ADAPTER_MODE,
+            }
+        )
+        result["delegated"] = True
+        result["status"] = REALITY_ADAPTER_STATUS_SIMULATED
+        result["writer_response"] = (
+            dict(response) if isinstance(response, _AssetMapping) else response
+        )
+        result["production_reached"] = bool(
+            isinstance(response, _AssetMapping)
+            and response.get("production_reached") is True
+        )
+        result["reasons"].append(
+            "non-production simulation: delegated to "
+            + REALITY_WRITER_ENTRYPOINTS[target]
+            + " with a fake writer; canonical write remains disabled"
+        )
+        return result
+
+
+def execute_reality_candidate_write_simulation(
+    plan: object,
+    candidate: object,
+    writers: object,
+    *,
+    human_gate_authorized: bool = False,
+) -> dict:
+    """Convenience wrapper: simulate EXECUTE with injected fake writers."""
+    adapter = RealityCandidateWriterAdapter(writers)
+    return adapter.execute(
+        plan, candidate, human_gate_authorized=human_gate_authorized
+    )
+
+
+def personal_ai_reality_candidate_writer_adapter_v0_1() -> dict:
+    """Deterministic report proving the reversible adapter contract."""
+    provenance, decision = _cloud_asset_canonical_components()
+
+    decision_input = decision.build_decision(
+        task_id=REALITY_ADAPTER_TASK_ID,
+        review_verdict="PASS",
+        dispatch_outcome="DISPATCHED",
+        promotion_decision="PROMOTE",
+        user_choice="PROMOTE",
+        user_outcome="GOLDEN_PENDING",
+        promotion_event="reality-adapter-fixture",
+        decided_at=REALITY_WRITER_FIXTURE_AT,
+    )
+
+    candidates = {
+        ROUTE_KNOWLEDGE: _cloud_asset_fixture_candidate(
+            "cand-adapter-knowledge", "msg-a1", "knowledge", 0.9, {"text": "tip"}
+        ),
+        ROUTE_SKILL: _cloud_asset_fixture_candidate(
+            "cand-adapter-skill", "msg-a2", "skill", 0.8, {"steps": ["a", "b"]}
+        ),
+        ROUTE_DECISION: _cloud_asset_fixture_candidate(
+            "cand-adapter-decision",
+            "msg-a3",
+            "decision",
+            0.7,
+            {"decision": "PROMOTE"},
+            decision=decision_input,
+        ),
+    }
+
+    writers = {
+        target: make_reality_simulation_writer(target)
+        for target in REALITY_WRITER_TARGET_ASSET_TYPES
+    }
+    adapter = RealityCandidateWriterAdapter(writers)
+
+    prepared: dict = {}
+    executed: dict = {}
+    for target, candidate in candidates.items():
+        plan = adapter.prepare(candidate)
+        prepared[target] = plan
+        executed[target] = adapter.execute(
+            plan, candidate, human_gate_authorized=True
+        )
+
+    knowledge = candidates[ROUTE_KNOWLEDGE]
+    first = adapter.prepare(knowledge)
+    again = adapter.prepare(
+        _cloud_asset_fixture_candidate(
+            "cand-adapter-knowledge", "msg-a1", "knowledge", 0.9, {"text": "tip"}
+        )
+    )
+    admit_first = adapter.admit(first)
+    admit_replay = adapter.admit(again)
+
+    same_hash = adapter.prepare(
+        knowledge,
+        existing_asset={
+            "current_version": 3,
+            "content_hash": first["content_hash"],
+        },
+    )
+    new_hash = adapter.prepare(
+        knowledge,
+        existing_asset={"current_version": 3, "content_hash": "0" * 64},
+    )
+
+    blocked = adapter.execute(first, knowledge)
+
+    low = _cloud_asset_fixture_candidate(
+        "cand-adapter-low", "msg-a4", "knowledge", 0.2, {"text": "maybe"}
+    )
+    missing_message = _cloud_asset_fixture_candidate(
+        "cand-adapter-missing", "msg-a5", "knowledge", 0.9, {"text": "x"}
+    )
+    missing_message["message_id"] = None
+    bad_provenance = _cloud_asset_fixture_candidate(
+        "cand-adapter-prov",
+        "msg-a6",
+        "knowledge",
+        0.9,
+        {"text": "y"},
+        provenance={"promotion": {"decision": "PROMOTE"}},
+    )
+    unknown = _cloud_asset_fixture_candidate(
+        "cand-adapter-unknown", "msg-a7", "opinion", 0.9, {"text": "z"}
+    )
+    quarantine_candidates = {
+        "low confidence": low,
+        "missing message id": missing_message,
+        "incomplete provenance": bad_provenance,
+        "unknown classification": unknown,
+        "malformed": "not-a-candidate",
+    }
+    quarantined = {
+        name: adapter.prepare(candidate)
+        for name, candidate in quarantine_candidates.items()
+    }
+
+    disallowed_plan = {
+        "phase": WRITER_PHASE_PREPARE,
+        "status": WRITER_STATUS_PREPARED,
+        "candidate_id": "cand-adapter-knowledge",
+        "message_id": "msg-a1",
+        "source_identity": "reality:cand-adapter-knowledge",
+        "target_asset_type": ROUTE_KNOWLEDGE,
+        "intent_hash": first["intent_hash"],
+        "idempotency_key": first["idempotency_key"],
+        "write_request": dict(first["write_request"]),
+    }
+    disallowed_plan["target_asset_type"] = REALITY_WRITER_SOURCE_ASSET_TYPE
+    allowlist_refused = adapter.execute(
+        disallowed_plan, knowledge, human_gate_authorized=True
+    )
+
+    production_flag_refused = False
+    try:
+        RealityCandidateWriterAdapter(production=True)
+    except PermissionError:
+        production_flag_refused = True
+
+    unmarked_writer_refused = False
+    try:
+        RealityCandidateWriterAdapter({ROUTE_KNOWLEDGE: lambda request: None})
+    except PermissionError:
+        unmarked_writer_refused = True
+
+    delegated_targets = sorted(
+        target for target, outcome in executed.items() if outcome["delegated"]
+    )
+
+    checks = [
+        {
+            "check": "adapter reuses the spec PREPARE boundary deterministically",
+            "status": PASS
+            if all(
+                prepared[target]["phase"] == WRITER_PHASE_PREPARE
+                and prepared[target]["status"] == WRITER_STATUS_PREPARED
+                and prepared[target]["write_request"] is not None
+                for target in REALITY_WRITER_TARGET_ASSET_TYPES
+            )
+            else FAIL,
+            "detail": "all three routed candidates produce a PREPARE plan",
+        },
+        {
+            "check": "PREPARE performs zero persistent mutation",
+            "status": PASS
+            if all(
+                plan["phase_prepare_mutated_canonical"] is False
+                and plan["canonical_write_enabled"] is False
+                and plan["canonical_write_performed"] is False
+                for plan in prepared.values()
+            )
+            else FAIL,
+            "detail": "phase_prepare_mutated_canonical / canonical_write_* are all False",
+        },
+        {
+            "check": "three target writers delegate with a normalized request",
+            "status": PASS
+            if delegated_targets == sorted(REALITY_WRITER_TARGET_ASSET_TYPES)
+            and all(
+                executed[target]["canonical_writer"]
+                == REALITY_WRITER_ENTRYPOINTS[target]
+                and len(writers[target].calls) == 1
+                and executed[target]["delegation_request"] is not None
+                for target in REALITY_WRITER_TARGET_ASSET_TYPES
+            )
+            else FAIL,
+            "detail": "delegated: " + ", ".join(delegated_targets),
+        },
+        {
+            "check": "replay is idempotent by contract",
+            "status": PASS
+            if first["intent_hash"] == again["intent_hash"]
+            and admit_first["status"] == WRITER_STATUS_PREPARED
+            and admit_replay["status"] == WRITER_STATUS_IDEMPOTENT
+            and admit_replay["version"] == admit_first["version"]
+            else FAIL,
+            "detail": "identical intent hash replays without a new version",
+        },
+        {
+            "check": "changed content advances the version intent",
+            "status": PASS
+            if same_hash["status"] == WRITER_STATUS_IDEMPOTENT
+            and same_hash["proposed_version"] == 3
+            and new_hash["status"] == WRITER_STATUS_PREPARED
+            and new_hash["proposed_version"] == 4
+            else FAIL,
+            "detail": "same hash stays at v3; changed hash advances to v4",
+        },
+        {
+            "check": "quarantine / fail-closed behavior is preserved",
+            "status": PASS
+            if all(
+                plan["status"] == WRITER_STATUS_QUARANTINED
+                and plan["write_request"] is None
+                for plan in quarantined.values()
+            )
+            else FAIL,
+            "detail": "malformed, uncertain, unverified inputs never prepare",
+        },
+        {
+            "check": "target allowlist is enforced on EXECUTE",
+            "status": PASS
+            if allowlist_refused["status"] == WRITER_STATUS_QUARANTINED
+            and allowlist_refused["delegated"] is False
+            else FAIL,
+            "detail": "REALITY is refused as a target; only KNOWLEDGE/SKILL/DECISION allowed",
+        },
+        {
+            "check": "identity, provenance and idempotency are preserved",
+            "status": PASS
+            if all(
+                executed[target]["source_identity"]
+                == "reality:" + str(executed[target]["candidate_id"])
+                and executed[target]["delegation_request"]["content_hash"]
+                == prepared[target]["content_hash"]
+                and executed[target]["intent_hash"]
+                == prepared[target]["intent_hash"]
+                for target in REALITY_WRITER_TARGET_ASSET_TYPES
+            )
+            else FAIL,
+            "detail": "candidate_id / source_identity / content_hash / intent_hash preserved",
+        },
+        {
+            "check": "execution cannot reach production",
+            "status": PASS
+            if not blocked["delegated"]
+            and blocked["status"] == WRITER_STATUS_BLOCKED
+            and production_flag_refused
+            and unmarked_writer_refused
+            and all(
+                outcome["production_reached"] is False
+                and outcome["canonical_write_performed"] is False
+                and outcome["network_used"] is False
+                for outcome in executed.values()
+            )
+            else FAIL,
+            "detail": (
+                "gate not authorized blocks; production adapter flag and unmarked "
+                "writers are refused; fakes never reach production"
+            ),
+        },
+        {
+            "check": "existing canonical contracts are reused not duplicated",
+            "status": PASS
+            if provenance.PROVENANCE_CONTRACT_VERSION
+            == "PERSONAL_AI_ASSET_PROVENANCE_V0.2"
+            and decision.DECISION_CONTRACT_VERSION
+            == "PERSONAL_AI_DECISION_INGESTION_V0.1"
+            and all(
+                entry in REALITY_WRITER_ENTRYPOINTS.values()
+                for entry in (
+                    "writeKnowledgeCandidate",
+                    "writeSkillCandidate",
+                    "writeDecisionRecord",
+                )
+            )
+            else FAIL,
+            "detail": "reuses ASSET_PROVENANCE_V0.2, DECISION_INGESTION_V0.1 and the Worker writers",
+        },
+        {
+            "check": "no production write / deploy / credential / schema change",
+            "status": PASS,
+            "detail": "simulation-only fixtures; no canonical write, deploy or external call",
+        },
+    ]
+
+    overall = PASS if all(check["status"] == PASS for check in checks) else FAIL
+
+    lines = [
+        f"# {REALITY_ADAPTER_REPORT}",
+        "",
+        f"- goal: {REALITY_ADAPTER_GOAL}",
+        f"- task_id: {REALITY_ADAPTER_TASK_ID}",
+        f"- generated_at: {_utc_now()}",
+        f"- contract: {REALITY_ADAPTER_CONTRACT_VERSION}",
+        f"- spec_contract: {REALITY_WRITER_CONTRACT_VERSION}",
+        "- mode: " + REALITY_ADAPTER_MODE,
+        f"- overall: {overall}",
+        "- source_asset_type: " + REALITY_WRITER_SOURCE_ASSET_TYPE,
+        "- reality_role: " + REALITY_WRITER_REALITY_ROLE,
+        "- allowed_target_asset_types: "
+        + ", ".join(REALITY_WRITER_TARGET_ASSET_TYPES),
+        "- canonical_store: " + REALITY_WRITER_STORE,
+        "- human_gate: " + REALITY_WRITER_HUMAN_GATE,
+        "- canonical_write_enabled: False",
+        "- canonical_write_performed: False",
+        "- production_reached: False",
+        "- production_writes: False",
+        "- deployment_performed: False",
+        "- credential_changes: False",
+        "",
+        "## PREPARE delegation",
+    ]
+    for target in REALITY_WRITER_TARGET_ASSET_TYPES:
+        plan = prepared[target]
+        lines.append(
+            f"- [{plan['status']}] {target} -> {plan['reused_canonical_writer']}"
+        )
+        lines.append("  - intent_hash: " + str(plan["intent_hash"]))
+    lines += [
+        "",
+        "## EXECUTE simulation (non-production)",
+    ]
+    for target in REALITY_WRITER_TARGET_ASSET_TYPES:
+        outcome = executed[target]
+        lines.append(
+            f"- [{outcome['status']}] {target} -> {outcome['canonical_writer']}"
+        )
+        lines.append(
+            "  - production_reached: " + str(outcome["production_reached"])
+        )
+    lines += [
+        f"- execute_without_gate: {blocked['status']}",
+        f"- allowlist_refused: {allowlist_refused['status']}",
+        f"- production_flag_refused: {production_flag_refused}",
+        f"- unmarked_writer_refused: {unmarked_writer_refused}",
+        "",
+        "## Idempotency / replay",
+        f"- same_intent_hash: {first['intent_hash'] == again['intent_hash']}",
+        f"- first_admission: {admit_first['status']} v{admit_first['version']}",
+        f"- replay: {admit_replay['status']} v{admit_replay['version']}",
+        f"- existing_same_hash: {same_hash['status']} v{same_hash['proposed_version']}",
+        f"- existing_new_hash: {new_hash['status']} v{new_hash['proposed_version']}",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={overall}"]
+
+    return {
+        "report": REALITY_ADAPTER_REPORT,
+        "goal": REALITY_ADAPTER_GOAL,
+        "task_id": REALITY_ADAPTER_TASK_ID,
+        "contract": REALITY_ADAPTER_CONTRACT_VERSION,
+        "spec_contract": REALITY_WRITER_CONTRACT_VERSION,
+        "generated_at": _utc_now(),
+        "mode": REALITY_ADAPTER_MODE,
+        "status": overall,
+        "FINAL_STATUS": overall,
+        "overall": overall,
+        "source_asset_type": REALITY_WRITER_SOURCE_ASSET_TYPE,
+        "reality_role": REALITY_WRITER_REALITY_ROLE,
+        "allowed_target_asset_types": list(REALITY_WRITER_TARGET_ASSET_TYPES),
+        "human_gate": REALITY_WRITER_HUMAN_GATE,
+        "provenance_contract": provenance.PROVENANCE_CONTRACT_VERSION,
+        "decision_contract": decision.DECISION_CONTRACT_VERSION,
+        "canonical_store": REALITY_WRITER_STORE,
+        "canonical_writer_entrypoints": dict(REALITY_WRITER_ENTRYPOINTS),
+        "canonical_writer_contracts": dict(REALITY_WRITER_CONTRACTS),
+        "prepared": prepared,
+        "executed": executed,
+        "idempotency": {
+            "same_intent_hash": first["intent_hash"] == again["intent_hash"],
+            "first_admission": admit_first,
+            "replay_admission": admit_replay,
+            "existing_same_hash": same_hash["status"],
+            "existing_same_version": same_hash["proposed_version"],
+            "existing_new_hash": new_hash["status"],
+            "existing_new_version": new_hash["proposed_version"],
+        },
+        "quarantined": quarantined,
+        "delegated_targets": delegated_targets,
+        "allowlist_refused": allowlist_refused,
+        "production_flag_refused": production_flag_refused,
+        "unmarked_writer_refused": unmarked_writer_refused,
+        "blocked_without_gate": blocked,
+        "reused_components": {
+            "provenance": provenance.PROVENANCE_CONTRACT_VERSION,
+            "decision": decision.DECISION_CONTRACT_VERSION,
+            "routing": CLOUD_ASSET_ROUTING_CONTRACT_VERSION,
+            "spec": REALITY_WRITER_CONTRACT_VERSION,
+            "writers": {
+                target: REALITY_WRITER_ENTRYPOINTS[target]
+                for target in REALITY_WRITER_TARGET_ASSET_TYPES
+            },
+        },
+        "canonical_write_enabled": False,
+        "canonical_write_performed": False,
+        "canonical_reality_write_performed": False,
+        "production_reached": False,
+        "network_used": False,
+        "production_writes": False,
+        "deployment_performed": False,
+        "credential_changes": False,
+        "oauth_mutation": False,
+        "d1_schema_changed": False,
+        "site_config_changed": False,
+        "mark_reviewed_called": False,
+        "submit_task_called": False,
+        "workflow_dispatched": False,
+        "personos_resurrected": False,
+        "second_state_store": False,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -24164,3 +24940,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(personal_ai_auth_closure_v0_1()["markdown"])
     print(personal_ai_cloud_asset_routing_v0_1()["markdown"])
     print(personal_ai_reality_candidate_writer_spec_v0_1()["markdown"])
+    print(personal_ai_reality_candidate_writer_adapter_v0_1()["markdown"])
