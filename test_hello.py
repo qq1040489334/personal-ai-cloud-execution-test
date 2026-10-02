@@ -238,6 +238,31 @@ from hello import (
     serverchan_real_push_golden_02,
 )
 
+from hello import (
+    CANDIDATE_VERSION_ACTION_HUMAN_GATE,
+    CANDIDATE_VERSION_ACTION_REPO_FIX,
+    CANDIDATE_VERSION_CAPABILITY_AVAILABLE,
+    CANDIDATE_VERSION_CAPABILITY_UNAVAILABLE,
+    CANDIDATE_VERSION_DIAGNOSIS_GOAL,
+    CANDIDATE_VERSION_DIAGNOSIS_TASK_ID,
+    CANDIDATE_VERSION_ERROR,
+    CANDIDATE_VERSION_ERROR_CLASS,
+    CANDIDATE_VERSION_FAILED_ARTIFACT,
+    CANDIDATE_VERSION_FAILED_JOB,
+    CANDIDATE_VERSION_FAILED_STEP,
+    CANDIDATE_VERSION_FAILED_STEP_NUMBER,
+    CANDIDATE_VERSION_FAILED_TASK_ID,
+    CANDIDATE_VERSION_FAILURE_CREDENTIAL,
+    CANDIDATE_VERSION_FAILURE_SCOPE,
+    CANDIDATE_VERSION_FAILURE_STAGE,
+    CANDIDATE_VERSION_RUN_CONCLUSION,
+    CANDIDATE_VERSION_SKIPPED_STEPS,
+    CANDIDATE_VERSION_WORKFLOW_RUN_ID,
+    candidate_version_execution_capability,
+    candidate_version_workflow_failure_diagnosis,
+    classify_candidate_version_failure,
+)
+
 VALID_STATUSES = {"PASS", "FAIL", "BLOCKED"}
 
 # TEST ISOLATION (task cf-2f2b71c331da): the runner-process SendKey is
@@ -9492,4 +9517,147 @@ def test_reality_candidate_writer_adapter_markdown_and_main_entrypoint() -> None
     assert (
         'personal_ai_reality_candidate_writer_adapter_v0_1()["markdown"]'
         in source
+    )
+
+
+# ---------------------------------------------------------------------------
+# CANDIDATE_VERSION_WORKFLOW_FAILURE_DIAGNOSIS_V0.1
+# (task cf-3383040b627a / failed task cf-1eca185810c0)
+# ---------------------------------------------------------------------------
+def test_candidate_version_diagnosis_shape() -> None:
+    report = candidate_version_workflow_failure_diagnosis()
+    assert report["report"] == (
+        "CANDIDATE_VERSION_WORKFLOW_FAILURE_DIAGNOSIS_REPORT"
+    )
+    assert report["goal"] == CANDIDATE_VERSION_DIAGNOSIS_GOAL
+    assert report["task_id"] == CANDIDATE_VERSION_DIAGNOSIS_TASK_ID
+    assert report["failed_task_id"] == CANDIDATE_VERSION_FAILED_TASK_ID
+    assert report["status"] in VALID_STATUSES
+    assert set(report) >= {
+        "report",
+        "goal",
+        "task_id",
+        "failed_task_id",
+        "exact_failure_point",
+        "failure_class",
+        "classification",
+        "version_only_capability",
+        "next_action",
+        "checks",
+        "markdown",
+    }
+
+
+def test_candidate_version_diagnosis_exact_failure_point() -> None:
+    point = candidate_version_workflow_failure_diagnosis()["exact_failure_point"]
+    assert point["workflow_run_id"] == CANDIDATE_VERSION_WORKFLOW_RUN_ID
+    assert point["failed_job"] == CANDIDATE_VERSION_FAILED_JOB
+    assert point["failed_step"] == CANDIDATE_VERSION_FAILED_STEP
+    assert point["failed_step_number"] == CANDIDATE_VERSION_FAILED_STEP_NUMBER
+    assert point["run_conclusion"] == CANDIDATE_VERSION_RUN_CONCLUSION
+    assert point["error"] == CANDIDATE_VERSION_ERROR == (
+        "Process completed with exit code 1."
+    )
+    assert point["error_class"] == CANDIDATE_VERSION_ERROR_CLASS
+    assert point["failure_stage"] == CANDIDATE_VERSION_FAILURE_STAGE
+    assert point["failed_artifact"] == CANDIDATE_VERSION_FAILED_ARTIFACT
+    assert point["skipped_steps"] == list(CANDIDATE_VERSION_SKIPPED_STEPS)
+
+
+def test_candidate_version_capability_unavailable_with_evidence() -> None:
+    capability = candidate_version_execution_capability()
+    assert capability["status"] == CANDIDATE_VERSION_CAPABILITY_UNAVAILABLE
+    assert capability["version_deploy_step_present"] is False
+    assert capability["cloudflare_credential_env_present"] is False
+    assert capability["hints_found"] == []
+    assert capability["evidence"]
+    assert all(isinstance(item, str) and item for item in capability["evidence"])
+    assert capability["reason"]
+
+
+def test_candidate_version_capability_is_not_fabricated_available() -> None:
+    report = candidate_version_workflow_failure_diagnosis()
+    assert report["VERSION_ONLY_CAPABILITY"] != (
+        CANDIDATE_VERSION_CAPABILITY_AVAILABLE
+    )
+    assert report["capability_available"] is False
+    assert report["capability_unavailable"] is True
+
+
+def test_candidate_version_failure_classified_task_scope() -> None:
+    report = candidate_version_workflow_failure_diagnosis()
+    assert report["failure_class"] == CANDIDATE_VERSION_FAILURE_SCOPE
+    classification = report["classification"]
+    assert classification["failure_class"] == CANDIDATE_VERSION_FAILURE_SCOPE
+    assert classification["transient"] is False
+    assert classification["retry_sufficient"] is False
+    assert classification["human_gate_required"] is True
+    assert "Gate 1" in classification["reason"]
+
+
+def test_classify_candidate_version_failure_branches() -> None:
+    transient = classify_candidate_version_failure(
+        failed_step="Verify tests (independent)",
+        run_conclusion="failure",
+        error="The action timed out after 15 minutes",
+        capability=CANDIDATE_VERSION_CAPABILITY_AVAILABLE,
+    )
+    assert transient["failure_class"] != CANDIDATE_VERSION_FAILURE_SCOPE
+    assert transient["transient"] is True
+    assert transient["retry_sufficient"] is True
+
+    credential = classify_candidate_version_failure(
+        failed_step="Version upload",
+        run_conclusion="failure",
+        error="401 unauthorized: missing credential",
+        capability=CANDIDATE_VERSION_CAPABILITY_UNAVAILABLE,
+    )
+    assert credential["failure_class"] == CANDIDATE_VERSION_FAILURE_CREDENTIAL
+    assert credential["human_gate_required"] is True
+
+    gate1 = classify_candidate_version_failure(
+        failed_step=CANDIDATE_VERSION_FAILED_STEP,
+        run_conclusion="failure",
+        error=CANDIDATE_VERSION_ERROR,
+        capability=CANDIDATE_VERSION_CAPABILITY_UNAVAILABLE,
+    )
+    assert gate1["failure_class"] == CANDIDATE_VERSION_FAILURE_SCOPE
+    assert gate1["error_class"] == "task_contract_validation_failure"
+
+
+def test_candidate_version_next_action_is_human_gate_and_no_mutation() -> None:
+    report = candidate_version_workflow_failure_diagnosis()
+    action = report["next_action"]
+    assert action["classification"] == CANDIDATE_VERSION_ACTION_HUMAN_GATE
+    assert action["classification"] != CANDIDATE_VERSION_ACTION_REPO_FIX
+    assert action["retry_candidate_upload"] is False
+    assert action["repository_patch_required"] is False
+    assert action["action"]
+
+    assert report["candidate_not_retried"] is True
+    assert report["production_mutated"] is False
+    assert report["cloudflare_version_uploaded"] is False
+    assert report["deployment_performed"] is False
+    assert report["credential_changed"] is False
+    assert report["schema_changed"] is False
+    assert report["site_mutated"] is False
+
+
+def test_candidate_version_diagnosis_checks_and_markdown() -> None:
+    report = candidate_version_workflow_failure_diagnosis()
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+    assert all(check["status"] == "PASS" for check in report["checks"])
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {CANDIDATE_VERSION_DIAGNOSIS_GOAL}")
+    assert f"- task_id: {CANDIDATE_VERSION_DIAGNOSIS_TASK_ID}" in markdown
+    assert f"- failed_task_id: {CANDIDATE_VERSION_FAILED_TASK_ID}" in markdown
+    assert CANDIDATE_VERSION_FAILED_STEP in markdown
+    assert f"FINAL_STATUS={report['status']}" in markdown
+    assert (
+        f"VERSION_ONLY_CAPABILITY={report['VERSION_ONLY_CAPABILITY']}"
+        in markdown
     )

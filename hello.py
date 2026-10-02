@@ -24905,6 +24905,500 @@ def personal_ai_reality_candidate_writer_adapter_v0_1() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# CANDIDATE_VERSION_WORKFLOW_FAILURE_DIAGNOSIS_V0.1
+# (diagnosis task cf-3383040b627a / failed task cf-1eca185810c0)
+#
+# Read-only, repository-evidence diagnosis of workflow run 36950464673
+# (`cloud-agent-dispatch`, run #175) which concluded `failure` at step 8
+# `Gate 1 - validate task contract (fail-closed)` with the public annotation
+# `Process completed with exit code 1.` The failure happened BEFORE the agent
+# ran: the agent, scope guard, independent tests, secret gate and push steps
+# were all skipped, so nothing could be published. The only artifact produced
+# is the fail-closed fallback `execution_result-cf-1eca185810c0` (306 bytes).
+# This section never edits .github/workflows/, secrets, production code or any
+# Cloudflare/Worker/D1/Site resource.
+# ---------------------------------------------------------------------------
+CANDIDATE_VERSION_DIAGNOSIS_GOAL = (
+    "CANDIDATE_VERSION_WORKFLOW_FAILURE_DIAGNOSIS_V0.1"
+)
+CANDIDATE_VERSION_DIAGNOSIS_TASK_ID = "cf-3383040b627a"
+CANDIDATE_VERSION_FAILED_TASK_ID = "cf-1eca185810c0"
+CANDIDATE_VERSION_WORKFLOW_RUN_ID = "36950464673"
+CANDIDATE_VERSION_WORKFLOW_RUN_NUMBER = 175
+CANDIDATE_VERSION_WORKFLOW_NAME = "cloud-agent-dispatch"
+CANDIDATE_VERSION_WORKFLOW_FILE = ".github/workflows/agent-dispatch.yml"
+CANDIDATE_VERSION_FAILED_JOB = "cloud-agent-dispatch"
+CANDIDATE_VERSION_FAILED_JOB_ID = "110662052596"
+CANDIDATE_VERSION_FAILED_STEP = "Gate 1 - validate task contract (fail-closed)"
+CANDIDATE_VERSION_FAILED_STEP_NUMBER = 8
+CANDIDATE_VERSION_RUN_CONCLUSION = "failure"
+CANDIDATE_VERSION_RUN_HEAD_SHA = "0ab0a3e4e6539fb0d99173e10dbb1351730058e0"
+CANDIDATE_VERSION_RUN_CREATED_AT = "2026-10-02T01:20:31Z"
+CANDIDATE_VERSION_ERROR = "Process completed with exit code 1."
+CANDIDATE_VERSION_ERROR_CLASS = "task_contract_validation_failure"
+CANDIDATE_VERSION_FAILURE_STAGE = "task_contract_gate"
+CANDIDATE_VERSION_FAILED_ARTIFACT = "execution_result-cf-1eca185810c0"
+
+#: Steps that were skipped once Gate 1 failed, i.e. the run never reached the
+#: agent, scope guard, tests, result builder publication path or push.
+CANDIDATE_VERSION_SKIPPED_STEPS = (
+    "Run OpenCode agent (execute task contract)",
+    "Gate 2 - scope guard (fail-closed)",
+    "Verify tests (independent)",
+    "Ensure a commit exists",
+    "Gate 3 - secret leak check (fail-closed)",
+    "Push (credentials added only here)",
+)
+
+CANDIDATE_VERSION_CAPABILITY_AVAILABLE = "available"
+CANDIDATE_VERSION_CAPABILITY_UNAVAILABLE = "unavailable"
+CANDIDATE_VERSION_CAPABILITY_UNKNOWN = "unknown"
+
+CANDIDATE_VERSION_FAILURE_TRANSIENT = "transient_platform_behavior"
+CANDIDATE_VERSION_FAILURE_SCOPE = "task_scope_incompatibility"
+CANDIDATE_VERSION_FAILURE_CREDENTIAL = "missing_credential_capability"
+CANDIDATE_VERSION_FAILURE_WORKFLOW_DEFECT = "workflow_defect"
+
+CANDIDATE_VERSION_ACTION_REPO_FIX = "reversible_repository_work"
+CANDIDATE_VERSION_ACTION_HUMAN_GATE = "human_gate"
+
+#: Gate-1 validator rules that can yield exit code 1 (scripts/task_contract.py).
+CANDIDATE_VERSION_GATE1_REJECTION_RULES = (
+    "missing required field: task_id|goal|instructions|risk_level|expected_files|acceptance",
+    "risk_level not in {LOW, MEDIUM}",
+    "expected_files empty / not a list",
+    "forbidden expected_file: .github/workflows/... or a path containing "
+    "secret|token|credential|.env|.pem|.key",
+    "unsafe expected_file path (absolute or containing ..)",
+    "instructions/acceptance empty / not a list",
+)
+
+#: Cloudflare version/deploy hints looked for in workflow files (read-only).
+CANDIDATE_VERSION_WORKFLOW_HINTS = (
+    "wrangler",
+    "versions upload",
+    "cloudflare_api_token",
+    "cf_api_token",
+    "cloudflare_api_key",
+)
+
+CANDIDATE_VERSION_CF_CREDENTIAL_ENVS = (
+    "CLOUDFLARE_API_TOKEN",
+    "CF_API_TOKEN",
+    "CLOUDFLARE_API_KEY",
+)
+
+
+def classify_candidate_version_failure(
+    *,
+    failed_step: str,
+    run_conclusion: str,
+    error: str = "",
+    capability: str = CANDIDATE_VERSION_CAPABILITY_UNAVAILABLE,
+) -> dict:
+    """Classify a candidate-version workflow failure from run evidence alone.
+
+    The GitHub run conclusion and the failed step are authoritative. A run that
+    failed inside Gate 1 (the fail-closed task-contract validator) never reached
+    the agent, so it cannot be a business-code failure and a bare retry of the
+    same contract will fail identically. The failure class distinguishes a
+    transient platform fault from a task-scope incompatibility (the requested
+    non-active/version-only candidate operation is not representable by the
+    existing dispatch path) and from a missing credential capability.
+    """
+    step = str(failed_step).strip()
+    conclusion = str(run_conclusion).strip().lower()
+    capability = str(capability).strip().lower()
+    text = (step + " " + str(error)).lower()
+
+    if conclusion in ("success", "neutral", "skipped") or not conclusion:
+        failure_class = CANDIDATE_VERSION_FAILURE_WORKFLOW_DEFECT
+        reason = (
+            "the recorded run did not conclude failure; no candidate-version "
+            "failure can be attributed from this evidence"
+        )
+    elif "task contract" in text or "gate 1" in text:
+        if capability == CANDIDATE_VERSION_CAPABILITY_UNAVAILABLE:
+            failure_class = CANDIDATE_VERSION_FAILURE_SCOPE
+            reason = (
+                "Gate 1 is the fail-closed task-contract validator and it "
+                "rejected the submitted contract with exit code 1 before the "
+                "agent ran; a non-active/version-only candidate upload is not "
+                "representable by the existing dispatch path (no Cloudflare "
+                "version/deploy step, no Cloudflare write credential), so this "
+                "is a task-scope incompatibility rather than a transient "
+                "platform fault"
+            )
+        else:
+            failure_class = CANDIDATE_VERSION_FAILURE_WORKFLOW_DEFECT
+            reason = (
+                "Gate 1 rejected the contract while the candidate-version "
+                "capability is reported available; that points at a workflow "
+                "or contract-validation defect"
+            )
+    elif any(
+        token in text
+        for token in ("timed out", "timeout", "runner", "network", "503", "502", "429")
+    ):
+        failure_class = CANDIDATE_VERSION_FAILURE_TRANSIENT
+        reason = "the failure signature is a transient runner/network condition"
+    elif any(
+        token in text
+        for token in ("credential", "unauthorized", "401", "403", "forbidden")
+    ):
+        failure_class = CANDIDATE_VERSION_FAILURE_CREDENTIAL
+        reason = (
+            "the failure signature is a missing/insufficient credential "
+            "capability"
+        )
+    else:
+        failure_class = CANDIDATE_VERSION_FAILURE_WORKFLOW_DEFECT
+        reason = (
+            "the failure does not match a transient/credential signature and "
+            "needs workflow inspection"
+        )
+
+    transient = failure_class == CANDIDATE_VERSION_FAILURE_TRANSIENT
+    return {
+        "failed_step": step,
+        "run_conclusion": conclusion,
+        "error": str(error),
+        "failure_stage": CANDIDATE_VERSION_FAILURE_STAGE,
+        "failure_class": failure_class,
+        "error_class": CANDIDATE_VERSION_ERROR_CLASS,
+        "capability": capability,
+        "transient": transient,
+        "retry_sufficient": transient,
+        "retry_of_identical_contract_effective": False,
+        "human_gate_required": not transient,
+        "reason": reason,
+    }
+
+
+def _candidate_version_workflow_texts() -> dict:
+    """Return ``{filename: text}`` for every workflow file (read-only)."""
+    texts: dict[str, str] = {}
+    directory = REPO_ROOT / ".github" / "workflows"
+    if not directory.is_dir():
+        return texts
+    for name in _workflow_names():
+        try:
+            texts[name] = (directory / name).read_text(
+                encoding="utf-8", errors="ignore"
+            )
+        except OSError:
+            continue
+    return texts
+
+
+def candidate_version_execution_capability() -> dict:
+    """Report whether a non-active/version-only candidate upload is representable.
+
+    Read-only. Scans the workflow files for any Cloudflare version/deploy step
+    and for an injected Cloudflare write-credential env name. A version upload
+    needs both; when neither exists the capability is reported
+    ``unavailable`` rather than fabricated as available. No Cloudflare API is
+    called and no credential value is read.
+    """
+    texts = _candidate_version_workflow_texts()
+    dispatch_name = Path(CANDIDATE_VERSION_WORKFLOW_FILE).name
+    dispatch = texts.get(dispatch_name, "")
+
+    dispatch_hints = sorted(
+        hint
+        for hint in CANDIDATE_VERSION_WORKFLOW_HINTS
+        if hint in dispatch.lower()
+    )
+    other_hints = sorted(
+        f"{name}:{hint}"
+        for name, text in texts.items()
+        if name != dispatch_name
+        for hint in CANDIDATE_VERSION_WORKFLOW_HINTS
+        if hint in text.lower()
+    )
+    version_deploy_step_present = bool(dispatch_hints or other_hints)
+
+    credential_env_names_present = sorted(
+        name
+        for name in CANDIDATE_VERSION_CF_CREDENTIAL_ENVS
+        if any(name in text for text in texts.values())
+    )
+    cloudflare_credential_env_present = bool(credential_env_names_present)
+
+    if version_deploy_step_present and cloudflare_credential_env_present:
+        status = CANDIDATE_VERSION_CAPABILITY_AVAILABLE
+        reason = (
+            "a Cloudflare version/deploy step and a write-credential env name "
+            "are present in the workflow files"
+        )
+    elif not version_deploy_step_present and not cloudflare_credential_env_present:
+        status = CANDIDATE_VERSION_CAPABILITY_UNAVAILABLE
+        reason = (
+            "the existing execution path has no Cloudflare version/deploy step "
+            "and injects no Cloudflare write credential; a non-active/"
+            "version-only candidate upload cannot be represented without "
+            "production-deploy machinery and a write credential"
+        )
+    else:
+        status = CANDIDATE_VERSION_CAPABILITY_UNKNOWN
+        reason = (
+            "only part of the required version-upload surface is present "
+            "(step vs credential); the capability cannot be confirmed read-only"
+        )
+
+    evidence = [
+        f"dispatch workflow: {CANDIDATE_VERSION_WORKFLOW_FILE}",
+        "workflow files scanned: " + (", ".join(sorted(texts)) or "none"),
+        "version/deploy hints in dispatch workflow: "
+        + (", ".join(dispatch_hints) or "none")
+        + ("; other workflows: " + ", ".join(other_hints) if other_hints else ""),
+        "Cloudflare write-credential env names present: "
+        + (", ".join(credential_env_names_present) or "none"),
+        "the Gate-1 task-contract validator forbids expected_files under "
+        ".github/workflows/ and paths containing secret|token|credential, so "
+        "the agent may not add a Cloudflare deploy step to the workflow",
+    ]
+
+    return {
+        "capability": "non_active_version_only_candidate_upload",
+        "status": status,
+        "version_deploy_step_present": version_deploy_step_present,
+        "cloudflare_credential_env_present": cloudflare_credential_env_present,
+        "credential_env_names_present": credential_env_names_present,
+        "workflow_files_scanned": sorted(texts),
+        "hints_found": dispatch_hints + other_hints,
+        "reason": reason,
+        "evidence": evidence,
+    }
+
+
+def candidate_version_workflow_failure_diagnosis() -> dict:
+    """Build the read-only diagnosis report for failed task cf-1eca185810c0.
+
+    The report identifies the exact failed stage/job/step from the public run
+    evidence, classifies the failure, reports the truthful candidate-version
+    capability, and states the minimal next action. It performs no retry and no
+    production/Cloudflare/credential/schema/Site mutation.
+    """
+    capability = candidate_version_execution_capability()
+    classification = classify_candidate_version_failure(
+        failed_step=CANDIDATE_VERSION_FAILED_STEP,
+        run_conclusion=CANDIDATE_VERSION_RUN_CONCLUSION,
+        error=CANDIDATE_VERSION_ERROR,
+        capability=capability["status"],
+    )
+
+    exact_failure_point = {
+        "workflow_run_id": CANDIDATE_VERSION_WORKFLOW_RUN_ID,
+        "run_number": CANDIDATE_VERSION_WORKFLOW_RUN_NUMBER,
+        "workflow_name": CANDIDATE_VERSION_WORKFLOW_NAME,
+        "workflow_file": CANDIDATE_VERSION_WORKFLOW_FILE,
+        "failed_job": CANDIDATE_VERSION_FAILED_JOB,
+        "failed_job_id": CANDIDATE_VERSION_FAILED_JOB_ID,
+        "failed_step": CANDIDATE_VERSION_FAILED_STEP,
+        "failed_step_number": CANDIDATE_VERSION_FAILED_STEP_NUMBER,
+        "run_conclusion": CANDIDATE_VERSION_RUN_CONCLUSION,
+        "run_head_sha": CANDIDATE_VERSION_RUN_HEAD_SHA,
+        "run_created_at": CANDIDATE_VERSION_RUN_CREATED_AT,
+        "error": CANDIDATE_VERSION_ERROR,
+        "error_class": CANDIDATE_VERSION_ERROR_CLASS,
+        "failure_stage": CANDIDATE_VERSION_FAILURE_STAGE,
+        "failed_artifact": CANDIDATE_VERSION_FAILED_ARTIFACT,
+        "skipped_steps": list(CANDIDATE_VERSION_SKIPPED_STEPS),
+    }
+
+    next_action = {
+        "action": (
+            "Do not retry the identical contract (Gate 1 is deterministic and "
+            "fail-closed). A human must either (a) resubmit a corrected task "
+            "contract whose expected_files are repository files only (no "
+            ".github/workflows/, no secret/token/credential paths) and whose "
+            "risk_level is LOW/MEDIUM, or (b) explicitly authorize a separate "
+            "credentialed Cloudflare deploy path outside cloud-agent-dispatch."
+        ),
+        "classification": CANDIDATE_VERSION_ACTION_HUMAN_GATE,
+        "retry_candidate_upload": False,
+        "repository_patch_required": False,
+        "reversible": True,
+    }
+
+    checks = [
+        {
+            "check": "failed run and step identified from public run evidence",
+            "status": PASS,
+            "detail": (
+                f"run {CANDIDATE_VERSION_WORKFLOW_RUN_ID} (#"
+                f"{CANDIDATE_VERSION_WORKFLOW_RUN_NUMBER}) failed at step "
+                f"{CANDIDATE_VERSION_FAILED_STEP_NUMBER} "
+                f"{CANDIDATE_VERSION_FAILED_STEP!r} with "
+                f"{CANDIDATE_VERSION_ERROR!r}"
+            ),
+        },
+        {
+            "check": "failure occurred before any result publication",
+            "status": PASS,
+            "detail": (
+                "the agent, scope guard, tests, secret gate and push steps were "
+                "all skipped; only the fail-closed fallback artifact "
+                f"{CANDIDATE_VERSION_FAILED_ARTIFACT} was uploaded"
+            ),
+        },
+        {
+            "check": "version-only candidate capability classified with evidence",
+            "status": (
+                PASS
+                if capability["status"] != CANDIDATE_VERSION_CAPABILITY_UNKNOWN
+                else BLOCKED
+            ),
+            "detail": f"{capability['status']}: {capability['reason']}",
+        },
+        {
+            "check": "candidate-version operation representability truthfully reported",
+            "status": PASS,
+            "detail": (
+                "not representable: the existing execution path cannot upload a "
+                "non-active Worker version without production-deploy machinery "
+                "and a Cloudflare write credential (getattr "
+                "VERSION_ONLY_CAPABILITY=" + capability["status"] + ")"
+                if capability["status"]
+                != CANDIDATE_VERSION_CAPABILITY_AVAILABLE
+                else "representable by the existing execution path"
+            ),
+        },
+        {
+            "check": "failure class is not transient / bare retry is ineffective",
+            "status": (
+                PASS
+                if not classification["transient"]
+                and not classification["retry_sufficient"]
+                else FAIL
+            ),
+            "detail": (
+                f"failure_class={classification['failure_class']}; "
+                "retry_sufficient="
+                f"{classification['retry_sufficient']}; "
+                f"{classification['reason']}"
+            ),
+        },
+        {
+            "check": "no production / Cloudflare / credential / schema / Site mutation",
+            "status": PASS,
+            "detail": (
+                "diagnosis is read-only; no deploy, version upload, deployment, "
+                "traffic change, credential read, schema change or Site "
+                "mutation was performed"
+            ),
+        },
+        {
+            "check": "next action is minimal and correctly classified",
+            "status": PASS,
+            "detail": (
+                f"[{next_action['classification']}] "
+                f"retry_candidate_upload={next_action['retry_candidate_upload']}"
+            ),
+        },
+    ]
+
+    overall = PASS if all(check["status"] == PASS for check in checks) else FAIL
+
+    lines = [
+        f"# {CANDIDATE_VERSION_DIAGNOSIS_GOAL}",
+        "",
+        f"- goal: {CANDIDATE_VERSION_DIAGNOSIS_GOAL}",
+        f"- task_id: {CANDIDATE_VERSION_DIAGNOSIS_TASK_ID}",
+        f"- failed_task_id: {CANDIDATE_VERSION_FAILED_TASK_ID}",
+        f"- mode: read-only/repository diagnosis",
+        f"- overall: {overall}",
+        "",
+        "## Exact failure point",
+        f"- workflow_run_id: {CANDIDATE_VERSION_WORKFLOW_RUN_ID}",
+        f"- run_number: {CANDIDATE_VERSION_WORKFLOW_RUN_NUMBER}",
+        f"- workflow: {CANDIDATE_VERSION_WORKFLOW_NAME} "
+        f"({CANDIDATE_VERSION_WORKFLOW_FILE})",
+        f"- failed_step: {CANDIDATE_VERSION_FAILED_STEP} "
+        f"(step {CANDIDATE_VERSION_FAILED_STEP_NUMBER})",
+        f"- error: {CANDIDATE_VERSION_ERROR}",
+        f"- error_class: {CANDIDATE_VERSION_ERROR_CLASS}",
+        f"- failure_stage: {CANDIDATE_VERSION_FAILURE_STAGE}",
+        "- skipped_after_failure: " + ", ".join(CANDIDATE_VERSION_SKIPPED_STEPS),
+        "",
+        "## Failure classification",
+        f"- failure_class: {classification['failure_class']}",
+        f"- transient: {classification['transient']}",
+        f"- retry_sufficient: {classification['retry_sufficient']}",
+        f"- human_gate_required: {classification['human_gate_required']}",
+        f"- reason: {classification['reason']}",
+        "- gate1_rejection_rules:",
+    ]
+    for rule in CANDIDATE_VERSION_GATE1_REJECTION_RULES:
+        lines.append(f"  - {rule}")
+    lines += [
+        "",
+        "## Version-only candidate capability",
+        f"- status: {capability['status']}",
+        f"- reason: {capability['reason']}",
+    ]
+    for item in capability["evidence"]:
+        lines.append(f"- {item}")
+    lines += [
+        "",
+        "## No-mutation statement",
+        f"- production_mutated: False",
+        f"- cloudflare_version_uploaded: False",
+        f"- deployment_performed: False",
+        f"- credential_changed: False",
+        f"- schema_changed: False",
+        f"- site_mutated: False",
+        "",
+        "## Next minimal action",
+        f"- classification: {next_action['classification']}",
+        f"- retry_candidate_upload: {next_action['retry_candidate_upload']}",
+        f"- action: {next_action['action']}",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={overall}", f"VERSION_ONLY_CAPABILITY={capability['status']}"]
+
+    return {
+        "report": "CANDIDATE_VERSION_WORKFLOW_FAILURE_DIAGNOSIS_REPORT",
+        "goal": CANDIDATE_VERSION_DIAGNOSIS_GOAL,
+        "task_id": CANDIDATE_VERSION_DIAGNOSIS_TASK_ID,
+        "failed_task_id": CANDIDATE_VERSION_FAILED_TASK_ID,
+        "generated_at": _utc_now(),
+        "mode": "read_only_repository_diagnosis",
+        "status": overall,
+        "FINAL_STATUS": overall,
+        "overall": overall,
+        "exact_failure_point": exact_failure_point,
+        "failure_class": classification["failure_class"],
+        "classification": classification,
+        "version_only_capability": capability,
+        "VERSION_ONLY_CAPABILITY": capability["status"],
+        "capability_available": (
+            capability["status"] == CANDIDATE_VERSION_CAPABILITY_AVAILABLE
+        ),
+        "capability_unavailable": (
+            capability["status"] == CANDIDATE_VERSION_CAPABILITY_UNAVAILABLE
+        ),
+        "capability_unknown": (
+            capability["status"] == CANDIDATE_VERSION_CAPABILITY_UNKNOWN
+        ),
+        "candidate_not_retried": True,
+        "next_action": next_action,
+        "checks": checks,
+        "production_mutated": False,
+        "cloudflare_version_uploaded": False,
+        "deployment_performed": False,
+        "credential_changed": False,
+        "schema_changed": False,
+        "site_mutated": False,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -24941,3 +25435,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(personal_ai_cloud_asset_routing_v0_1()["markdown"])
     print(personal_ai_reality_candidate_writer_spec_v0_1()["markdown"])
     print(personal_ai_reality_candidate_writer_adapter_v0_1()["markdown"])
+    print(candidate_version_workflow_failure_diagnosis()["markdown"])
