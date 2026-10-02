@@ -2936,6 +2936,31 @@ var TOOLS = [
     }
   },
   {
+    name: "write_skill_candidate",
+    description: "Controlled canonical writer for a SKILL candidate. Write only; never used for non-SKILL assets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        asset_id: { type: "string" },
+        candidate_id: { type: "string" },
+        asset_type: { type: "string", enum: ["SKILL"] },
+        title: { type: "string" },
+        content: { type: ["string", "object", "array"] },
+        schema_version: { type: "string" },
+        source_identity: { type: "string" },
+        source_location: { type: "string" },
+        source_version: { type: "string" },
+        content_version: { type: "string" },
+        source_content_hash: { type: "string" },
+        promotion_decision: { type: "string" },
+        promotion_event: { type: "string" },
+        captured_at: { type: "string" },
+        promoted_at: { type: "string" }
+      },
+      required: ["title", "content"]
+    }
+  },
+  {
     name: "write_decision_record",
     description: "Controlled canonical writer for a normalized VERIFIED DECISION record. Write only; never used for non-DECISION assets.",
     inputSchema: {
@@ -3003,6 +3028,9 @@ async function handleMcp(request, env, cors, auth) {
       } else if (name === "write_knowledge_candidate") {
         if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolWriteKnowledgeCandidate(env, args);
+      } else if (name === "write_skill_candidate") {
+        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
+        outcome = await writeSkillCandidate(env, args);
       } else if (name === "write_decision_record") {
         if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolWriteDecisionRecord(env, args);

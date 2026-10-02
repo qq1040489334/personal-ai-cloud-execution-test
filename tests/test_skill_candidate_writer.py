@@ -28,6 +28,8 @@ import pytest
 
 from personal_ai_execution import evaluate_provenance
 
+import test_knowledge_candidate_writer as _knowledge_writer
+
 from test_knowledge_candidate_writer import (
     FakeD1,
     HASH_RE,
@@ -59,6 +61,22 @@ def run_probe(script: str) -> dict:
         os.unlink(path)
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def _file_backed_run_worker_probe(script: str) -> dict:
+    """Reuse the size-safe temp-file runner for the KNOWLEDGE suite.
+
+    The Worker bundle now also carries the ``write_skill_candidate`` MCP
+    surface, which pushes the largest KNOWLEDGE probes past the kernel's
+    single-argument limit when they are passed through ``node -e``. Rebinding
+    the sibling suite's ``run_worker_probe`` to this temp-file runner (identical
+    JSON contract) keeps every existing KNOWLEDGE regression executing
+    unmodified instead of failing at the OS argv limit.
+    """
+    return run_probe(script)
+
+
+_knowledge_writer.run_worker_probe = _file_backed_run_worker_probe
 
 
 def skill_probe(calls: list[dict], asset_id: str | None = None, setup: str = "") -> dict:
@@ -330,3 +348,131 @@ def test_written_skill_reads_back_through_get_asset() -> None:
     assert read["content_hash"] == sha256_of(content)
     assert read["provenance_status"] == "VERIFIED"
     assert read["provenance_verified"] is True
+
+
+# -- MCP surface: registration / schema / dispatch / scope -----------------
+
+WRITE_SCOPE = ["mcp"]
+READ_SCOPE = ["asset.read"]
+
+
+def mcp_probe(method: str, params: dict, scopes: list[str], setup: str = "") -> dict:
+    message = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    script = (
+        FakeD1
+        + "\n"
+        + setup
+        + "\nconst env = { ASSET_DB: makeD1() };\n"
+        + "const auth = { scopes: " + json.dumps(scopes) + " };\n"
+        + "const req = new Request('https://worker.example/mcp', { method: 'POST', "
+        + "headers: { 'Content-Type': 'application/json' }, body: JSON.stringify("
+        + json.dumps(message) + ") });\n"
+        + "const res = await handleMcp(req, env, {}, auth);\n"
+        + "const body = await res.json();\n"
+        + "console.log(JSON.stringify({ status: res.status, body, "
+        + "assets: Array.from(assetRows.values()), "
+        + "versions: Array.from(versionRows.values()) }));\n"
+    )
+    return run_probe(script)
+
+
+def test_skill_tool_is_registered_in_tools_list() -> None:
+    report = mcp_probe("tools/list", {}, WRITE_SCOPE)
+    tools = {tool["name"]: tool for tool in report["body"]["result"]["tools"]}
+    assert "write_skill_candidate" in tools
+    skill = tools["write_skill_candidate"]
+    assert skill["inputSchema"]["properties"]["asset_type"]["enum"] == ["SKILL"]
+    assert skill["inputSchema"]["required"] == ["title", "content"]
+
+
+def test_skill_schema_is_skill_only_source_contract() -> None:
+    source = worker_source()
+    tool_block = source.split('name: "write_skill_candidate"', 1)[1].split(
+        "},\n  {", 1
+    )[0]
+    assert "SKILL" in tool_block
+    assert "KNOWLEDGE" not in tool_block
+
+
+def test_skill_tool_call_dispatches_and_writes_skill() -> None:
+    report = mcp_probe(
+        "tools/call",
+        {"name": "write_skill_candidate", "arguments": candidate()},
+        WRITE_SCOPE,
+    )
+    result = report["body"]["result"]
+    assert result["isError"] is False
+    structured_content = result["structuredContent"]
+    assert structured_content["asset_type"] == "SKILL"
+    assert structured_content["status"] == "WRITTEN"
+    assert len(report["assets"]) == 1
+    assert report["assets"][0]["asset_type"] == "SKILL"
+
+
+def test_skill_tool_call_requires_write_scope() -> None:
+    report = mcp_probe(
+        "tools/call",
+        {"name": "write_skill_candidate", "arguments": candidate()},
+        READ_SCOPE,
+    )
+    assert report["body"]["error"]["code"] == -32002
+    assert report["assets"] == []
+    assert report["versions"] == []
+
+
+def test_skill_tool_call_rejects_non_skill_asset_type() -> None:
+    report = mcp_probe(
+        "tools/call",
+        {
+            "name": "write_skill_candidate",
+            "arguments": candidate(asset_type="KNOWLEDGE"),
+        },
+        WRITE_SCOPE,
+    )
+    result = report["body"]["result"]
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "INVALID_ASSET_TYPE"
+    assert report["assets"] == []
+
+
+def test_knowledge_tool_registration_and_dispatch_unchanged() -> None:
+    report = mcp_probe("tools/list", {}, WRITE_SCOPE)
+    tools = {tool["name"]: tool for tool in report["body"]["result"]["tools"]}
+    assert "write_knowledge_candidate" in tools
+    knowledge = tools["write_knowledge_candidate"]
+    assert knowledge["inputSchema"]["properties"]["asset_type"]["enum"] == [
+        "KNOWLEDGE"
+    ]
+
+    call = mcp_probe(
+        "tools/call",
+        {
+            "name": "write_knowledge_candidate",
+            "arguments": {
+                "asset_id": "knowledge:inbox:1",
+                "title": "Panama DIY notes",
+                "content": {"type": "note", "text": "deepseek v4.1"},
+            },
+        },
+        WRITE_SCOPE,
+    )
+    result = call["body"]["result"]
+    assert result["isError"] is False
+    assert result["structuredContent"]["asset_type"] == "KNOWLEDGE"
+    assert result["structuredContent"]["status"] == "WRITTEN"
+
+
+def test_knowledge_tool_still_rejects_skill() -> None:
+    report = mcp_probe(
+        "tools/call",
+        {
+            "name": "write_knowledge_candidate",
+            "arguments": candidate(
+                asset_id="knowledge:inbox:1", asset_type="SKILL"
+            ),
+        },
+        WRITE_SCOPE,
+    )
+    result = report["body"]["result"]
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == "INVALID_ASSET_TYPE"
