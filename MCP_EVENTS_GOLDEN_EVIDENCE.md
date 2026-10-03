@@ -6,10 +6,17 @@
 - **Official contract:** https://developers.openai.com/plugins/build/mcp-events
   (`.md` route) — MCP 2.0 / protocol `2026-07-28`
 - **Baseline commit:** `fd04b2da55a3e9084332840a9f4f59cfee84cfe9`
-- **Final status:** `BLOCKED` — the task's own `expected_files` allowlist excludes
-  every implementation/test path, and the only authorized candidate path has no
-  Cloudflare credential. The tested implementation is delivered below as a
-  reviewable patch for an expanded-allowlist Human Gate.
+- **Prior status:** `BLOCKED` — the original task's `expected_files` allowlist
+  excluded every implementation/test path, so the tested implementation was
+  delivered below as a reviewable patch for an expanded-allowlist Human Gate.
+- **Status at closure (task `cf-0578beacd5e7`):** `READY_FOR_EXTERNAL_CANDIDATE` —
+  the concrete allowlist (`worker/index.js`, `tests/test_mcp_events_golden.py`,
+  `tests/conftest.py`, `MCP_EVENTS_GOLDEN_EVIDENCE.md`) was granted, the exact
+  tested patch from §6 was reapplied and committed, all deterministic
+  verification re-ran green against the exact committed artifact
+  (sha256 `babe8187…96de`), and no Cloudflare/Wrangler credential exists in the
+  Cloud Agent environment, so the non-active candidate is handed to the
+  already-connected Deploy & Write control plane. See §8.
 
 ---
 
@@ -1487,3 +1494,66 @@ workflow artifact and in `agent_result.json`.
   binding changes, or schema changes.
 - `scripts/scope_guard.py`: `PASS` (only the allowlisted path).
 - `scripts/secret_guard.py`: `PASS` (no secret value / api-key-like string).
+
+---
+
+## 8. Closure addendum — task `cf-0578beacd5e7`
+
+The concrete allowlist requested in §5.1 was granted. The exact implementation
+and harness captured in §6 were reapplied byte-for-byte from that evidence, so no
+redesign or scope broadening occurred.
+
+### 8.1 Committed artifact identity
+
+| Item | Value |
+| --- | --- |
+| `worker/index.js` sha256 (committed) | `babe8187e7c58c1e388b6fbafed9fb46da956d496c73d9da4c40ef8cc41396de` |
+| bytes / lines | 144,017 / 3,535 |
+| Prior tested hash (§2) | identical — reproducible regeneration difference: none |
+| `node --check worker/index.js` | exit `0` |
+
+### 8.2 Deterministic verification (committed artifact)
+
+| Command | Exit | Result |
+| --- | --- | --- |
+| `node --check worker/index.js` | 0 | syntax OK |
+| `python -m pytest -q tests/test_mcp_events_golden.py` | 0 | **24 passed** |
+| `python -m pytest -q` (full repository) | 0 | **1101 passed, 1 skipped** |
+| `python scripts/scope_guard.py HEAD <concrete allowlist>` | 0 | `PASS` |
+| `python scripts/secret_guard.py HEAD` | 0 | `PASS` |
+
+The pre-existing 11 tools and the `initialize` protocol surface remain
+regression-clean (`test_initialize_protocol_and_tools_unchanged`). The single
+skip is the pre-existing environment-dependent skip on the baseline.
+
+### 8.3 Candidate read-back
+
+`which wrangler` => absent; `npx` has no installed `wrangler`; no
+`CLOUDFLARE_API_TOKEN` / `CF_API_TOKEN` / `CLOUDFLARE_API_KEY` in the
+environment. The EXISTING Deploy & Write candidate-creation path is therefore
+**not reachable from the Cloud Agent** — this is intentionally-absent
+credentials, **not** a production-credential Human Gate, and no token was
+requested or pasted.
+
+| Item | Result |
+| --- | --- |
+| Non-active candidate created | **No** — candidate path not reachable (no credential) |
+| Production version/traffic read-back | **UNKNOWN** (unchanged by this task) |
+| Production mutated / deployed / traffic-shifted | `false` / `false` / `false` |
+| Canonical write | `false` |
+
+### 8.4 READY_FOR_EXTERNAL_CANDIDATE handoff
+
+The connected Deploy & Write control plane should, in a later supervisor turn:
+
+1. Check out commit `main` at the closure commit (SHA in `agent_result.json`).
+2. Confirm `sha256sum worker/index.js` ==
+   `babe8187e7c58c1e388b6fbafed9fb46da956d496c73d9da4c40ef8cc41396de`.
+3. Upload a **non-active** version from that build (`worker/wrangler.toml`,
+   `main = "index.js"`; prebuilt bundle, so the deploy artifact equals the tested
+   source). Required candidate parameters: account
+   `78a22a0699aa94a39d8f7bfdbac18249`, worker `personal-ai-execution-mcp`,
+   source hash `babe8187…96de`, no new binding/schema/secret/OAuth change.
+4. Read back the non-active version id and confirm it receives **no** traffic.
+5. Stop before production promotion. Promote only under explicit owner approval,
+   then run exactly one live `task.completed` wake test.

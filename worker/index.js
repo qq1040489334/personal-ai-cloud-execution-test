@@ -526,6 +526,424 @@ var SELF_REPORTED_SUCCESS_STATUSES = [
   "completed"
 ];
 var PROTOCOL_VERSION = "2025-06-18";
+var EVENTS_PROTOCOL_VERSION = "2026-07-28";
+var EVENTS_KV_PREFIX = "events-subscription::";
+var EVENTS_DELIVERY_PREFIX = "events-delivered::";
+var EVENT_MAX_BYTES = 262144;
+var EVENT_DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+var EVENT_MIN_TTL_MS = 60 * 1000;
+var EVENT_MAX_ATTEMPTS = 4;
+var EVENT_RETRY_BASE_MS = 25;
+var EVENT_CALLBACK_TIMEOUT_MS = 10000;
+var EVENT_SIGNATURE_TOLERANCE_SEC = 300;
+var TASK_COMPLETED_EVENT = "task.completed";
+var EVENTS = [
+  {
+    name: TASK_COMPLETED_EVENT,
+    description: "A Personal AI execution task reached a terminal result. Read the full evidence with the existing get_task_result(task_id) tool; the payload carries identifiers only.",
+    delivery: ["webhook"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Only deliver completions for this task id." },
+        project_id: { type: "string", description: "Only deliver completions for this project lineage." }
+      },
+      additionalProperties: false
+    },
+    payloadSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string" },
+        status: { type: "string" },
+        project_id: { type: "string" }
+      },
+      required: ["task_id", "status"],
+      additionalProperties: false
+    }
+  }
+];
+function canonicalJson(value) {
+  if (Array.isArray(value)) return "[" + value.map(canonicalJson).join(",") + "]";
+  if (value && typeof value === "object") {
+    return "{" + Object.keys(value).sort().map((k) => JSON.stringify(k) + ":" + canonicalJson(value[k])).join(",") + "}";
+  }
+  return JSON.stringify(value);
+}
+function bytesToB64(bytes) {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+function decodeWhsec(secret) {
+  if (typeof secret !== "string" || !secret.startsWith("whsec_")) return null;
+  const raw = secret.slice(6);
+  if (!raw || !/^[A-Za-z0-9+/=_-]+$/.test(raw)) return null;
+  try {
+    const b64 = raw.replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i2 = 0; i2 < bin.length; i2++) bytes[i2] = bin.charCodeAt(i2);
+    if (bytes.length < 24 || bytes.length > 64) return null;
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+async function standardWebhookSignature(secret, msgId, timestamp, body) {
+  const raw = decodeWhsec(secret);
+  if (!raw) throw mcpError(-32602, "INVALID_PARAMS", "invalid_signing_secret");
+  const key = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${msgId}.${timestamp}.${body}`));
+  return "v1," + bytesToB64(new Uint8Array(sig));
+}
+async function verifyStandardWebhookSignature(secret, msgId, timestamp, body, header, toleranceSec) {
+  if (typeof header !== "string") return false;
+  const ts = Number(timestamp);
+  if (!Number.isFinite(ts)) return false;
+  const tolerance = toleranceSec == null ? EVENT_SIGNATURE_TOLERANCE_SEC : Number(toleranceSec);
+  if (Math.abs(nowSec() - ts) > tolerance) return false;
+  const expected = await standardWebhookSignature(secret, msgId, String(timestamp), body);
+  const expectedSig = expected.slice(expected.indexOf(",") + 1);
+  for (const part of header.split(/\s+/).filter(Boolean)) {
+    const comma = part.indexOf(",");
+    const version = comma === -1 ? "" : part.slice(0, comma);
+    const sig = comma === -1 ? part : part.slice(comma + 1);
+    if (version === "v1" && timingSafeEqual(sig, expectedSig)) return true;
+  }
+  return false;
+}
+function mcpError(code, message, data) {
+  const err = new Error(message);
+  let payload = null;
+  if (typeof data === "string") payload = { reason: data };
+  else if (data && typeof data === "object") payload = data;
+  err.mcpError = { code, message, data: payload };
+  return err;
+}
+function callbackUrlError(reason) {
+  return mcpError(-32015, "CallbackEndpointError", reason);
+}
+function validateCallbackUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl || ""));
+  } catch {
+    throw callbackUrlError("invalid_url");
+  }
+  if (parsed.protocol !== "https:") throw callbackUrlError("insecure_scheme");
+  if (parsed.username || parsed.password) throw callbackUrlError("userinfo_not_allowed");
+  const host = parsed.hostname.toLowerCase();
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) {
+    throw callbackUrlError("non_public_address");
+  }
+  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const parts = ipv4.slice(1).map(Number);
+    if (parts.some((n) => n > 255)) throw callbackUrlError("invalid_url");
+    const [a, b] = parts;
+    if (a === 0 || a === 10 || a === 127 || a >= 224 || a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a === 100 && b >= 64 && b <= 127 || a === 198 && (b === 18 || b === 19)) {
+      throw callbackUrlError("non_public_address");
+    }
+  } else if (host.includes(":")) {
+    const h = host.replace(/^\[|\]$/g, "");
+    if (h === "::" || h === "::1" || h.startsWith("fe80") || h.startsWith("fc") || h.startsWith("fd") || h.startsWith("ff")) {
+      throw callbackUrlError("non_public_address");
+    }
+  }
+  return parsed;
+}
+async function eventFetch(url, options) {
+  validateCallbackUrl(url);
+  if (typeof fetch !== "function") throw callbackUrlError("network_unavailable");
+  return fetch(url, options);
+}
+function utf8ByteLength(text) {
+  return new TextEncoder().encode(text).length;
+}
+function authPrincipal(auth) {
+  if (auth && auth.payload && auth.payload.sub) return String(auth.payload.sub);
+  return "owner";
+}
+function validateEventArgs(args, schema) {
+  const value = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const props = schema.properties || {};
+  for (const key of Object.keys(value)) {
+    if (!props[key]) return { ok: false, reason: `unexpected_argument:${key}` };
+    const type = props[key].type;
+    if (type && typeof value[key] !== type) return { ok: false, reason: `invalid_argument:${key}` };
+  }
+  for (const required of schema.required || []) {
+    if (value[required] === void 0 || value[required] === null || value[required] === "") {
+      return { ok: false, reason: `missing_argument:${required}` };
+    }
+  }
+  return { ok: true, value };
+}
+function resolveTtlMs(requested) {
+  if (requested === null || requested === void 0) return EVENT_DEFAULT_TTL_MS;
+  const value = Number(requested);
+  if (!Number.isFinite(value) || value < 0) return EVENT_DEFAULT_TTL_MS;
+  return Math.max(EVENT_MIN_TTL_MS, Math.min(value, EVENT_DEFAULT_TTL_MS));
+}
+function newEventId() {
+  if (crypto.randomUUID) return "evt_" + crypto.randomUUID().replace(/-/g, "");
+  return "evt_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+function newChallenge() {
+  if (crypto.randomUUID) return crypto.randomUUID().replace(/-/g, "");
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+async function deterministicSubscriptionId(principal, url, name, args) {
+  const fingerprint = `${principal}
+${url}
+${name}
+${canonicalJson(args || {})}`;
+  return "sub_" + (await sha256Hex(fingerprint)).slice(0, 32);
+}
+function listEvents() {
+  return { events: EVENTS, nextCursor: null, truncated: false };
+}
+async function listSubscriptions(env) {
+  if (!env.TASK_REGISTRY || typeof env.TASK_REGISTRY.list !== "function") return [];
+  const listed = await env.TASK_REGISTRY.list({ prefix: EVENTS_KV_PREFIX });
+  const subscriptions = [];
+  for (const key of listed.keys || []) {
+    const sub = await env.TASK_REGISTRY.get(key.name, "json");
+    if (sub) subscriptions.push(sub);
+  }
+  return subscriptions;
+}
+function matchEventFilter(args, data) {
+  const filter = args && typeof args === "object" ? args : {};
+  for (const key of Object.keys(filter)) {
+    if (filter[key] === void 0 || filter[key] === null) continue;
+    if (String(data[key]) !== String(filter[key])) return false;
+  }
+  return true;
+}
+function isSubscriptionExpired(sub, nowMs) {
+  if (!sub || !sub.refreshBefore) return false;
+  const expiry = Date.parse(sub.refreshBefore);
+  return Number.isFinite(expiry) && expiry <= nowMs;
+}
+async function verifyCallbackEndpoint(sub) {
+  const challenge = newChallenge();
+  const msgId = "msg_verification_" + challenge.slice(0, 16);
+  const timestamp = String(nowSec());
+  const body = JSON.stringify({ type: "verification", challenge });
+  let response;
+  try {
+    const signature = await standardWebhookSignature(sub.secret, msgId, timestamp, body);
+    response = await eventFetch(sub.url, {
+      method: "POST",
+      redirect: "error",
+      signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(EVENT_CALLBACK_TIMEOUT_MS) : void 0,
+      headers: {
+        "Content-Type": "application/json",
+        "webhook-id": msgId,
+        "webhook-timestamp": timestamp,
+        "webhook-signature": signature,
+        "X-MCP-Subscription-Id": sub.id
+      },
+      body
+    });
+  } catch (err) {
+    return { ok: false, reason: err && err.mcpError && err.mcpError.data ? err.mcpError.data.reason : "timeout" };
+  }
+  if (!response || response.status < 200 || response.status >= 300) return { ok: false, reason: "challenge_failed" };
+  let echoed = null;
+  try {
+    echoed = await response.json();
+  } catch {
+    echoed = null;
+  }
+  if (!echoed || typeof echoed.challenge !== "string" || !timingSafeEqual(echoed.challenge, challenge)) {
+    return { ok: false, reason: "challenge_failed" };
+  }
+  return { ok: true, reason: null };
+}
+async function handleEventsSubscribe(env, auth, params) {
+  if (!env.TASK_REGISTRY) throw mcpError(-32000, "UNSUPPORTED", "TASK_REGISTRY_UNAVAILABLE");
+  const name = String(params.name || "");
+  const definition = EVENTS.find((event) => event.name === name);
+  if (!definition) throw mcpError(-32602, "INVALID_PARAMS", `unknown event: ${name}`);
+  const validated = validateEventArgs(params.arguments || {}, definition.inputSchema);
+  if (!validated.ok) throw mcpError(-32602, "INVALID_PARAMS", validated.reason);
+  const delivery = params.delivery && typeof params.delivery === "object" ? params.delivery : {};
+  const mode = String(delivery.mode || "webhook");
+  if (mode !== "webhook") throw mcpError(-32602, "INVALID_PARAMS", "unsupported_delivery_mode");
+  const url = validateCallbackUrl(delivery.url).toString();
+  if (decodeWhsec(delivery.secret) === null) throw mcpError(-32602, "INVALID_PARAMS", "invalid_signing_secret");
+  const principal = authPrincipal(auth);
+  const id = await deterministicSubscriptionId(principal, url, name, validated.value);
+  const key = EVENTS_KV_PREFIX + id;
+  let existing = null;
+  try {
+    existing = await env.TASK_REGISTRY.get(key, "json");
+  } catch {
+    existing = null;
+  }
+  const verified = await verifyCallbackEndpoint({ id, url, secret: delivery.secret });
+  if (!verified.ok) throw mcpError(-32015, "CallbackEndpointError", verified.reason || "challenge_failed");
+  const now = /* @__PURE__ */ new Date();
+  const ttlMs = resolveTtlMs(params.ttlMs);
+  const refreshBefore = ttlMs === null ? null : new Date(now.getTime() + ttlMs).toISOString();
+  const secretRotated = Boolean(existing && existing.delivery && existing.delivery.secret && existing.delivery.secret !== delivery.secret);
+  const record = {
+    id,
+    principal,
+    name,
+    arguments: validated.value,
+    delivery: { mode: "webhook", url, secret: delivery.secret },
+    created_at: existing && existing.created_at ? existing.created_at : now.toISOString(),
+    updated_at: now.toISOString(),
+    refreshBefore,
+    ttlMs,
+    verified_at: now.toISOString(),
+    cursor: null,
+    previous_secret: secretRotated ? existing.delivery.secret : null,
+    previous_secret_expires_at: secretRotated ? new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString() : null
+  };
+  await env.TASK_REGISTRY.put(key, JSON.stringify(record), { metadata: { name, principal } });
+  return { id, refreshBefore, cursor: null, truncated: false, secret_rotated: secretRotated };
+}
+async function handleEventsUnsubscribe(env, auth, params) {
+  if (!env.TASK_REGISTRY) throw mcpError(-32000, "UNSUPPORTED", "TASK_REGISTRY_UNAVAILABLE");
+  const name = String(params.name || "");
+  const definition = EVENTS.find((event) => event.name === name);
+  if (!definition) throw mcpError(-32602, "INVALID_PARAMS", `unknown event: ${name}`);
+  const validated = validateEventArgs(params.arguments || {}, definition.inputSchema);
+  if (!validated.ok) throw mcpError(-32602, "INVALID_PARAMS", validated.reason);
+  const delivery = params.delivery && typeof params.delivery === "object" ? params.delivery : {};
+  const url = validateCallbackUrl(delivery.url).toString();
+  const principal = authPrincipal(auth);
+  const id = await deterministicSubscriptionId(principal, url, name, validated.value);
+  const key = EVENTS_KV_PREFIX + id;
+  let existing = null;
+  try {
+    existing = await env.TASK_REGISTRY.get(key, "json");
+  } catch {
+    existing = null;
+  }
+  if (existing && existing.principal === principal && typeof env.TASK_REGISTRY.delete === "function") {
+    try {
+      await env.TASK_REGISTRY.delete(key);
+    } catch {
+    }
+  }
+  return {};
+}
+function retryDelayMs(attempt, options) {
+  const base = options && options.retryBaseMs != null ? options.retryBaseMs : EVENT_RETRY_BASE_MS;
+  return base * Math.pow(2, Math.max(0, attempt - 1));
+}
+async function sleepMs(ms, options) {
+  if (options && typeof options.sleep === "function") return options.sleep(ms);
+  if (!ms || ms <= 0) return;
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+async function sendEventToSubscription(env, sub, event, options) {
+  const opts = options || {};
+  const maxAttempts = Math.max(1, Number(opts.maxAttempts) || EVENT_MAX_ATTEMPTS);
+  const body = JSON.stringify(event);
+  if (utf8ByteLength(body) > EVENT_MAX_BYTES) throw callbackUrlError("payload_too_large");
+  const attempts = [];
+  const secrets = [sub.delivery && sub.delivery.secret ? sub.delivery.secret : sub.secret];
+  const previous = sub.previous_secret || sub.delivery && sub.delivery.previous_secret;
+  if (previous && (!sub.previous_secret_expires_at || Date.parse(sub.previous_secret_expires_at) > Date.now())) secrets.push(previous);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const signedAt = opts.now ? new Date(opts.now) : /* @__PURE__ */ new Date();
+    const timestamp = String(Math.floor(signedAt.getTime() / 1e3));
+    const signatures = [];
+    for (const secret of secrets) signatures.push(await standardWebhookSignature(secret, event.eventId, timestamp, body));
+    let response = null;
+    try {
+      response = await eventFetch(sub.delivery.url, {
+        method: "POST",
+        redirect: "error",
+        signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(EVENT_CALLBACK_TIMEOUT_MS) : void 0,
+        headers: {
+          "Content-Type": "application/json",
+          "webhook-id": event.eventId,
+          "webhook-timestamp": timestamp,
+          "webhook-signature": signatures.join(" "),
+          "X-MCP-Subscription-Id": sub.id
+        },
+        body
+      });
+    } catch (err) {
+      attempts.push({ attempt, status: null, error: "network_error" });
+      if (attempt < maxAttempts) await sleepMs(retryDelayMs(attempt, opts), opts);
+      continue;
+    }
+    const status = response ? response.status : null;
+    attempts.push({ attempt, status });
+    if (status != null && status >= 200 && status < 300) return { accepted: true, status, attempts };
+    if (status === 410 || status === 413) return { accepted: false, status, attempts, retryable: false };
+    if (attempt < maxAttempts) await sleepMs(retryDelayMs(attempt, opts), opts);
+  }
+  const last = attempts[attempts.length - 1] || {};
+  return { accepted: false, status: last.status == null ? null : last.status, attempts, retryable: true };
+}
+async function readDeliveryMarker(env, subscriptionId, eventId) {
+  if (!env.TASK_REGISTRY || typeof env.TASK_REGISTRY.get !== "function") return null;
+  try {
+    return await env.TASK_REGISTRY.get(EVENTS_DELIVERY_PREFIX + subscriptionId + "::" + eventId, "text");
+  } catch {
+    return null;
+  }
+}
+async function writeDeliveryMarker(env, subscriptionId, eventId) {
+  if (!env.TASK_REGISTRY || typeof env.TASK_REGISTRY.put !== "function") return;
+  try {
+    await env.TASK_REGISTRY.put(EVENTS_DELIVERY_PREFIX + subscriptionId + "::" + eventId, "1", { expirationTtl: 86400 });
+  } catch {
+  }
+}
+async function emitTaskCompleted(env, input, options) {
+  const opts = options || {};
+  if (!env || !env.TASK_REGISTRY) return { eventId: null, delivered: [], skipped: [], reason: "TASK_REGISTRY_UNAVAILABLE" };
+  const data = {
+    task_id: String(input && input.task_id ? input.task_id : ""),
+    status: String(input && input.status ? input.status : "")
+  };
+  if (input && input.project_id) data.project_id = String(input.project_id);
+  if (!data.task_id || !data.status) return { eventId: null, delivered: [], skipped: [], reason: "INVALID_EVENT_DATA" };
+  const event = {
+    eventId: input.event_id ? String(input.event_id) : newEventId(),
+    name: TASK_COMPLETED_EVENT,
+    timestamp: new Date(opts.now ? opts.now : Date.now()).toISOString(),
+    data,
+    cursor: null
+  };
+  const nowMs = opts.now ? new Date(opts.now).getTime() : Date.now();
+  const subscriptions = await listSubscriptions(env);
+  const delivered = [];
+  const skipped = [];
+  for (const sub of subscriptions) {
+    if (!sub || sub.name !== event.name) continue;
+    if (isSubscriptionExpired(sub, nowMs)) {
+      skipped.push({ id: sub.id, reason: "expired" });
+      continue;
+    }
+    if (!matchEventFilter(sub.arguments, event.data)) {
+      skipped.push({ id: sub.id, reason: "filter_mismatch" });
+      continue;
+    }
+    if (await readDeliveryMarker(env, sub.id, event.eventId)) {
+      skipped.push({ id: sub.id, reason: "duplicate" });
+      continue;
+    }
+    const result = await sendEventToSubscription(env, sub, event, opts);
+    if (result.accepted) {
+      await writeDeliveryMarker(env, sub.id, event.eventId);
+      delivered.push({ id: sub.id, status: result.status, attempts: result.attempts.length });
+    } else {
+      skipped.push({ id: sub.id, reason: "delivery_failed", status: result.status });
+    }
+  }
+  return { eventId: event.eventId, delivered, skipped };
+}
 var ACCESS_TTL = 3600;
 var REFRESH_TTL = 60 * 60 * 24 * 30;
 var CODE_TTL = 300;
@@ -2025,6 +2443,14 @@ async function finalizeTaskResult(env, taskId, result) {
       synced: true,
       updated_at: (/* @__PURE__ */ new Date()).toISOString()
     });
+    try {
+      await emitTaskCompleted(env, {
+        task_id: taskId,
+        status: result.status,
+        project_id: registry && registry.project_id ? registry.project_id : void 0
+      });
+    } catch {
+    }
   }
   return result;
 }
@@ -2975,6 +3401,12 @@ var TOOLS = [
     outputSchema: { type: "object", additionalProperties: true }
   }
 ];
+function jsonRpcError(cors, id, err) {
+  const info = err && err.mcpError ? err.mcpError : { code: -32603, message: "Internal error", data: null };
+  const error = { code: info.code, message: info.message };
+  if (info.data) error.data = info.data;
+  return json({ jsonrpc: "2.0", id, error }, 200, cors);
+}
 async function handleMcp(request, env, cors, auth) {
   let message;
   try {
@@ -2995,6 +3427,30 @@ async function handleMcp(request, env, cors, auth) {
       });
     case "ping":
       return ok({});
+    case "server/discover":
+      return ok({
+        resultType: "complete",
+        supportedVersions: [EVENTS_PROTOCOL_VERSION],
+        capabilities: { tools: {}, events: {} }
+      });
+    case "events/list":
+      return ok(listEvents());
+    case "events/subscribe": {
+      if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
+      try {
+        return ok(await handleEventsSubscribe(env, auth, params));
+      } catch (err) {
+        return jsonRpcError(cors, id, err);
+      }
+    }
+    case "events/unsubscribe": {
+      if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
+      try {
+        return ok(await handleEventsUnsubscribe(env, auth, params));
+      } catch (err) {
+        return jsonRpcError(cors, id, err);
+      }
+    }
     case "tools/list":
       return ok({ tools: TOOLS });
     case "tools/call": {
