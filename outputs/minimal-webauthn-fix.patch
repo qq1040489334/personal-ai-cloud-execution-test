@@ -1,0 +1,520 @@
+diff --git a/src/personal_ai_execution/approval_webauthn.py b/src/personal_ai_execution/approval_webauthn.py
+new file mode 100644
+index 0000000..e39cc1b
+--- /dev/null
++++ b/src/personal_ai_execution/approval_webauthn.py
+@@ -0,0 +1,281 @@
++"""Fail-closed evaluator for the Personal AI WebAuthn approval assertion.
++
++This module is a *reviewable reference fix* for the live Site branch that
++currently returns ``APPROVAL_CREDENTIALS_INVALID``. It exists to make the
++failure localizable and to normalize the most common configuration defect
++(standard-base64 vs base64url credential material in
++``PAI_APPROVAL_CREDENTIALS``) without ever reading or emitting real secret
++material.
++
++Design rules
++------------
++* Pure standard library; cryptographic signature verification is injected so
++  the whole chain can be unit-tested with synthetic fixtures and no real key.
++* Fail-closed: every path returns exactly one reason and no production state
++  is touched.
++* Output never contains a credential id, public key, signature, challenge or
++  any other raw/usable authentication material.
++"""
++
++from __future__ import annotations
++
++import base64
++import binascii
++import hashlib
++import hmac
++import json
++from typing import Callable
++
++ERROR_CODE = "APPROVAL_CREDENTIALS_INVALID"
++
++REASON_OK = "OK"
++REASON_CREDENTIALS_PARSE_ERROR = "CREDENTIALS_PARSE_ERROR"
++REASON_CREDENTIALS_SCHEMA_ERROR = "CREDENTIALS_SCHEMA_ERROR"
++REASON_CREDENTIAL_ID_ENCODING_ERROR = "CREDENTIAL_ID_ENCODING_ERROR"
++REASON_PUBLIC_KEY_ENCODING_ERROR = "PUBLIC_KEY_ENCODING_ERROR"
++REASON_ASSERTION_ENCODING_ERROR = "ASSERTION_ENCODING_ERROR"
++REASON_CLIENT_DATA_PARSE_ERROR = "CLIENT_DATA_PARSE_ERROR"
++REASON_ASSERTION_TYPE_INVALID = "ASSERTION_TYPE_INVALID"
++REASON_CHALLENGE_MISMATCH = "CHALLENGE_MISMATCH"
++REASON_ORIGIN_MISMATCH = "ORIGIN_MISMATCH"
++REASON_RP_ID_MISMATCH = "RP_ID_MISMATCH"
++REASON_USER_PRESENCE_REQUIRED = "USER_PRESENCE_REQUIRED"
++REASON_USER_VERIFICATION_REQUIRED = "USER_VERIFICATION_REQUIRED"
++REASON_CREDENTIAL_NOT_FOUND = "CREDENTIAL_NOT_FOUND"
++REASON_SIGNATURE_INVALID = "SIGNATURE_INVALID"
++REASON_COUNTER_REGRESSION = "COUNTER_REGRESSION"
++REASON_CHALLENGE_NOT_FOUND = "CHALLENGE_NOT_FOUND"
++REASON_CHALLENGE_EXPIRED = "CHALLENGE_EXPIRED"
++REASON_CHALLENGE_CONSUMED = "CHALLENGE_CONSUMED"
++
++REASON_VOCABULARY = (
++    REASON_OK,
++    REASON_CREDENTIALS_PARSE_ERROR,
++    REASON_CREDENTIALS_SCHEMA_ERROR,
++    REASON_CREDENTIAL_ID_ENCODING_ERROR,
++    REASON_PUBLIC_KEY_ENCODING_ERROR,
++    REASON_ASSERTION_ENCODING_ERROR,
++    REASON_CLIENT_DATA_PARSE_ERROR,
++    REASON_ASSERTION_TYPE_INVALID,
++    REASON_CHALLENGE_MISMATCH,
++    REASON_ORIGIN_MISMATCH,
++    REASON_RP_ID_MISMATCH,
++    REASON_USER_PRESENCE_REQUIRED,
++    REASON_USER_VERIFICATION_REQUIRED,
++    REASON_CREDENTIAL_NOT_FOUND,
++    REASON_SIGNATURE_INVALID,
++    REASON_COUNTER_REGRESSION,
++    REASON_CHALLENGE_NOT_FOUND,
++    REASON_CHALLENGE_EXPIRED,
++    REASON_CHALLENGE_CONSUMED,
++)
++
++#: authenticatorData flag bits.
++FLAG_USER_PRESENT = 0x01
++FLAG_USER_VERIFIED = 0x04
++
++REQUIRED_CREDENTIAL_FIELDS = ("credential_id", "public_key", "rp_id", "alg")
++
++
++class ApprovalConfigError(ValueError):
++    """Raised when ``PAI_APPROVAL_CREDENTIALS`` cannot be normalized."""
++
++    def __init__(self, reason: str) -> None:
++        super().__init__(reason)
++        self.reason = reason
++        self.code = ERROR_CODE
++
++
++def b64url_decode(value: str) -> bytes:
++    """Decode base64 *or* base64url, with or without padding.
++
++    Returns the decoded bytes or raises :class:`ApprovalConfigError`. The
++    function deliberately accepts the standard-base64 alphabet as well as the
++    URL alphabet so a mis-encoded ``PAI_APPROVAL_CREDENTIALS`` entry is
++    normalized instead of silently failing a later byte comparison.
++    """
++    if not isinstance(value, str) or not value.strip():
++        raise ApprovalConfigError(REASON_CREDENTIAL_ID_ENCODING_ERROR)
++    raw = value.strip().replace("-", "+").replace("_", "/")
++    padding = (-len(raw)) % 4
++    raw = raw + ("=" * padding)
++    try:
++        return base64.b64decode(raw, validate=True)
++    except (binascii.Error, ValueError) as exc:
++        raise ApprovalConfigError(REASON_CREDENTIAL_ID_ENCODING_ERROR) from exc
++
++
++def _decode_field(value: str, reason: str) -> bytes:
++    try:
++        return b64url_decode(value)
++    except ApprovalConfigError as exc:
++        raise ApprovalConfigError(reason) from exc
++
++
++def parse_approval_credentials(raw: object) -> list[dict]:
++    """Parse and normalize the ``PAI_APPROVAL_CREDENTIALS`` JSON document.
++
++    Accepts either a JSON list of credentials or an object with a
++    ``credentials`` list. Each credential must carry ``credential_id``,
++    ``public_key``, ``rp_id`` and ``alg``. Only *normalized lengths* and
++    non-secret metadata are returned; no raw value is echoed.
++    """
++    document = raw
++    if isinstance(raw, (str, bytes)):
++        try:
++            document = json.loads(raw)
++        except (ValueError, TypeError) as exc:
++            raise ApprovalConfigError(REASON_CREDENTIALS_PARSE_ERROR) from exc
++    if isinstance(document, dict):
++        document = document.get("credentials")
++    if not isinstance(document, list) or not document:
++        raise ApprovalConfigError(REASON_CREDENTIALS_SCHEMA_ERROR)
++
++    parsed: list[dict] = []
++    for entry in document:
++        if not isinstance(entry, dict):
++            raise ApprovalConfigError(REASON_CREDENTIALS_SCHEMA_ERROR)
++        if any(
++            key not in entry or entry[key] in (None, "")
++            for key in REQUIRED_CREDENTIAL_FIELDS
++        ):
++            raise ApprovalConfigError(REASON_CREDENTIALS_SCHEMA_ERROR)
++        alg = entry["alg"]
++        if not isinstance(alg, int) or isinstance(alg, bool):
++            raise ApprovalConfigError(REASON_CREDENTIALS_SCHEMA_ERROR)
++        credential_id = _decode_field(
++            entry["credential_id"], REASON_CREDENTIAL_ID_ENCODING_ERROR
++        )
++        public_key = _decode_field(
++            entry["public_key"], REASON_PUBLIC_KEY_ENCODING_ERROR
++        )
++        parsed.append(
++            {
++                "credential_id": credential_id,
++                "public_key": public_key,
++                "rp_id": str(entry["rp_id"]),
++                "alg": alg,
++                "user_verification": str(
++                    entry.get("user_verification", "preferred")
++                ),
++            }
++        )
++    return parsed
++
++
++def parse_authenticator_data(authenticator_data: bytes) -> dict:
++    """Parse the fixed ``authenticatorData`` layout (no extensions)."""
++    if len(authenticator_data) < 37:
++        raise ApprovalConfigError(REASON_ASSERTION_ENCODING_ERROR)
++    flags = authenticator_data[32]
++    return {
++        "rp_id_hash": authenticator_data[:32],
++        "user_present": bool(flags & FLAG_USER_PRESENT),
++        "user_verified": bool(flags & FLAG_USER_VERIFIED),
++        "counter": int.from_bytes(authenticator_data[33:37], "big"),
++    }
++
++
++def evaluate_assertion(
++    *,
++    credentials: list[dict],
++    client_data_json: bytes,
++    authenticator_data: bytes,
++    signature: bytes,
++    credential_id: bytes,
++    expected_challenge: str,
++    expected_origins: tuple[str, ...] | list[str],
++    signature_verifier: Callable[[bytes, bytes, bytes, int], bool],
++    challenge_consume: Callable[[str], str],
++    stored_counters: dict[bytes, int] | None = None,
++) -> dict:
++    """Evaluate one WebAuthn assertion through the full approval chain.
++
++    Stages, in order: clientData parse -> type -> challenge -> origin ->
++    authenticator rpIdHash -> user presence -> credential lookup -> user
++    verification -> signature -> counter -> atomic challenge consume/replay.
++
++    Returns ``{"ok", "reason", "code", "stage"}`` only. No raw credential
++    material is ever included in the result.
++    """
++    result = {"ok": False, "reason": "", "code": ERROR_CODE, "stage": ""}
++
++    def fail(stage: str, reason: str) -> dict:
++        result["stage"] = stage
++        result["reason"] = reason
++        return result
++
++    # 1. clientDataJSON parse.
++    try:
++        client_data = json.loads(client_data_json.decode("utf-8"))
++    except (UnicodeDecodeError, ValueError):
++        return fail("client_data", REASON_CLIENT_DATA_PARSE_ERROR)
++    if not isinstance(client_data, dict):
++        return fail("client_data", REASON_CLIENT_DATA_PARSE_ERROR)
++
++    # 2. assertion type.
++    if client_data.get("type") != "webauthn.get":
++        return fail("assertion_type", REASON_ASSERTION_TYPE_INVALID)
++
++    # 3. challenge (constant-time compare).
++    challenge = str(client_data.get("challenge", ""))
++    if not hmac.compare_digest(challenge, str(expected_challenge)):
++        return fail("challenge", REASON_CHALLENGE_MISMATCH)
++
++    # 4. origin allowlist.
++    origin = str(client_data.get("origin", ""))
++    if origin not in tuple(expected_origins):
++        return fail("origin", REASON_ORIGIN_MISMATCH)
++
++    # 5. credential lookup.
++    credential = next(
++        (c for c in credentials if c["credential_id"] == credential_id), None
++    )
++    if credential is None:
++        return fail("credential_lookup", REASON_CREDENTIAL_NOT_FOUND)
++
++    # 6. authenticatorData: rpIdHash + flags + counter.
++    try:
++        parsed = parse_authenticator_data(authenticator_data)
++    except ApprovalConfigError:
++        return fail("authenticator_data", REASON_ASSERTION_ENCODING_ERROR)
++    if not hmac.compare_digest(
++        parsed["rp_id_hash"], hashlib.sha256(credential["rp_id"].encode()).digest()
++    ):
++        return fail("rp_id", REASON_RP_ID_MISMATCH)
++
++    # 7. user presence / verification policy.
++    if not parsed["user_present"]:
++        return fail("user_presence", REASON_USER_PRESENCE_REQUIRED)
++    if credential["user_verification"] == "required" and not parsed["user_verified"]:
++        return fail("user_verification", REASON_USER_VERIFICATION_REQUIRED)
++
++    # 8. signature over authenticatorData || sha256(clientDataJSON).
++    message = authenticator_data + hashlib.sha256(client_data_json).digest()
++    try:
++        signature_ok = bool(
++            signature_verifier(
++                credential["public_key"], message, signature, credential["alg"]
++            )
++        )
++    except Exception:
++        signature_ok = False
++    if not signature_ok:
++        return fail("signature", REASON_SIGNATURE_INVALID)
++
++    # 9. signature counter (0 means "no counter"; otherwise must strictly grow).
++    counters = stored_counters if stored_counters is not None else {}
++    previous = int(counters.get(credential_id, 0) or 0)
++    if parsed["counter"] != 0 and parsed["counter"] <= previous:
++        return fail("counter", REASON_COUNTER_REGRESSION)
++
++    # 10. atomic challenge consume / replay rejection (last, so an otherwise
++    #     invalid assertion never consumes a legitimate challenge).
++    consume = challenge_consume(str(expected_challenge))
++    if consume != REASON_OK:
++        return fail("challenge_ledger", consume)
++
++    result.update(
++        {"ok": True, "reason": REASON_OK, "code": None, "stage": "complete"}
++    )
++    return result
+diff --git a/tests/test_approval_webauthn.py b/tests/test_approval_webauthn.py
+new file mode 100644
+index 0000000..6a28e3c
+--- /dev/null
++++ b/tests/test_approval_webauthn.py
+@@ -0,0 +1,227 @@
++"""Offline tests for the fail-closed WebAuthn approval evaluator.
++
++All fixtures are synthetic markers, never real credentials or key material.
++"""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++import json
++
++import pytest
++
++from personal_ai_execution import approval_webauthn as aw
++
++
++def _b64url(data: bytes) -> str:
++    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
++
++
++SYNTHETIC_CREDENTIAL_ID = b"SYNTHETIC-CREDENTIAL-ID-FIXTURE"
++SYNTHETIC_PUBLIC_KEY = b"SYNTHETIC-PUBLIC-KEY-FIXTURE-NOT-A-KEY"
++RP_ID = "approval.example.test"
++ORIGIN = "https://approval.example.test"
++CHALLENGE = "synthetic-challenge-fixture"
++ALG = -7
++
++
++def _credential_document(*, credential_id: bytes = SYNTHETIC_CREDENTIAL_ID,
++                         public_key: bytes = SYNTHETIC_PUBLIC_KEY,
++                         user_verification: str = "required") -> dict:
++    return {
++        "credential_id": _b64url(credential_id),
++        "public_key": _b64url(public_key),
++        "rp_id": RP_ID,
++        "alg": ALG,
++        "user_verification": user_verification,
++    }
++
++
++def _authenticator_data(*, rp_id: str = RP_ID, user_present: bool = True,
++                        user_verified: bool = True, counter: int = 1) -> bytes:
++    flags = 0
++    if user_present:
++        flags |= aw.FLAG_USER_PRESENT
++    if user_verified:
++        flags |= aw.FLAG_USER_VERIFIED
++    return (
++        hashlib.sha256(rp_id.encode()).digest()
++        + bytes([flags])
++        + counter.to_bytes(4, "big")
++    )
++
++
++def _client_data(*, challenge: str = CHALLENGE, origin: str = ORIGIN,
++                 type_: str = "webauthn.get") -> bytes:
++    return json.dumps(
++        {"type": type_, "challenge": challenge, "origin": origin}
++    ).encode("utf-8")
++
++
++def _verifier(public_key, message, signature, alg):  # noqa: ANN001
++    return signature != b"SYNTHETIC-BAD-SIGNATURE"
++
++
++class _Ledger:
++    def __init__(self, status: str = aw.REASON_OK) -> None:
++        self.status = status
++        self.used: set[str] = set()
++
++    def consume(self, challenge: str) -> str:
++        if self.status != aw.REASON_OK:
++            return self.status
++        if challenge in self.used:
++            return aw.REASON_CHALLENGE_CONSUMED
++        self.used.add(challenge)
++        return aw.REASON_OK
++
++
++def _evaluate(**overrides):  # noqa: ANN003
++    credentials = overrides.pop(
++        "credentials",
++        [aw.parse_approval_credentials([_credential_document()])[0]],
++    )
++    params = dict(
++        credentials=credentials,
++        client_data_json=_client_data(),
++        authenticator_data=_authenticator_data(),
++        signature=b"synthetic-signature",
++        credential_id=SYNTHETIC_CREDENTIAL_ID,
++        expected_challenge=CHALLENGE,
++        expected_origins=(ORIGIN,),
++        signature_verifier=_verifier,
++        challenge_consume=_Ledger().consume,
++        stored_counters=None,
++    )
++    params.update(overrides)
++    return aw.evaluate_assertion(**params)
++
++
++def test_parse_accepts_list_and_object_wrapper() -> None:
++    assert aw.parse_approval_credentials([_credential_document()])[0]["rp_id"] == RP_ID
++    wrapped = aw.parse_approval_credentials({"credentials": [_credential_document()]})
++    assert wrapped[0]["credential_id"] == SYNTHETIC_CREDENTIAL_ID
++
++
++def test_parse_normalizes_standard_base64_and_padding() -> None:
++    standard = {
++        "credential_id": base64.b64encode(SYNTHETIC_CREDENTIAL_ID).decode(),
++        "public_key": base64.b64encode(SYNTHETIC_PUBLIC_KEY).decode(),
++        "rp_id": RP_ID,
++        "alg": ALG,
++    }
++    parsed = aw.parse_approval_credentials([standard])
++    assert parsed[0]["credential_id"] == SYNTHETIC_CREDENTIAL_ID
++    assert parsed[0]["public_key"] == SYNTHETIC_PUBLIC_KEY
++
++
++@pytest.mark.parametrize(
++    "raw, reason",
++    [
++        ("{not json", aw.REASON_CREDENTIALS_PARSE_ERROR),
++        (42, aw.REASON_CREDENTIALS_SCHEMA_ERROR),
++        ([], aw.REASON_CREDENTIALS_SCHEMA_ERROR),
++        ([{"rp_id": RP_ID}], aw.REASON_CREDENTIALS_SCHEMA_ERROR),
++        ([dict(_credential_document(), credential_id="!!!")],
++         aw.REASON_CREDENTIAL_ID_ENCODING_ERROR),
++        ([dict(_credential_document(), public_key="***")],
++         aw.REASON_PUBLIC_KEY_ENCODING_ERROR),
++    ],
++)
++def test_parse_rejects_invalid_documents(raw, reason) -> None:  # noqa: ANN001
++    with pytest.raises(aw.ApprovalConfigError) as excinfo:
++        aw.parse_approval_credentials(raw)
++    assert excinfo.value.reason == reason
++    assert excinfo.value.code == aw.ERROR_CODE
++
++
++def test_full_chain_success_returns_exactly_one_reason() -> None:
++    result = _evaluate()
++    assert result["ok"] is True
++    assert result["reason"] == aw.REASON_OK
++    assert result["code"] is None
++
++
++def test_challenge_mismatch_is_localized() -> None:
++    result = _evaluate(expected_challenge="different-challenge")
++    assert result["reason"] == aw.REASON_CHALLENGE_MISMATCH
++    assert result["stage"] == "challenge"
++
++
++def test_origin_mismatch_is_localized() -> None:
++    result = _evaluate(expected_origins=("https://other.example.test",))
++    assert result["reason"] == aw.REASON_ORIGIN_MISMATCH
++
++
++def test_rp_id_mismatch_is_localized() -> None:
++    result = _evaluate(authenticator_data=_authenticator_data(rp_id="other.test"))
++    assert result["reason"] == aw.REASON_RP_ID_MISMATCH
++
++
++def test_user_verification_required_but_absent() -> None:
++    result = _evaluate(
++        authenticator_data=_authenticator_data(user_verified=False)
++    )
++    assert result["reason"] == aw.REASON_USER_VERIFICATION_REQUIRED
++
++
++def test_user_presence_required_but_absent() -> None:
++    result = _evaluate(
++        client_data_json=_client_data(),
++        authenticator_data=_authenticator_data(user_present=False, user_verified=False),
++    )
++    assert result["reason"] == aw.REASON_USER_PRESENCE_REQUIRED
++
++
++def test_credential_not_found_is_localized() -> None:
++    result = _evaluate(credential_id=b"other-credential")
++    assert result["reason"] == aw.REASON_CREDENTIAL_NOT_FOUND
++
++
++def test_signature_invalid_is_localized() -> None:
++    result = _evaluate(signature=b"SYNTHETIC-BAD-SIGNATURE")
++    assert result["reason"] == aw.REASON_SIGNATURE_INVALID
++
++
++def test_counter_regression_is_localized() -> None:
++    result = _evaluate(
++        authenticator_data=_authenticator_data(counter=5),
++        stored_counters={SYNTHETIC_CREDENTIAL_ID: 9},
++    )
++    assert result["reason"] == aw.REASON_COUNTER_REGRESSION
++
++
++def test_replay_is_rejected_by_atomic_consume() -> None:
++    ledger = _Ledger()
++    first = _evaluate(challenge_consume=ledger.consume)
++    second = _evaluate(challenge_consume=ledger.consume)
++    assert first["ok"] is True
++    assert second["ok"] is False
++    assert second["reason"] == aw.REASON_CHALLENGE_CONSUMED
++
++
++@pytest.mark.parametrize(
++    "status",
++    [aw.REASON_CHALLENGE_NOT_FOUND, aw.REASON_CHALLENGE_EXPIRED],
++)
++def test_ledger_status_reasons_are_forwarded(status: str) -> None:
++    result = _evaluate(challenge_consume=_Ledger(status).consume)
++    assert result["reason"] == status
++
++
++def test_result_never_contains_raw_material() -> None:
++    serialized = json.dumps(_evaluate(), sort_keys=True)
++    for token in (
++        _b64url(SYNTHETIC_CREDENTIAL_ID),
++        _b64url(SYNTHETIC_PUBLIC_KEY),
++        CHALLENGE,
++        "synthetic-signature",
++    ):
++        assert token not in serialized
++
++
++def test_reason_vocabulary_is_complete_and_unique() -> None:
++    assert len(aw.REASON_VOCABULARY) == len(set(aw.REASON_VOCABULARY))
++    assert aw.ERROR_CODE == "APPROVAL_CREDENTIALS_INVALID"
++    assert aw.REASON_OK in aw.REASON_VOCABULARY

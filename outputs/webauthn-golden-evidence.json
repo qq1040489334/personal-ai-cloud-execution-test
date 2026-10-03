@@ -1,0 +1,212 @@
+{
+  "schema_version": "approval-webauthn-golden-evidence/v1",
+  "goal": "APPROVAL_WEBAUTHN_GOLDEN_CLOSURE_V1",
+  "task_id": "cf-f2e99a93b4d5",
+  "generated_at": "2026-10-03T00:00:00Z",
+  "mode": "READ_ONLY_FORENSIC_CLOSURE",
+  "workflow_status": "success",
+  "final_status": "BLOCKED",
+  "webAuthn_golden": "BLOCKED",
+  "status_rationale": "No real browser WebAuthn assertion was executed and server-side verified on the current live Site, so WebAuthn Golden PASS is not claimable. The live Site approval verifier source at version 25 / commit 0e3bdbd77bb38fc5115a408df675940ce47d9c22 is not present in this repository and no redacted server-side rejection trace was available, so the exact branch producing APPROVAL_CREDENTIALS_INVALID cannot be localized from trustworthy evidence.",
+  "claimed_live_state": {
+    "site_live_version": 25,
+    "site_live_commit": "0e3bdbd77bb38fc5115a408df675940ce47d9c22",
+    "production_deploy_performed": false,
+    "candidate_version_id": "1b6a318a-c40c-413c-b62e-3d5497e4d0c2",
+    "candidate_verified_correct": true,
+    "source_commit": "0ab0a3e4e6539fb0d99173e10dbb1351730058e0",
+    "current_error": "APPROVAL_CREDENTIALS_INVALID"
+  },
+  "repository_evidence": {
+    "repo_head_before_commit": "cd451883e170b1d14044989e9e7d012402d1e958",
+    "webauthn_component_present": false,
+    "passkey_component_present": false,
+    "approval_verifier_present": false,
+    "notes": [
+      "No file in the repository implements WebAuthn/passkey assertion verification; hello.py reports passkey readiness NOT_AVAILABLE with challenge_issued=false and component_found=false.",
+      "hello.py's approval-ledger probe is a read-only SQL ledger check gated by an absent test contract; it never verifies a real passkey.",
+      "worker/index.js is the MCP asset-write worker; it contains no approval-credential or WebAuthn parsing/verification code.",
+      "Therefore the live Site approval verifier (version 25) is out-of-repo and cannot be read to pinpoint the failing branch."
+    ]
+  },
+  "verification_chain": [
+    {
+      "stage": "parser_schema",
+      "name": "PAI_APPROVAL_CREDENTIALS read + JSON parse/schema validation",
+      "checked_read_only": true,
+      "result": "NOT_VERIFIABLE_IN_REPO",
+      "reason": "No repository code reads PAI_APPROVAL_CREDENTIALS for approval verification; live Site runtime config values are not readable here and must never be printed."
+    },
+    {
+      "stage": "credential_id_public_key",
+      "name": "credential ID / public key presence and encoding (base64 vs base64url) resolution",
+      "checked_read_only": true,
+      "result": "NOT_VERIFIABLE_IN_REPO",
+      "reason": "Requires the live verifier source or a redacted structured rejection trace; encoding mismatch is the most common APPROVAL_CREDENTIALS_INVALID cause and is retained as a live hypothesis."
+    },
+    {
+      "stage": "rp_id",
+      "name": "RP ID hash match against authenticatorData.rpIdHash",
+      "checked_read_only": true,
+      "result": "NOT_VERIFIABLE_IN_REPO",
+      "reason": "No live assertion or live verifier source available."
+    },
+    {
+      "stage": "origin",
+      "name": "clientDataJSON.origin allowlist match",
+      "checked_read_only": true,
+      "result": "NOT_VERIFIABLE_IN_REPO",
+      "reason": "No live assertion or live verifier source available."
+    },
+    {
+      "stage": "challenge",
+      "name": "issued challenge match (single expected value, constant-time)",
+      "checked_read_only": true,
+      "result": "NOT_VERIFIABLE_IN_REPO",
+      "reason": "No issued challenge or live assertion available."
+    },
+    {
+      "stage": "user_verification",
+      "name": "user presence / user verification policy (UV required)",
+      "checked_read_only": true,
+      "result": "NOT_VERIFIABLE_IN_REPO",
+      "reason": "Requires live RP policy and authenticator flags from a real assertion."
+    },
+    {
+      "stage": "signature",
+      "name": "assertion signature verification over authenticatorData || sha256(clientDataJSON)",
+      "checked_read_only": true,
+      "result": "NOT_VERIFIABLE_IN_REPO",
+      "reason": "Requires the real assertion and the registered public key; neither is available and neither may be emitted."
+    },
+    {
+      "stage": "counter",
+      "name": "signature counter monotonicity / clone detection",
+      "checked_read_only": true,
+      "result": "NOT_VERIFIABLE_IN_REPO",
+      "reason": "Requires stored counter state from the live approval store."
+    },
+    {
+      "stage": "ledger_consume_replay",
+      "name": "approval ledger atomic consume + replay rejection",
+      "checked_read_only": true,
+      "result": "NOT_VERIFIABLE_IN_REPO",
+      "reason": "hello.py exposes only a read-only SQL ledger sequence gated by an absent contract; no consume/replay path is exercised and the live ledger state is not reachable."
+    },
+    {
+      "stage": "browser_call_chain",
+      "name": "browser navigator.credentials.get() -> server verify",
+      "checked_read_only": true,
+      "result": "NOT_EXECUTED",
+      "reason": "No browser/user gesture on the live Site was available in this cloud runner; therefore no real WebAuthn assertion exists."
+    }
+  ],
+  "real_browser_assertion": {
+    "executed": false,
+    "site_origin_used": null,
+    "server_side_verified": false,
+    "evidence_captured": false
+  },
+  "golden_pass_coverage_review": {
+    "prior_claims_reviewed": true,
+    "ledger_only_evidence": [
+      "hello.py approval-ledger sequence (register/consume/replay/concurrency-cleanup) is reported NOT_RUN and canonical_asset_tables_touched=false.",
+      "Auth-closure tests assert credential presence/flags only; they never verify a passkey signature."
+    ],
+    "real_passkey_verified": false,
+    "conclusion": "No prior Golden PASS in this repository covers a real passkey/WebAuthn assertion. Any WebAuthn Golden PASS based on synthetic/mock/unit evidence would be invalid."
+  },
+  "root_cause": {
+    "status": "UNDETERMINED_WITH_MISSING_EVIDENCE",
+    "error_code": "APPROVAL_CREDENTIALS_INVALID",
+    "localized_branch": null,
+    "primary_hypothesis": {
+      "id": "H1_live_revision_lacks_verified_candidate_fix",
+      "statement": "Production publish has not occurred, so the live Site still runs version 25 @ commit 0e3bdbd while the verified candidate 1b6a318a is not deployed. The running approval verifier is therefore not the verified revision, and the invalid-credentials branch lives in that older revision.",
+      "confidence": "HIGH that the live revision differs from the verified candidate; UNKNOWN which inner chain branch fails"
+    },
+    "alternative_hypotheses": [
+      {
+        "id": "H2_credential_material_drift",
+        "statement": "Live PAI_APPROVAL_CREDENTIALS material or encoding (credential ID/public key, RP ID, origin) drifted from what was registered.",
+        "confidence": "CANNOT_RULE_OUT"
+      },
+      {
+        "id": "H3_challenge_ledger_replay",
+        "statement": "Challenge not found/expired/already consumed (replay) or clock/counter skew causes rejection.",
+        "confidence": "CANNOT_RULE_OUT"
+      }
+    ],
+    "why_not_localized": "The live Site approval verifier source (version 25) is out-of-repo, and no redacted server-side structured rejection trace for a real assertion was available. Without those, no branch can be named without fabrication."
+  },
+  "missing_trusted_evidence": [
+    "Live Site approval-verifier source (or its committed revision) at version 25 / commit 0e3bdbd77bb38fc5115a408df675940ce47d9c22, or the verified candidate 1b6a318a diff against it.",
+    "One redacted server-side structured rejection record for a real browser assertion on the live Site: only {stage, reason}, no credential ID, public key, challenge, signature bytes or counter value.",
+    "Confirmation (presence/shape only, never values) that live PAI_APPROVAL_CREDENTIALS parses under the deployed schema and that its RP ID / allowed origin match the live Site origin.",
+    "Live challenge/ledger state for the failing attempt (issued vs consumed), again as status only."
+  ],
+  "proposed_fix": {
+    "artifact": "outputs/minimal-webauthn-fix.patch",
+    "applied_to_repo": false,
+    "deployed": false,
+    "scope": "Adds a fail-closed, dependency-free reference evaluator (src/personal_ai_execution/approval_webauthn.py) plus offline tests (tests/test_approval_webauthn.py).",
+    "what_it_fixes": [
+      "Normalizes standard-base64 and base64url credential IDs/public keys before comparison (most common APPROVAL_CREDENTIALS_INVALID encoding defect).",
+      "Enforces strict PAI_APPROVAL_CREDENTIALS JSON schema with distinct reasons.",
+      "Orders the chain as clientData parse -> type -> challenge -> origin -> rpIdHash -> UP/UV -> credential lookup -> signature -> counter -> atomic challenge consume/replay.",
+      "Emits only {ok, reason, code, stage}; never emits raw credential/key/signature/challenge material."
+    ],
+    "not_claimed_as": "It is not the Cloudflare candidate 1b6a318a and does not assert that it is the confirmed root cause; it is a reviewable, reproducible minimal fix/instrumentation artifact."
+  },
+  "reproducible_tests": {
+    "command": "git apply outputs/minimal-webauthn-fix.patch && python -m pytest tests/test_approval_webauthn.py -q",
+    "result": "22 passed",
+    "full_suite_command": "python -m pytest -q",
+    "full_suite_result": "1077 passed, 1 skipped (pre-existing suite; unchanged by this task)",
+    "production_side_effects": false
+  },
+  "credential_change": {
+    "required": false,
+    "status": "NOT_INDICATED_BY_REPO_EVIDENCE",
+    "action_taken": "none",
+    "note": "No credential/secret value was read, printed, or modified. If live evidence later proves credential re-registration is needed, stop at HUMAN_GATE_REQUIRED and request the human operation without exposing values."
+  },
+  "site_publish": {
+    "required_eventually": true,
+    "performed": false,
+    "prepared": false,
+    "note": "The verified candidate 1b6a318a is not live. Publishing it may be necessary after the failing branch is confirmed, but no publish, deploy, candidate create, or approval consume was performed or prepared here."
+  },
+  "non_mutation_flags": {
+    "worker_production_deploy": false,
+    "traffic_change": false,
+    "canonical_write": false,
+    "credential_secret_oauth_permission_binding_schema_change": false,
+    "site_production_publish": false,
+    "candidate_state_changed": false,
+    "production_state_changed": false,
+    "approval_consumed": false,
+    "new_deployment_approval_created": false,
+    "secret_material_emitted": false
+  },
+  "human_gate": {
+    "required": true,
+    "gate": "HUMAN_GATE_REQUIRED",
+    "reason": "The decisive evidence is human/live-only and no safe automated action can obtain it."
+  },
+  "single_next_action": {
+    "classification": "HUMAN_GATE_REQUIRED",
+    "action": "Capture one REDACTED server-side structured rejection record from a real browser WebAuthn approval attempt on the live Site (version 25 / commit 0e3bdbd): report only the failing {stage, reason} and the live verifier revision; do not output credential IDs, public keys, challenges, signatures or counter values. This is the single piece of evidence that localizes the APPROVAL_CREDENTIALS_INVALID branch.",
+    "forbidden_alongside": [
+      "No PAI_APPROVAL_CREDENTIALS modification",
+      "No Worker/Site production deploy or publish",
+      "No candidate CREATE or approval consume",
+      "No parallel fix directions"
+    ]
+  },
+  "evidence_integrity": {
+    "conclusions_based_on_readable_evidence": true,
+    "webAuthn_golden_pass_claimed": false,
+    "fabricated_evidence": false
+  }
+}
