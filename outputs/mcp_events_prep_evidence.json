@@ -1,0 +1,308 @@
+{
+  "schema_version": "mcp-events-golden-prep-evidence/v1",
+  "task_id": "cf-7b631b36bfe4",
+  "project_id": "mcp-events-golden",
+  "goal": "MCP_EVENTS_GOLDEN_PREP_V0.1",
+  "mode": "LOCAL_SIMULATION_PREP",
+  "risk_level": "LOW",
+  "generated_at": "2026-10-03T00:00:00Z",
+  "workflow_status": "success",
+  "final_status": "PASS_PREP_ONLY",
+  "business_outcome": {
+    "prep": "PASS",
+    "live_wake_golden": "NOT_CLAIMED",
+    "end_to_end_wake": "UNKNOWN",
+    "production_mutated": false,
+    "secrets_disclosed": false,
+    "external_messages_sent": false,
+    "live_subscriptions_created": false
+  },
+  "baseline": {
+    "repository": "qq1040489334/personal-ai-cloud-execution-test",
+    "worker_service": "personal-ai-execution-mcp",
+    "current_head": "6e0050ea5c14b0c87315f4f4635b5e25b9095b39",
+    "current_branch": "main",
+    "task_declared_deployed_source_commit": "0ab0a3e4e6539fb0d99173e10dbb1351730058e0",
+    "task_declared_production_version": "1b6a318a-c40c-413c-b62e-3d5497e4d0c2",
+    "worker_source_path": "worker/index.js",
+    "worker_source_sha256": "2559370db404e837a0bf0185f3194146c49697e465156581e7480237a41cac22",
+    "worker_source_bytes": 124259,
+    "worker_source_lines": 3079,
+    "worker_source_sha256_at_declared_source_commit": "2559370db404e837a0bf0185f3194146c49697e465156581e7480237a41cac22",
+    "head_worker_equals_declared_authorized_source": true,
+    "declared_source_commit_is_ancestor_of_head": true,
+    "repo_production_baseline_file": {
+      "path": "worker/PRODUCTION-BASELINE.json",
+      "service": "personal-ai-execution-mcp",
+      "production_version": "3e2fed43",
+      "source_sha256": "8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1",
+      "source_bytes": 55278,
+      "source_lines": 1543,
+      "compatibility_date": "2026-09-23",
+      "bindings": {
+        "ASSET_DB": "45d6f18a-3a34-4ccd-8337-c00a775cd7a2",
+        "TASK_REGISTRY": "60f6203f262d44378abd0accfa7fef46"
+      },
+      "controlled_deploy_v0_1_result": "BLOCKED",
+      "controlled_deploy_v0_1_reason": "no Cloudflare deploy credential in execution environment; fail closed before deploy"
+    },
+    "baseline_discrepancy": {
+      "observed": "The task-declared production version 1b6a318a-c40c-413c-b62e-3d5497e4d0c2 and source commit 0ab0a3e4e6539fb0d99173e10dbb1351730058e0 match outputs/webauthn-golden-evidence.json (candidate_version_id / source_commit), i.e. a Cloudflare Pages WebAuthn closure artifact. The MCP Worker's own repo baseline (worker/PRODUCTION-BASELINE.json) declares production_version 3e2fed43 with a 55,278-byte source, which does not equal the current 124,259-byte worker/index.js.",
+      "conclusion": "Current HEAD worker/index.js IS byte-identical to the declared authorized source commit 0ab0a3e4 (verified by sha256). The live production Worker version CANNOT be confirmed from this sandbox (no Cloudflare credentials). Per instruction, current HEAD is NOT assumed equal to deployed source.",
+      "live_version_verification": "UNKNOWN_NO_CREDENTIALS"
+    }
+  },
+  "official_protocol_reference": {
+    "primary_url": "https://developers.openai.com/plugins/build/mcp-events",
+    "markdown_url": "https://developers.openai.com/plugins/build/mcp-events.md",
+    "retrieved": true,
+    "retrieval": "live WebFetch of the .md and HTML routes; content identical on the event-specific sections",
+    "protocol_version_required": "2026-07-28",
+    "requires_mcp_2_0": true,
+    "protocol_design_sketch": "https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md",
+    "supported_by_integration": ["webhook delivery", "callback verification"],
+    "not_supported_by_integration": ["polling", "streaming", "gap control notification", "terminated control notification"],
+    "required_server_discover_shape": {
+      "jsonrpc": "2.0",
+      "result": {
+        "resultType": "complete",
+        "supportedVersions": ["2026-07-28"],
+        "capabilities": { "tools": {}, "events": {} }
+      }
+    },
+    "required_methods": ["events/list", "events/subscribe", "events/unsubscribe"],
+    "callback_verification_schema": {
+      "request_body": { "type": "verification", "challenge": "<single-use-random-value>" },
+      "request_headers": [
+        "Content-Type: application/json",
+        "webhook-id: msg_verification_<unique>",
+        "webhook-timestamp: <unix-seconds>",
+        "webhook-signature: v1,<standard-webhooks-hmac>",
+        "X-MCP-Subscription-Id: <sub id>"
+      ],
+      "response_body": { "challenge": "<echoed>" },
+      "success_criteria": "2xx response and constant-time challenge match before activating delivery",
+      "error": { "jsonrpc_code": -32015, "name": "CallbackEndpointError", "data.reason_examples": ["challenge_failed", "timeout"] }
+    },
+    "delivery_event_shape": {
+      "eventId": "unique, preserved across retries",
+      "name": "must match subscribed event",
+      "timestamp": "ISO 8601 with timezone (occurrence time)",
+      "data": "object matching payloadSchema",
+      "cursor": null
+    },
+    "standard_webhooks_headers": [
+      "Content-Type: application/json",
+      "webhook-id == body.eventId",
+      "webhook-timestamp == unix seconds",
+      "webhook-signature == Standard Webhooks HMAC over exact serialized bytes",
+      "X-MCP-Subscription-Id"
+    ],
+    "retry_policy": {
+      "ack": "2xx",
+      "retry": "transient failures with exponential backoff and bounded attempts",
+      "preserve_event_id": true,
+      "fresh_timestamp_and_signature_each_attempt": true,
+      "do_not_retry_statuses": [410, 413]
+    },
+    "size_bound_bytes": 262144,
+    "callback_url_requirements": ["HTTPS only", "resolve and validate destination at connection time", "block private/local/non-public addresses", "do not follow redirects"],
+    "secret_requirements": ["whsec_ prefix", "base64 value decodes to 24-64 bytes"],
+    "subscription_requirements": ["deterministic id from principal + url + name + canonical arguments", "idempotent create/refresh", "TTL/refreshBefore", "persistent state across restarts", "account-scoped unsubscribe idempotent"]
+  },
+  "current_source_reuse_audit": {
+    "reused_components": {
+      "mcp_endpoint": "single POST /mcp route in worker/index.js fetch() (line ~3065), reusing existing auth (mcpAuthorized) and scope gates (hasWriteScope/hasReadScope)",
+      "jsonrpc_dispatch": "existing handleMcp() switch/method dispatch (worker/index.js:2989) extended with server/discover and events/* cases",
+      "task_registry": "existing KV binding TASK_REGISTRY (wrangler.toml id 60f6203f262d44378abd0accfa7fef46) reused for namespaced subscription operational state under prefix events-subscription:: (no new binding, no production writes during PREP)",
+      "read_tool": "existing get_task_result (worker/index.js:2741, handler at 3007) remains the evidence read path; event payload carries only {golden_id, task_id, status}",
+      "hmac_helpers": "existing crypto.subtle HMAC-SHA256 usage pattern (hmacKey/signPayload, worker/index.js:575-608) reused for Standard Webhooks signing"
+    },
+    "not_created": ["second MCP server", "second task database", "second router", "event-bus repository"],
+    "not_restored": ["PersonOS", "Curator", "Inbox"],
+    "existing_endpoint_unchanged_by_prep": true,
+    "existing_tools": [
+      "submit_task", "get_task_result", "list_pending_results", "plan_task_redispatch",
+      "retry_task_dispatch", "mark_reviewed", "search_assets", "get_asset",
+      "write_knowledge_candidate", "write_skill_candidate", "write_decision_record"
+    ],
+    "existing_tool_count": 11,
+    "current_protocol_version": "2025-06-18",
+    "current_missing_for_events": ["server/discover method", "events capability", "events/list", "events/subscribe", "events/unsubscribe"],
+    "compatibility_approach": "additive only: server/discover + events/* added; initialize and tools/list/tools/call responses unchanged so existing clients and all 11 tools keep working"
+  },
+  "adapter_design": {
+    "label": "PROPOSED_NOT_APPLIED",
+    "event": {
+      "name": "personal_ai.golden.completed",
+      "delivery": ["webhook"],
+      "inputSchema": {
+        "type": "object",
+        "properties": { "golden_id": { "type": "string" }, "task_id": { "type": "string" } },
+        "required": ["golden_id", "task_id"],
+        "additionalProperties": false
+      },
+      "payloadSchema": {
+        "type": "object",
+        "properties": { "golden_id": { "type": "string" }, "task_id": { "type": "string" }, "status": { "type": "string" } },
+        "required": ["golden_id", "task_id", "status"],
+        "additionalProperties": false
+      },
+      "filtering": "deliver only when subscription arguments golden_id and task_id both equal the event data",
+      "scope": "harmless test event only; real task completions intentionally NOT wired"
+    },
+    "storage_namespace": "events-subscription::<sub_id>",
+    "deterministic_sub_id": "sub_ + sha256(principal | callback url | name | canonical-json(arguments))[:32]",
+    "ttl": { "default_ms": 604800000, "min_ms": 60000, "ttlMs_null_default": "finite (no-expiry only if explicitly allowed policy)" },
+    "evidence_path": "get_task_result(task_id)"
+  },
+  "security_controls": {
+    "auth": "events/subscribe and events/unsubscribe require the existing authenticated MCP scope (hasWriteScope); principal/account captured from the token",
+    "account_scoping": "subscription identity includes authenticated principal; cross-account unsubscribe derives a different id and cannot remove another account's subscription",
+    "ttl_refresh": "refreshBefore returned; interval subscriptions refresh idempotently by identity; ttlMs bounded to [min, default]",
+    "idempotency": "duplicate subscribe returns same deterministic id; duplicate event delivery preserves eventId; canonical JSON argument comparison ignores key order",
+    "callback_https": "HTTPS required",
+    "callback_private_ip_rejection": "resolved addresses validated at connection time; loopback/link-local/private/reserved/multicast/unspecified/CGNAT blocked",
+    "redirect_rejection": "fetch uses redirect:error; redirects never followed (verification and delivery)",
+    "signature": "Standard Webhooks HMAC-SHA256 over exact serialized bytes of msg_id.timestamp.body; constant-time compare; timestamp tolerance",
+    "secret_validation": "whsec_ prefix, base64 decodes to 24-64 bytes",
+    "no_secret_disclosure": "secrets referenced by sha256 fingerprint only in artifacts; no callback URL or secret in logs/evidence",
+    "input_payload_validation": "JSON schema validation of name, arguments (required + additionalProperties:false), delivery.mode",
+    "size_bound": "one event per request, complete body <= 256 KiB (262144 bytes)",
+    "retries": "bounded attempts with backoff; preserve eventId; fresh timestamp/signature per attempt; stop (no retry) on 410/413",
+    "access_revocation": "delivery skips subscriptions whose account access is revoked or which are expired"
+  },
+  "local_simulation": {
+    "label": "LOCAL_SIMULATION",
+    "no_live_claim": true,
+    "network_io": false,
+    "production_writes": false,
+    "ephemeral_signing_secret": {
+      "used_only_locally": true,
+      "value_stored_in_artifacts": false,
+      "fingerprint_example": "sha256:5e2c0a0f0e1f...",
+      "note": "test secret is generated in-memory in /tmp and excluded from repository artifacts; only a non-reversible fingerprint is reported"
+    },
+    "simulation_module": "/tmp/opencode/mcp_events_sim.py (outside repo, not committed)",
+    "simulation_tests": "/tmp/opencode/test_mcp_events_sim.py (outside repo, not committed)",
+    "commands": [
+      {
+        "command": "python -m pytest -q /tmp/opencode/test_mcp_events_sim.py",
+        "exit_code": 0,
+        "result": "24 passed in 0.03s",
+        "named_test_count": 24
+      },
+      {
+        "command": "python -m pytest -q",
+        "cwd": "repository root",
+        "exit_code": 0,
+        "result": "1077 passed, 1 skipped in 35.09s",
+        "named_test_count": 1077
+      },
+      {
+        "command": "node --check worker/index.js",
+        "exit_code": 0,
+        "result": "syntax OK (no build step; prebuilt ESM bundle is the deploy artifact)"
+      }
+    ],
+    "golden_sequence": [
+      "events/list -> personal_ai.golden.completed definition",
+      "events/subscribe -> deterministic sub id + callback verification challenge (signed) -> 2xx echo verified",
+      "signed webhook delivery of personal_ai.golden.completed (eventId preserved, standard webhooks signature valid)",
+      "fixture read-back through get_task_result(task_id)",
+      "events/unsubscribe -> idempotent empty result; no further delivery"
+    ],
+    "test_matrix": [
+      { "name": "server/discover advertises events capability", "kind": "protocol", "result": "pass" },
+      { "name": "events/list exposes only golden event", "kind": "protocol", "result": "pass" },
+      { "name": "golden subscribe/verify/deliver/read-back/unsubscribe", "kind": "golden", "result": "pass" },
+      { "name": "wrong signature rejected", "kind": "security", "result": "pass" },
+      { "name": "tampered body fails exact-byte signature", "kind": "security", "result": "pass" },
+      { "name": "replayed timestamp outside tolerance rejected", "kind": "security", "result": "pass" },
+      { "name": "secret must be whsec_ and 24-64 bytes", "kind": "security", "result": "pass" },
+      { "name": "unauthorized subscribe/unsubscribe rejected", "kind": "security", "result": "pass" },
+      { "name": "cross-account unsubscribe cannot remove", "kind": "security", "result": "pass" },
+      { "name": "duplicate subscribe idempotent same id", "kind": "idempotency", "result": "pass" },
+      { "name": "duplicate event delivery reuses event id", "kind": "idempotency", "result": "pass" },
+      { "name": "filter mismatch not delivered", "kind": "filter", "result": "pass" },
+      { "name": "refresh extends and rotates secret", "kind": "lifecycle", "result": "pass" },
+      { "name": "expired subscription receives nothing", "kind": "lifecycle", "result": "pass" },
+      { "name": "state survives simulated restart via shared store", "kind": "lifecycle", "result": "pass" },
+      { "name": "ttl null returns finite expiry by default", "kind": "lifecycle", "result": "pass" },
+      { "name": "blocked callback destinations", "kind": "security", "result": "pass" },
+      { "name": "failed verification blocks subscription", "kind": "security", "result": "pass" },
+      { "name": "retries stop on 410 and preserve event id", "kind": "delivery", "result": "pass" },
+      { "name": "bounded retries then give up on 500", "kind": "delivery", "result": "pass" },
+      { "name": "413 not retried", "kind": "delivery", "result": "pass" },
+      { "name": "event payload bound and ids only", "kind": "security", "result": "pass" },
+      { "name": "evidence fingerprint never contains secret", "kind": "security", "result": "pass" },
+      { "name": "existing tools unchanged regression", "kind": "regression", "result": "pass" }
+    ]
+  },
+  "changed_files": {
+    "allowlist": [
+      "outputs/mcp_events_prep_evidence.json",
+      "outputs/mcp_events_release_plan.md"
+    ],
+    "modified": [
+      "outputs/mcp_events_prep_evidence.json",
+      "outputs/mcp_events_release_plan.md"
+    ],
+    "code_changes_in_repo": "none (worker/index.js patch is embedded in the release plan as PROPOSED_NOT_APPLIED)",
+    "deletions": [],
+    "forbidden_paths_touched": []
+  },
+  "scope_guard": {
+    "tool": "scripts/scope_guard.py",
+    "expected_files": ["outputs/mcp_events_prep_evidence.json", "outputs/mcp_events_release_plan.md"],
+    "expected_result": "PASS: all changes within allowlist, no deletions, no forbidden paths",
+    "secret_guard": "no secret value and no api-key-like string in the change set"
+  },
+  "release_gate": {
+    "plan_artifact": "outputs/mcp_events_release_plan.md",
+    "baseline_commit_for_deploy": "6e0050ea5c14b0c87315f4f4635b5e25b9095b39",
+    "proposed_build_hash_source_sha256": "2559370db404e837a0bf0185f3194146c49697e465156581e7480237a41cac22",
+    "rollback_target": "Cloudflare version 3e2fed43 (per worker/PRODUCTION-BASELINE.json); live verification of that target from this sandbox is UNKNOWN",
+    "human_gate_required": true,
+    "human_gate_scope": [
+      "review + apply the proposed worker/index.js patch on an isolated branch",
+      "run node --check and the local MCP events simulation + full pytest against the patched tree",
+      "verify live production version and set a known rollback target with Cloudflare credentials",
+      "deploy to a non-production/staging version first if available; then production with explicit approval",
+      "run one LIVE wake test with ChatGPT Work chat and observe a real subscription/verification/delivery"
+    ],
+    "not_performed": ["deploy", "upload", "publish", "OAuth changes", "secret changes", "Canonical writes", "external messages", "live subscriptions", "production KV/D1 writes"]
+  },
+  "blockers_and_dependencies": [
+    {
+      "id": "DEP-1",
+      "severity": "non-blocking-for-prep",
+      "description": "Implemented code cannot be committed under the PREP allowlist (only the two outputs files are writable). The adapter is delivered as a reviewable proposed patch inside the release plan; applying it requires a Human Gate with an expanded allowlist.",
+      "affected_work": "worker/index.js modification"
+    },
+    {
+      "id": "DEP-2",
+      "severity": "human-gate",
+      "description": "Subscription operational state and signing secrets are stored in the existing TASK_REGISTRY KV. This reuses the existing binding (no schema/binding/permission change) but storing signing secrets requires a Human Gate security review before production.",
+      "affected_work": "events/subscribe persistence"
+    },
+    {
+      "id": "DEP-3",
+      "severity": "unknown",
+      "description": "Live production version of personal-ai-execution-mcp cannot be verified without Cloudflare credentials; worker/PRODUCTION-BASELINE.json (3e2fed43) conflicts with the task-declared 1b6a318a (which is a Pages WebAuthn artifact).",
+      "affected_work": "rollback target selection",
+      "status": "UNKNOWN"
+    },
+    {
+      "id": "DEP-4",
+      "severity": "protocol",
+      "description": "The current Worker speaks protocol 2025-06-18 and has no server/discover. Adding MCP 2.0 / 2026-07-28 server/discover is additive but must be reviewed for OAuth resource-metadata and client handshake compatibility.",
+      "affected_work": "protocol negotiation"
+    }
+  ],
+  "artifacts": {
+    "evidence": "outputs/mcp_events_prep_evidence.json",
+    "release_plan": "outputs/mcp_events_release_plan.md",
+    "result_publication": "/home/runner/work/_temp/agent_result.json"
+  }
+}
