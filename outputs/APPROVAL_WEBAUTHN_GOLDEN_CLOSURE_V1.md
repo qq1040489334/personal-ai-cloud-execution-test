@@ -110,9 +110,10 @@ server-side verified. That did not happen.
   - `outputs/minimal-webauthn-fix.patch` (prepared reference fix, **not applied**)
 - No source, Worker, workflow, secret/credential, binding or schema file was
   modified. Candidate and production state are unchanged.
-- Commit: recorded by the runner as `cloud agent: gpt task`; see
-  `outputs/webauthn-golden-evidence.json` and the execution result for the
-  resolved hash.
+- Base revision: `cd451883e170b1d14044989e9e7d012402d1e958`.
+- Task commit: the final `cloud agent: gpt task` commit whose history includes
+  the base revision above; the resolved hash is authoritative in the runner's
+  `execution_result.json` (`commit` field).
 
 The prepared patch adds (when applied) a dependency-free fail-closed evaluator
 `src/personal_ai_execution/approval_webauthn.py` and offline tests
