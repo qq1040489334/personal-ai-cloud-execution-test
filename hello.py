@@ -27148,6 +27148,621 @@ def reality_first_canonical_promotion_execution_v0_1(
     }
 
 
+# ---------------------------------------------------------------------------
+# REALITY_CANONICAL_PROMOTION_INDEPENDENT_READBACK_V0.1  (task cf-ddb63520782c)
+#
+# Read-only, independent read-back of the Canonical state produced by
+# REALITY_FIRST_CANONICAL_PROMOTION_EXECUTION_V0.1 (task cf-e49d91425a33).
+# It consults the existing canonical asset read surface for
+# asset_id=reality:cap-1 and compares the observed version / content_hash /
+# provenance with the write evidence *stated* by the promotion execution. It
+# never writes, deploys, reads a secret or changes a permission / binding /
+# schema, and never creates a second state store or a simulated Canonical.
+# ---------------------------------------------------------------------------
+CANONICAL_READBACK_GOAL = "REALITY_CANONICAL_PROMOTION_INDEPENDENT_READBACK_V0.1"
+CANONICAL_READBACK_TASK_ID = "cf-ddb63520782c"
+CANONICAL_READBACK_REPORT = CANONICAL_READBACK_GOAL + "_REPORT"
+CANONICAL_READBACK_CONTRACT = "PERSONAL_AI_" + CANONICAL_READBACK_GOAL
+CANONICAL_READBACK_ASSET_ID = "reality:cap-1"
+CANONICAL_READBACK_STATUSES = (PASS, PARTIAL, BLOCKED)
+
+#: The four epistemic tiers this read-back distinguishes explicitly.
+CANONICAL_READBACK_EVIDENCE_TIERS = ("OBSERVED", "STATED", "INFERRED", "UNKNOWN")
+
+#: The write evidence fields compared against the actual read-back.
+CANONICAL_READBACK_WRITE_EVIDENCE_FIELDS = (
+    "asset_id",
+    "version",
+    "content_hash",
+    "provenance",
+)
+
+#: The code artifacts whose "abnormal" change is assessed for any bearing on the
+#: canonical promotion truth judgment. They are not the canonical asset.
+CANONICAL_READBACK_CODE_ARTIFACTS = ("hello.py", "test_hello.py")
+
+#: Every mutation flag that must remain False for this read-only task.
+CANONICAL_READBACK_MUTATION_FLAGS = (
+    "production_write_performed",
+    "deployment_performed",
+    "credentials_accessed",
+    "secret_accessed",
+    "permissions_changed",
+    "binding_changed",
+    "schema_changed",
+    "reality_canonical_written",
+    "canonical_written",
+    "knowledge_written",
+    "skill_written",
+    "decision_written",
+    "second_state_store_created",
+    "mark_reviewed_called",
+    "content_exposed",
+    "message_content_exposed",
+)
+
+
+def _canonical_readback_expected(write_evidence: object) -> dict:
+    """Normalize the STATED write evidence of the promotion execution.
+
+    Accepts either a bare ``write_evidence`` mapping or a full
+    ``REALITY_FIRST_CANONICAL_PROMOTION_EXECUTION_V0.1`` report, and resolves the
+    claimed asset_id / version / content_hash / provenance without guessing.
+    """
+    record = write_evidence if isinstance(write_evidence, dict) else {}
+    nested = record.get("write_evidence")
+    nested = nested if isinstance(nested, dict) else {}
+
+    def pick(*keys: str):
+        for key in keys:
+            for container in (record, nested):
+                if not isinstance(container, dict):
+                    continue
+                value = container.get(key)
+                if value is not None and value != "":
+                    return value
+        return None
+
+    return {
+        "asset_id": pick("canonical_asset_id", "asset_id"),
+        "version": pick("canonical_version", "version"),
+        "content_hash": pick("content_hash", "canonical_content_hash"),
+        "provenance": pick("provenance"),
+        "provenance_status": pick(
+            "promoted_provenance_status",
+            "read_back_provenance_status",
+            "provenance_status",
+        ),
+    }
+
+
+def _canonical_readback_read(read_surface: object, asset_id: str):
+    """Invoke the injected/in-memory read surface once, read-only.
+
+    Returns ``(record, error)``. ``error`` is a short, non-sensitive label when
+    the surface could not be used; ``record`` is the returned mapping (or
+    ``None`` when the asset is absent).
+    """
+    if read_surface is None:
+        return None, None
+    if callable(read_surface):
+        try:
+            record = read_surface(asset_id)
+        except Exception as exc:  # pragma: no cover - defensive fail-closed
+            return None, type(exc).__name__
+    elif isinstance(read_surface, dict):
+        record = read_surface.get(asset_id)
+    elif hasattr(read_surface, "get"):
+        try:
+            record = read_surface.get(asset_id)
+        except Exception as exc:  # pragma: no cover - defensive fail-closed
+            return None, type(exc).__name__
+    else:
+        return None, "unsupported_read_surface"
+    if record is not None and not isinstance(record, dict):
+        return None, "malformed_read_surface_record"
+    return record, None
+
+
+def _canonical_readback_provenance_status(record: object, provenance_mod) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    provenance = record.get("provenance")
+    if not isinstance(provenance, dict):
+        return None
+    try:
+        return provenance_mod.evaluate_provenance(
+            provenance, content_hash=record.get("content_hash")
+        )["status"]
+    except Exception:  # pragma: no cover - defensive fail-closed
+        return None
+
+
+def _canonical_readback_code_artifacts() -> list[dict]:
+    """Hash the code artifacts (read-only) for the anomaly assessment."""
+    artifacts: list[dict] = []
+    for rel in CANONICAL_READBACK_CODE_ARTIFACTS:
+        path = REPO_ROOT / rel
+        if path.is_file():
+            artifacts.append(
+                {
+                    "path": rel,
+                    "sha256": _sha256(path),
+                    "bytes": path.stat().st_size,
+                }
+            )
+    return artifacts
+
+
+def _canonical_readback_field_status(
+    *, observed_present: bool, expected_present: bool, matched: bool
+) -> str:
+    """PASS / FAIL / BLOCKED for one compared write-evidence field."""
+    if not observed_present or not expected_present:
+        return BLOCKED
+    return PASS if matched else FAIL
+
+
+def reality_canonical_promotion_independent_readback_v0_1(
+    read_surface: object = None,
+    *,
+    write_evidence: object = None,
+    asset_id: str = CANONICAL_READBACK_ASSET_ID,
+) -> dict:
+    """Independently read back the promoted Reality Canonical asset.
+
+    Read-only and fail-closed. It consults the *existing* canonical asset read
+    surface (an injected, read-only mapping or ``read(asset_id)`` callable --
+    e.g. the live ``ASSET_DB`` read path) for ``asset_id`` and compares the
+    observed ``version`` / ``content_hash`` / ``provenance`` with the write
+    evidence *stated* by the prior promotion execution.
+
+    Verdict (``PASS`` / ``PARTIAL`` / ``BLOCKED``):
+
+    * ``BLOCKED`` -- the canonical read surface is unreachable/errored, or the
+      asset is absent; existence and truth cannot be observed;
+    * ``PARTIAL`` -- the asset is observed but its version/hash/provenance could
+      not be confirmed against the stated write evidence (missing or mismatched);
+    * ``PASS`` -- the asset is observed and every stated field is independently
+      confirmed (including a VERIFIED provenance).
+
+    Every conclusion is tagged ``OBSERVED`` (read in this run), ``STATED``
+    (claimed by the prior execution), ``INFERRED`` (derived) or ``UNKNOWN`` (no
+    evidence). No write, deploy, secret, permission, binding or schema change is
+    ever performed and no second/simulated Canonical store is created.
+    """
+    _capture, _writer, provenance_mod = _reality_review_components()
+
+    expected = _canonical_readback_expected(write_evidence)
+    expected_available = any(
+        expected[field] is not None
+        for field in ("asset_id", "version", "content_hash", "provenance")
+    )
+
+    observed_record, read_error = _canonical_readback_read(read_surface, asset_id)
+    read_available = read_surface is not None and read_error is None
+    found = isinstance(observed_record, dict) and bool(observed_record)
+
+    observed = {
+        "asset_id": observed_record.get("asset_id") if found else None,
+        "version": observed_record.get("version") if found else None,
+        "content_hash": observed_record.get("content_hash") if found else None,
+        "provenance": observed_record.get("provenance") if found else None,
+        "provenance_status": (
+            _canonical_readback_provenance_status(observed_record, provenance_mod)
+            if found
+            else None
+        ),
+    }
+
+    observed_present = {
+        "asset_id": observed["asset_id"] not in (None, ""),
+        "version": observed["version"] is not None,
+        "content_hash": observed["content_hash"] not in (None, ""),
+        "provenance": isinstance(observed["provenance"], dict)
+        and bool(observed["provenance"]),
+    }
+    expected_present = {
+        "asset_id": expected["asset_id"] not in (None, ""),
+        "version": expected["version"] is not None,
+        "content_hash": expected["content_hash"] not in (None, ""),
+        "provenance": isinstance(expected["provenance"], dict)
+        and bool(expected["provenance"]),
+    }
+
+    observed_hash_norm = _canonical_promotion_normalize_hash(observed["content_hash"])
+    expected_hash_norm = _canonical_promotion_normalize_hash(expected["content_hash"])
+
+    matched = {
+        "asset_id": bool(
+            observed_present["asset_id"]
+            and str(observed["asset_id"]) == str(asset_id)
+            and (
+                not expected_present["asset_id"]
+                or str(observed["asset_id"]) == str(expected["asset_id"])
+            )
+        ),
+        "version": bool(
+            observed_present["version"]
+            and expected_present["version"]
+            and str(observed["version"]).strip() == str(expected["version"]).strip()
+        ),
+        "content_hash": bool(
+            observed_present["content_hash"]
+            and expected_present["content_hash"]
+            and observed_hash_norm == expected_hash_norm
+        ),
+        "provenance": bool(
+            observed_present["provenance"]
+            and expected_present["provenance"]
+            and observed["provenance"] == expected["provenance"]
+            and observed["provenance_status"] == "VERIFIED"
+        ),
+    }
+
+    field_status = {
+        "asset_id": _canonical_readback_field_status(
+            observed_present=observed_present["asset_id"],
+            expected_present=expected_present["asset_id"],
+            matched=matched["asset_id"],
+        ),
+        "version": _canonical_readback_field_status(
+            observed_present=observed_present["version"],
+            expected_present=expected_present["version"],
+            matched=matched["version"],
+        ),
+        "content_hash": _canonical_readback_field_status(
+            observed_present=observed_present["content_hash"],
+            expected_present=expected_present["content_hash"],
+            matched=matched["content_hash"],
+        ),
+        "provenance": _canonical_readback_field_status(
+            observed_present=observed_present["provenance"],
+            expected_present=expected_present["provenance"],
+            matched=matched["provenance"],
+        ),
+    }
+
+    if not read_available or not found:
+        verdict = BLOCKED
+    elif expected_available and all(
+        field_status[field] == PASS for field in field_status
+    ):
+        verdict = PASS
+    else:
+        verdict = PARTIAL
+
+    # -- epistemic evidence ------------------------------------------------
+    evidence: list[dict] = []
+    if read_error is not None:
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "the canonical read surface could not be used ("
+                + str(read_error)
+                + "); the actual Canonical state of "
+                + str(asset_id)
+                + " is UNKNOWN and is never guessed",
+            )
+        )
+    elif not read_available:
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "no live canonical asset read surface was supplied to this run; "
+                "the actual Canonical store is not reachable offline, so "
+                "existence of "
+                + str(asset_id)
+                + " is UNKNOWN",
+            )
+        )
+    elif found:
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "read "
+                + str(asset_id)
+                + " from the actual canonical read surface: asset_id="
+                + str(observed["asset_id"])
+                + "; version="
+                + str(observed["version"])
+                + "; content_hash="
+                + str(observed["content_hash"])
+                + "; provenance_status="
+                + str(observed["provenance_status"]),
+            )
+        )
+    else:
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "the actual canonical read surface returned no record for "
+                + str(asset_id)
+                + "; the asset is absent from the actual Canonical store",
+            )
+        )
+
+    if expected_available:
+        evidence.append(
+            _revalidation_evidence(
+                "STATED",
+                "REALITY_FIRST_CANONICAL_PROMOTION_EXECUTION_V0.1 write evidence "
+                "claims asset_id="
+                + str(expected["asset_id"])
+                + "; version="
+                + str(expected["version"])
+                + "; content_hash="
+                + str(expected["content_hash"])
+                + "; provenance_status="
+                + str(expected["provenance_status"]),
+            )
+        )
+    else:
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "no write evidence from the prior promotion execution was "
+                "supplied; the claimed version/hash/provenance are UNKNOWN",
+            )
+        )
+
+    evidence.append(
+        _revalidation_evidence(
+            "INFERRED",
+            "the hello.py / test_hello.py code artifacts are execution-environment "
+            "code, not the canonical asset; their size/content change cannot raise "
+            "or lower the truth of the reality:cap-1 promotion read-back",
+        )
+    )
+    evidence.append(
+        _revalidation_evidence(
+            "OBSERVED",
+            "scope: read-only independent read-back; production_write_performed=False; "
+            "deployment_performed=False; secret_accessed=False; "
+            "permissions_changed=False; binding_changed=False; schema_changed=False; "
+            "second_state_store_created=False; no simulated Canonical created",
+        )
+    )
+
+    epistemic_summary = {
+        "observed": [
+            item["detail"] for item in evidence if item["source"] == "OBSERVED"
+        ],
+        "stated": [
+            item["detail"] for item in evidence if item["source"] == "STATED"
+        ],
+        "inferred": [
+            item["detail"] for item in evidence if item["source"] == "INFERRED"
+        ],
+        "unknown": [
+            item["detail"] for item in evidence if item["source"] == "UNKNOWN"
+        ],
+    }
+
+    code_artifacts = _canonical_readback_code_artifacts()
+    modified_code_artifacts = [
+        path
+        for path in _git("diff", "--name-only", "HEAD").splitlines()
+        if path in CANONICAL_READBACK_CODE_ARTIFACTS
+    ]
+
+    checks = [
+        {
+            "check": "actual canonical read surface available",
+            "status": PASS if read_available else BLOCKED,
+            "detail": (
+                "read surface consulted read-only for " + str(asset_id)
+                if read_available
+                else "no live canonical read surface available in this environment"
+            ),
+        },
+        {
+            "check": "reality:cap-1 present in actual Canonical store",
+            "status": PASS if found else BLOCKED,
+            "detail": (
+                "observed in the actual canonical store"
+                if found
+                else "not observable/absent; existence cannot be confirmed"
+            ),
+        },
+        {
+            "check": "observed asset_id matches requested asset_id",
+            "status": field_status["asset_id"],
+            "detail": "observed="
+            + str(observed["asset_id"])
+            + "; requested="
+            + str(asset_id),
+        },
+        {
+            "check": "observed version matches write evidence",
+            "status": field_status["version"],
+            "detail": "observed="
+            + str(observed["version"])
+            + "; stated="
+            + str(expected["version"]),
+        },
+        {
+            "check": "observed content_hash matches write evidence",
+            "status": field_status["content_hash"],
+            "detail": "observed="
+            + str(observed["content_hash"])
+            + "; stated="
+            + str(expected["content_hash"]),
+        },
+        {
+            "check": "observed provenance is VERIFIED and matches write evidence",
+            "status": field_status["provenance"],
+            "detail": "observed_status="
+            + str(observed["provenance_status"])
+            + "; stated_status="
+            + str(expected["provenance_status"]),
+        },
+        {
+            "check": "verdict is PASS / PARTIAL / BLOCKED",
+            "status": PASS if verdict in CANONICAL_READBACK_STATUSES else FAIL,
+            "detail": "verdict=" + str(verdict),
+        },
+        {
+            "check": "hello.py / test_hello.py changes do not affect promotion judgment",
+            "status": PASS,
+            "detail": "code artifacts ("
+            + ", ".join(a["path"] for a in code_artifacts)
+            + ") are not the canonical asset; modified vs HEAD: "
+            + (", ".join(modified_code_artifacts) or "none"),
+        },
+        {
+            "check": "no production write / deploy / secret / permission / binding / schema change",
+            "status": PASS,
+            "detail": (
+                "production_write_performed=False; deployment_performed=False; "
+                "credentials_accessed=False; secret_accessed=False; "
+                "permissions_changed=False; binding_changed=False; "
+                "schema_changed=False; second_state_store_created=False"
+            ),
+        },
+    ]
+    workflow_status = (
+        PASS if all(check["status"] != FAIL for check in checks) else FAIL
+    )
+
+    final_status = (
+        "VERDICT="
+        + str(verdict)
+        + ";ASSET_ID="
+        + str(asset_id)
+        + ";EXISTS="
+        + str(found)
+        + ";OBSERVED_VERSION="
+        + str(observed["version"])
+        + ";OBSERVED_CONTENT_HASH="
+        + str(observed["content_hash"])
+        + ";OBSERVED_PROVENANCE_STATUS="
+        + str(observed["provenance_status"])
+    )
+
+    lines = [
+        f"# {CANONICAL_READBACK_GOAL}",
+        "",
+        f"- goal: {CANONICAL_READBACK_GOAL}",
+        f"- task_id: {CANONICAL_READBACK_TASK_ID}",
+        f"- contract: {CANONICAL_READBACK_CONTRACT}",
+        "- mode: read-only independent canonical read-back (no write)",
+        f"- workflow_status: {workflow_status}",
+        f"- verdict: {verdict}",
+        f"- asset_id: {asset_id}",
+        f"- exists_in_actual_store: {found}",
+        f"- read_surface_available: {read_available}",
+        f"- actual_version: {observed['version'] if observed['version'] is not None else 'UNKNOWN'}",
+        f"- actual_content_hash: {observed['content_hash'] if observed['content_hash'] is not None else 'UNKNOWN'}",
+        f"- actual_provenance_status: {observed['provenance_status'] if observed['provenance_status'] is not None else 'UNKNOWN'}",
+        f"- stated_version: {expected['version'] if expected['version'] is not None else 'UNKNOWN'}",
+        f"- stated_content_hash: {expected['content_hash'] if expected['content_hash'] is not None else 'UNKNOWN'}",
+        f"- stated_provenance_status: {expected['provenance_status'] if expected['provenance_status'] is not None else 'UNKNOWN'}",
+        "",
+        "## Epistemic breakdown",
+    ]
+    for tier in ("observed", "stated", "inferred", "unknown"):
+        lines.append(
+            f"- {tier}: {', '.join(epistemic_summary.get(tier) or []) or '[]'}"
+        )
+    lines += ["", "## Field consistency"]
+    for field in CANONICAL_READBACK_WRITE_EVIDENCE_FIELDS:
+        lines.append(
+            f"- {field}: {field_status[field]} "
+            f"(observed={observed.get(field) if field != 'provenance' else observed['provenance_status']})"
+        )
+    lines += [
+        "",
+        "## Code artifact anomaly assessment",
+        f"- modified_vs_HEAD: {', '.join(modified_code_artifacts) or 'none'}",
+    ]
+    for artifact in code_artifacts:
+        lines.append(
+            f"- {artifact['path']}: {artifact['bytes']} bytes sha256={artifact['sha256']}"
+        )
+    lines += [
+        "- bearing_on_promotion_truth: none (code artifacts are not the canonical asset)",
+        "",
+        "## No-mutation statement",
+        "- production_write_performed: False",
+        "- deployment_performed: False",
+        "- credentials_accessed: False",
+        "- secret_accessed: False",
+        "- permissions_changed: False",
+        "- binding_changed: False",
+        "- schema_changed: False",
+        "- reality_canonical_written: False",
+        "- knowledge_written: False",
+        "- skill_written: False",
+        "- decision_written: False",
+        "- second_state_store_created: False",
+        "",
+        "## Evidence",
+    ]
+    for item in evidence:
+        lines.append(f"- [{item['source']}] {item['detail']}")
+    lines += ["", "## Checks"]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final_status}"]
+
+    return {
+        "report": CANONICAL_READBACK_REPORT,
+        "goal": CANONICAL_READBACK_GOAL,
+        "task_id": CANONICAL_READBACK_TASK_ID,
+        "contract": CANONICAL_READBACK_CONTRACT,
+        "generated_at": _utc_now(),
+        "mode": "read_only_independent_canonical_readback",
+        "workflow_status": workflow_status,
+        "status": verdict,
+        "verdict": verdict,
+        "final_verdict": verdict,
+        "final_status": final_status,
+        "asset_id": asset_id,
+        "exists_in_actual_store": found,
+        "read_surface_available": read_available,
+        "read_error": read_error,
+        "actual_asset_id": observed["asset_id"],
+        "actual_version": observed["version"],
+        "actual_content_hash": observed["content_hash"],
+        "actual_provenance_status": observed["provenance_status"],
+        "observed": observed,
+        "write_evidence": expected,
+        "expected": expected,
+        "write_evidence_available": expected_available,
+        "field_consistency": field_status,
+        "fields_matched": matched,
+        "observed_present": observed_present,
+        "expected_present": expected_present,
+        "code_artifacts": code_artifacts,
+        "modified_code_artifacts": modified_code_artifacts,
+        "code_artifacts_affect_promotion": False,
+        "evidence": evidence,
+        "evidence_tiers": list(CANONICAL_READBACK_EVIDENCE_TIERS),
+        "evidence_tiers_present": sorted({item["source"] for item in evidence}),
+        "epistemic_summary": epistemic_summary,
+        "checks": checks,
+        "production_write_performed": False,
+        "canonical_write_performed": False,
+        "reality_canonical_written": False,
+        "canonical_written": False,
+        "knowledge_written": False,
+        "skill_written": False,
+        "decision_written": False,
+        "deployment_performed": False,
+        "credentials_accessed": False,
+        "secret_accessed": False,
+        "permissions_changed": False,
+        "binding_changed": False,
+        "schema_changed": False,
+        "mark_reviewed_called": False,
+        "second_state_store_created": False,
+        "content_exposed": False,
+        "message_content_exposed": False,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -27188,3 +27803,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(wechatread_real_source_probe_v0_1()["markdown"])
     print(reality_first_candidate_review_v0_1()["markdown"])
     print(reality_first_canonical_promotion_execution_v0_1()["markdown"])
+    print(reality_canonical_promotion_independent_readback_v0_1()["markdown"])

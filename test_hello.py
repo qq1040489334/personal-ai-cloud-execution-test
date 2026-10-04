@@ -313,6 +313,20 @@ from hello import (
     reality_first_canonical_promotion_execution_v0_1,
 )
 
+from hello import (
+    CANONICAL_READBACK_ASSET_ID,
+    CANONICAL_READBACK_CODE_ARTIFACTS,
+    CANONICAL_READBACK_CONTRACT,
+    CANONICAL_READBACK_EVIDENCE_TIERS,
+    CANONICAL_READBACK_GOAL,
+    CANONICAL_READBACK_MUTATION_FLAGS,
+    CANONICAL_READBACK_REPORT,
+    CANONICAL_READBACK_STATUSES,
+    CANONICAL_READBACK_TASK_ID,
+    CANONICAL_READBACK_WRITE_EVIDENCE_FIELDS,
+    reality_canonical_promotion_independent_readback_v0_1,
+)
+
 VALID_STATUSES = {"PASS", "FAIL", "BLOCKED"}
 
 # TEST ISOLATION (task cf-2f2b71c331da): the runner-process SendKey is
@@ -10359,3 +10373,258 @@ def test_reality_first_canonical_promotion_markdown_and_entrypoint() -> None:
 
     source = inspect.getsource(hello_module)
     assert "reality_first_canonical_promotion_execution_v0_1()" in source
+
+
+# ---------------------------------------------------------------------------
+# REALITY_CANONICAL_PROMOTION_INDEPENDENT_READBACK_V0.1  (task cf-ddb63520782c)
+# Independent, read-only read-back of asset_id=reality:cap-1 against the write
+# evidence STATED by the promotion execution. Distinguishes OBSERVED / STATED /
+# INFERRED / UNKNOWN and concludes PASS / PARTIAL / BLOCKED. Performs no write.
+# ---------------------------------------------------------------------------
+def _canonical_readback_promoted() -> tuple[dict, dict]:
+    envelope = _canonical_promotion_envelope()
+    preflight = _canonical_promotion_preflight(envelope)
+    store: dict = {}
+    report = reality_first_canonical_promotion_execution_v0_1(
+        preflight, candidate=envelope, canonical_store=store, write_ledger={}
+    )
+    assert report["execution_status"] == CANONICAL_PROMOTION_PROMOTED
+    return store, report
+
+
+def test_canonical_readback_constants() -> None:
+    assert CANONICAL_READBACK_GOAL == (
+        "REALITY_CANONICAL_PROMOTION_INDEPENDENT_READBACK_V0.1"
+    )
+    assert CANONICAL_READBACK_TASK_ID == "cf-ddb63520782c"
+    assert CANONICAL_READBACK_REPORT == CANONICAL_READBACK_GOAL + "_REPORT"
+    assert CANONICAL_READBACK_CONTRACT == "PERSONAL_AI_" + CANONICAL_READBACK_GOAL
+    assert CANONICAL_READBACK_ASSET_ID == "reality:cap-1"
+    assert set(CANONICAL_READBACK_STATUSES) == {"PASS", "PARTIAL", "BLOCKED"}
+    assert set(CANONICAL_READBACK_EVIDENCE_TIERS) == {
+        "OBSERVED",
+        "STATED",
+        "INFERRED",
+        "UNKNOWN",
+    }
+    assert CANONICAL_READBACK_CODE_ARTIFACTS == ("hello.py", "test_hello.py")
+    assert set(CANONICAL_READBACK_WRITE_EVIDENCE_FIELDS) == {
+        "asset_id",
+        "version",
+        "content_hash",
+        "provenance",
+    }
+
+
+def test_canonical_readback_no_surface_is_blocked() -> None:
+    report = reality_canonical_promotion_independent_readback_v0_1()
+
+    assert report["report"] == CANONICAL_READBACK_REPORT
+    assert report["goal"] == CANONICAL_READBACK_GOAL
+    assert report["task_id"] == CANONICAL_READBACK_TASK_ID
+    assert report["contract"] == CANONICAL_READBACK_CONTRACT
+    assert report["mode"] == "read_only_independent_canonical_readback"
+
+    assert report["verdict"] == "BLOCKED"
+    assert report["verdict"] in CANONICAL_READBACK_STATUSES
+    assert report["status"] == report["verdict"] == report["final_verdict"]
+    assert report["read_surface_available"] is False
+    assert report["exists_in_actual_store"] is False
+    assert report["actual_version"] is None
+    assert report["actual_content_hash"] is None
+    assert report["actual_provenance_status"] is None
+
+
+def test_canonical_readback_current_repo_is_unobservable() -> None:
+    report = reality_canonical_promotion_independent_readback_v0_1()
+    assert report["exists_in_actual_store"] is False
+    assert report["verdict"] in {"PARTIAL", "BLOCKED"}
+    assert report["verdict"] != "PASS"
+    assert "UNKNOWN" in report["evidence_tiers_present"]
+
+
+def test_canonical_readback_not_found_is_blocked() -> None:
+    report = reality_canonical_promotion_independent_readback_v0_1({})
+    assert report["read_surface_available"] is True
+    assert report["exists_in_actual_store"] is False
+    assert report["verdict"] == "BLOCKED"
+    assert any(
+        "returned no record" in item["detail"]
+        for item in report["evidence"]
+        if item["source"] == "OBSERVED"
+    )
+
+
+def test_canonical_readback_match_is_pass() -> None:
+    store, promotion = _canonical_readback_promoted()
+    report = reality_canonical_promotion_independent_readback_v0_1(
+        store, write_evidence=promotion
+    )
+
+    assert report["verdict"] == "PASS"
+    assert report["exists_in_actual_store"] is True
+    assert report["read_surface_available"] is True
+    assert report["actual_asset_id"] == "reality:cap-1"
+    assert report["actual_version"] == promotion["canonical_version"]
+    assert report["actual_content_hash"] == promotion["content_hash"]
+    assert report["actual_provenance_status"] == "VERIFIED"
+    assert report["write_evidence"]["content_hash"] == promotion["content_hash"]
+    assert all(
+        status == "PASS" for status in report["field_consistency"].values()
+    )
+    assert report["workflow_status"] == "PASS"
+
+
+def test_canonical_readback_actual_values_are_read_not_guessed() -> None:
+    store, promotion = _canonical_readback_promoted()
+    report = reality_canonical_promotion_independent_readback_v0_1(
+        store, write_evidence=promotion
+    )
+    record = store["reality:cap-1"]
+    assert report["actual_version"] == record["version"]
+    assert report["actual_content_hash"] == record["content_hash"]
+    assert report["actual_provenance_status"] == "VERIFIED"
+    assert report["observed"]["provenance"] == record["provenance"]
+
+
+def test_canonical_readback_version_mismatch_is_partial() -> None:
+    store, promotion = _canonical_readback_promoted()
+    tampered = {"reality:cap-1": dict(store["reality:cap-1"])}
+    tampered["reality:cap-1"]["version"] = 2
+    report = reality_canonical_promotion_independent_readback_v0_1(
+        tampered, write_evidence=promotion
+    )
+    assert report["verdict"] == "PARTIAL"
+    assert report["field_consistency"]["version"] == "FAIL"
+    assert report["workflow_status"] == "FAIL"
+
+
+def test_canonical_readback_hash_mismatch_is_partial() -> None:
+    store, promotion = _canonical_readback_promoted()
+    tampered = {"reality:cap-1": dict(store["reality:cap-1"])}
+    tampered["reality:cap-1"]["content_hash"] = "sha256:" + "0" * 64
+    report = reality_canonical_promotion_independent_readback_v0_1(
+        tampered, write_evidence=promotion
+    )
+    assert report["verdict"] == "PARTIAL"
+    assert report["field_consistency"]["content_hash"] == "FAIL"
+    assert report["verdict"] in CANONICAL_READBACK_STATUSES
+    assert report["verdict"] != "PASS"
+
+
+def test_canonical_readback_missing_write_evidence_is_partial() -> None:
+    store, _promotion = _canonical_readback_promoted()
+    report = reality_canonical_promotion_independent_readback_v0_1(store)
+    assert report["exists_in_actual_store"] is True
+    assert report["write_evidence_available"] is False
+    assert report["verdict"] == "PARTIAL"
+    assert any(
+        "UNKNOWN" == item["source"] for item in report["evidence"]
+    )
+
+
+def test_canonical_readback_callable_surface_supported() -> None:
+    store, promotion = _canonical_readback_promoted()
+    report = reality_canonical_promotion_independent_readback_v0_1(
+        lambda aid: store.get(aid), write_evidence=promotion
+    )
+    assert report["verdict"] == "PASS"
+    assert report["actual_version"] == promotion["canonical_version"]
+
+
+def test_canonical_readback_surface_error_fails_closed() -> None:
+    def _broken(_asset_id: str):
+        raise RuntimeError("store unreachable")
+
+    report = reality_canonical_promotion_independent_readback_v0_1(_broken)
+    assert report["verdict"] == "BLOCKED"
+    assert report["read_error"] == "RuntimeError"
+    assert report["exists_in_actual_store"] is False
+    assert any(
+        item["source"] == "UNKNOWN" and item["detail"]
+        for item in report["evidence"]
+    )
+
+
+def test_canonical_readback_epistemic_tiers_distinct() -> None:
+    store, promotion = _canonical_readback_promoted()
+    matched = reality_canonical_promotion_independent_readback_v0_1(
+        store, write_evidence=promotion
+    )
+    assert set(matched["evidence_tiers"]) == set(CANONICAL_READBACK_EVIDENCE_TIERS)
+    assert "OBSERVED" in matched["evidence_tiers_present"]
+    assert "STATED" in matched["evidence_tiers_present"]
+    assert "INFERRED" in matched["evidence_tiers_present"]
+
+    blocked = reality_canonical_promotion_independent_readback_v0_1()
+    assert "UNKNOWN" in blocked["evidence_tiers_present"]
+
+    for report in (matched, blocked):
+        for item in report["evidence"]:
+            assert set(item) == {"source", "detail"}
+            assert item["source"] in CANONICAL_READBACK_EVIDENCE_TIERS
+            assert item["detail"]
+        assert set(report["epistemic_summary"]) == {
+            "observed",
+            "stated",
+            "inferred",
+            "unknown",
+        }
+
+
+def test_canonical_readback_code_artifacts_do_not_affect_promotion() -> None:
+    report = reality_canonical_promotion_independent_readback_v0_1()
+    paths = {artifact["path"] for artifact in report["code_artifacts"]}
+    assert {"hello.py", "test_hello.py"} <= paths
+    for artifact in report["code_artifacts"]:
+        assert len(artifact["sha256"]) == 64
+        assert artifact["bytes"] > 0
+    assert report["code_artifacts_affect_promotion"] is False
+    check = next(
+        c
+        for c in report["checks"]
+        if "hello.py / test_hello.py" in c["check"]
+    )
+    assert check["status"] == "PASS"
+
+
+def test_canonical_readback_no_production_write() -> None:
+    store, promotion = _canonical_readback_promoted()
+    reports = [
+        reality_canonical_promotion_independent_readback_v0_1(),
+        reality_canonical_promotion_independent_readback_v0_1(
+            store, write_evidence=promotion
+        ),
+    ]
+    for report in reports:
+        for flag in CANONICAL_READBACK_MUTATION_FLAGS:
+            assert report[flag] is False, flag
+        no_mutation = next(
+            c
+            for c in report["checks"]
+            if "no production write" in c["check"]
+        )
+        assert no_mutation["status"] == "PASS"
+
+
+def test_canonical_readback_checks_shape() -> None:
+    report = reality_canonical_promotion_independent_readback_v0_1()
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+
+
+def test_canonical_readback_markdown_and_entrypoint() -> None:
+    report = reality_canonical_promotion_independent_readback_v0_1()
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {CANONICAL_READBACK_GOAL}")
+    assert f"- task_id: {CANONICAL_READBACK_TASK_ID}" in markdown
+    assert f"- asset_id: {CANONICAL_READBACK_ASSET_ID}" in markdown
+    assert f"FINAL_STATUS={report['final_status']}" in markdown
+    assert "## Epistemic breakdown" in markdown
+    assert "## No-mutation statement" in markdown
+
+    source = inspect.getsource(hello_module)
+    assert "reality_canonical_promotion_independent_readback_v0_1(" in source
