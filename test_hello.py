@@ -283,6 +283,20 @@ from hello import (
     wechatread_real_source_probe_v0_1,
 )
 
+from hello import (
+    NEEDS_MORE_EVIDENCE,
+    PROMOTION_BLOCKED,
+    PROMOTION_ELIGIBLE,
+    REALITY_PROMOTION_STATUSES,
+    REALITY_REVIEW_GOAL,
+    REALITY_REVIEW_LIVE_RUN,
+    REALITY_REVIEW_REPORT,
+    REALITY_REVIEW_RUN_FIELDS,
+    REALITY_REVIEW_STATUSES,
+    REALITY_REVIEW_TASK_ID,
+    reality_first_candidate_review_v0_1,
+)
+
 VALID_STATUSES = {"PASS", "FAIL", "BLOCKED"}
 
 # TEST ISOLATION (task cf-2f2b71c331da): the runner-process SendKey is
@@ -9866,3 +9880,189 @@ def test_wechat_probe_evidence_is_source_tagged_and_checks_pass() -> None:
     assert all(check["status"] == "PASS" for check in report["checks"])
 
     assert list(report["required_schema_fields"]) == _wechat_probe_full_fields()
+
+
+# ---------------------------------------------------------------------------
+# REALITY_FIRST_CANDIDATE_REVIEW_V0.1  (task cf-3911a7f2be2c)
+# Read-only, advisory review of the first real WeChat-derived Reality Candidate
+# produced by REALITY_FIRST_LIVE_WECHAT_SNAPSHOT_RUN_V0.1.
+# ---------------------------------------------------------------------------
+def _reality_review_fields() -> tuple:
+    return (
+        "source_identity",
+        "source_location",
+        "source_version",
+        "content_version",
+        "captured_at",
+        "content",
+        "verification_evidence",
+    )
+
+
+def _reality_review_all_observed() -> dict:
+    return {field: "OBSERVED" for field in _reality_review_fields()}
+
+
+def _reality_review_envelope(*, epistemic: dict | None = None) -> dict:
+    from personal_ai_execution.reality_capture import build_capture_envelope
+
+    return build_capture_envelope(
+        source_identity="wechat:conversation:conv-42",
+        source_location="wechat://local-snapshot/messages.sqlite/conv-42",
+        source_version="2026-10-01",
+        content_version="msg-1",
+        captured_at="2026-10-01T00:00:00Z",
+        content={"text": "reusable tip"},
+        verification_evidence={"method": "wechat-reader-v1"},
+        message_id="msg-1",
+        epistemic=(
+            epistemic if epistemic is not None else _reality_review_all_observed()
+        ),
+    )
+
+
+def test_reality_first_candidate_review_default_is_blocked_and_read_only() -> None:
+    report = reality_first_candidate_review_v0_1()
+
+    assert report["report"] == REALITY_REVIEW_REPORT
+    assert report["goal"] == REALITY_REVIEW_GOAL
+    assert report["task_id"] == REALITY_REVIEW_TASK_ID
+    assert report["live_run"] == REALITY_REVIEW_LIVE_RUN
+    assert report["mode"] == "read_only_advisory_review"
+
+    assert report["review_status"] == "BLOCKED"
+    assert report["review_status"] in REALITY_REVIEW_STATUSES
+    assert report["promotion_status"] == PROMOTION_BLOCKED
+    assert report["promotion_status"] in REALITY_PROMOTION_STATUSES
+    assert report["promotion_eligible"] is False
+    assert report["workflow_status"] == "PASS"
+    assert report["status"] == report["workflow_status"]
+
+    assert report["evidence_gaps"]
+    assert report["unknowns"]
+    assert report["final_status"] == (
+        "REVIEW_STATUS=BLOCKED;PROMOTION_STATUS=" + PROMOTION_BLOCKED
+    )
+
+    for key in (
+        "files_modified",
+        "production_mutated",
+        "deployment_performed",
+        "credentials_accessed",
+        "secret_accessed",
+        "permissions_changed",
+        "reality_written",
+        "reality_canonical_written",
+        "canonical_written",
+        "knowledge_written",
+        "skill_written",
+        "decision_written",
+        "mark_reviewed_called",
+        "second_state_store_created",
+    ):
+        assert report[key] is False
+
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {REALITY_REVIEW_GOAL}")
+    assert f"- task_id: {REALITY_REVIEW_TASK_ID}" in markdown
+    assert f"- live_run: {REALITY_REVIEW_LIVE_RUN}" in markdown
+    assert f"FINAL_STATUS={report['final_status']}" in markdown
+
+
+def test_reality_first_candidate_review_verified_is_promotion_eligible() -> None:
+    report = reality_first_candidate_review_v0_1(_reality_review_envelope())
+
+    assert report["review_status"] == "PASS"
+    assert report["promotion_status"] == PROMOTION_ELIGIBLE
+    assert report["promotion_eligible"] is True
+    assert report["normalized_status"] == "VERIFIED"
+    assert report["verified"] is True
+    assert report["required_observed"] is True
+    assert report["evidence_gaps"] == []
+    assert report["semantic_value"]["content_present"] is True
+    assert all(check["status"] == "PASS" for check in report["checks"])
+
+
+def test_reality_first_candidate_review_partial_needs_more_evidence() -> None:
+    epistemic = _reality_review_all_observed()
+    epistemic["source_version"] = "STATED"
+    report = reality_first_candidate_review_v0_1(
+        _reality_review_envelope(epistemic=epistemic)
+    )
+
+    assert report["review_status"] == "PARTIAL"
+    assert report["promotion_status"] == NEEDS_MORE_EVIDENCE
+    assert report["promotion_eligible"] is False
+    assert report["normalized_status"] == "VERIFIED"
+    assert report["required_observed"] is False
+    assert (
+        "required field 'source_version' is STATED, not OBSERVED"
+        in report["evidence_gaps"]
+    )
+    assert "source_version" in report["epistemic_summary"]["stated"]
+
+
+def test_reality_first_candidate_review_hash_mismatch_is_blocked() -> None:
+    envelope = _reality_review_envelope()
+    envelope["content_hash"] = "sha256:deadbeef"
+    report = reality_first_candidate_review_v0_1(envelope)
+
+    assert report["review_status"] == "BLOCKED"
+    assert report["promotion_status"] == PROMOTION_BLOCKED
+    assert report["normalized_status"] == "HASH_MISMATCH"
+    assert report["verified"] is False
+    assert any(
+        "content_hash" in gap for gap in report["evidence_gaps"]
+    )
+
+
+def test_reality_first_candidate_review_malformed_is_blocked() -> None:
+    report = reality_first_candidate_review_v0_1("not-a-candidate")
+
+    assert report["review_status"] == "BLOCKED"
+    assert report["promotion_status"] == PROMOTION_BLOCKED
+    assert report["evidence_gaps"]
+
+
+def test_reality_first_candidate_review_normalized_input_and_run_metadata() -> None:
+    from personal_ai_execution.reality_capture import normalize_reality_capture
+
+    normalized = normalize_reality_capture(_reality_review_envelope())
+    run = {
+        "run_id": "run-1",
+        "reader_version": "wechat-reader-v1.0.0",
+        "source_db": "messages.sqlite",
+        "window_start": "2026-10-01T00:00:00Z",
+        "window_end": "2026-10-02T00:00:00Z",
+        "produced_at": "2026-10-02T00:00:01Z",
+        "source_class": "REAL",
+    }
+    report = reality_first_candidate_review_v0_1(normalized, run=run)
+
+    assert report["review_status"] == "PASS"
+    assert report["promotion_status"] == PROMOTION_ELIGIBLE
+    assert report["run"]["run_id"] == "run-1"
+    assert report["run"]["source_class"] == "REAL"
+    assert set(report["run_fields_present"]) == set(REALITY_REVIEW_RUN_FIELDS)
+    assert report["run_fields_absent"] == []
+
+
+def test_reality_first_candidate_review_evidence_tagged_and_content_minimised() -> None:
+    sentinel = "REALITY_REVIEW_CONTENT_SENTINEL_4b1_DO_NOT_EXPOSE"
+    envelope = _reality_review_envelope()
+    envelope["content"] = {"text": sentinel}
+    report = reality_first_candidate_review_v0_1(envelope)
+
+    assert report["evidence"]
+    for item in report["evidence"]:
+        assert set(item) == {"source", "detail"}
+        assert item["source"] in hello_module.EVIDENCE_SOURCES
+        assert item["detail"]
+
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+
+    assert sentinel not in json.dumps(report)
+    assert sentinel not in report["markdown"]

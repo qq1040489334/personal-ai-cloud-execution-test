@@ -25867,6 +25867,574 @@ def wechatread_real_source_probe_v0_1(reader: dict | None = None) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# REALITY_FIRST_CANDIDATE_REVIEW_V0.1  (task cf-3911a7f2be2c)
+#
+# Read-only, evidence-first review of the first real WeChat-derived Reality
+# Candidate produced by REALITY_FIRST_LIVE_WECHAT_SNAPSHOT_RUN_V0.1.
+#
+# This section is strictly advisory and side-effect free: it never writes
+# Reality Canonical, Knowledge, Skill or Decision state, never deploys and never
+# mutates the reviewed candidate. It preserves UNKNOWN wherever the live run
+# evidence is missing and distinguishes OBSERVED / STATED / INFERRED / UNKNOWN.
+# ---------------------------------------------------------------------------
+REALITY_REVIEW_GOAL = "REALITY_FIRST_CANDIDATE_REVIEW_V0.1"
+REALITY_REVIEW_TASK_ID = "cf-3911a7f2be2c"
+REALITY_REVIEW_REPORT = "REALITY_FIRST_CANDIDATE_REVIEW_V0.1_REPORT"
+REALITY_REVIEW_LIVE_RUN = "REALITY_FIRST_LIVE_WECHAT_SNAPSHOT_RUN_V0.1"
+
+#: The only review verdicts this reviewer may emit.
+REALITY_REVIEW_STATUSES = (PASS, PARTIAL, BLOCKED)
+
+PROMOTION_ELIGIBLE = "PROMOTION_ELIGIBLE"
+PROMOTION_BLOCKED = "PROMOTION_BLOCKED"
+NEEDS_MORE_EVIDENCE = "NEEDS_MORE_EVIDENCE"
+REALITY_PROMOTION_STATUSES = (
+    PROMOTION_ELIGIBLE,
+    PROMOTION_BLOCKED,
+    NEEDS_MORE_EVIDENCE,
+)
+
+#: Live-run metadata fields the reviewer expects to be able to cite. Their
+#: absence is recorded as an evidence gap, never fabricated.
+REALITY_REVIEW_RUN_FIELDS = (
+    "run_id",
+    "reader_version",
+    "source_db",
+    "window_start",
+    "window_end",
+    "produced_at",
+)
+
+#: Evidence quality tiers, ordered weakest -> strongest.
+REALITY_REVIEW_EVIDENCE_ORDER = (
+    "UNKNOWN",
+    "INFERRED",
+    "STATED",
+    "OBSERVED",
+)
+
+
+def _reality_review_components():
+    """Import the existing Reality contracts (reuse, never duplicate)."""
+    src = str(REPO_ROOT / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from personal_ai_execution import provenance_contract as _provenance
+    from personal_ai_execution import reality_canonical_writer as _writer
+    from personal_ai_execution import reality_capture as _capture
+
+    return _capture, _writer, _provenance
+
+
+def _reality_review_is_normalized(value: object) -> bool:
+    """Return whether ``value`` already looks like an L2 normalized candidate.
+
+    A normalized result carries the ``candidate`` mapping plus the ``status`` /
+    ``verified`` / ``epistemic`` keys emitted by
+    ``reality_capture.normalize_reality_capture``. This is a shape check only;
+    the normalized result is still re-read fail-closed by the reviewer.
+    """
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("candidate"), dict)
+        and "status" in value
+        and "verified" in value
+        and "epistemic" in value
+    )
+
+
+def _reality_review_run_metadata(run: object) -> dict:
+    record = run if isinstance(run, dict) else {}
+    return {
+        "run_id": _routing_text(record.get("run_id")),
+        "reader_version": _routing_text(record.get("reader_version")),
+        "source_db": _routing_text(record.get("source_db")),
+        "window_start": _routing_text(record.get("window_start")),
+        "window_end": _routing_text(record.get("window_end")),
+        "produced_at": _routing_text(record.get("produced_at")),
+        "source_class": _routing_text(record.get("source_class")),
+        "run_goal": _routing_text(record.get("run_goal"))
+        or REALITY_REVIEW_LIVE_RUN,
+    }
+
+
+def _reality_review_candidate_input(candidate: object, run: object) -> object:
+    """Resolve the reviewed candidate from an explicit value or run record."""
+    if candidate is not None:
+        return candidate
+    if isinstance(run, dict):
+        for key in ("candidate", "produced_candidate", "normalized", "snapshot"):
+            value = run.get(key)
+            if value is not None:
+                return value
+    return None
+
+
+def reality_first_candidate_review_v0_1(
+    candidate: object = None,
+    *,
+    run: object = None,
+) -> dict:
+    """Review the first real WeChat-derived Reality Candidate, read-only.
+
+    The reviewer accepts either a raw L2 capture envelope or an already
+    normalized L2 result (plus optional live-run metadata). It returns a
+    ``PASS`` / ``PARTIAL`` / ``BLOCKED`` review verdict, a promotion status of
+    ``PROMOTION_ELIGIBLE`` / ``PROMOTION_BLOCKED`` / ``NEEDS_MORE_EVIDENCE``,
+    the exact evidence gaps and the epistemic breakdown of the candidate.
+
+    When no candidate is supplied -- because the live snapshot run published no
+    artifact into this checkout -- the reviewer fails closed: it reports
+    ``BLOCKED`` / ``PROMOTION_BLOCKED`` and lists the missing live-run evidence
+    as gaps instead of inventing a candidate. Nothing is written, staged,
+    deployed or mutated.
+    """
+    capture, writer, provenance = _reality_review_components()
+
+    run_meta = _reality_review_run_metadata(run)
+    subject = _reality_review_candidate_input(candidate, run)
+
+    required_fields = tuple(capture.REQUIRED_CAPTURE_FIELDS)
+
+    evidence: list[dict] = []
+    unknowns: list[str] = []
+    gaps: list[str] = []
+
+    present_run_fields = [
+        field for field in REALITY_REVIEW_RUN_FIELDS if run_meta.get(field)
+    ]
+    absent_run_fields = [
+        field for field in REALITY_REVIEW_RUN_FIELDS if not run_meta.get(field)
+    ]
+
+    normalized: object = None
+    epistemic_summary = {
+        "observed": [],
+        "stated": [],
+        "inferred": [],
+        "unknown": [],
+    }
+    provenance_status = None
+    semantic_value = {
+        "content_present": False,
+        "classification": None,
+        "observed": False,
+        "reason": "candidate not reviewed",
+    }
+    candidate_id = None
+    source_identity = None
+    normalized_status = None
+    required_observed = False
+
+    if present_run_fields:
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "live-run metadata cited for review: "
+                + ", ".join(
+                    f"{field}={run_meta.get(field)}" for field in present_run_fields
+                ),
+            )
+        )
+    if absent_run_fields:
+        for field in absent_run_fields:
+            unknowns.append(f"live-run {field}")
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "live-run metadata unavailable for: "
+                + ", ".join(absent_run_fields)
+                + " (never guessed)",
+            )
+        )
+
+    if subject is None:
+        # Fail closed: no candidate artifact is observable for the live run.
+        review_status = BLOCKED
+        promotion_status = PROMOTION_BLOCKED
+        gaps.extend(
+            [
+                (
+                    f"{REALITY_REVIEW_LIVE_RUN} published no WeChat-derived "
+                    "Reality Candidate artifact into this checkout"
+                ),
+                (
+                    "candidate provenance (reader_version, source_db, window, "
+                    "produced_at) is not observable"
+                ),
+            ]
+        )
+        unknowns.extend(
+            [
+                "whether the live WeChat snapshot run produced any candidate",
+                "reader_version and source_db of the producing reader",
+                "source window and produced_at of the candidate",
+            ]
+        )
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "reviewed the checkout for a live WeChat-derived Reality "
+                "Candidate artifact; none was present (no production path was "
+                "read or written)",
+            )
+        )
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                f"{REALITY_REVIEW_LIVE_RUN} terminal evidence is unavailable, "
+                "so no candidate can be admitted for promotion",
+            )
+        )
+    elif _reality_review_is_normalized(subject):
+        normalized = subject
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "reviewed a normalized L2 Reality candidate supplied by the "
+                "live-run record",
+            )
+        )
+    elif isinstance(subject, dict):
+        normalized = capture.normalize_reality_capture(subject)
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "normalized the supplied live-run capture envelope read-only "
+                "via normalize_reality_capture (no write)",
+            )
+        )
+    else:
+        normalized = None
+
+    if subject is not None and normalized is None:
+        review_status = BLOCKED
+        promotion_status = PROMOTION_BLOCKED
+        gaps.append("candidate is malformed: expected a capture envelope mapping")
+        unknowns.append("candidate shape and provenance")
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "candidate input is not a mapping; no candidate can be reviewed",
+            )
+        )
+    elif normalized is not None:
+        normalized_status = normalized["status"]
+        verified = bool(normalized["verified"])
+        promotion_eligible = bool(normalized["promotion_eligible"])
+        epistemic = normalized["epistemic"]
+        epistemic_summary = normalized["epistemic_summary"]
+        provenance_eval = normalized.get("provenance_completeness") or {}
+        provenance_status = provenance_eval.get("status")
+        missing = list(normalized["missing"])
+        invalid = list(normalized["invalid"])
+        candidate = normalized.get("candidate") or {}
+        candidate_id = candidate.get("candidate_id")
+        source_identity = candidate.get("source_identity")
+
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "capture status="
+                + str(normalized_status)
+                + "; verified="
+                + str(verified)
+                + "; promotion_eligible="
+                + str(promotion_eligible),
+            )
+        )
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED" if epistemic_summary.get("observed") else "UNKNOWN",
+                "epistemic breakdown observed="
+                + str(epistemic_summary.get("observed") or [])
+                + "; stated="
+                + str(epistemic_summary.get("stated") or [])
+                + "; inferred="
+                + str(epistemic_summary.get("inferred") or [])
+                + "; unknown="
+                + str(epistemic_summary.get("unknown") or []),
+            )
+        )
+
+        for field in required_fields:
+            tag = epistemic.get(field)
+            if field in missing:
+                gaps.append(f"required field {field!r} is missing")
+            elif field in invalid:
+                gaps.append(
+                    f"required field {field!r} has an unrecognized epistemic status"
+                )
+            elif tag != capture.EPISTEMIC_OBSERVED:
+                gaps.append(
+                    f"required field {field!r} is {tag}, not "
+                    f"{capture.EPISTEMIC_OBSERVED}"
+                )
+
+        if normalized_status == capture.STATUS_HASH_MISMATCH:
+            gaps.append(
+                "declared content_hash disagrees with the recomputed content hash"
+            )
+        if provenance_eval.get("hash_match") is False:
+            gaps.append(
+                "candidate provenance content hash does not match the "
+                "recomputed content hash"
+            )
+        elif provenance_status == provenance.STATUS_INCOMPLETE:
+            # Capture-stage provenance deliberately leaves the promotion-only
+            # fields unset; they are filled only by the L3 Human Gate. This is
+            # recorded as INFERRED context, never as a promotion blocker.
+            evidence.append(
+                _revalidation_evidence(
+                    "INFERRED",
+                    "capture-stage provenance is INCOMPLETE for promotion-only "
+                    "fields ("
+                    + ", ".join(provenance_eval.get("missing") or [])
+                    + "); these are filled only by the L3 Human Gate",
+                )
+            )
+
+        content = candidate.get("content")
+        content_present = _routing_meaningful(content)
+        classification = _routing_text(
+            candidate.get("classification")
+            or candidate.get("kind")
+            or candidate.get("asset_type")
+        )
+        semantic_value = {
+            "content_present": content_present,
+            "classification": classification,
+            "observed": content_present,
+            "reason": (
+                "candidate carries a reusable content payload"
+                if content_present
+                else "candidate has no reusable content payload"
+            ),
+        }
+        if verified and not content_present:
+            gaps.append(
+                "candidate has no reusable content payload (no semantic value)"
+            )
+
+        required_observed = all(
+            epistemic.get(field) == capture.EPISTEMIC_OBSERVED
+            for field in required_fields
+        )
+
+        if not verified:
+            review_status = BLOCKED
+            promotion_status = PROMOTION_BLOCKED
+        elif gaps:
+            review_status = PARTIAL
+            promotion_status = NEEDS_MORE_EVIDENCE
+        else:
+            review_status = PASS
+            promotion_status = PROMOTION_ELIGIBLE
+
+        if review_status == PASS:
+            evidence.append(
+                _revalidation_evidence(
+                    "OBSERVED",
+                    "candidate is VERIFIED with every required field OBSERVED "
+                    "and verified provenance: promotion eligible",
+                )
+            )
+        elif review_status == PARTIAL:
+            evidence.append(
+                _revalidation_evidence(
+                    "STATED",
+                    "candidate is VERIFIED but promotion evidence is "
+                    "incomplete; more evidence required before promotion",
+                )
+            )
+        else:
+            evidence.append(
+                _revalidation_evidence(
+                    "OBSERVED",
+                    "candidate is not VERIFIED; promotion is blocked",
+                )
+            )
+
+    expected_promotion = {
+        PASS: PROMOTION_ELIGIBLE,
+        PARTIAL: NEEDS_MORE_EVIDENCE,
+        BLOCKED: PROMOTION_BLOCKED,
+    }[review_status]
+
+    checks = [
+        {
+            "check": "review executed read-only",
+            "status": PASS,
+            "detail": "advisory review; no file write, no catalog mutation",
+        },
+        {
+            "check": "review status is PASS / PARTIAL / BLOCKED",
+            "status": PASS if review_status in REALITY_REVIEW_STATUSES else FAIL,
+            "detail": f"review_status={review_status}",
+        },
+        {
+            "check": "promotion status is valid and consistent with review",
+            "status": (
+                PASS
+                if promotion_status in REALITY_PROMOTION_STATUSES
+                and promotion_status == expected_promotion
+                else FAIL
+            ),
+            "detail": f"promotion_status={promotion_status}",
+        },
+        {
+            "check": "evidence gaps are explicit when promotion is not eligible",
+            "status": (
+                PASS
+                if promotion_status == PROMOTION_ELIGIBLE or bool(gaps)
+                else FAIL
+            ),
+            "detail": f"evidence_gaps={len(gaps)}",
+        },
+        {
+            "check": "evidence items carry OBSERVED/STATED/INFERRED/UNKNOWN tags",
+            "status": (
+                PASS
+                if evidence
+                and all(item["source"] in EVIDENCE_SOURCES for item in evidence)
+                else FAIL
+            ),
+            "detail": "every evidence item is source-tagged",
+        },
+        {
+            "check": "no production write / canonical / knowledge / decision change",
+            "status": PASS,
+            "detail": (
+                "no Reality Canonical, Knowledge, Skill or Decision write; no "
+                "deploy, credential or permission change"
+            ),
+        },
+    ]
+    workflow_status = (
+        PASS if all(check["status"] == PASS for check in checks) else FAIL
+    )
+
+    promotion_eligible_review = review_status == PASS and (
+        normalized is not None and bool(normalized.get("promotion_eligible"))
+    )
+    final_status = (
+        f"REVIEW_STATUS={review_status};PROMOTION_STATUS={promotion_status}"
+    )
+
+    lines = [
+        f"# {REALITY_REVIEW_GOAL}",
+        "",
+        f"- goal: {REALITY_REVIEW_GOAL}",
+        f"- task_id: {REALITY_REVIEW_TASK_ID}",
+        f"- live_run: {REALITY_REVIEW_LIVE_RUN}",
+        "- mode: read-only/advisory review",
+        f"- workflow_status: {workflow_status}",
+        f"- review_status: {review_status}",
+        f"- promotion_status: {promotion_status}",
+        f"- candidate_id: {candidate_id if candidate_id is not None else 'UNKNOWN'}",
+        f"- source_identity: {source_identity if source_identity is not None else 'UNKNOWN'}",
+        f"- normalized_status: {normalized_status if normalized_status is not None else 'UNKNOWN'}",
+        "",
+        "## Run metadata",
+    ]
+    for field in REALITY_REVIEW_RUN_FIELDS:
+        value = run_meta.get(field)
+        lines.append(f"- {field}: {value if value is not None else 'UNKNOWN'}")
+    lines += ["", "## Epistemic breakdown"]
+    for tier in ("observed", "stated", "inferred", "unknown"):
+        lines.append(f"- {tier}: {', '.join(epistemic_summary.get(tier) or []) or '[]'}")
+    lines += [
+        "",
+        "## Semantic value",
+        f"- content_present: {semantic_value['content_present']}",
+        f"- classification: {semantic_value['classification'] or 'UNKNOWN'}",
+        f"- reason: {semantic_value['reason']}",
+        "",
+        "## Evidence gaps",
+    ]
+    if gaps:
+        for gap in gaps:
+            lines.append(f"- {gap}")
+    else:
+        lines.append("- (none; promotion eligible)")
+    lines += ["", "## Unknowns"]
+    if unknowns:
+        for item in unknowns:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- (none recorded)")
+    lines += ["", "## Evidence"]
+    for item in evidence:
+        lines.append(f"- [{item['source']}] {item['detail']}")
+    lines += [
+        "",
+        "## No-mutation statement",
+        "- production_mutated: False",
+        "- deployment_performed: False",
+        "- credentials_accessed: False",
+        "- permissions_changed: False",
+        "- reality_canonical_written: False",
+        "- knowledge_written: False",
+        "- skill_written: False",
+        "- decision_written: False",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final_status}"]
+
+    return {
+        "report": REALITY_REVIEW_REPORT,
+        "goal": REALITY_REVIEW_GOAL,
+        "task_id": REALITY_REVIEW_TASK_ID,
+        "live_run": REALITY_REVIEW_LIVE_RUN,
+        "contract": "PERSONAL_AI_REALITY_FIRST_CANDIDATE_REVIEW_V0.1",
+        "generated_at": _utc_now(),
+        "mode": "read_only_advisory_review",
+        "workflow_status": workflow_status,
+        "status": workflow_status,
+        "review_status": review_status,
+        "promotion_status": promotion_status,
+        "promotion_eligible": promotion_eligible_review,
+        "final_status": final_status,
+        "candidate_id": candidate_id,
+        "source_identity": source_identity,
+        "normalized_status": normalized_status,
+        "verified": (
+            bool(normalized.get("verified")) if normalized is not None else False
+        ),
+        "required_fields": list(required_fields),
+        "required_observed": required_observed,
+        "provenance_status": provenance_status,
+        "run": run_meta,
+        "run_fields_present": present_run_fields,
+        "run_fields_absent": absent_run_fields,
+        "epistemic_summary": epistemic_summary,
+        "semantic_value": semantic_value,
+        "evidence_gaps": gaps,
+        "unknowns": unknowns,
+        "evidence": evidence,
+        "checks": checks,
+        "files_modified": False,
+        "production_mutated": False,
+        "deployment_performed": False,
+        "credentials_accessed": False,
+        "secret_accessed": False,
+        "permissions_changed": False,
+        "reality_written": False,
+        "reality_canonical_written": False,
+        "canonical_written": False,
+        "knowledge_written": False,
+        "skill_written": False,
+        "decision_written": False,
+        "mark_reviewed_called": False,
+        "second_state_store_created": False,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -25905,3 +26473,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(personal_ai_reality_candidate_writer_adapter_v0_1()["markdown"])
     print(candidate_version_workflow_failure_diagnosis()["markdown"])
     print(wechatread_real_source_probe_v0_1()["markdown"])
+    print(reality_first_candidate_review_v0_1()["markdown"])
