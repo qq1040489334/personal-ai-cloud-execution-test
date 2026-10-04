@@ -297,6 +297,22 @@ from hello import (
     reality_first_candidate_review_v0_1,
 )
 
+from hello import (
+    CANONICAL_PROMOTION_ASSET_TYPE,
+    CANONICAL_PROMOTION_BLOCKED,
+    CANONICAL_PROMOTION_CONTRACT,
+    CANONICAL_PROMOTION_GOAL,
+    CANONICAL_PROMOTION_HG3_GATE,
+    CANONICAL_PROMOTION_IDEMPOTENT,
+    CANONICAL_PROMOTION_PRECONDITIONS,
+    CANONICAL_PROMOTION_PROMOTED,
+    CANONICAL_PROMOTION_REPORT,
+    CANONICAL_PROMOTION_STATUSES,
+    CANONICAL_PROMOTION_STORE,
+    CANONICAL_PROMOTION_TASK_ID,
+    reality_first_canonical_promotion_execution_v0_1,
+)
+
 VALID_STATUSES = {"PASS", "FAIL", "BLOCKED"}
 
 # TEST ISOLATION (task cf-2f2b71c331da): the runner-process SendKey is
@@ -10066,3 +10082,280 @@ def test_reality_first_candidate_review_evidence_tagged_and_content_minimised() 
 
     assert sentinel not in json.dumps(report)
     assert sentinel not in report["markdown"]
+
+
+# ---------------------------------------------------------------------------
+# REALITY_FIRST_CANONICAL_PROMOTION_EXECUTION_V0.1  (task cf-e49d91425a33)
+# HG-3: promote one preflight-PASS Reality Candidate into the Reality Canonical
+# layer exactly once, preserving provenance/hash/version and verifying by an
+# independent read-back. It never writes Knowledge / Skill / Decision.
+# ---------------------------------------------------------------------------
+def _canonical_promotion_observed() -> dict:
+    from personal_ai_execution.reality_capture import REQUIRED_CAPTURE_FIELDS
+
+    return {field: "OBSERVED" for field in REQUIRED_CAPTURE_FIELDS}
+
+
+def _canonical_promotion_envelope(*, epistemic: dict | None = None, content="hello reality"):
+    from personal_ai_execution.reality_capture import build_capture_envelope
+
+    return build_capture_envelope(
+        source_identity="wechat:conversation:conv-42",
+        source_location="wechat://local-snapshot/MSG.db/conv-42",
+        source_version="rev-3",
+        content_version="content-7",
+        captured_at="2026-10-01T00:00:00+00:00",
+        content=content,
+        verification_evidence={"capability": "wechat-reader-v1"},
+        capture_id="cap-1",
+        message_id="msg-42",
+        epistemic=(
+            epistemic if epistemic is not None else _canonical_promotion_observed()
+        ),
+    )
+
+
+def _canonical_promotion_preflight(envelope=None, *, target="KNOWLEDGE"):
+    from personal_ai_execution.reality_candidate_handoff import (
+        build_candidate_artifact,
+    )
+    from personal_ai_execution.reality_canonical_promotion_preflight import (
+        canonical_promotion_preflight,
+    )
+
+    artifact = build_candidate_artifact(
+        envelope if envelope is not None else _canonical_promotion_envelope(),
+        snapshot_id="snap-42",
+    )
+    return canonical_promotion_preflight(artifact, target_asset_type=target)
+
+
+def test_reality_first_canonical_promotion_promotes_exactly_once() -> None:
+    envelope = _canonical_promotion_envelope()
+    preflight = _canonical_promotion_preflight(envelope)
+    store: dict = {}
+    ledger: dict = {}
+
+    report = reality_first_canonical_promotion_execution_v0_1(
+        preflight,
+        candidate=envelope,
+        canonical_store=store,
+        write_ledger=ledger,
+    )
+
+    assert report["report"] == CANONICAL_PROMOTION_REPORT
+    assert report["goal"] == CANONICAL_PROMOTION_GOAL
+    assert report["task_id"] == CANONICAL_PROMOTION_TASK_ID
+    assert report["contract"] == CANONICAL_PROMOTION_CONTRACT
+    assert report["mode"] == "hg3_sandboxed_reality_canonical_promotion"
+    assert report["workflow_status"] == "PASS"
+
+    assert report["execution_status"] == CANONICAL_PROMOTION_PROMOTED
+    assert report["execution_status"] in CANONICAL_PROMOTION_STATUSES
+    assert report["preflight_verdict"] == "PASS"
+    assert report["single_candidate"] is True
+    assert report["candidate_id"] == "cap-1"
+
+    assert report["canonical_asset_id"] == "reality:cap-1"
+    assert report["canonical_asset_type"] == CANONICAL_PROMOTION_ASSET_TYPE
+    assert report["canonical_store"] == CANONICAL_PROMOTION_STORE
+    assert report["canonical_version"] == 1
+    assert report["content_hash"].startswith("sha256:")
+    assert report["promoted_provenance_status"] == "VERIFIED"
+    assert report["provenance"]["content_hash"] == report["content_hash"]
+    assert report["provenance"]["canonical_version"] == 1
+
+    assert report["write_evidence"]["write_performed"] is True
+    assert report["write_evidence"]["write_surface_calls"] == 1
+    assert report["write_evidence"]["human_gate"] == CANONICAL_PROMOTION_HG3_GATE
+    assert report["reality_canonical_written"] is True
+    assert report["canonical_write_performed"] is True
+    assert list(store) == ["reality:cap-1"]
+    assert set(ledger) == {report["idempotency_key"]}
+
+    assert report["read_back_consistent"] is True
+    assert report["read_back"]["version"] == 1
+    assert report["read_back"]["content_hash"] == report["content_hash"]
+    assert report["read_back_provenance_status"] == "VERIFIED"
+
+    assert report["final_status"] == (
+        "EXECUTION_STATUS=PROMOTED;CANONICAL_ASSET_ID=reality:cap-1;"
+        "CANONICAL_VERSION=1"
+    )
+    assert all(check["status"] == "PASS" for check in report["checks"])
+    names = {item["name"] for item in report["preconditions"]}
+    assert names == set(CANONICAL_PROMOTION_PRECONDITIONS)
+    assert all(item["satisfied"] for item in report["preconditions"])
+
+
+def test_reality_first_canonical_promotion_replay_is_idempotent() -> None:
+    envelope = _canonical_promotion_envelope()
+    preflight = _canonical_promotion_preflight(envelope)
+    store: dict = {}
+    ledger: dict = {}
+
+    first = reality_first_canonical_promotion_execution_v0_1(
+        preflight, candidate=envelope, canonical_store=store, write_ledger=ledger
+    )
+    version_after_first = dict(store["reality:cap-1"])
+    second = reality_first_canonical_promotion_execution_v0_1(
+        preflight, candidate=envelope, canonical_store=store, write_ledger=ledger
+    )
+
+    assert first["execution_status"] == CANONICAL_PROMOTION_PROMOTED
+    assert second["execution_status"] == CANONICAL_PROMOTION_IDEMPOTENT
+    assert second["write_evidence"]["write_surface_calls"] == 0
+    assert second["write_evidence"]["write_performed"] is False
+    assert second["read_back_consistent"] is True
+
+    assert list(store) == ["reality:cap-1"]
+    assert store["reality:cap-1"] == version_after_first
+    assert len(ledger) == 1
+    assert second["workflow_status"] == "PASS"
+
+
+def test_reality_first_canonical_promotion_fails_closed_without_preflight() -> None:
+    envelope = _canonical_promotion_envelope()
+    store: dict = {}
+
+    report = reality_first_canonical_promotion_execution_v0_1(
+        candidate=envelope, canonical_store=store
+    )
+
+    assert report["execution_status"] == CANONICAL_PROMOTION_BLOCKED
+    assert report["preflight_verdict"] is None
+    assert report["reality_canonical_written"] is False
+    assert report["canonical_write_performed"] is False
+    assert report["write_evidence"]["write_surface_calls"] == 0
+    assert store == {}
+    assert report["evidence_gaps"]
+    assert any(
+        "preflight" in item["detail"].lower() for item in report["evidence"]
+    )
+    assert report["workflow_status"] == "PASS"
+
+
+def test_reality_first_canonical_promotion_ineligible_is_blocked() -> None:
+    epistemic = _canonical_promotion_observed()
+    epistemic["source_version"] = "STATED"
+    envelope = _canonical_promotion_envelope(epistemic=epistemic)
+    preflight = _canonical_promotion_preflight(envelope)
+    store: dict = {}
+
+    assert preflight["verdict"] == "PARTIAL"
+    report = reality_first_canonical_promotion_execution_v0_1(
+        preflight, candidate=envelope, canonical_store=store
+    )
+
+    assert report["execution_status"] == CANONICAL_PROMOTION_BLOCKED
+    assert report["preconditions_satisfied"] is False
+    assert report["reality_canonical_written"] is False
+    assert store == {}
+
+
+def test_reality_first_canonical_promotion_hash_mismatch_is_blocked() -> None:
+    envelope = _canonical_promotion_envelope()
+    envelope["content_hash"] = "sha256:" + "0" * 64
+    preflight = _canonical_promotion_preflight(envelope)
+    store: dict = {}
+
+    assert preflight["verdict"] == "BLOCKED"
+    report = reality_first_canonical_promotion_execution_v0_1(
+        preflight, candidate=envelope, canonical_store=store
+    )
+
+    assert report["execution_status"] == CANONICAL_PROMOTION_BLOCKED
+    assert report["reality_canonical_written"] is False
+    assert store == {}
+
+
+def test_reality_first_canonical_promotion_candidate_mismatch_is_blocked() -> None:
+    preflight = _canonical_promotion_preflight()
+    other = _canonical_promotion_envelope()
+    other["capture_id"] = "cap-2"
+    other["message_id"] = "msg-99"
+    store: dict = {}
+
+    report = reality_first_canonical_promotion_execution_v0_1(
+        preflight, candidate=other, canonical_store=store
+    )
+
+    assert report["execution_status"] == CANONICAL_PROMOTION_BLOCKED
+    assert report["candidate_id"] == "cap-2"
+    assert report["preflight_candidate_id"] == "cap-1"
+    assert report["reality_canonical_written"] is False
+    assert store == {}
+
+
+def test_reality_first_canonical_promotion_never_writes_knowledge_skill_decision() -> None:
+    envelope = _canonical_promotion_envelope()
+    preflight = _canonical_promotion_preflight(envelope)
+    report = reality_first_canonical_promotion_execution_v0_1(
+        preflight, candidate=envelope, canonical_store={}
+    )
+
+    assert report["execution_status"] == CANONICAL_PROMOTION_PROMOTED
+    assert report["knowledge_written"] is False
+    assert report["skill_written"] is False
+    assert report["decision_written"] is False
+
+
+def test_reality_first_canonical_promotion_no_deploy_secret_permission_change() -> None:
+    envelope = _canonical_promotion_envelope()
+    preflight = _canonical_promotion_preflight(envelope)
+    report = reality_first_canonical_promotion_execution_v0_1(
+        preflight, candidate=envelope, canonical_store={}
+    )
+
+    for key in (
+        "production_write_performed",
+        "deployment_performed",
+        "credentials_accessed",
+        "secret_accessed",
+        "permissions_changed",
+        "binding_changed",
+        "schema_changed",
+        "second_state_store_created",
+        "mark_reviewed_called",
+        "content_exposed",
+        "message_content_exposed",
+    ):
+        assert report[key] is False, key
+
+
+def test_reality_first_canonical_promotion_evidence_tagged_and_content_minimised() -> None:
+    sentinel = "CANONICAL_PROMOTION_CONTENT_SENTINEL_9c2_DO_NOT_EXPOSE"
+    envelope = _canonical_promotion_envelope(content={"text": sentinel})
+    preflight = _canonical_promotion_preflight(envelope)
+    report = reality_first_canonical_promotion_execution_v0_1(
+        preflight, candidate=envelope, canonical_store={}
+    )
+
+    assert report["evidence"]
+    for item in report["evidence"]:
+        assert set(item) == {"source", "detail"}
+        assert item["source"] in hello_module.EVIDENCE_SOURCES
+        assert item["detail"]
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+
+    assert sentinel not in json.dumps(report)
+    assert sentinel not in report["markdown"]
+
+
+def test_reality_first_canonical_promotion_markdown_and_entrypoint() -> None:
+    report = reality_first_canonical_promotion_execution_v0_1()
+
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {CANONICAL_PROMOTION_GOAL}")
+    assert f"- task_id: {CANONICAL_PROMOTION_TASK_ID}" in markdown
+    assert f"- canonical_store: {CANONICAL_PROMOTION_STORE}" in markdown
+    assert f"- human_gate: {CANONICAL_PROMOTION_HG3_GATE}" in markdown
+    assert f"FINAL_STATUS={report['final_status']}" in markdown
+    for name in CANONICAL_PROMOTION_PRECONDITIONS:
+        assert name in markdown
+
+    source = inspect.getsource(hello_module)
+    assert "reality_first_canonical_promotion_execution_v0_1()" in source

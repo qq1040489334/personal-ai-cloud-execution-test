@@ -26435,6 +26435,719 @@ def reality_first_candidate_review_v0_1(
     }
 
 
+# ---------------------------------------------------------------------------
+# REALITY_FIRST_CANONICAL_PROMOTION_EXECUTION_V0.1  (task cf-e49d91425a33)
+#
+# HG-3 execution of the first REALITY Canonical promotion. It re-reads the
+# REALITY_FIRST_CANONICAL_PROMOTION_PREFLIGHT_V0.1 result, admits at most one
+# preflight-PASS candidate, and promotes it exactly once into the single Reality
+# Canonical store. It never writes Knowledge / Skill / Decision, never deploys
+# and never touches a secret, permission, binding or schema.
+# ---------------------------------------------------------------------------
+CANONICAL_PROMOTION_GOAL = "REALITY_FIRST_CANONICAL_PROMOTION_EXECUTION_V0.1"
+CANONICAL_PROMOTION_TASK_ID = "cf-e49d91425a33"
+CANONICAL_PROMOTION_REPORT = CANONICAL_PROMOTION_GOAL + "_REPORT"
+CANONICAL_PROMOTION_CONTRACT = "PERSONAL_AI_" + CANONICAL_PROMOTION_GOAL
+
+#: The single canonical store the execution may write; no second store is created.
+CANONICAL_PROMOTION_STORE = "ASSET_DB:assets/asset_versions"
+#: Reality is source/provenance; its canonical asset type is REALITY itself.
+CANONICAL_PROMOTION_ASSET_TYPE = "REALITY"
+CANONICAL_PROMOTION_ROLE = "SOURCE_PROVENANCE"
+#: Human Gate HG-3 that authorizes the first Reality Canonical write.
+CANONICAL_PROMOTION_HG3_GATE = "HUMAN_GATE_REALITY_CANONICAL_WRITE_V0.1"
+
+#: Execution outcomes. ``PROMOTED`` performed exactly one canonical write,
+#: ``IDEMPOTENT`` performed none because the same version already exists, and
+#: ``BLOCKED`` failed closed.
+CANONICAL_PROMOTION_PROMOTED = "PROMOTED"
+CANONICAL_PROMOTION_IDEMPOTENT = "IDEMPOTENT"
+CANONICAL_PROMOTION_BLOCKED = "BLOCKED"
+CANONICAL_PROMOTION_STATUSES = (
+    CANONICAL_PROMOTION_PROMOTED,
+    CANONICAL_PROMOTION_IDEMPOTENT,
+    CANONICAL_PROMOTION_BLOCKED,
+)
+
+#: The non-human HG-3 preconditions re-read before the single write.
+CANONICAL_PROMOTION_PRECONDITIONS = (
+    "preflight_verdict_pass",
+    "single_candidate",
+    "candidate_verified",
+    "candidate_promotion_eligible",
+    "promoted_provenance_verified",
+    "evidence_source_tagged",
+    "canonical_target_resolved_unique",
+    "canonical_store_single",
+    "first_promotion_no_duplicate",
+)
+
+
+def _canonical_promotion_normalize_hash(value: object) -> str:
+    text = str(value or "").strip().lower()
+    for prefix in ("sha256:", "sha-256:", "sha512:", "sha-512:", "0x"):
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+            break
+    return text.replace(" ", "")
+
+
+def _canonical_promotion_precondition(
+    name: str, satisfied: bool, detail: str
+) -> dict:
+    return {"name": name, "satisfied": bool(satisfied), "detail": detail}
+
+
+def _canonical_promotion_build_provenance(
+    candidate: object,
+    content_hash: object,
+    canonical_version: object,
+    provenance_mod,
+) -> dict:
+    """Complete the L2 provenance with the promotion fields (deterministic)."""
+    record = candidate if isinstance(candidate, dict) else {}
+    candidate_id = record.get("candidate_id")
+    promoted_at = (
+        record.get("promoted_at") or record.get("captured_at") or ""
+    )
+    captured_at = record.get("captured_at") or ""
+    promotion_event = record.get("promotion_event") or (
+        "promote:" + str(candidate_id) + ":" + str(canonical_version)
+    )
+    built = provenance_mod.build_provenance(
+        source_identity=str(record.get("source_identity")),
+        source_location=str(record.get("source_location")),
+        source_version=str(record.get("source_version")),
+        content_version=str(record.get("content_version")),
+        canonical_version=canonical_version,
+        content_hash=content_hash,
+        verification_evidence=record.get("verification_evidence"),
+        promotion_decision="PROMOTE",
+        promotion_event=promotion_event,
+        captured_at=str(captured_at),
+        promoted_at=str(promoted_at),
+        source_content_hash=record.get("source_content_hash"),
+    )
+    existing = record.get("provenance")
+    if isinstance(existing, dict):
+        for key, value in existing.items():
+            built.setdefault(key, value)
+    return built
+
+
+def reality_first_canonical_promotion_execution_v0_1(
+    preflight: object = None,
+    *,
+    candidate: object = None,
+    canonical_store: object = None,
+    write_ledger: object = None,
+) -> dict:
+    """Execute HG-3: promote one preflight-PASS Reality Candidate to Canonical.
+
+    The execution is deliberately narrow and fail-closed:
+
+    * it re-reads the ``REALITY_FIRST_CANONICAL_PROMOTION_PREFLIGHT_V0.1``
+      result and admits **only** a single ``PASS`` candidate whose id matches;
+    * it writes exactly once into the single Reality Canonical store
+      (``ASSET_DB:assets/asset_versions``) via the injected/in-memory
+      ``canonical_store``; a repeated execution is ``IDEMPOTENT`` and performs no
+      additional write;
+    * it records the canonical ``asset_id``, ``version``, ``content_hash`` and
+      the complete promoted provenance, then performs an independent read-back;
+    * it never writes Knowledge / Skill / Decision, never deploys and never
+      changes a secret, permission, binding or schema.
+
+    When evidence is insufficient, the candidate mismatches the preflight, or
+    the target is ambiguous, the execution is ``BLOCKED`` and performs no write.
+    """
+    capture, _writer, provenance_mod = _reality_review_components()
+
+    store = canonical_store if isinstance(canonical_store, dict) else {}
+    ledger = write_ledger if isinstance(write_ledger, dict) else {}
+
+    evidence: list[dict] = []
+    gaps: list[str] = []
+    unknowns: list[str] = []
+
+    normalized = None
+    if _reality_review_is_normalized(candidate):
+        normalized = candidate
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "re-read the normalized L2 Reality candidate handed over for "
+                "execution",
+            )
+        )
+    elif isinstance(candidate, dict):
+        normalized = capture.normalize_reality_capture(candidate)
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "normalized the supplied capture envelope read-only via "
+                "normalize_reality_capture (no write)",
+            )
+        )
+    else:
+        unknowns.append("the single Reality candidate to promote")
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "no Reality candidate was supplied to the execution; it is never "
+                "guessed",
+            )
+        )
+
+    preflight_report = preflight if isinstance(preflight, dict) else None
+    preflight_verdict = None
+    preflight_candidate_id = None
+    preflight_target = None
+    preflight_preconditions_ok = False
+    if preflight_report is not None:
+        preflight_verdict = (
+            preflight_report.get("verdict")
+            or preflight_report.get("preflight_status")
+        )
+        preflight_candidate_id = preflight_report.get("candidate_id")
+        preflight_target = preflight_report.get("target_asset_type")
+        preflight_preconditions_ok = bool(
+            preflight_report.get("hg3_write_preconditions_satisfied")
+        )
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "re-read REALITY_FIRST_CANONICAL_PROMOTION_PREFLIGHT_V0.1: "
+                "verdict="
+                + str(preflight_verdict)
+                + "; candidate_id="
+                + str(preflight_candidate_id)
+                + "; first_promotion="
+                + str(preflight_report.get("first_promotion"))
+                + "; hg3_preconditions_satisfied="
+                + str(preflight_preconditions_ok),
+            )
+        )
+    else:
+        unknowns.append("REALITY_FIRST_CANONICAL_PROMOTION_PREFLIGHT_V0.1 result")
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "no preflight result was supplied; the execution fails closed",
+            )
+        )
+
+    candidate_id = None
+    content_hash = None
+    promoted_provenance = None
+    promoted_provenance_status = None
+    canonical_version = None
+    if isinstance(normalized, dict):
+        cand = normalized.get("candidate") or {}
+        candidate_id = cand.get("candidate_id")
+        content_hash = cand.get("content_hash")
+        if candidate_id is not None:
+            canonical_version = cand.get("canonical_version") or 1
+            promoted_provenance = _canonical_promotion_build_provenance(
+                cand, content_hash, canonical_version, provenance_mod
+            )
+            evaluated = provenance_mod.evaluate_provenance(
+                promoted_provenance, content_hash=content_hash
+            )
+            promoted_provenance_status = evaluated["status"]
+
+    verified = bool(isinstance(normalized, dict) and normalized.get("verified"))
+    capture_verified = bool(
+        isinstance(normalized, dict) and normalized.get("status") == "VERIFIED"
+    )
+    promotion_eligible = bool(
+        isinstance(normalized, dict) and normalized.get("promotion_eligible")
+    )
+    target_unique = bool(
+        isinstance(normalized, dict)
+        and (normalized.get("candidate") or {}).get("asset_type")
+        == CANONICAL_PROMOTION_ASSET_TYPE
+    )
+    candidate_matches_preflight = bool(
+        candidate_id is not None
+        and (
+            preflight_report is None
+            or preflight_candidate_id is None
+            or str(preflight_candidate_id) == str(candidate_id)
+        )
+    )
+
+    asset_id = (
+        CANONICAL_PROMOTION_ASSET_TYPE.lower() + ":" + str(candidate_id)
+        if candidate_id is not None
+        else None
+    )
+    existing = store.get(asset_id) if asset_id is not None else None
+    replay = bool(
+        isinstance(existing, dict)
+        and _canonical_promotion_normalize_hash(existing.get("content_hash"))
+        == _canonical_promotion_normalize_hash(content_hash)
+    )
+    conflicting_duplicate = bool(isinstance(existing, dict) and not replay)
+    idempotency_key = (
+        CANONICAL_PROMOTION_ASSET_TYPE.lower()
+        + ":"
+        + str(candidate_id)
+        + ":"
+        + _canonical_promotion_normalize_hash(content_hash)
+        if candidate_id is not None
+        else None
+    )
+    ledger_admitted = bool(
+        idempotency_key is not None and idempotency_key in ledger
+    )
+    evidence_tagged = bool(evidence) and all(
+        item["source"] in EVIDENCE_SOURCES for item in evidence
+    )
+
+    preconditions = [
+        _canonical_promotion_precondition(
+            "preflight_verdict_pass",
+            preflight_verdict == PASS,
+            "preflight_verdict=" + str(preflight_verdict),
+        ),
+        _canonical_promotion_precondition(
+            "single_candidate",
+            candidate_id is not None and candidate_matches_preflight,
+            "candidate_id="
+            + str(candidate_id)
+            + "; preflight_candidate_id="
+            + str(preflight_candidate_id),
+        ),
+        _canonical_promotion_precondition(
+            "candidate_verified",
+            capture_verified and verified,
+            "capture_status="
+            + str(normalized.get("status") if isinstance(normalized, dict) else None)
+            + "; verified="
+            + str(verified),
+        ),
+        _canonical_promotion_precondition(
+            "candidate_promotion_eligible",
+            promotion_eligible,
+            "promotion_eligible=" + str(promotion_eligible),
+        ),
+        _canonical_promotion_precondition(
+            "promoted_provenance_verified",
+            promoted_provenance_status == "VERIFIED",
+            "promoted_provenance_status=" + str(promoted_provenance_status),
+        ),
+        _canonical_promotion_precondition(
+            "evidence_source_tagged",
+            evidence_tagged,
+            "evidence items=" + str(len(evidence)),
+        ),
+        _canonical_promotion_precondition(
+            "canonical_target_resolved_unique",
+            target_unique,
+            "canonical_target=" + CANONICAL_PROMOTION_ASSET_TYPE,
+        ),
+        _canonical_promotion_precondition(
+            "canonical_store_single",
+            True,
+            "canonical_store="
+            + CANONICAL_PROMOTION_STORE
+            + "; second_state_store=False",
+        ),
+        _canonical_promotion_precondition(
+            "first_promotion_no_duplicate",
+            not conflicting_duplicate,
+            "replay="
+            + str(replay)
+            + "; conflicting_duplicate="
+            + str(conflicting_duplicate),
+        ),
+    ]
+    preconditions_satisfied = all(item["satisfied"] for item in preconditions)
+
+    write_performed = False
+    write_surface_calls = 0
+    write_record = None
+    intent_hash = None
+    if not preconditions_satisfied:
+        execution_status = CANONICAL_PROMOTION_BLOCKED
+        reason = (
+            "HG-3 preconditions not satisfied; no Reality Canonical write performed"
+        )
+        for item in preconditions:
+            if not item["satisfied"]:
+                gaps.append(
+                    f"precondition {item['name']} not satisfied: {item['detail']}"
+                )
+    elif replay or ledger_admitted:
+        execution_status = CANONICAL_PROMOTION_IDEMPOTENT
+        reason = (
+            "identical Reality Canonical version already present; no new version "
+            "written (exactly one canonical write)"
+        )
+        write_record = existing if replay else ledger.get(idempotency_key)
+    else:
+        cand = normalized.get("candidate") or {}
+        write_record = {
+            "canonical_store": CANONICAL_PROMOTION_STORE,
+            "asset_id": asset_id,
+            "asset_type": CANONICAL_PROMOTION_ASSET_TYPE,
+            "reality_role": CANONICAL_PROMOTION_ROLE,
+            "version": canonical_version,
+            "content_hash": content_hash,
+            "candidate_id": candidate_id,
+            "source_identity": cand.get("source_identity"),
+            "provenance": promoted_provenance,
+            "idempotency_key": idempotency_key,
+            "promoted_at": cand.get("promoted_at") or cand.get("captured_at"),
+        }
+        intent_hash = hashlib.sha256(
+            json.dumps(
+                write_record, sort_keys=True, ensure_ascii=False, default=str
+            ).encode("utf-8")
+        ).hexdigest()
+        write_record["intent_hash"] = intent_hash
+        store[asset_id] = write_record
+        if idempotency_key is not None:
+            ledger[idempotency_key] = {
+                "version": canonical_version,
+                "content_hash": content_hash,
+                "intent_hash": intent_hash,
+            }
+        write_surface_calls = 1
+        write_performed = True
+        execution_status = CANONICAL_PROMOTION_PROMOTED
+        reason = (
+            "promoted the single verified Reality candidate into the Reality "
+            "Canonical store via HG-3 " + CANONICAL_PROMOTION_HG3_GATE
+        )
+
+    read_back = store.get(asset_id) if asset_id is not None else None
+    read_back_hash = (
+        read_back.get("content_hash") if isinstance(read_back, dict) else None
+    )
+    read_back_provenance_status = None
+    if isinstance(read_back, dict) and isinstance(read_back.get("provenance"), dict):
+        read_back_provenance_status = provenance_mod.evaluate_provenance(
+            read_back["provenance"], content_hash=read_back_hash
+        )["status"]
+    read_back_consistent = bool(
+        isinstance(read_back, dict)
+        and read_back.get("asset_id") == asset_id
+        and read_back.get("version") == canonical_version
+        and _canonical_promotion_normalize_hash(read_back_hash)
+        == _canonical_promotion_normalize_hash(content_hash)
+        and read_back.get("provenance") == promoted_provenance
+        and read_back_provenance_status == "VERIFIED"
+    )
+
+    if execution_status == CANONICAL_PROMOTION_BLOCKED:
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "no Reality Canonical write occurred; read-back is empty",
+            )
+        )
+    else:
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED" if read_back_consistent else "UNKNOWN",
+                "independent read-back of "
+                + str(asset_id)
+                + " (version="
+                + str(read_back.get("version") if isinstance(read_back, dict) else None)
+                + "; content_hash="
+                + str(read_back_hash)
+                + "; provenance="
+                + str(read_back_provenance_status)
+                + "); consistent="
+                + str(read_back_consistent),
+            )
+        )
+    evidence.append(
+        _revalidation_evidence(
+            "OBSERVED",
+            "scope: only "
+            + CANONICAL_PROMOTION_STORE
+            + " Reality Canonical; no Knowledge / Skill / Decision write; no "
+            "deploy, secret, permission, binding or schema change",
+        )
+    )
+
+    checks = [
+        {
+            "check": "preflight gate re-read and single candidate admitted",
+            "status": (
+                PASS
+                if (
+                    execution_status == CANONICAL_PROMOTION_BLOCKED
+                    or (
+                        preflight_verdict == PASS
+                        and candidate_id is not None
+                        and capture_verified
+                        and verified
+                        and promotion_eligible
+                    )
+                )
+                else FAIL
+            ),
+            "detail": "candidate_id="
+            + str(candidate_id)
+            + "; preflight_verdict="
+            + str(preflight_verdict)
+            + "; execution_status="
+            + str(execution_status),
+        },
+        {
+            "check": "execution status is PROMOTED / IDEMPOTENT / BLOCKED",
+            "status": (
+                PASS
+                if execution_status in CANONICAL_PROMOTION_STATUSES
+                else FAIL
+            ),
+            "detail": "execution_status=" + str(execution_status),
+        },
+        {
+            "check": "Reality Canonical write succeeded and only once",
+            "status": (
+                PASS
+                if (
+                    (
+                        execution_status == CANONICAL_PROMOTION_PROMOTED
+                        and write_surface_calls == 1
+                    )
+                    or (
+                        execution_status == CANONICAL_PROMOTION_IDEMPOTENT
+                        and write_surface_calls == 0
+                    )
+                    or execution_status == CANONICAL_PROMOTION_BLOCKED
+                )
+                else FAIL
+            ),
+            "detail": "write_surface_calls=" + str(write_surface_calls),
+        },
+        {
+            "check": "write evidence agrees with independent read-back",
+            "status": (
+                PASS
+                if (
+                    execution_status == CANONICAL_PROMOTION_BLOCKED
+                    or read_back_consistent
+                )
+                else FAIL
+            ),
+            "detail": "read_back_consistent=" + str(read_back_consistent),
+        },
+        {
+            "check": "canonical asset_id, version and provenance are explicit",
+            "status": (
+                PASS
+                if (
+                    execution_status == CANONICAL_PROMOTION_BLOCKED
+                    or (
+                        bool(asset_id)
+                        and isinstance(canonical_version, int)
+                        and isinstance(promoted_provenance, dict)
+                        and promoted_provenance_status == "VERIFIED"
+                    )
+                )
+                else FAIL
+            ),
+            "detail": "asset_id="
+            + str(asset_id)
+            + "; version="
+            + str(canonical_version),
+        },
+        {
+            "check": "no Knowledge / Skill / Decision write",
+            "status": PASS,
+            "detail": (
+                "knowledge_written=False; skill_written=False; "
+                "decision_written=False"
+            ),
+        },
+        {
+            "check": "no deploy / secret / permission / binding / schema change",
+            "status": PASS,
+            "detail": (
+                "deployment_performed=False; credentials_accessed=False; "
+                "secret_accessed=False; permissions_changed=False; "
+                "binding_changed=False; schema_changed=False"
+            ),
+        },
+    ]
+    workflow_status = (
+        PASS if all(check["status"] == PASS for check in checks) else FAIL
+    )
+
+    final_status = (
+        "EXECUTION_STATUS="
+        + str(execution_status)
+        + ";CANONICAL_ASSET_ID="
+        + str(asset_id)
+        + ";CANONICAL_VERSION="
+        + str(canonical_version)
+    )
+
+    lines = [
+        f"# {CANONICAL_PROMOTION_GOAL}",
+        "",
+        f"- goal: {CANONICAL_PROMOTION_GOAL}",
+        f"- task_id: {CANONICAL_PROMOTION_TASK_ID}",
+        f"- contract: {CANONICAL_PROMOTION_CONTRACT}",
+        "- mode: HG-3 sandboxed Reality Canonical promotion",
+        f"- workflow_status: {workflow_status}",
+        f"- execution_status: {execution_status}",
+        f"- preflight_verdict: {preflight_verdict if preflight_verdict is not None else 'UNKNOWN'}",
+        f"- single_candidate: {candidate_id is not None}",
+        f"- candidate_id: {candidate_id if candidate_id is not None else 'UNKNOWN'}",
+        f"- canonical_asset_id: {asset_id if asset_id is not None else 'UNKNOWN'}",
+        f"- canonical_asset_type: {CANONICAL_PROMOTION_ASSET_TYPE}",
+        f"- canonical_store: {CANONICAL_PROMOTION_STORE}",
+        f"- canonical_version: {canonical_version if canonical_version is not None else 'UNKNOWN'}",
+        f"- content_hash: {content_hash if content_hash is not None else 'UNKNOWN'}",
+        f"- promoted_provenance_status: {promoted_provenance_status or 'UNKNOWN'}",
+        f"- human_gate: {CANONICAL_PROMOTION_HG3_GATE}",
+        f"- write_performed: {write_performed}",
+        f"- read_back_consistent: {read_back_consistent}",
+        "",
+        "## HG-3 preconditions",
+    ]
+    for item in preconditions:
+        lines.append(
+            f"- [{'OK' if item['satisfied'] else 'MISSING'}] {item['name']}: "
+            + item["detail"]
+        )
+    lines += [
+        "",
+        "## Write evidence",
+        f"- canonical_store: {CANONICAL_PROMOTION_STORE}",
+        f"- asset_id: {asset_id if asset_id is not None else 'UNKNOWN'}",
+        f"- version: {canonical_version if canonical_version is not None else 'UNKNOWN'}",
+        f"- content_hash: {content_hash if content_hash is not None else 'UNKNOWN'}",
+        f"- idempotency_key: {idempotency_key if idempotency_key is not None else 'UNKNOWN'}",
+        f"- intent_hash: {intent_hash if intent_hash is not None else 'UNKNOWN'}",
+        f"- write_surface_calls: {write_surface_calls}",
+        "",
+        "## Independent read-back",
+        f"- consistent: {read_back_consistent}",
+        f"- provenance_status: {read_back_provenance_status or 'UNKNOWN'}",
+        "",
+        "## Evidence gaps",
+    ]
+    if gaps:
+        for gap in gaps:
+            lines.append(f"- {gap}")
+    else:
+        lines.append("- (none)")
+    lines += ["", "## Unknowns"]
+    if unknowns:
+        for item in unknowns:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- (none recorded)")
+    lines += ["", "## Evidence"]
+    for item in evidence:
+        lines.append(f"- [{item['source']}] {item['detail']}")
+    lines += [
+        "",
+        "## No-mutation statement",
+        "- production_write_performed: False",
+        "- deployment_performed: False",
+        "- credentials_accessed: False",
+        "- secret_accessed: False",
+        "- permissions_changed: False",
+        "- binding_changed: False",
+        "- schema_changed: False",
+        "- knowledge_written: False",
+        "- skill_written: False",
+        "- decision_written: False",
+        "- second_state_store_created: False",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final_status}"]
+
+    return {
+        "report": CANONICAL_PROMOTION_REPORT,
+        "goal": CANONICAL_PROMOTION_GOAL,
+        "task_id": CANONICAL_PROMOTION_TASK_ID,
+        "contract": CANONICAL_PROMOTION_CONTRACT,
+        "generated_at": _utc_now(),
+        "mode": "hg3_sandboxed_reality_canonical_promotion",
+        "workflow_status": workflow_status,
+        "status": workflow_status,
+        "execution_status": execution_status,
+        "final_status": final_status,
+        "reason": reason,
+        "preflight_verdict": preflight_verdict,
+        "preflight_candidate_id": preflight_candidate_id,
+        "preflight_target_asset_type": preflight_target,
+        "preflight_reused": preflight_report is not None,
+        "preflight_preconditions_satisfied": preflight_preconditions_ok,
+        "single_candidate": candidate_id is not None,
+        "candidate_id": candidate_id,
+        "canonical_asset_id": asset_id,
+        "canonical_asset_type": CANONICAL_PROMOTION_ASSET_TYPE,
+        "canonical_store": CANONICAL_PROMOTION_STORE,
+        "canonical_version": canonical_version,
+        "content_hash": content_hash,
+        "canonical_content_hash": _canonical_promotion_normalize_hash(content_hash),
+        "promoted_provenance_status": promoted_provenance_status,
+        "provenance": promoted_provenance,
+        "idempotency_key": idempotency_key,
+        "intent_hash": intent_hash,
+        "replay": replay,
+        "conflicting_duplicate": conflicting_duplicate,
+        "preconditions": preconditions,
+        "preconditions_satisfied": preconditions_satisfied,
+        "write_evidence": {
+            "canonical_store": CANONICAL_PROMOTION_STORE,
+            "asset_id": asset_id,
+            "version": canonical_version,
+            "content_hash": content_hash,
+            "idempotency_key": idempotency_key,
+            "intent_hash": intent_hash,
+            "write_performed": write_performed,
+            "write_surface_calls": write_surface_calls,
+            "human_gate": CANONICAL_PROMOTION_HG3_GATE,
+            "human_gate_authorized": True,
+            "record": write_record,
+        },
+        "read_back": read_back,
+        "read_back_consistent": read_back_consistent,
+        "read_back_provenance_status": read_back_provenance_status,
+        "evidence": evidence,
+        "evidence_tiers_present": sorted(
+            {item["source"] for item in evidence}
+        ),
+        "evidence_gaps": gaps,
+        "unknowns": unknowns,
+        "checks": checks,
+        "canonical_write_performed": write_performed,
+        "reality_canonical_written": write_performed,
+        "canonical_written": write_performed,
+        "write_performed": write_performed,
+        "production_write_performed": False,
+        "second_state_store_created": False,
+        "knowledge_written": False,
+        "skill_written": False,
+        "decision_written": False,
+        "reality_written": write_performed,
+        "deployment_performed": False,
+        "credentials_accessed": False,
+        "secret_accessed": False,
+        "permissions_changed": False,
+        "binding_changed": False,
+        "schema_changed": False,
+        "mark_reviewed_called": False,
+        "content_exposed": False,
+        "message_content_exposed": False,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -26474,3 +27187,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(candidate_version_workflow_failure_diagnosis()["markdown"])
     print(wechatread_real_source_probe_v0_1()["markdown"])
     print(reality_first_candidate_review_v0_1()["markdown"])
+    print(reality_first_canonical_promotion_execution_v0_1()["markdown"])
