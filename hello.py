@@ -25399,6 +25399,474 @@ def candidate_version_workflow_failure_diagnosis() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# WECHATREAD_REAL_SOURCE_PROBE_V0.1  (task cf-d009d2bf9fb7)
+#
+# Read-only, metadata-only probe of the existing ``wechat-reader-v1``
+# capability. It determines whether the *currently available* WeChat data
+# source is REAL, SYNTHETIC or UNKNOWN. It never reads, decodes, prints,
+# hashes or returns message bodies: it inspects only tracked file *names*,
+# declared schema field *names* and the *names* of environment variables. It
+# never authenticates, never opens a database, never deploys and never writes
+# Reality / Canonical / Knowledge / Skill / Decision records.
+#
+# Evidence layering (shared with EVIDENCE_SOURCES):
+#   OBSERVED -- actually read in this environment (checkout / env names)
+#   STATED   -- a document or historical record claims it
+#   INFERRED -- derived from observed facts
+#   UNKNOWN  -- no evidence
+#
+# The probe deliberately does NOT assume from any previous test: with no
+# reader module and no source metadata observable in this checkout, the honest
+# answer is WECHAT_SOURCE=UNKNOWN rather than a fabricated REAL/SYNTHETIC.
+# ---------------------------------------------------------------------------
+WECHAT_READ_PROBE_GOAL = "WECHATREAD_REAL_SOURCE_PROBE_V0.1"
+WECHAT_READ_PROBE_TASK_ID = "cf-d009d2bf9fb7"
+WECHAT_READ_PROBE_REPORT = "WECHATREAD_REAL_SOURCE_PROBE_V0.1_REPORT"
+WECHAT_READER_CAPABILITY_ID = "wechat-reader-v1"
+
+WECHAT_SOURCE_REAL = "REAL"
+WECHAT_SOURCE_SYNTHETIC = "SYNTHETIC"
+WECHAT_SOURCE_UNKNOWN = "UNKNOWN"
+WECHAT_SOURCE_CLASSES = (
+    WECHAT_SOURCE_REAL,
+    WECHAT_SOURCE_SYNTHETIC,
+    WECHAT_SOURCE_UNKNOWN,
+)
+
+WECHAT_SCHEMA_COMPATIBLE = "COMPATIBLE"
+WECHAT_SCHEMA_INCOMPATIBLE = "INCOMPATIBLE"
+WECHAT_SCHEMA_UNKNOWN = "UNKNOWN"
+WECHAT_SCHEMA_STATUSES = (
+    WECHAT_SCHEMA_COMPATIBLE,
+    WECHAT_SCHEMA_INCOMPATIBLE,
+    WECHAT_SCHEMA_UNKNOWN,
+)
+
+# Output-schema fields the reader output must expose (names only).
+WECHAT_READ_REQUIRED_SCHEMA_FIELDS = (
+    "chat_id",
+    "message_id",
+    "sender_id",
+    "create_time_iso",
+    "content_available",
+    "source_db",
+)
+
+# Environment variable *names* that could point at a source DB. Values are
+# never read or recorded, only the fact of their presence.
+WECHAT_READ_SOURCE_DB_ENV_NAMES = (
+    "WECHAT_READER_SOURCE_DB",
+    "WECHAT_READER_DB",
+    "WECHAT_SOURCE_DB",
+    "WECHAT_DB_PATH",
+)
+
+WECHAT_READER_REPO_MARKERS = (
+    "wechat-reader-v1",
+    "wechat_reader",
+    "wechat-reader",
+)
+
+WECHAT_READ_ACTION_DISCOVER = "discover_reader_metadata_human_gate"
+WECHAT_READ_ACTION_RERUN = "rerun_probe_with_complete_schema"
+WECHAT_READ_ACTION_BIND_SCHEMA = "proceed_to_readonly_schema_binding"
+WECHAT_READ_NO_CONTENT_STATEMENT = (
+    "message content is never read, decoded, hashed or included in this result"
+)
+
+
+def _wechat_probe_env_names(names: tuple[str, ...]) -> list[str]:
+    """Return present env var *names* only; values are never read or recorded."""
+    return sorted(name for name in names if os.environ.get(name))
+
+
+def _wechat_probe_scan_checkout() -> dict:
+    """Read-only metadata scan of the current checkout.
+
+    Reads only tracked file *names* and, for filenames that look like a reader
+    module, the *presence* of marker tokens and required schema field names.
+    Raw file text and any message bodies are never copied into the result.
+    """
+    tracked = [
+        line.strip() for line in _git("ls-files").splitlines() if line.strip()
+    ]
+    reader_candidates = sorted(
+        path
+        for path in tracked
+        if "wechat" in path.lower() and "reader" in path.lower()
+    )
+    wechat_paths = sorted(path for path in tracked if "wechat" in path.lower())
+    marker_hits: list[dict] = []
+    schema_fields: set[str] = set()
+    for path in reader_candidates:
+        try:
+            text = (REPO_ROOT / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lowered = text.lower()
+        for marker in WECHAT_READER_REPO_MARKERS:
+            if marker in lowered:
+                marker_hits.append({"path": path, "marker": marker})
+        for field in WECHAT_READ_REQUIRED_SCHEMA_FIELDS:
+            if field in text:
+                schema_fields.add(field)
+    return {
+        "tracked_count": len(tracked),
+        "reader_candidates": reader_candidates,
+        "wechat_paths": wechat_paths,
+        "marker_hits": marker_hits,
+        "schema_fields": schema_fields,
+    }
+
+
+def _wechat_probe_classify_source(meta: dict) -> str:
+    """Classify the available data source as REAL / SYNTHETIC / UNKNOWN.
+
+    An explicit ``source_kind`` wins; otherwise a synthetic marker anywhere in
+    the identifiers forces SYNTHETIC, a declared ``source_db`` with no synthetic
+    marker is REAL, and the absence of a reader capability or source metadata is
+    UNKNOWN. No message content participates in this decision.
+    """
+    if not meta or not meta.get("capability_present"):
+        return WECHAT_SOURCE_UNKNOWN
+    declared = meta.get("source_kind")
+    if declared in WECHAT_SOURCE_CLASSES:
+        return declared
+    identifiers = " ".join(
+        str(meta.get(key) or "")
+        for key in ("source_db", "source_identity", "reader_version")
+    ).lower()
+    if meta.get("synthetic") or any(
+        token in identifiers
+        for token in ("synthetic", "fixture", "sample", "fake", "mock")
+    ):
+        return WECHAT_SOURCE_SYNTHETIC
+    if meta.get("source_db"):
+        return WECHAT_SOURCE_REAL
+    return WECHAT_SOURCE_UNKNOWN
+
+
+def wechatread_real_source_probe_v0_1(reader: dict | None = None) -> dict:
+    """Probe existing ``wechat-reader-v1`` capability (read-only, metadata only).
+
+    With no ``reader`` argument the probe examines the current checkout and the
+    *names* of source-db environment variables. A caller may inject a reader
+    metadata descriptor (``capability_present``, ``reader_version``,
+    ``source_kind``, ``source_db``, ``synthetic``, ``schema_fields``) for
+    deterministic normalization; any ``message_sample``/content is ignored and
+    never surfaced. Returns WECHAT_SOURCE (REAL/SYNTHETIC/UNKNOWN), a schema
+    compatibility status, source-tagged evidence and the smallest next action.
+    Performs no write, deploy, secret access, permission change or record
+    creation of any kind.
+    """
+    evidence: list[dict] = []
+    unknowns: list[str] = []
+
+    reader = reader if isinstance(reader, dict) else None
+
+    if reader is None:
+        metadata_origin = "repository_checkout"
+        scan = _wechat_probe_scan_checkout()
+        reader_candidates = scan["reader_candidates"]
+        capability_present = bool(reader_candidates)
+        reader_version = None
+        source_db = None
+        declared_kind = None
+        schema_fields = scan["schema_fields"] if capability_present else None
+        source_db_env_names = _wechat_probe_env_names(WECHAT_READ_SOURCE_DB_ENV_NAMES)
+
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                f"tracked files scanned: {scan['tracked_count']}; "
+                f"wechat-reader-v1 candidate paths: {reader_candidates or '[]'}",
+            )
+        )
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "tracked paths containing 'wechat': "
+                f"{scan['wechat_paths'] or '[]'}",
+            )
+        )
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "source-db env var names present: "
+                f"{source_db_env_names or '[]'} (names only; values never read)",
+            )
+        )
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "wechat-reader-v1 schema declaration observed: "
+                f"{schema_fields is not None}",
+            )
+        )
+        if scan["marker_hits"]:
+            evidence.append(
+                _revalidation_evidence(
+                    "OBSERVED",
+                    f"reader marker token hits: {scan['marker_hits']}",
+                )
+            )
+        else:
+            evidence.append(
+                _revalidation_evidence(
+                    "STATED",
+                    "documents reference a caller-supplied WeChat snapshot "
+                    "normalization interface, but no reader module/version is "
+                    "declared in this checkout",
+                )
+            )
+        if not capability_present:
+            evidence.append(
+                _revalidation_evidence(
+                    "INFERRED",
+                    "no wechat-reader-v1 module or schema is observable, so "
+                    "neither a REAL nor a SYNTHETIC source can be admitted",
+                )
+            )
+            unknowns.extend(
+                [
+                    "reader module and version",
+                    "source_db identity and reachability",
+                    "reader output schema field names",
+                ]
+            )
+    else:
+        metadata_origin = "injected_metadata"
+        capability_present = bool(reader.get("capability_present"))
+        reader_version = reader.get("reader_version")
+        source_db = reader.get("source_db")
+        declared_kind = reader.get("source_kind")
+        raw_fields = reader.get("schema_fields") if capability_present else None
+        if raw_fields is None:
+            schema_fields = None
+        else:
+            schema_fields = set(str(field) for field in raw_fields)
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "reader metadata supplied by injected descriptor "
+                "(normalization path); message content is ignored",
+            )
+        )
+        if not capability_present:
+            unknowns.append("reader module and version")
+
+    meta_for_class = {
+        "capability_present": capability_present,
+        "source_kind": declared_kind,
+        "source_db": source_db,
+        "source_identity": reader.get("source_identity") if reader else None,
+        "reader_version": reader_version,
+        "synthetic": bool(reader.get("synthetic")) if reader else False,
+    }
+    source_class = _wechat_probe_classify_source(meta_for_class)
+
+    if schema_fields is None:
+        schema_status = WECHAT_SCHEMA_UNKNOWN
+        present_fields: list[str] = []
+        missing_fields = list(WECHAT_READ_REQUIRED_SCHEMA_FIELDS)
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "reader output schema is not observable, so compatibility "
+                "cannot be asserted",
+            )
+        )
+    else:
+        present_fields = [
+            field
+            for field in WECHAT_READ_REQUIRED_SCHEMA_FIELDS
+            if field in schema_fields
+        ]
+        missing_fields = [
+            field
+            for field in WECHAT_READ_REQUIRED_SCHEMA_FIELDS
+            if field not in schema_fields
+        ]
+        schema_status = (
+            WECHAT_SCHEMA_COMPATIBLE
+            if not missing_fields
+            else WECHAT_SCHEMA_INCOMPATIBLE
+        )
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "required schema fields present: "
+                f"{present_fields or '[]'}; missing: {missing_fields or '[]'}",
+            )
+        )
+
+    if source_class == WECHAT_SOURCE_UNKNOWN:
+        classification = WECHAT_READ_ACTION_DISCOVER
+        action = (
+            "Expose only the existing wechat-reader-v1 module/version and "
+            "source_db identifier (names/metadata, no message content) to the "
+            "probe, then re-run; no write or deploy."
+        )
+    elif schema_status == WECHAT_SCHEMA_INCOMPATIBLE:
+        classification = WECHAT_READ_ACTION_RERUN
+        action = (
+            "Re-run the probe once the reader schema declares every required "
+            f"field; currently missing: {missing_fields}."
+        )
+    else:
+        classification = WECHAT_READ_ACTION_BIND_SCHEMA
+        action = (
+            "Schema is compatible; perform the smallest read-only schema "
+            "binding without promoting any asset or writing any record."
+        )
+
+    next_action = {
+        "classification": classification,
+        "action": action,
+        "smallest_next_action": action,
+        "requires_human_gate": classification == WECHAT_READ_ACTION_DISCOVER,
+        "writes_records": False,
+    }
+
+    final_status = (
+        f"WECHAT_SOURCE={source_class};SCHEMA_COMPATIBILITY={schema_status}"
+    )
+
+    checks = [
+        {
+            "check": "probe completed read-only",
+            "status": PASS,
+            "detail": f"metadata_origin={metadata_origin}; status=PASS",
+        },
+        {
+            "check": "no message content exposed",
+            "status": PASS,
+            "detail": WECHAT_READ_NO_CONTENT_STATEMENT,
+        },
+        {
+            "check": "WECHAT_SOURCE is REAL/SYNTHETIC/UNKNOWN",
+            "status": PASS if source_class in WECHAT_SOURCE_CLASSES else FAIL,
+            "detail": f"WECHAT_SOURCE={source_class}",
+        },
+        {
+            "check": "schema compatibility status is valid",
+            "status": PASS if schema_status in WECHAT_SCHEMA_STATUSES else FAIL,
+            "detail": f"schema_compatibility={schema_status}",
+        },
+        {
+            "check": "no production write / deploy / secret / permission change",
+            "status": PASS,
+            "detail": (
+                "read-only checkout metadata probe; no file write, deploy, "
+                "credential access, permission change or record creation"
+            ),
+        },
+    ]
+    workflow_status = PASS if all(c["status"] == PASS for c in checks) else FAIL
+
+    lines = [
+        f"# {WECHAT_READ_PROBE_GOAL}",
+        "",
+        f"- goal: {WECHAT_READ_PROBE_GOAL}",
+        f"- task_id: {WECHAT_READ_PROBE_TASK_ID}",
+        f"- capability: {WECHAT_READER_CAPABILITY_ID}",
+        f"- mode: read-only/metadata-only probe",
+        f"- workflow_status: {workflow_status}",
+        f"- final_status: {final_status}",
+        "",
+        "## Source classification",
+        f"- WECHAT_SOURCE: {source_class}",
+        f"- reader_version: {reader_version if reader_version is not None else 'UNKNOWN'}",
+        f"- source_db: {source_db if source_db is not None else 'UNKNOWN'}",
+        f"- metadata_origin: {metadata_origin}",
+        "",
+        "## Schema compatibility",
+        f"- schema_compatibility: {schema_status}",
+        f"- required_fields: {', '.join(WECHAT_READ_REQUIRED_SCHEMA_FIELDS)}",
+        f"- present_fields: {', '.join(present_fields) or '[]'}",
+        f"- missing_fields: {', '.join(missing_fields) or '[]'}",
+        "",
+        "## Evidence",
+    ]
+    for item in evidence:
+        lines.append(f"- [{item['source']}] {item['detail']}")
+    lines += [
+        "",
+        "## Unknowns",
+    ]
+    if unknowns:
+        for item in unknowns:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- (none recorded)")
+    lines += [
+        "",
+        "## Next minimal action",
+        f"- classification: {next_action['classification']}",
+        f"- action: {next_action['action']}",
+        "",
+        "## No-mutation statement",
+        f"- {WECHAT_READ_NO_CONTENT_STATEMENT}",
+        "- production_mutated: False",
+        "- deployment_performed: False",
+        "- credentials_accessed: False",
+        "- permissions_changed: False",
+        "- reality_written: False",
+        "- canonical_written: False",
+        "- knowledge_written: False",
+        "- skill_written: False",
+        "- decision_written: False",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final_status}"]
+
+    return {
+        "report": WECHAT_READ_PROBE_REPORT,
+        "goal": WECHAT_READ_PROBE_GOAL,
+        "task_id": WECHAT_READ_PROBE_TASK_ID,
+        "capability": WECHAT_READER_CAPABILITY_ID,
+        "generated_at": _utc_now(),
+        "mode": "read_only_metadata_probe",
+        "metadata_origin": metadata_origin,
+        "workflow_status": workflow_status,
+        "status": workflow_status,
+        "final_status": final_status,
+        "WECHAT_SOURCE": source_class,
+        "source_class": source_class,
+        "source_kind_declared": declared_kind,
+        "reader_version": reader_version,
+        "source_db": source_db,
+        "capability_present": capability_present,
+        "schema_compatibility": schema_status,
+        "schema_compatible": schema_status == WECHAT_SCHEMA_COMPATIBLE,
+        "required_schema_fields": list(WECHAT_READ_REQUIRED_SCHEMA_FIELDS),
+        "present_schema_fields": present_fields,
+        "missing_schema_fields": missing_fields,
+        "evidence": evidence,
+        "unknowns": unknowns,
+        "next_action": next_action,
+        "checks": checks,
+        "message_content_exposed": False,
+        "content_read": False,
+        "files_modified": False,
+        "production_mutated": False,
+        "deployment_performed": False,
+        "credentials_accessed": False,
+        "secret_accessed": False,
+        "permissions_changed": False,
+        "reality_written": False,
+        "canonical_written": False,
+        "knowledge_written": False,
+        "skill_written": False,
+        "decision_written": False,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -25436,3 +25904,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(personal_ai_reality_candidate_writer_spec_v0_1()["markdown"])
     print(personal_ai_reality_candidate_writer_adapter_v0_1()["markdown"])
     print(candidate_version_workflow_failure_diagnosis()["markdown"])
+    print(wechatread_real_source_probe_v0_1()["markdown"])

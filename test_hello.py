@@ -263,6 +263,26 @@ from hello import (
     classify_candidate_version_failure,
 )
 
+from hello import (
+    WECHAT_READ_ACTION_BIND_SCHEMA,
+    WECHAT_READ_ACTION_DISCOVER,
+    WECHAT_READ_ACTION_RERUN,
+    WECHAT_READ_PROBE_GOAL,
+    WECHAT_READ_PROBE_REPORT,
+    WECHAT_READ_PROBE_TASK_ID,
+    WECHAT_READ_REQUIRED_SCHEMA_FIELDS,
+    WECHAT_READER_CAPABILITY_ID,
+    WECHAT_SCHEMA_COMPATIBLE,
+    WECHAT_SCHEMA_INCOMPATIBLE,
+    WECHAT_SCHEMA_STATUSES,
+    WECHAT_SCHEMA_UNKNOWN,
+    WECHAT_SOURCE_CLASSES,
+    WECHAT_SOURCE_REAL,
+    WECHAT_SOURCE_SYNTHETIC,
+    WECHAT_SOURCE_UNKNOWN,
+    wechatread_real_source_probe_v0_1,
+)
+
 VALID_STATUSES = {"PASS", "FAIL", "BLOCKED"}
 
 # TEST ISOLATION (task cf-2f2b71c331da): the runner-process SendKey is
@@ -9661,3 +9681,188 @@ def test_candidate_version_diagnosis_checks_and_markdown() -> None:
         f"VERSION_ONLY_CAPABILITY={report['VERSION_ONLY_CAPABILITY']}"
         in markdown
     )
+
+
+# ---------------------------------------------------------------------------
+# WECHATREAD_REAL_SOURCE_PROBE_V0.1  (task cf-d009d2bf9fb7)
+# Read-only, metadata-only probe of the existing wechat-reader-v1 capability.
+# ---------------------------------------------------------------------------
+def _wechat_probe_full_fields() -> list:
+    return list(hello_module.WECHAT_READ_REQUIRED_SCHEMA_FIELDS)
+
+
+def test_wechat_probe_default_is_unknown_and_read_only() -> None:
+    report = wechatread_real_source_probe_v0_1()
+    assert report["report"] == WECHAT_READ_PROBE_REPORT
+    assert report["goal"] == WECHAT_READ_PROBE_GOAL
+    assert report["task_id"] == WECHAT_READ_PROBE_TASK_ID
+    assert report["capability"] == WECHAT_READER_CAPABILITY_ID
+    assert report["mode"] == "read_only_metadata_probe"
+    assert report["metadata_origin"] == "repository_checkout"
+
+    assert report["WECHAT_SOURCE"] in WECHAT_SOURCE_CLASSES
+    assert report["schema_compatibility"] in WECHAT_SCHEMA_STATUSES
+    assert report["workflow_status"] == "PASS"
+    assert report["status"] == report["workflow_status"]
+    assert report["final_status"].startswith("WECHAT_SOURCE=")
+    assert report["final_status"] != report["workflow_status"]
+
+    for key in (
+        "message_content_exposed",
+        "content_read",
+        "files_modified",
+        "production_mutated",
+        "deployment_performed",
+        "credentials_accessed",
+        "secret_accessed",
+        "permissions_changed",
+        "reality_written",
+        "canonical_written",
+        "knowledge_written",
+        "skill_written",
+        "decision_written",
+    ):
+        assert report[key] is False
+
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {WECHAT_READ_PROBE_GOAL}")
+    assert f"- task_id: {WECHAT_READ_PROBE_TASK_ID}" in markdown
+    assert f"FINAL_STATUS={report['final_status']}" in markdown
+
+
+def test_wechat_probe_default_does_not_assume_previous_tests() -> None:
+    report = wechatread_real_source_probe_v0_1()
+    assert report["capability_present"] is False
+    assert report["WECHAT_SOURCE"] == WECHAT_SOURCE_UNKNOWN
+    assert report["schema_compatibility"] == WECHAT_SCHEMA_UNKNOWN
+    assert report["next_action"]["classification"] == WECHAT_READ_ACTION_DISCOVER
+    assert report["next_action"]["requires_human_gate"] is True
+    assert report["unknowns"]
+
+
+def test_wechat_probe_source_classification_real_synthetic_unknown() -> None:
+    real = wechatread_real_source_probe_v0_1(
+        {
+            "capability_present": True,
+            "reader_version": "wechat-reader-v1.0.0",
+            "source_db": "/data/wechat/messages.sqlite",
+        }
+    )
+    assert real["WECHAT_SOURCE"] == WECHAT_SOURCE_REAL
+
+    synthetic = wechatread_real_source_probe_v0_1(
+        {
+            "capability_present": True,
+            "reader_version": "wechat-reader-v1.0.0",
+            "source_db": "fixtures/wechat/sample.db",
+        }
+    )
+    assert synthetic["WECHAT_SOURCE"] == WECHAT_SOURCE_SYNTHETIC
+
+    declared = wechatread_real_source_probe_v0_1(
+        {
+            "capability_present": True,
+            "source_kind": WECHAT_SOURCE_REAL,
+            "source_db": "fixtures/wechat/sample.db",
+        }
+    )
+    assert declared["WECHAT_SOURCE"] == WECHAT_SOURCE_REAL
+
+    unknown = wechatread_real_source_probe_v0_1({"capability_present": False})
+    assert unknown["WECHAT_SOURCE"] == WECHAT_SOURCE_UNKNOWN
+
+
+def test_wechat_probe_schema_compatibility_status() -> None:
+    compatible = wechatread_real_source_probe_v0_1(
+        {
+            "capability_present": True,
+            "source_db": "messages.sqlite",
+            "schema_fields": _wechat_probe_full_fields(),
+        }
+    )
+    assert compatible["schema_compatibility"] == WECHAT_SCHEMA_COMPATIBLE
+    assert compatible["schema_compatible"] is True
+    assert compatible["missing_schema_fields"] == []
+
+    incomplete = wechatread_real_source_probe_v0_1(
+        {
+            "capability_present": True,
+            "source_db": "messages.sqlite",
+            "schema_fields": ["chat_id", "message_id"],
+        }
+    )
+    assert incomplete["schema_compatibility"] == WECHAT_SCHEMA_INCOMPATIBLE
+    assert set(incomplete["missing_schema_fields"]) == {
+        "sender_id",
+        "create_time_iso",
+        "content_available",
+        "source_db",
+    }
+
+    absent = wechatread_real_source_probe_v0_1(
+        {"capability_present": True, "source_db": "messages.sqlite"}
+    )
+    assert absent["schema_compatibility"] == WECHAT_SCHEMA_UNKNOWN
+
+
+def test_wechat_probe_next_action_matches_state() -> None:
+    compatible = wechatread_real_source_probe_v0_1(
+        {
+            "capability_present": True,
+            "source_db": "messages.sqlite",
+            "schema_fields": _wechat_probe_full_fields(),
+        }
+    )
+    assert (
+        compatible["next_action"]["classification"]
+        == WECHAT_READ_ACTION_BIND_SCHEMA
+    )
+
+    incomplete = wechatread_real_source_probe_v0_1(
+        {
+            "capability_present": True,
+            "source_db": "messages.sqlite",
+            "schema_fields": ["chat_id"],
+        }
+    )
+    assert incomplete["next_action"]["classification"] == WECHAT_READ_ACTION_RERUN
+
+    unknown = wechatread_real_source_probe_v0_1()
+    assert unknown["next_action"]["classification"] == WECHAT_READ_ACTION_DISCOVER
+    assert unknown["next_action"]["writes_records"] is False
+
+
+def test_wechat_probe_never_exposes_message_content() -> None:
+    sentinel = "WECHAT_CONTENT_SENTINEL_9f3c_DO_NOT_EXPOSE"
+    report = wechatread_real_source_probe_v0_1(
+        {
+            "capability_present": True,
+            "source_db": "messages.sqlite",
+            "schema_fields": _wechat_probe_full_fields(),
+            "message_sample": {
+                "chat_id": "c1",
+                "message_id": "m1",
+                "content": sentinel,
+            },
+        }
+    )
+    assert report["message_content_exposed"] is False
+    assert sentinel not in json.dumps(report)
+    assert sentinel not in report["markdown"]
+
+
+def test_wechat_probe_evidence_is_source_tagged_and_checks_pass() -> None:
+    report = wechatread_real_source_probe_v0_1()
+    assert report["evidence"]
+    for item in report["evidence"]:
+        assert set(item) == {"source", "detail"}
+        assert item["source"] in hello_module.EVIDENCE_SOURCES
+        assert item["detail"]
+
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+    assert all(check["status"] == "PASS" for check in report["checks"])
+
+    assert list(report["required_schema_fields"]) == _wechat_probe_full_fields()
