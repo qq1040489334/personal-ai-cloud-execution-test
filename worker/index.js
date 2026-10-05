@@ -957,6 +957,15 @@ var CHATGPT_REDIRECT_PREFIX = "https://chatgpt.com/connector/oauth/";
 var ALLOWLIST = ["hello.py", "test_hello.py"];
 var FORBIDDEN_PREFIXES = [".github/workflows/"];
 var FORBIDDEN_SUBSTRINGS = ["secret", "token", "credential", ".env", ".pem", ".key"];
+var READONLY_MODES = /* @__PURE__ */ new Set(["readonly", "read_only", "read-only"]);
+var WRITE_MODES = /* @__PURE__ */ new Set(["write", "readwrite", "read_write", "read-write"]);
+function resolveMode(raw) {
+  if (raw === void 0 || raw === null || String(raw).trim() === "") return "write";
+  const mode = String(raw).trim().toLowerCase();
+  if (READONLY_MODES.has(mode)) return "readonly";
+  if (WRITE_MODES.has(mode)) return "write";
+  return null;
+}
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
@@ -1247,13 +1256,15 @@ function unauthorized(origin) {
 function newTaskId() {
   return `cf-${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
 }
-function buildContract(goal, instructions, acceptance, expectedFiles, lineage) {
-  const expected_files = expectedFiles === void 0 ? [...ALLOWLIST] : Array.isArray(expectedFiles) ? expectedFiles.map(String) : [];
+function buildContract(goal, instructions, acceptance, expectedFiles, lineage, mode) {
+  const resolvedMode = resolveMode(mode);
+  const expected_files = expectedFiles === void 0 ? resolvedMode === "readonly" ? [] : [...ALLOWLIST] : Array.isArray(expectedFiles) ? expectedFiles.map(String) : [];
   const contract = {
     task_id: newTaskId(),
     goal: String(goal ?? ""),
     instructions: Array.isArray(instructions) ? instructions.map(String) : [],
     risk_level: "LOW",
+    mode: resolvedMode === null ? String(mode) : resolvedMode,
     expected_files,
     acceptance: Array.isArray(acceptance) ? acceptance.map(String) : []
   };
@@ -1268,6 +1279,9 @@ function validateContract(contract) {
   if (!contract.goal.trim()) errors.push("goal must be non-empty");
   if (!contract.instructions.length) errors.push("instructions must be a non-empty list");
   if (!contract.acceptance.length) errors.push("acceptance must be a non-empty list");
+  if (resolveMode(contract.mode) === null) {
+    errors.push(`mode not acceptable: ${contract.mode} (allowed: readonly, write)`);
+  }
   for (const path of contract.expected_files) {
     if (typeof path !== "string" || !path.trim()) {
       errors.push(`expected_file must be a non-empty string: ${path}`);
@@ -1396,7 +1410,8 @@ function buildApprovedChildContract(approvedNextTask, parentLineage) {
       project_id: approvedNextTask.project_id || inherited.project_id,
       root_task_id: approvedNextTask.root_task_id || inherited.root_task_id,
       parent_task_id: inherited.parent_task_id
-    }
+    },
+    approvedNextTask.mode
   );
   return { contract, errors: validateContract(contract) };
 }
@@ -2269,7 +2284,7 @@ async function toolSubmitTask(env, args) {
     project_id: args.project_id,
     root_task_id: args.root_task_id,
     parent_task_id: args.parent_task_id
-  });
+  }, args.mode);
   const errors = validateContract(contract);
   if (errors.length) return { isError: true, text: `INVALID_TASK: ${errors.join("; ")}` };
   try {
@@ -3156,6 +3171,7 @@ var TOOLS = [
         instructions: { type: "array", items: { type: "string" } },
         acceptance: { type: "array", items: { type: "string" } },
         expected_files: { type: "array", items: { type: "string" } },
+        mode: { type: ["string", "null"], description: "Optional execution mode passed through to the Gate mode resolver. Supported values: readonly / write (missing or empty defaults to write; any other value fails closed)." },
         project_id: { type: ["string", "null"], description: "Optional active-project lineage id." },
         root_task_id: { type: ["string", "null"], description: "Optional lineage root task id." },
         parent_task_id: { type: ["string", "null"], description: "Optional immediate parent task id." }

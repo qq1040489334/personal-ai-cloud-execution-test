@@ -227,3 +227,66 @@ closed on any change under an empty readonly allowlist, and keep the non-empty
 changed-files allowlist for write mode.
 
 `final_status`: `READONLY_MODE_GATE_ADAPTATION_RELEASED`
+
+---
+
+## 8. Addendum — submit_task mode passthrough adapter (V0.1)
+
+- goal: `CLOUD_AGENT_SUBMIT_TASK_MODE_PASSTHROUGH_ADAPTER_V0.1`
+- task_id: `cf-e38d97dd7f75`
+- risk_level: `LOW`
+- business `final_status`: `SUBMIT_TASK_MODE_PASSTHROUGH_ADAPTER_RELEASED`
+- workflow status: separate from the business outcome above
+
+The released Gate mode resolver above already consumes a `mode` field. This
+bounded, non-production follow-up carries that field from the MCP
+`submit_task` surface through the `repository_dispatch` task payload into the
+Gate resolver. `OBSERVED`.
+
+### 8.1 Behavior
+
+- `worker/index.js` `buildContract()` now resolves a `mode` argument with
+  `resolveMode()`: `readonly` / `read_only` / `read-only` canonicalize to
+  `readonly`; `write` / `readwrite` / `read_write` / `read-write` canonicalize
+  to `write`; a missing, `null`, or empty mode defaults to **write**. Any other
+  value resolves to `null`, is written verbatim into the contract, and
+  `validateContract()` fails closed with `mode not acceptable`. `OBSERVED`.
+- The resolved mode is emitted on the task contract as `mode`, so it is carried
+  in the `client_payload.task` of the outbound `repository_dispatch` request and
+  persisted alongside `dispatch_contract`. `OBSERVED`.
+- A `readonly` submit with no explicit `expected_files` defaults to an empty
+  allowlist, so readonly is never an unbounded write grant; write (including a
+  missing mode) keeps the backwards-compatible default allowlist. `OBSERVED`.
+- The approved-child dispatch path (`buildApprovedChildContract`) passes
+  `approvedNextTask.mode` through the same `buildContract()` resolver, so the
+  same bounded mode rules apply to an explicitly approved child. `OBSERVED`.
+
+### 8.2 Focused tests
+
+`tests/test_submit_task_mode_passthrough.py` executes the production Worker
+source under Node, captures the dispatched `client_payload.task`, and runs the
+**real** Gate 1 evaluator (`scripts/task_contract.py`) against it. It pins:
+`mode=readonly` reaches the Gate, `mode=write` reaches the Gate, a missing mode
+is dispatched as `write`, and an unknown mode is rejected before any dispatch.
+`OBSERVED`.
+
+### 8.3 Safety / scope statement
+
+- Changed paths: `worker/index.js`, `tests/test_submit_task_mode_passthrough.py`,
+  and this document — exactly within the task allowlist.
+- **No** `.github/workflows/` edit; **no** Personal AI Canonical mutation; **no**
+  production Worker deployment; **no** secret/token/credential/OAuth/permission/
+  binding/schema change; **no** deletion.
+- The existing `expected_files` and changed-files safety behavior is unchanged:
+  the Gate still enforces forbidden/unsafe checks and the changed-files
+  allowlist in both modes.
+
+### Bounded next_action
+
+```
+next_action = NONE
+```
+
+The submit_task mode passthrough is complete: the submit surface, dispatched
+task payload, and Gate mode resolver agree on the readonly/write contract, and
+unknown modes fail closed.
