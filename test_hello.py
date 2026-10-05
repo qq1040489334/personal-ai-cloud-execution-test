@@ -10858,3 +10858,203 @@ def test_promotion_adapter_design_contract_unchanged() -> None:
     source = inspect.getsource(hello_module)
     assert "def reality_promotion_adapter_design_v0_1(" in source
     assert callable(hello_module.reality_promotion_adapter_design_v0_1)
+
+
+# ---------------------------------------------------------------------------
+# REALITY_FIRST_CANONICAL_PROMOTION_V0.2_PREFLIGHT  (task cf-1134ba8b1992)
+# Production Promotion preflight only: bind a real Reviewed Candidate, verify
+# Candidate -> Adapter -> Writer -> ASSET_DB -> Read-back read-only, and emit
+# READY_FOR_HG3 or BLOCKED without performing any Canonical write.
+# ---------------------------------------------------------------------------
+def _v02_preflight_artifact(*, content="hello reality"):
+    src = str(pathlib.Path(hello_module.__file__).resolve().parent / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from personal_ai_execution.reality_candidate_handoff import (
+        build_candidate_artifact,
+    )
+
+    envelope = _canonical_promotion_envelope(content=content)
+    return build_candidate_artifact(envelope, snapshot_id="snap-42")
+
+
+def test_v02_preflight_ready_for_hg3_with_reviewed_candidate() -> None:
+    report = hello_module.reality_first_canonical_promotion_v0_2_preflight(
+        _v02_preflight_artifact(), target_asset_type="KNOWLEDGE"
+    )
+
+    assert report["report"] == hello_module.REALITY_PREFLIGHT_V02_REPORT
+    assert report["goal"] == hello_module.REALITY_PREFLIGHT_V02_GOAL
+    assert report["task_id"] == hello_module.REALITY_PREFLIGHT_V02_TASK_ID
+    assert report["task_id"] == "cf-1134ba8b1992"
+    assert report["contract"] == hello_module.REALITY_PREFLIGHT_V02_CONTRACT
+    assert report["mode"] == "read_only_production_promotion_preflight"
+
+    assert report["verdict"] == hello_module.REALITY_PREFLIGHT_READY
+    assert report["verdict"] == "READY_FOR_HG3"
+    assert report["verdict"] in hello_module.REALITY_PREFLIGHT_V02_STATUSES
+    assert report["status"] == report["verdict"] == report["final_verdict"]
+    assert report["ready_for_hg3"] is True
+    assert report["workflow_status"] == "PASS"
+
+    assert report["candidate_bound"] is True
+    assert report["candidate_id"] == "cap-1"
+    assert report["review_status"] == "PASS"
+    assert report["promotion_status"] == "PROMOTION_ELIGIBLE"
+    assert report["adapter_status"] == "ADAPTED"
+    assert report["adapter_mapped"] is True
+
+    assert len(report["content_hash"]) == 64
+    assert report["idempotency_key"].startswith("knowledge:cap-1:")
+    assert report["canonical_version"] == 1
+    assert report["promoted_provenance_status"] == "VERIFIED"
+    assert report["canonical_store"] == "ASSET_DB:assets/asset_versions"
+
+
+def test_v02_preflight_without_candidate_is_blocked() -> None:
+    report = hello_module.reality_first_canonical_promotion_v0_2_preflight()
+
+    assert report["verdict"] == "BLOCKED"
+    assert report["verdict"] in hello_module.REALITY_PREFLIGHT_V02_STATUSES
+    assert report["ready_for_hg3"] is False
+    assert report["candidate_bound"] is False
+    assert report["adapter_status"] is None
+    assert "candidate_not_bound" in report["blocking_gaps"]
+    assert "UNKNOWN" in report["evidence_tiers_present"]
+
+
+def test_v02_preflight_real_writer_not_callable_without_hg3() -> None:
+    report = hello_module.reality_first_canonical_promotion_v0_2_preflight(
+        _v02_preflight_artifact(), target_asset_type="KNOWLEDGE"
+    )
+
+    assert report["writer_interface_present"] is True
+    assert report["real_writer_callable"] is False
+    assert report["writer_callable_now"] is False
+    assert report["production_write_surface_available"] is False
+    assert (
+        report["writer_blocked_by"]
+        == hello_module.CANONICAL_PROMOTION_HG3_GATE
+        == "HUMAN_GATE_REALITY_CANONICAL_WRITE_V0.1"
+    )
+    assert set(report["writer_entrypoints"]) == {
+        "writeKnowledgeCandidate",
+        "writeSkillCandidate",
+        "writeDecisionRecord",
+    }
+    assert report["reused_canonical_writer"] == "writeKnowledgeCandidate"
+
+
+def test_v02_preflight_human_gate_gap_reported() -> None:
+    report = hello_module.reality_first_canonical_promotion_v0_2_preflight(
+        _v02_preflight_artifact(), target_asset_type="KNOWLEDGE"
+    )
+
+    gap = report["human_gate_gap"]
+    assert gap["gate"] == "HUMAN_GATE_REALITY_CANONICAL_WRITE_V0.1"
+    assert gap["required"] is True
+    assert gap["authorized"] is False
+    assert gap["remaining"] is True
+    assert gap["auto_approved"] is False
+    assert report["human_gate_required"] is True
+    assert report["human_gate_remaining"] is True
+
+
+def test_v02_preflight_readback_available_for_future_write() -> None:
+    report = hello_module.reality_first_canonical_promotion_v0_2_preflight(
+        _v02_preflight_artifact(), target_asset_type="KNOWLEDGE"
+    )
+
+    assert report["readback_available"] is True
+    assert report["read_back_available"] is True
+    assert report["readback_can_verify_future_write"] is True
+    assert report["readback_live_surface_available"] is False
+    assert report["readback_verdict"] in {"PASS", "PARTIAL", "BLOCKED"}
+    assert report["live_asset_db_reachable"] is False
+
+
+def test_v02_preflight_path_stages_complete() -> None:
+    report = hello_module.reality_first_canonical_promotion_v0_2_preflight(
+        _v02_preflight_artifact(), target_asset_type="KNOWLEDGE"
+    )
+
+    assert tuple(report["promotion_path"]) == hello_module.REALITY_PROMOTION_PATH
+    assert [s["stage"] for s in report["path_stages"]] == list(
+        hello_module.REALITY_PROMOTION_PATH
+    )
+    assert report["promotion_path_text"] == hello_module.REALITY_PROMOTION_PATH_TEXT
+    assert report["blocking_gaps"] == []
+    assert all(s["status"] == "PASS" for s in report["path_stages"])
+
+
+def test_v02_preflight_evidence_tiers_and_checks() -> None:
+    report = hello_module.reality_first_canonical_promotion_v0_2_preflight(
+        _v02_preflight_artifact(), target_asset_type="KNOWLEDGE"
+    )
+
+    assert report["evidence"]
+    for item in report["evidence"]:
+        assert set(item) == {"source", "detail"}
+        assert item["source"] in hello_module.EVIDENCE_SOURCES
+        assert item["detail"]
+    assert {"OBSERVED", "STATED", "INFERRED", "UNKNOWN"} <= set(
+        report["evidence_tiers_present"]
+    )
+
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+    assert all(check["status"] == "PASS" for check in report["checks"])
+
+
+def test_v02_preflight_no_canonical_write_occurs() -> None:
+    reports = [
+        hello_module.reality_first_canonical_promotion_v0_2_preflight(),
+        hello_module.reality_first_canonical_promotion_v0_2_preflight(
+            _v02_preflight_artifact(), target_asset_type="KNOWLEDGE"
+        ),
+    ]
+    for report in reports:
+        for flag in hello_module.REALITY_PREFLIGHT_V02_MUTATION_FLAGS:
+            assert report[flag] is False, flag
+        no_write = next(
+            c
+            for c in report["checks"]
+            if "no canonical write" in c["check"]
+        )
+        assert no_write["status"] == "PASS"
+
+
+def test_v02_preflight_content_not_exposed() -> None:
+    sentinel = "V02_PREFLIGHT_CONTENT_SENTINEL_do_not_expose"
+    report = hello_module.reality_first_canonical_promotion_v0_2_preflight(
+        _v02_preflight_artifact(content={"text": sentinel}),
+        target_asset_type="KNOWLEDGE",
+    )
+    assert report["content_exposed"] is False
+    assert report["message_content_exposed"] is False
+    assert sentinel not in json.dumps(report)
+    assert sentinel not in report["markdown"]
+
+
+def test_v02_preflight_markdown_and_entrypoint() -> None:
+    report = hello_module.reality_first_canonical_promotion_v0_2_preflight(
+        _v02_preflight_artifact(), target_asset_type="KNOWLEDGE"
+    )
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {hello_module.REALITY_PREFLIGHT_V02_GOAL}")
+    assert f"- task_id: {hello_module.REALITY_PREFLIGHT_V02_TASK_ID}" in markdown
+    assert "## Promotion path" in markdown
+    assert "## Human Gate gap" in markdown
+    assert "## No-mutation statement" in markdown
+    assert f"FINAL_STATUS={report['final_status']}" in markdown
+
+    source = inspect.getsource(hello_module)
+    assert "def reality_first_canonical_promotion_v0_2_preflight(" in source
+    assert callable(hello_module.reality_first_canonical_promotion_v0_2_preflight)
+    assert (
+        hello_module.reality_first_canonical_promotion_preflight_v0_2
+        is hello_module.reality_first_canonical_promotion_v0_2_preflight
+    )

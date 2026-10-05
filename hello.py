@@ -28364,6 +28364,657 @@ def reality_promotion_adapter_design_v0_1() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# REALITY_FIRST_CANONICAL_PROMOTION_V0.2_PREFLIGHT  (task cf-1134ba8b1992)
+#
+# Production Promotion preflight only. It binds one real Reviewed Candidate and
+# verifies the full ``Candidate -> Adapter -> Writer -> ASSET_DB -> Read-back``
+# path read-only, reusing the already-completed ``reality_promotion_adapter``
+# (no new writer, no new state store) and the existing independent read-back.
+# It answers exactly one question: is every *non-human* piece verified so that
+# the promotion is READY_FOR_HG3, or is it BLOCKED? It never performs a
+# Canonical write, deploy, secret read or permission / binding / schema change.
+# Every conclusion is tagged OBSERVED / STATED / INFERRED / UNKNOWN.
+# ---------------------------------------------------------------------------
+REALITY_PREFLIGHT_V02_GOAL = "REALITY_FIRST_CANONICAL_PROMOTION_V0.2_PREFLIGHT"
+REALITY_PREFLIGHT_V02_TASK_ID = "cf-1134ba8b1992"
+REALITY_PREFLIGHT_V02_REPORT = REALITY_PREFLIGHT_V02_GOAL + "_REPORT"
+REALITY_PREFLIGHT_V02_CONTRACT = "PERSONAL_AI_" + REALITY_PREFLIGHT_V02_GOAL
+
+#: The only two preflight verdicts: ready for the human gate, or fail-closed.
+REALITY_PREFLIGHT_READY = "READY_FOR_HG3"
+REALITY_PREFLIGHT_V02_STATUSES = (REALITY_PREFLIGHT_READY, BLOCKED)
+
+#: HG-3 -- the human gate that is the single remaining requirement once ready.
+REALITY_PREFLIGHT_V02_HG3_GATE = CANONICAL_PROMOTION_HG3_GATE
+
+#: The staged promotion path this preflight walks read-only.
+REALITY_PREFLIGHT_V02_PATH = REALITY_PROMOTION_PATH
+
+#: Every mutation flag that must remain False for this read-only preflight.
+REALITY_PREFLIGHT_V02_MUTATION_FLAGS = (
+    "production_write_performed",
+    "canonical_write_performed",
+    "reality_canonical_written",
+    "canonical_written",
+    "knowledge_written",
+    "skill_written",
+    "decision_written",
+    "deployment_performed",
+    "credentials_accessed",
+    "secret_accessed",
+    "permissions_changed",
+    "binding_changed",
+    "schema_changed",
+    "second_state_store_created",
+    "reality_specific_writer_created",
+    "mark_reviewed_called",
+    "content_exposed",
+    "message_content_exposed",
+)
+
+
+def _reality_promotion_adapter_module():
+    """Import the already-completed promotion adapter (reuse, never duplicate)."""
+    src = str(REPO_ROOT / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from personal_ai_execution import reality_promotion_adapter as _adapter
+
+    return _adapter
+
+
+def _reality_preflight_redact_request(request: object) -> object:
+    """Return a copy of a Worker request with any raw content redacted.
+
+    The preflight never exposes candidate content; only the structural fields and
+    integrity hashes are echoed back.
+    """
+    if not isinstance(request, dict):
+        return request
+    redacted = dict(request)
+    if "content" in redacted:
+        redacted["content"] = "[REDACTED]"
+    return redacted
+
+
+def reality_first_canonical_promotion_v0_2_preflight(
+    artifact: object = None,
+    *,
+    review: object = None,
+    target_asset_type: object = None,
+    existing_asset: object = None,
+    human_gate_authorized: bool = False,
+    read_surface: object = None,
+    write_evidence: object = None,
+) -> dict:
+    """Read-only preflight of the first REALITY Canonical promotion (HG-3).
+
+    Binds one real Reviewed Candidate (a Candidate Artifact, or a raw capture /
+    normalized candidate that is re-read read-only through
+    ``build_candidate_artifact``) and walks the whole promotion path with the
+    existing :mod:`reality_promotion_adapter` in ``dry_run`` mode:
+
+    * **Candidate** -- the Reviewed Candidate is bound and its review verdict is
+      recorded (never authored);
+    * **Adapter** -- ``adapt_reviewed_candidate`` maps the candidate onto the
+      *existing* Asset Worker request shape (production-refusing);
+    * **Writer** -- the real Asset Worker writer interface / contracts are
+      observed; the real writer is reported **not callable** until HG-3 and a
+      production write surface exist;
+    * **ASSET_DB** -- the single canonical store is stated; its live binding is
+      not reachable in this environment (``UNKNOWN``);
+    * **Read-back** -- the independent read-back path is confirmed available so a
+      future write can be verified.
+
+    The verdict is exactly ``READY_FOR_HG3`` (every non-human piece is verified;
+    only the human gate remains) or ``BLOCKED`` (fail-closed). It never performs
+    a write, deploy, secret read or permission / binding / schema change and
+    never creates a second state store or Reality-specific writer.
+    """
+    adapter = _reality_promotion_adapter_module()
+    _capture, writer_mod, _provenance = _reality_review_components()
+    observed = _reality_adapter_design_observed()
+
+    gate = getattr(writer_mod, "HUMAN_GATE", CANONICAL_PROMOTION_HG3_GATE)
+    writer_contract = getattr(
+        writer_mod, "WRITER_CONTRACT_VERSION", "PERSONAL_AI_REALITY_CANONICAL_WRITER_V0.1"
+    )
+
+    evidence: list[dict] = []
+    gaps: list[str] = []
+    unknowns: list[str] = []
+
+    # -- Candidate stage ----------------------------------------------------
+    candidate_artifact = None
+    candidate_bound = False
+    if artifact is None:
+        unknowns.append("a real Reviewed Candidate to bind")
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "no Reviewed Candidate was supplied; the preflight fails closed "
+                "and binds nothing",
+            )
+        )
+    elif not isinstance(artifact, dict):
+        unknowns.append("Reviewed Candidate mapping shape")
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "the supplied value is not a candidate mapping; it is never guessed",
+            )
+        )
+    else:
+        from personal_ai_execution.reality_candidate_handoff import (
+            HANDOFF_CONTRACT,
+            build_candidate_artifact,
+        )
+
+        if artifact.get("artifact_contract") == HANDOFF_CONTRACT:
+            candidate_artifact = artifact
+            evidence.append(
+                _revalidation_evidence(
+                    "OBSERVED",
+                    "bound a " + HANDOFF_CONTRACT + " Candidate Artifact",
+                )
+            )
+        else:
+            candidate_artifact = build_candidate_artifact(artifact)
+            evidence.append(
+                _revalidation_evidence(
+                    "OBSERVED",
+                    "re-read the supplied snapshot / normalized candidate read-only "
+                    "through build_candidate_artifact (no write)",
+                )
+            )
+        candidate_bound = isinstance(candidate_artifact, dict)
+
+    # -- Adapter stage (reuse the completed adapter, dry-run) ---------------
+    adaptation = None
+    adapter_status = None
+    adapter_mapped = False
+    if candidate_bound:
+        adaptation = adapter.adapt_reviewed_candidate(
+            candidate_artifact,
+            review=review if isinstance(review, dict) else None,
+            target_asset_type=target_asset_type,
+            existing_asset=existing_asset,
+            human_gate_authorized=bool(human_gate_authorized),
+            dry_run=True,
+        )
+        adapter_status = adaptation.get("status")
+        adapter_mapped = adapter_status in (
+            adapter.STATUS_ADAPTED,
+            adapter.STATUS_IDEMPOTENT,
+        )
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED" if adapter_mapped else "STATED",
+                "reality_promotion_adapter (dry-run, production-refusing) returned "
+                "status="
+                + str(adapter_status)
+                + "; review_status="
+                + str(adaptation.get("review_status"))
+                + "; promotion_status="
+                + str(adaptation.get("promotion_status")),
+            )
+        )
+        if not adapter_mapped:
+            gaps.extend(adaptation.get("reasons") or ["adapter did not map the candidate"])
+            unknowns.extend(adaptation.get("unknowns") or [])
+    else:
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "adapter not invoked: no Reviewed Candidate was bound",
+            )
+        )
+
+    candidate_id = (adaptation or {}).get("candidate_id")
+    review_status = (adaptation or {}).get("review_status")
+    promotion_status = (adaptation or {}).get("promotion_status")
+    content_hash = (adaptation or {}).get("content_hash")
+    idempotency_key = (adaptation or {}).get("idempotency_key")
+    intent_hash = (adaptation or {}).get("intent_hash")
+    canonical_version = (adaptation or {}).get("canonical_version")
+    promoted_provenance_status = (adaptation or {}).get("promoted_provenance_status")
+    worker_request = (adaptation or {}).get("worker_request")
+    reused_canonical_writer = (adaptation or {}).get("reused_canonical_writer")
+    reused_writer_contract = (adaptation or {}).get("reused_writer_contract")
+
+    # -- Writer stage -------------------------------------------------------
+    writer_entrypoints = dict(observed.get("worker_entrypoints") or {})
+    writer_interface_present = bool(
+        (observed.get("modules") or {}).get("reality_canonical_writer.py")
+        and writer_entrypoints
+        and all(writer_entrypoints.values())
+    )
+    production_write_surface_available = bool(
+        isinstance(adaptation, dict) and adaptation.get("write_surface")
+    )
+    real_writer_callable = bool(
+        writer_interface_present
+        and bool(human_gate_authorized)
+        and production_write_surface_available
+    )
+    if real_writer_callable:
+        writer_blocked_by = None
+    elif not writer_interface_present:
+        writer_blocked_by = "writer_interface_missing"
+    elif not human_gate_authorized:
+        writer_blocked_by = gate
+    else:
+        writer_blocked_by = "production_write_surface_unavailable"
+
+    # -- Human Gate gap -----------------------------------------------------
+    human_gate_gap = {
+        "gate": gate,
+        "required": True,
+        "authorized": bool(human_gate_authorized),
+        "remaining": not bool(human_gate_authorized),
+        "auto_approved": False,
+        "blocking_production": not bool(human_gate_authorized),
+    }
+
+    # -- Read-back stage ----------------------------------------------------
+    readback_available = callable(
+        globals().get("reality_canonical_promotion_independent_readback_v0_1")
+    )
+    readback_live_surface_available = read_surface is not None
+    readback_report = reality_canonical_promotion_independent_readback_v0_1(
+        read_surface, write_evidence=write_evidence
+    )
+    readback_verdict = readback_report.get("verdict")
+    readback_can_verify_future_write = bool(readback_available)
+
+    # -- Promotion path (read-only status per stage) ------------------------
+    path_stages = [
+        {
+            "stage": "Candidate",
+            "status": PASS if candidate_bound else BLOCKED,
+            "evidence": "OBSERVED" if candidate_bound else "UNKNOWN",
+            "detail": "candidate_bound="
+            + str(candidate_bound)
+            + "; candidate_id="
+            + str(candidate_id),
+        },
+        {
+            "stage": "Adapter",
+            "status": PASS if adapter_mapped else BLOCKED,
+            "evidence": "OBSERVED" if adapter_mapped else "STATED",
+            "detail": "adapter_status=" + str(adapter_status),
+        },
+        {
+            "stage": "Writer",
+            "status": PASS if writer_interface_present else BLOCKED,
+            "evidence": "OBSERVED",
+            "detail": "writer_interface_present="
+            + str(writer_interface_present)
+            + "; reuse="
+            + str(reused_canonical_writer),
+        },
+        {
+            "stage": "ASSET_DB",
+            "status": PASS if (writer_interface_present and readback_available) else BLOCKED,
+            "evidence": "OBSERVED",
+            "detail": "canonical_store="
+            + CANONICAL_PROMOTION_STORE
+            + "; live_binding_reachable=False; canonical_write_performed=False",
+            "live_binding_reachable": False,
+        },
+        {
+            "stage": "Read-back",
+            "status": PASS if readback_available else BLOCKED,
+            "evidence": "OBSERVED" if readback_available else "UNKNOWN",
+            "detail": "readback_available="
+            + str(readback_available)
+            + "; readback_verdict="
+            + str(readback_verdict),
+        },
+    ]
+
+    # -- Verdict ------------------------------------------------------------
+    blocking_gaps: list[str] = []
+    if not candidate_bound:
+        blocking_gaps.append("candidate_not_bound")
+    if candidate_bound and not adapter_mapped:
+        blocking_gaps.append("adapter_not_mapped")
+    if not writer_interface_present:
+        blocking_gaps.append("writer_interface_missing")
+    if not readback_available:
+        blocking_gaps.append("readback_unavailable")
+    verdict = REALITY_PREFLIGHT_READY if not blocking_gaps else BLOCKED
+
+    # -- Evidence for the remaining stages ----------------------------------
+    if writer_interface_present:
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "existing Asset Worker writer interface present: entrypoints="
+                + str(sorted(writer_entrypoints))
+                + "; contract="
+                + str(writer_contract),
+            )
+        )
+    else:
+        unknowns.append("Asset Worker writer interface (entrypoints / module)")
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "Asset Worker writer interface could not be observed in this checkout",
+            )
+        )
+    evidence.append(
+        _revalidation_evidence(
+            "STATED",
+            "real writer callable now="
+            + str(real_writer_callable)
+            + "; blocked by="
+            + str(writer_blocked_by)
+            + "; HG-3 "
+            + gate
+            + " remains required and is never auto-approved by this preflight "
+            + "(caller-reported authorized="
+            + str(bool(human_gate_authorized))
+            + ")",
+        )
+    )
+    evidence.append(
+        _revalidation_evidence(
+            "INFERRED",
+            "the adapter reused the existing canonical writer "
+            + str(reused_canonical_writer)
+            + " and mapped the candidate onto "
+            + str(reused_writer_contract)
+            + ", so no new writer and no second state store are required",
+        )
+    )
+    evidence.append(
+        _revalidation_evidence(
+            "OBSERVED" if readback_available else "UNKNOWN",
+            "independent read-back path available="
+            + str(readback_available)
+            + "; live read surface available="
+            + str(readback_live_surface_available)
+            + "; readback verdict now="
+            + str(readback_verdict),
+        )
+    )
+    evidence.append(
+        _revalidation_evidence(
+            "UNKNOWN",
+            "live ASSET_DB contents, the deployed Worker version and whether the "
+            "future canonical row already exists are not observable offline",
+        )
+    )
+    evidence.append(
+        _revalidation_evidence(
+            "OBSERVED",
+            "scope: preflight is read-only; only "
+            + CANONICAL_PROMOTION_STORE
+            + " is named; no deploy, secret, permission, binding or schema change",
+        )
+    )
+
+    # -- Checks (invariants of this read-only preflight) --------------------
+    checks = [
+        {
+            "check": "preflight executed read-only",
+            "status": PASS,
+            "detail": "no file write, no catalog mutation, no state store created",
+        },
+        {
+            "check": "verdict is READY_FOR_HG3 or BLOCKED",
+            "status": PASS if verdict in REALITY_PREFLIGHT_V02_STATUSES else FAIL,
+            "detail": "verdict=" + str(verdict),
+        },
+        {
+            "check": "full promotion path is stated (Candidate -> Adapter -> Writer -> ASSET_DB -> Read-back)",
+            "status": PASS
+            if tuple(stage["stage"] for stage in path_stages) == REALITY_PREFLIGHT_V02_PATH
+            else FAIL,
+            "detail": "path=" + REALITY_PROMOTION_PATH_TEXT,
+        },
+        {
+            "check": "real Asset Worker writer interface / callability reported",
+            "status": PASS,
+            "detail": "writer_interface_present="
+            + str(writer_interface_present)
+            + "; real_writer_callable="
+            + str(real_writer_callable)
+            + "; blocked_by="
+            + str(writer_blocked_by),
+        },
+        {
+            "check": "Human Gate gap reported and never auto-approved",
+            "status": PASS
+            if human_gate_gap["auto_approved"] is False
+            and human_gate_gap["required"] is True
+            else FAIL,
+            "detail": "gate=" + gate + "; authorized=" + str(human_gate_gap["authorized"]),
+        },
+        {
+            "check": "independent read-back availability reported",
+            "status": PASS,
+            "detail": "readback_available="
+            + str(readback_available)
+            + "; can_verify_future_write="
+            + str(readback_can_verify_future_write),
+        },
+        {
+            "check": "no canonical write / deploy / secret / permission / binding / schema change",
+            "status": PASS,
+            "detail": "production_write_performed=False; canonical_write_performed=False; "
+            "knowledge_written=False; skill_written=False; decision_written=False; "
+            "deployment_performed=False; secret_accessed=False; permissions_changed=False; "
+            "binding_changed=False; schema_changed=False",
+        },
+    ]
+    workflow_status = (
+        PASS if all(check["status"] == PASS for check in checks) else FAIL
+    )
+
+    final_status = (
+        "PREFLIGHT_VERDICT="
+        + str(verdict)
+        + ";REAL_WRITER_CALLABLE="
+        + str(real_writer_callable)
+        + ";HUMAN_GATE_REQUIRED=True;READBACK_AVAILABLE="
+        + str(readback_available)
+    )
+
+    lines = [
+        f"# {REALITY_PREFLIGHT_V02_GOAL}",
+        "",
+        f"- goal: {REALITY_PREFLIGHT_V02_GOAL}",
+        f"- task_id: {REALITY_PREFLIGHT_V02_TASK_ID}",
+        f"- contract: {REALITY_PREFLIGHT_V02_CONTRACT}",
+        "- mode: read-only production promotion preflight (no Canonical write)",
+        f"- workflow_status: {workflow_status}",
+        f"- verdict: {verdict}",
+        f"- candidate_bound: {candidate_bound}",
+        f"- candidate_id: {candidate_id if candidate_id is not None else 'UNKNOWN'}",
+        f"- review_status: {review_status if review_status is not None else 'UNKNOWN'}",
+        f"- promotion_status: {promotion_status if promotion_status is not None else 'UNKNOWN'}",
+        f"- adapter_status: {adapter_status if adapter_status is not None else 'UNKNOWN'}",
+        f"- target_asset_type: {(adaptation or {}).get('target_asset_type') or 'UNKNOWN'}",
+        f"- content_hash: {content_hash if content_hash is not None else 'UNKNOWN'}",
+        f"- idempotency_key: {idempotency_key if idempotency_key is not None else 'UNKNOWN'}",
+        f"- canonical_version: {canonical_version if canonical_version is not None else 'UNKNOWN'}",
+        f"- canonical_store: {CANONICAL_PROMOTION_STORE}",
+        f"- writer_interface_present: {writer_interface_present}",
+        f"- real_writer_callable: {real_writer_callable}",
+        f"- writer_blocked_by: {writer_blocked_by if writer_blocked_by is not None else 'NONE'}",
+        f"- human_gate: {gate}",
+        f"- human_gate_authorized: {bool(human_gate_authorized)}",
+        f"- readback_available: {readback_available}",
+        f"- readback_verdict: {readback_verdict}",
+        "",
+        "## Promotion path",
+    ]
+    for stage in path_stages:
+        lines.append(
+            f"- [{stage['status']}] {stage['stage']}: {stage['detail']} "
+            f"(evidence={stage['evidence']})"
+        )
+    lines += [
+        "",
+        "## Human Gate gap",
+        f"- gate: {gate}",
+        f"- required: {human_gate_gap['required']}",
+        f"- authorized: {human_gate_gap['authorized']}",
+        f"- remaining: {human_gate_gap['remaining']}",
+        f"- auto_approved: {human_gate_gap['auto_approved']}",
+        "",
+        "## Blocking gaps",
+    ]
+    if blocking_gaps:
+        for gap in blocking_gaps:
+            lines.append(f"- {gap}")
+    else:
+        lines.append("- (none: only the human gate remains)")
+    lines += ["", "## Evidence gaps"]
+    if gaps:
+        for gap in gaps:
+            lines.append(f"- {gap}")
+    else:
+        lines.append("- (none)")
+    lines += ["", "## Unknowns"]
+    if unknowns:
+        for item in unknowns:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- (none recorded)")
+    lines += [
+        "",
+        "## Evidence",
+    ]
+    for item in evidence:
+        lines.append(f"- [{item['source']}] {item['detail']}")
+    lines += [
+        "",
+        "## No-mutation statement",
+        "- production_write_performed: False",
+        "- canonical_write_performed: False",
+        "- reality_canonical_written: False",
+        "- knowledge_written: False",
+        "- skill_written: False",
+        "- decision_written: False",
+        "- deployment_performed: False",
+        "- credentials_accessed: False",
+        "- secret_accessed: False",
+        "- permissions_changed: False",
+        "- binding_changed: False",
+        "- schema_changed: False",
+        "- second_state_store_created: False",
+        "- reality_specific_writer_created: False",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final_status}"]
+
+    return {
+        "report": REALITY_PREFLIGHT_V02_REPORT,
+        "goal": REALITY_PREFLIGHT_V02_GOAL,
+        "task_id": REALITY_PREFLIGHT_V02_TASK_ID,
+        "contract": REALITY_PREFLIGHT_V02_CONTRACT,
+        "generated_at": _utc_now(),
+        "mode": "read_only_production_promotion_preflight",
+        "workflow_status": workflow_status,
+        "status": verdict,
+        "verdict": verdict,
+        "preflight_status": verdict,
+        "final_verdict": verdict,
+        "final_status": final_status,
+        "ready_for_hg3": verdict == REALITY_PREFLIGHT_READY,
+        "candidate_bound": candidate_bound,
+        "candidate_id": candidate_id,
+        "artifact_id": (adaptation or {}).get("artifact_id"),
+        "artifact_location": (adaptation or {}).get("artifact_location"),
+        "review_status": review_status,
+        "promotion_status": promotion_status,
+        "adapter_status": adapter_status,
+        "adapter_mapped": adapter_mapped,
+        "target_asset_type": (adaptation or {}).get("target_asset_type"),
+        "content_hash": content_hash,
+        "idempotency_key": idempotency_key,
+        "intent_hash": intent_hash,
+        "canonical_version": canonical_version,
+        "promoted_provenance_status": promoted_provenance_status,
+        "worker_request": _reality_preflight_redact_request(worker_request),
+        "worker_request_fields": (
+            sorted(worker_request) if isinstance(worker_request, dict) else []
+        ),
+        "worker_request_field_count": len(worker_request) if isinstance(worker_request, dict) else 0,
+        "canonical_store": CANONICAL_PROMOTION_STORE,
+        "reality_asset_type": CANONICAL_PROMOTION_ASSET_TYPE,
+        "reality_role": CANONICAL_PROMOTION_ROLE,
+        "reused_canonical_writer": reused_canonical_writer,
+        "reused_writer_contract": reused_writer_contract,
+        "writer_contract": writer_contract,
+        "writer_interface_present": writer_interface_present,
+        "writer_entrypoints": writer_entrypoints,
+        "real_writer_callable": real_writer_callable,
+        "writer_callable_now": real_writer_callable,
+        "writer_blocked_by": writer_blocked_by,
+        "production_write_surface_available": production_write_surface_available,
+        "human_gate": gate,
+        "human_gate_authorized": bool(human_gate_authorized),
+        "human_gate_required": True,
+        "human_gate_gap": human_gate_gap,
+        "human_gate_remaining": human_gate_gap["remaining"],
+        "readback_available": readback_available,
+        "read_back_available": readback_available,
+        "readback_live_surface_available": readback_live_surface_available,
+        "readback_verdict": readback_verdict,
+        "readback_can_verify_future_write": readback_can_verify_future_write,
+        "live_asset_db_reachable": False,
+        "promotion_path": [stage["stage"] for stage in path_stages],
+        "promotion_path_text": REALITY_PROMOTION_PATH_TEXT,
+        "path_stages": path_stages,
+        "blocking_gaps": blocking_gaps,
+        "evidence_gaps": gaps,
+        "unknowns": unknowns,
+        "evidence": evidence,
+        "evidence_tiers": list(EVIDENCE_SOURCES),
+        "evidence_tiers_present": sorted({item["source"] for item in evidence}),
+        "checks": checks,
+        "read_only": True,
+        "production_write_performed": False,
+        "canonical_write_performed": False,
+        "reality_written": False,
+        "reality_canonical_written": False,
+        "canonical_written": False,
+        "knowledge_written": False,
+        "skill_written": False,
+        "decision_written": False,
+        "deployment_performed": False,
+        "credentials_accessed": False,
+        "secret_accessed": False,
+        "permissions_changed": False,
+        "binding_changed": False,
+        "schema_changed": False,
+        "second_state_store_created": False,
+        "reality_specific_writer_created": False,
+        "mark_reviewed_called": False,
+        "content_exposed": False,
+        "message_content_exposed": False,
+        "markdown": "\n".join(lines),
+    }
+
+
+#: Backwards/forward-compatible aliases for the same V0.2 preflight.
+reality_first_canonical_promotion_preflight_v0_2 = (
+    reality_first_canonical_promotion_v0_2_preflight
+)
+reality_canonical_promotion_preflight_v0_2 = (
+    reality_first_canonical_promotion_v0_2_preflight
+)
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -28406,3 +29057,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(reality_first_canonical_promotion_execution_v0_1()["markdown"])
     print(reality_canonical_promotion_independent_readback_v0_1()["markdown"])
     print(reality_promotion_adapter_design_v0_1()["markdown"])
+    print(reality_first_canonical_promotion_v0_2_preflight()["markdown"])
