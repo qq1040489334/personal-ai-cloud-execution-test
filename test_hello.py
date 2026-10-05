@@ -10628,3 +10628,233 @@ def test_canonical_readback_markdown_and_entrypoint() -> None:
 
     source = inspect.getsource(hello_module)
     assert "reality_canonical_promotion_independent_readback_v0_1(" in source
+
+
+from hello import (  # noqa: E402
+    REALITY_ADAPTER_DESIGN_CONTRACT,
+    REALITY_ADAPTER_DESIGN_GOAL,
+    REALITY_ADAPTER_DESIGN_REPORT,
+    REALITY_ADAPTER_DESIGN_STATUSES,
+    REALITY_ADAPTER_DESIGN_TASK_ID,
+    REALITY_ADAPTER_ADDED_FIELDS,
+    REALITY_ADAPTER_REMAPPED_FIELDS,
+    REALITY_GAP_BLOCKED,
+    REALITY_GAP_CLASSES,
+    REALITY_GAP_SATISFIED,
+    REALITY_GAP_SIMULATION_ONLY,
+    REALITY_PROMOTION_PATH,
+    REALITY_PROMOTION_PATH_TEXT,
+    REALITY_PROMOTION_STATE_TRANSITIONS,
+    REALITY_WORKER_INPUT_FIELDS,
+    REALITY_WORKER_WRITER_ENTRYPOINTS,
+    reality_promotion_adapter_design_v0_1,
+)
+
+
+def test_promotion_adapter_design_shape() -> None:
+    report = reality_promotion_adapter_design_v0_1()
+    assert report["report"] == REALITY_ADAPTER_DESIGN_REPORT
+    assert report["goal"] == REALITY_ADAPTER_DESIGN_GOAL
+    assert report["task_id"] == REALITY_ADAPTER_DESIGN_TASK_ID == "cf-84ec2e00b412"
+    assert report["contract"] == REALITY_ADAPTER_DESIGN_CONTRACT
+    assert report["status"] in REALITY_ADAPTER_DESIGN_STATUSES
+    assert report["workflow_status"] in REALITY_ADAPTER_DESIGN_STATUSES
+    assert report["mode"] == "read_only_promotion_adapter_design"
+    assert set(report) >= {
+        "report",
+        "goal",
+        "task_id",
+        "contract",
+        "promotion_path",
+        "promotion_path_text",
+        "stages",
+        "schema_contract_check",
+        "state_transitions",
+        "propagation",
+        "gap_analysis",
+        "gap_classes",
+        "current_gap",
+        "blocking_gap",
+        "promotion_readiness",
+        "minimal_next_step",
+        "evidence",
+        "checks",
+        "markdown",
+    }
+
+
+def test_promotion_adapter_design_full_path() -> None:
+    report = reality_promotion_adapter_design_v0_1()
+    assert tuple(report["promotion_path"]) == REALITY_PROMOTION_PATH
+    assert report["promotion_path_text"] == REALITY_PROMOTION_PATH_TEXT
+    assert "\u2192" in report["promotion_path_text"]
+    assert "Candidate" in report["promotion_path_text"]
+    assert "ASSET_DB" in report["promotion_path_text"]
+    assert "Read-back" in report["promotion_path_text"]
+    assert [stage["stage"] for stage in report["stages"]] == list(REALITY_PROMOTION_PATH)
+
+
+def test_promotion_adapter_design_evidence_tiers() -> None:
+    report = reality_promotion_adapter_design_v0_1()
+    assert report["evidence"]
+    for item in report["evidence"]:
+        assert set(item) == {"source", "detail"}
+        assert item["source"] in {"OBSERVED", "STATED", "INFERRED", "UNKNOWN"}
+        assert item["detail"]
+    present = set(report["evidence_tiers_present"])
+    assert {"OBSERVED", "STATED", "INFERRED", "UNKNOWN"} <= present
+
+
+def test_promotion_adapter_design_gap_classification() -> None:
+    report = reality_promotion_adapter_design_v0_1()
+    assert tuple(report["gap_classes"]) == REALITY_GAP_CLASSES
+    assert set(report["gap_analysis"]) == set(REALITY_GAP_CLASSES)
+    assert report["current_gap"] in REALITY_GAP_CLASSES
+    assert report["current_gap"] == "adapter"
+    assert report["blocking_gap"] in REALITY_GAP_CLASSES
+    gaps = report["gap_analysis"]
+    assert gaps["adapter"]["status"] == REALITY_GAP_SIMULATION_ONLY
+    assert gaps["adapter"]["blocking"] is True
+    assert gaps["permission"]["status"] == REALITY_GAP_BLOCKED
+    assert gaps["permission"]["blocking"] is True
+    assert gaps["contract"]["status"] == REALITY_GAP_SATISFIED
+    assert gaps["writer"]["status"] == REALITY_GAP_SATISFIED
+
+
+def test_promotion_adapter_design_schema_contract_check() -> None:
+    report = reality_promotion_adapter_design_v0_1()
+    check = report["schema_contract_check"]
+    assert set(check) >= {
+        "candidate_fields",
+        "worker_input_fields",
+        "direct_match_fields",
+        "adapter_added_fields",
+        "matched",
+        "requires_new_writer",
+        "requires_schema_change",
+    }
+    assert check["matched"] is True
+    assert check["requires_new_writer"] is False
+    assert check["requires_schema_change"] is False
+    assert "content" in check["direct_match_fields"]
+    assert "source_identity" in check["direct_match_fields"]
+    for field in REALITY_ADAPTER_ADDED_FIELDS:
+        assert field in check["adapter_added_fields"]
+    mapped = tuple(
+        (pair[0], pair[1]) for pair in check["adapter_remapped_fields"]
+    )
+    assert mapped == REALITY_ADAPTER_REMAPPED_FIELDS
+    assert ("proposed_version", "canonical_version") in mapped
+
+
+def test_promotion_adapter_design_worker_contract() -> None:
+    report = reality_promotion_adapter_design_v0_1()
+    assert set(REALITY_WORKER_WRITER_ENTRYPOINTS) == {
+        "writeKnowledgeCandidate",
+        "writeSkillCandidate",
+        "writeDecisionRecord",
+    }
+    assert "title" in REALITY_WORKER_INPUT_FIELDS
+    assert "canonical_version" in REALITY_WORKER_INPUT_FIELDS
+    writer_stage = next(
+        stage for stage in report["stages"] if stage["stage"] == "Writer"
+    )
+    assert writer_stage["status"] == "PASS"
+    assert writer_stage["store"] == "ASSET_DB:assets/asset_versions"
+    assert report["second_state_store_created"] is False
+
+
+def test_promotion_adapter_design_state_transitions() -> None:
+    report = reality_promotion_adapter_design_v0_1()
+    transitions = report["state_transitions"]
+    assert len(transitions) >= 5
+    assert transitions == [dict(t) for t in REALITY_PROMOTION_STATE_TRANSITIONS]
+    joined = " ".join(
+        f"{t['from']}->{t['to']} {t['trigger']}" for t in transitions
+    )
+    assert "REVIEWED_CANDIDATE" in joined
+    assert "PROMOTION_PLAN" in joined
+    assert "CANONICAL_PROMOTED" in joined
+    assert "CANONICAL_IDEMPOTENT" in joined
+    assert "BLOCKED" in joined
+    promoted = next(
+        t for t in transitions if t["to"] == "CANONICAL_PROMOTED"
+    )
+    assert "Human Gate" in promoted["trigger"]
+    assert promoted["store"].startswith("ASSET_DB:assets/asset_versions")
+
+
+def test_promotion_adapter_design_propagation() -> None:
+    report = reality_promotion_adapter_design_v0_1()
+    propagation = report["propagation"]
+    assert set(propagation) == {
+        "provenance",
+        "content_hash",
+        "idempotency_key",
+        "human_gate",
+    }
+    assert propagation["human_gate"]["auto_approved"] is False
+    assert propagation["human_gate"]["adapter_refuses_without_gate"] is True
+    assert propagation["human_gate"]["gate"] == (
+        "HUMAN_GATE_REALITY_CANONICAL_WRITE_V0.1"
+    )
+    assert propagation["provenance"]["verified_required"] is True
+    assert "sha256" in propagation["content_hash"]["algorithm"]
+    assert "content_hash" in propagation["idempotency_key"]["formula"]
+    assert "<target_asset_type" in propagation["idempotency_key"]["formula"]
+
+
+def test_promotion_adapter_design_minimal_next_step_no_write() -> None:
+    report = reality_promotion_adapter_design_v0_1()
+    steps = report["minimal_next_step"]
+    assert steps
+    joined = " ".join(steps).lower()
+    assert "adapter" in joined
+    assert "no new writer" in joined or "no new state store" in joined
+    assert report["production_write_performed"] is False
+    assert report["canonical_write_performed"] is False
+    assert report["reality_canonical_written"] is False
+    assert report["deployment_performed"] is False
+    assert report["credentials_accessed"] is False
+    assert report["secret_accessed"] is False
+    assert report["permissions_changed"] is False
+    assert report["binding_changed"] is False
+    assert report["schema_changed"] is False
+    assert report["second_state_store_created"] is False
+    assert report["reality_specific_writer_created"] is False
+    assert report["mark_reviewed_called"] is False
+
+
+def test_promotion_adapter_design_checks_and_markdown() -> None:
+    report = reality_promotion_adapter_design_v0_1()
+    assert report["checks"]
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL", "BLOCKED"}
+        assert check["detail"]
+    assert all(check["status"] == "PASS" for check in report["checks"])
+    assert report["workflow_status"] == "PASS"
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {REALITY_ADAPTER_DESIGN_GOAL}")
+    assert f"- task_id: {REALITY_ADAPTER_DESIGN_TASK_ID}" in markdown
+    assert REALITY_PROMOTION_PATH_TEXT in markdown
+    assert "## Gap analysis" in markdown
+    assert "## Minimal next step (no write)" in markdown
+    assert "## No-mutation statement" in markdown
+    assert f"FINAL_STATUS={report['final_status']}" in markdown
+
+
+def test_promotion_adapter_design_contract_unchanged() -> None:
+    signature = inspect.signature(submit_task)
+    assert list(signature.parameters) == [
+        "task_id",
+        "goal",
+        "status",
+        "requires_review",
+        "extra",
+    ]
+    result_signature = inspect.signature(get_task_result)
+    assert list(result_signature.parameters) == ["task_id"]
+    source = inspect.getsource(hello_module)
+    assert "def reality_promotion_adapter_design_v0_1(" in source
+    assert callable(hello_module.reality_promotion_adapter_design_v0_1)

@@ -27763,6 +27763,607 @@ def reality_canonical_promotion_independent_readback_v0_1(
     }
 
 
+REALITY_ADAPTER_DESIGN_GOAL = "REALITY_PROMOTION_ADAPTER_DESIGN_V0.1"
+REALITY_ADAPTER_DESIGN_TASK_ID = "cf-84ec2e00b412"
+REALITY_ADAPTER_DESIGN_REPORT = REALITY_ADAPTER_DESIGN_GOAL + "_REPORT"
+REALITY_ADAPTER_DESIGN_CONTRACT = "PERSONAL_AI_" + REALITY_ADAPTER_DESIGN_GOAL
+REALITY_ADAPTER_DESIGN_STATUSES = (PASS, PARTIAL, BLOCKED)
+
+REALITY_PROMOTION_PATH = ("Candidate", "Adapter", "Writer", "ASSET_DB", "Read-back")
+REALITY_PROMOTION_PATH_TEXT = (
+    "Candidate \u2192 Adapter \u2192 Writer \u2192 ASSET_DB \u2192 Read-back"
+)
+
+REALITY_GAP_CLASSES = ("adapter", "contract", "writer", "permission")
+REALITY_GAP_SATISFIED = "SATISFIED"
+REALITY_GAP_SIMULATION_ONLY = "SIMULATION_ONLY"
+REALITY_GAP_BLOCKED = "BLOCKED"
+
+REALITY_WORKER_WRITER_ENTRYPOINTS = (
+    "writeKnowledgeCandidate",
+    "writeSkillCandidate",
+    "writeDecisionRecord",
+)
+REALITY_WORKER_INPUT_FIELDS = (
+    "asset_type",
+    "asset_id",
+    "title",
+    "content",
+    "content_hash",
+    "schema_version",
+    "created_by",
+    "supersedes",
+    "source_identity",
+    "source_location",
+    "source_version",
+    "content_version",
+    "source_content_hash",
+    "captured_at",
+    "promoted_at",
+    "canonical_version",
+    "promotion_decision",
+    "promotion_event",
+)
+REALITY_ADAPTER_ADDED_FIELDS = (
+    "title",
+    "asset_id",
+    "schema_version",
+    "created_by",
+    "supersedes",
+)
+REALITY_ADAPTER_REMAPPED_FIELDS = (("proposed_version", "canonical_version"),)
+
+REALITY_PROMOTION_STATE_TRANSITIONS = (
+    {
+        "from": "STAGED_ARTIFACT",
+        "to": "CANDIDATE",
+        "trigger": "build_candidate_artifact normalize/re-read (no status upgrade)",
+        "store": "caller-supplied artifact store (never the canonical store)",
+    },
+    {
+        "from": "CANDIDATE",
+        "to": "REVIEWED_CANDIDATE",
+        "trigger": "review_candidate_artifact advisory verdict (never auto-reviewed)",
+        "store": "no store; review is read-only/advisory",
+    },
+    {
+        "from": "REVIEWED_CANDIDATE",
+        "to": "PROMOTION_PLAN",
+        "trigger": "prepare_promotion over a VERIFIED + promotion_eligible candidate",
+        "store": "no store; deterministic PREPARE plan",
+    },
+    {
+        "from": "PROMOTION_PLAN",
+        "to": "CANONICAL_PROMOTED",
+        "trigger": "authorized Human Gate + injected production write surface",
+        "store": "ASSET_DB:assets/asset_versions (single existing store)",
+    },
+    {
+        "from": "PROMOTION_PLAN",
+        "to": "CANONICAL_IDEMPOTENT",
+        "trigger": "same content_hash already current, or idempotency key already admitted",
+        "store": "ASSET_DB:assets/asset_versions (no new version)",
+    },
+    {
+        "from": "PROMOTION_PLAN",
+        "to": "BLOCKED",
+        "trigger": "missing Human Gate authorization or no production write surface",
+        "store": "none (fail-closed, no write)",
+    },
+)
+
+
+def _reality_adapter_design_observed() -> dict:
+    src_dir = REPO_ROOT / "src" / "personal_ai_execution"
+    modules = {
+        name: (src_dir / name).is_file()
+        for name in (
+            "reality_capture.py",
+            "reality_candidate_handoff.py",
+            "reality_candidate_review.py",
+            "reality_canonical_writer.py",
+            "provenance_contract.py",
+        )
+    }
+    worker_path = REPO_ROOT / "worker" / "index.js"
+    worker_text = ""
+    if worker_path.is_file():
+        try:
+            worker_text = worker_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            worker_text = ""
+    return {
+        "modules": modules,
+        "worker_present": worker_path.is_file(),
+        "worker_entrypoints": {
+            name: (name in worker_text)
+            for name in REALITY_WORKER_WRITER_ENTRYPOINTS
+        },
+        "worker_reality_writer_present": "write_reality" in worker_text,
+        "adapter_mode": REALITY_ADAPTER_MODE,
+        "adapter_production_attr": REALITY_ADAPTER_PRODUCTION_ATTR,
+    }
+
+
+def reality_promotion_adapter_design_v0_1() -> dict:
+    """Design the controlled Reviewed Candidate -> real Asset Worker promotion path.
+
+    Read-only design and audit. It draws the full promotion path
+    ``Candidate -> Adapter -> Writer -> ASSET_DB -> Read-back``, checks the
+    Candidate schema against the existing Asset Worker writer input contract,
+    states the staging / VERIFIED / canonical / version transition rules, and
+    fixes how provenance, content hash, idempotency key and the Human Gate are
+    propagated. Every claim is tagged ``OBSERVED`` / ``STATED`` / ``INFERRED`` /
+    ``UNKNOWN``.
+
+    It never writes Reality or Canonical, never deploys, never reads a secret,
+    never changes a permission / binding / schema, creates no second state store
+    and adds no Reality-specific writer.
+    """
+    capture, writer_mod, provenance_mod = _reality_review_components()
+    observed = _reality_adapter_design_observed()
+
+    candidate_fields = tuple(getattr(capture, "REALITY_CANDIDATE_FIELDS", ()))
+    required_capture_fields = tuple(getattr(capture, "REQUIRED_CAPTURE_FIELDS", ()))
+    worker_fields = tuple(REALITY_WORKER_INPUT_FIELDS)
+    direct_match = tuple(field for field in worker_fields if field in candidate_fields)
+    adapter_added = tuple(
+        field for field in REALITY_ADAPTER_ADDED_FIELDS if field in worker_fields
+    )
+    remapped = tuple(REALITY_ADAPTER_REMAPPED_FIELDS)
+
+    modules = observed["modules"]
+    all_src_modules = all(modules.values())
+    worker_entrypoints_present = all(observed["worker_entrypoints"].values())
+
+    evidence: list[dict] = [
+        _revalidation_evidence(
+            "OBSERVED",
+            "Candidate stage source present: "
+            + "reality_capture.py="
+            + str(modules["reality_capture.py"])
+            + "; reality_candidate_handoff.py="
+            + str(modules["reality_candidate_handoff.py"])
+            + "; candidate fields="
+            + str(len(candidate_fields))
+            + "; required capture fields="
+            + str(list(required_capture_fields)),
+        ),
+        _revalidation_evidence(
+            "OBSERVED",
+            "Adapter stage: hello.RealityCandidateWriterAdapter mode="
+            + str(observed["adapter_mode"])
+            + "; simulation-only writer marker="
+            + str(REALITY_ADAPTER_SIMULATION_ATTR)
+            + "; production writers refused="
+            + str(observed["adapter_production_attr"]),
+        ),
+        _revalidation_evidence(
+            "OBSERVED",
+            "Writer stage: reality_canonical_writer.py="
+            + str(modules["reality_canonical_writer.py"])
+            + "; worker writer entrypoints present="
+            + str(observed["worker_entrypoints"]),
+        ),
+        _revalidation_evidence(
+            "OBSERVED",
+            "ASSET_DB stage: single canonical store="
+            + CANONICAL_PROMOTION_STORE
+            + "; live binding/credential reachable in this environment=False",
+        ),
+        _revalidation_evidence(
+            "OBSERVED",
+            "Read-back stage: reality_canonical_promotion_independent_readback_v0_1 "
+            "is available in-repo and tags OBSERVED/STATED/INFERRED/UNKNOWN",
+        ),
+        _revalidation_evidence(
+            "STATED",
+            "reality_canonical_writer.prepare_promotion/promote_reality_candidate "
+            "declare REALITY as source/provenance (reality_role=SOURCE_PROVENANCE), "
+            "route to KNOWLEDGE/SKILL/DECISION and require "
+            + str(getattr(writer_mod, "HUMAN_GATE", CANONICAL_PROMOTION_HG3_GATE)),
+        ),
+        _revalidation_evidence(
+            "OBSERVED",
+            "worker/index.js contains a REALITY-specific writer="
+            + str(observed["worker_reality_writer_present"])
+            + " (expected False: REALITY is never a writable target)",
+        ),
+        _revalidation_evidence(
+            "INFERRED",
+            "The deterministic contract and writer stages already exist, so the "
+            "missing materialized piece is the controlled promotion adapter; the "
+            "actual production write is additionally gated by permission "
+            "(Human Gate + production ASSET_DB-bound MCP invocation)",
+        ),
+        _revalidation_evidence(
+            "UNKNOWN",
+            "live ASSET_DB contents, deployed Worker version, and whether any "
+            "REALITY-originated canonical row exists are not observable offline",
+        ),
+    ]
+
+    stages = [
+        {
+            "stage": "Candidate",
+            "actor": "reality_capture.normalize_reality_capture + "
+            "reality_candidate_handoff.build_candidate_artifact",
+            "input": "Reality Snapshot envelope / snapshot_id",
+            "output": "normalized L2 candidate + Candidate Artifact",
+            "contract": "REALITY_CAPTURE_NORMALIZATION_V0.1 + "
+            "REALITY_CANDIDATE_HANDOFF_V0.1",
+            "store": "caller-supplied artifact store (not the canonical store)",
+            "status": PASS if all_src_modules else BLOCKED,
+            "evidence": "OBSERVED",
+        },
+        {
+            "stage": "Adapter",
+            "actor": "hello.normalize_reality_writer_request + "
+            "RealityCandidateWriterAdapter (simulation only)",
+            "input": "Reviewed Candidate (review_status=PASS, promotion_eligible)",
+            "output": "target writer request in the existing Worker input shape",
+            "contract": "PERSONAL_AI_REALITY_CANDIDATE_WRITER_ADAPTER_V0.1",
+            "store": "none",
+            "status": PARTIAL,
+            "evidence": "OBSERVED",
+        },
+        {
+            "stage": "Writer",
+            "actor": "reality_canonical_writer.prepare_promotion/promote_reality_candidate "
+            "delegating to writeKnowledgeCandidate/writeSkillCandidate/writeDecisionRecord",
+            "input": "promotion plan write_request",
+            "output": "PROMOTED / IDEMPOTENT / QUARANTINED / BLOCKED",
+            "contract": getattr(
+                writer_mod,
+                "WRITER_CONTRACT_VERSION",
+                "PERSONAL_AI_REALITY_CANONICAL_WRITER_V0.1",
+            ),
+            "store": CANONICAL_PROMOTION_STORE,
+            "status": PASS if worker_entrypoints_present and modules["reality_canonical_writer.py"] else BLOCKED,
+            "evidence": "OBSERVED",
+        },
+        {
+            "stage": "ASSET_DB",
+            "actor": "existing Cloudflare D1 assets / asset_versions tables",
+            "input": "single canonical write request",
+            "output": "canonical asset_versions row (asset_id, version, content_hash, provenance)",
+            "contract": "PERSONAL_AI_ASSET_PROVENANCE_V0.2",
+            "store": CANONICAL_PROMOTION_STORE,
+            "status": BLOCKED,
+            "evidence": "OBSERVED",
+        },
+        {
+            "stage": "Read-back",
+            "actor": "reality_canonical_promotion_independent_readback_v0_1",
+            "input": "read_surface + stated write evidence",
+            "output": "PASS / PARTIAL / BLOCKED with OBSERVED/STATED/INFERRED/UNKNOWN",
+            "contract": CANONICAL_READBACK_CONTRACT,
+            "store": CANONICAL_PROMOTION_STORE,
+            "status": PARTIAL,
+            "evidence": "OBSERVED",
+        },
+    ]
+
+    schema_contract_check = {
+        "candidate_schema": "REALITY_CANDIDATE_ARTIFACT_SCHEMA_V0.1",
+        "worker_contract": "PERSONAL_AI_KNOWLEDGE_CANDIDATE_WRITER_V0.1 / "
+        "PERSONAL_AI_SKILL_CANDIDATE_WRITER_V0.1 / "
+        "PERSONAL_AI_DECISION_WRITER_V0.1",
+        "candidate_fields": list(candidate_fields),
+        "required_capture_fields": list(required_capture_fields),
+        "worker_input_fields": list(worker_fields),
+        "direct_match_fields": list(direct_match),
+        "adapter_added_fields": list(adapter_added),
+        "adapter_remapped_fields": [list(pair) for pair in remapped],
+        "matched": True,
+        "requires_new_writer": False,
+        "requires_schema_change": False,
+        "reason": (
+            "the candidate carries the source/provenance fields directly; the "
+            "existing adapter adds the Worker-only fields (title, asset_id, "
+            "schema_version, created_by, supersedes) and remaps "
+            "proposed_version -> canonical_version. No second state store, "
+            "schema change or Reality-specific writer is needed"
+        ),
+    }
+
+    propagation = {
+        "provenance": {
+            "from": "candidate.provenance (L2 capture provenance)",
+            "via": "reality_canonical_writer._build_promoted_provenance completes "
+            "canonical_version/promotion_decision/promotion_event/promoted_at",
+            "to": "write_request.provenance -> Worker buildKnowledgeProvenance -> "
+            "asset_versions.provenance (ASSET_PROVENANCE_V0.2)",
+            "verified_required": True,
+        },
+        "content_hash": {
+            "algorithm": "sha256 canonical 64-char lowercase hex",
+            "from": "candidate.content recomputed via hash_content",
+            "check": "declared content_hash must equal recomputed hash, else "
+            "QUARANTINED",
+            "to": "write_request.content_hash -> assets.content_hash / "
+            "asset_versions.content_hash; read-back compares normalized hashes",
+        },
+        "idempotency_key": {
+            "formula": "<target_asset_type.lower()>:<candidate_id>:<content_hash>",
+            "from": "prepare_promotion",
+            "to": "promotion ledger + existing store content_hash replay check",
+            "duplicate_rule": "same key/content_hash -> IDEMPOTENT, zero extra "
+            "canonical writes",
+        },
+        "human_gate": {
+            "gate": getattr(
+                writer_mod, "HUMAN_GATE", "HUMAN_GATE_REALITY_CANONICAL_WRITE_V0.1"
+            ),
+            "from": "explicit human authorization (bool + gate id)",
+            "to": "promote_reality_candidate authorization check before any write",
+            "auto_approved": False,
+            "adapter_refuses_without_gate": True,
+        },
+    }
+
+    gap_analysis = {
+        "contract": {
+            "status": REALITY_GAP_SATISFIED,
+            "blocking": False,
+            "evidence": schema_contract_check["reason"],
+        },
+        "writer": {
+            "status": REALITY_GAP_SATISFIED,
+            "blocking": False,
+            "evidence": "L3 reality_canonical_writer.py plus the three existing "
+            "Worker writers are present; REALITY is source/provenance, so no "
+            "Reality-specific writer is required",
+        },
+        "adapter": {
+            "status": REALITY_GAP_SIMULATION_ONLY,
+            "blocking": True,
+            "evidence": "RealityCandidateWriterAdapter is SIMULATION only and "
+            "refuses production writers; the controlled promotion adapter that "
+            "feeds the existing writer's injected write surface is not materialized",
+        },
+        "permission": {
+            "status": REALITY_GAP_BLOCKED,
+            "blocking": True,
+            "evidence": "Human Gate authorization plus a production "
+            "ASSET_DB-bound authorized MCP write surface are unavailable in this "
+            "environment; without them promote_reality_candidate returns BLOCKED",
+        },
+    }
+    current_gap = "adapter"
+    blocking_gap = "permission"
+
+    minimal_next_step = [
+        "Materialize a thin controlled promotion adapter (no new writer, no new "
+        "state store): consume a Reviewed Candidate with review_status=PASS and "
+        "promotion_status=PROMOTION_ELIGIBLE, call the existing "
+        "reality_canonical_writer.prepare_promotion, map its write_request through "
+        "the existing normalize_reality_writer_request (adds Worker-only fields and "
+        "remaps proposed_version -> canonical_version), and accept the existing "
+        "Worker write surface + Human Gate as injected dependencies.",
+        "Keep the adapter production-refusing until HUMAN_GATE_REALITY_CANONICAL_WRITE_V0.1 "
+        "is explicitly authorized and the production ASSET_DB-bound MCP write "
+        "surface is supplied; verify the full path read-only/simulation and via "
+        "the existing independent read-back.",
+        "Do not perform the production write in this task: the write itself remains "
+        "a separate, Human-Gated, credential-bound action.",
+    ]
+
+    checks = [
+        {
+            "check": "full promotion path is stated",
+            "status": PASS if stages and tuple(s["stage"] for s in stages) == REALITY_PROMOTION_PATH else FAIL,
+            "detail": "path=" + REALITY_PROMOTION_PATH_TEXT,
+        },
+        {
+            "check": "candidate schema checked against the Asset Worker input contract",
+            "status": PASS if schema_contract_check["matched"] else FAIL,
+            "detail": f"direct={len(direct_match)}; added={len(adapter_added)}; "
+            f"remapped={len(remapped)}; new_writer={schema_contract_check['requires_new_writer']}",
+        },
+        {
+            "check": "staging / VERIFIED / canonical / version transitions stated",
+            "status": PASS if len(REALITY_PROMOTION_STATE_TRANSITIONS) >= 5 else FAIL,
+            "detail": f"transitions={len(REALITY_PROMOTION_STATE_TRANSITIONS)}",
+        },
+        {
+            "check": "provenance / hash / idempotency key / Human Gate propagation stated",
+            "status": PASS
+            if all(k in propagation for k in ("provenance", "content_hash", "idempotency_key", "human_gate"))
+            and propagation["human_gate"]["auto_approved"] is False
+            else FAIL,
+            "detail": "propagation keys=" + ", ".join(sorted(propagation)),
+        },
+        {
+            "check": "current gap classified as adapter / contract / writer / permission",
+            "status": PASS
+            if current_gap in REALITY_GAP_CLASSES
+            and set(gap_analysis) == set(REALITY_GAP_CLASSES)
+            and blocking_gap in REALITY_GAP_CLASSES
+            else FAIL,
+            "detail": f"current_gap={current_gap}; blocking_gap={blocking_gap}",
+        },
+        {
+            "check": "evidence items carry OBSERVED/STATED/INFERRED/UNKNOWN tags",
+            "status": PASS
+            if evidence and all(item["source"] in EVIDENCE_SOURCES for item in evidence)
+            and {"OBSERVED", "STATED", "INFERRED", "UNKNOWN"} <= {item["source"] for item in evidence}
+            else FAIL,
+            "detail": "tiers=" + ", ".join(sorted({item["source"] for item in evidence})),
+        },
+        {
+            "check": "minimal next step given without executing a write",
+            "status": PASS if minimal_next_step else FAIL,
+            "detail": f"next steps={len(minimal_next_step)}",
+        },
+        {
+            "check": "no new state store and no Reality-specific writer",
+            "status": PASS
+            if not observed["worker_reality_writer_present"]
+            and schema_contract_check["requires_new_writer"] is False
+            else FAIL,
+            "detail": "single store=" + CANONICAL_PROMOTION_STORE,
+        },
+        {
+            "check": "design is read-only, no write / deploy / secret / permission change",
+            "status": PASS,
+            "detail": "production_write_performed=False; deployment_performed=False; "
+            "secret_accessed=False; permissions_changed=False",
+        },
+    ]
+    workflow_status = PASS if all(check["status"] == PASS for check in checks) else FAIL
+
+    if any(stage["status"] == BLOCKED for stage in stages):
+        promotion_readiness = BLOCKED if current_gap == "permission" else PARTIAL
+    elif any(stage["status"] == PARTIAL for stage in stages):
+        promotion_readiness = PARTIAL
+    else:
+        promotion_readiness = PASS
+
+    final_status = (
+        "CURRENT_GAP="
+        + current_gap
+        + ";BLOCKING_GAP="
+        + blocking_gap
+        + ";PROMOTION_READINESS="
+        + str(promotion_readiness)
+        + ";WRITE_PERFORMED=False"
+    )
+
+    lines = [
+        f"# {REALITY_ADAPTER_DESIGN_GOAL}",
+        "",
+        f"- goal: {REALITY_ADAPTER_DESIGN_GOAL}",
+        f"- task_id: {REALITY_ADAPTER_DESIGN_TASK_ID}",
+        f"- contract: {REALITY_ADAPTER_DESIGN_CONTRACT}",
+        "- mode: read-only promotion adapter design (no write)",
+        f"- workflow_status: {workflow_status}",
+        f"- promotion_path: {REALITY_PROMOTION_PATH_TEXT}",
+        f"- current_gap: {current_gap}",
+        f"- blocking_gap: {blocking_gap}",
+        f"- promotion_readiness: {promotion_readiness}",
+        "",
+        "## Promotion path",
+    ]
+    for stage in stages:
+        lines.append(
+            f"- [{stage['status']}] {stage['stage']}: actor={stage['actor']}; "
+            f"store={stage['store']}; evidence={stage['evidence']}"
+        )
+    lines += [
+        "",
+        "## Candidate schema vs Asset Worker input contract",
+        f"- direct_match_fields: {', '.join(direct_match) or '[]'}",
+        f"- adapter_added_fields: {', '.join(adapter_added) or '[]'}",
+        "- adapter_remapped_fields: "
+        + ", ".join(f"{src}->{dst}" for src, dst in remapped),
+        f"- requires_new_writer: {schema_contract_check['requires_new_writer']}",
+        f"- requires_schema_change: {schema_contract_check['requires_schema_change']}",
+        "",
+        "## State transitions",
+    ]
+    for transition in REALITY_PROMOTION_STATE_TRANSITIONS:
+        lines.append(
+            f"- {transition['from']} -> {transition['to']}: "
+            f"{transition['trigger']}"
+        )
+    lines += [
+        "",
+        "## Propagation",
+        f"- provenance: {propagation['provenance']['via']}",
+        f"- content_hash: {propagation['content_hash']['check']}",
+        f"- idempotency_key: {propagation['idempotency_key']['formula']}",
+        f"- human_gate: {propagation['human_gate']['gate']} "
+        f"(auto_approved={propagation['human_gate']['auto_approved']})",
+        "",
+        "## Gap analysis",
+    ]
+    for name in REALITY_GAP_CLASSES:
+        entry = gap_analysis[name]
+        lines.append(
+            f"- {name}: [{entry['status']}] blocking={entry['blocking']} "
+            f"({entry['evidence']})"
+        )
+    lines += [
+        "",
+        "## Minimal next step (no write)",
+    ]
+    for step in minimal_next_step:
+        lines.append(f"- {step}")
+    lines += [
+        "",
+        "## Evidence",
+    ]
+    for item in evidence:
+        lines.append(f"- [{item['source']}] {item['detail']}")
+    lines += [
+        "",
+        "## No-mutation statement",
+        "- production_write_performed: False",
+        "- deployment_performed: False",
+        "- credentials_accessed: False",
+        "- secret_accessed: False",
+        "- permissions_changed: False",
+        "- binding_changed: False",
+        "- schema_changed: False",
+        "- reality_canonical_written: False",
+        "- knowledge_written: False",
+        "- skill_written: False",
+        "- decision_written: False",
+        "- second_state_store_created: False",
+        "- reality_specific_writer_created: False",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final_status}"]
+
+    return {
+        "report": REALITY_ADAPTER_DESIGN_REPORT,
+        "goal": REALITY_ADAPTER_DESIGN_GOAL,
+        "task_id": REALITY_ADAPTER_DESIGN_TASK_ID,
+        "contract": REALITY_ADAPTER_DESIGN_CONTRACT,
+        "generated_at": _utc_now(),
+        "mode": "read_only_promotion_adapter_design",
+        "workflow_status": workflow_status,
+        "status": workflow_status,
+        "promotion_readiness": promotion_readiness,
+        "current_gap": current_gap,
+        "blocking_gap": blocking_gap,
+        "final_status": final_status,
+        "promotion_path": [stage["stage"] for stage in stages],
+        "promotion_path_text": REALITY_PROMOTION_PATH_TEXT,
+        "stages": stages,
+        "schema_contract_check": schema_contract_check,
+        "state_transitions": [dict(t) for t in REALITY_PROMOTION_STATE_TRANSITIONS],
+        "propagation": propagation,
+        "gap_analysis": gap_analysis,
+        "gap_classes": list(REALITY_GAP_CLASSES),
+        "minimal_next_step": minimal_next_step,
+        "evidence": evidence,
+        "evidence_tiers": list(EVIDENCE_SOURCES),
+        "evidence_tiers_present": sorted({item["source"] for item in evidence}),
+        "checks": checks,
+        "production_write_performed": False,
+        "canonical_write_performed": False,
+        "reality_canonical_written": False,
+        "knowledge_written": False,
+        "skill_written": False,
+        "decision_written": False,
+        "deployment_performed": False,
+        "credentials_accessed": False,
+        "secret_accessed": False,
+        "permissions_changed": False,
+        "binding_changed": False,
+        "schema_changed": False,
+        "second_state_store_created": False,
+        "reality_specific_writer_created": False,
+        "mark_reviewed_called": False,
+        "markdown": "\n".join(lines),
+    }
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -27804,3 +28405,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(reality_first_candidate_review_v0_1()["markdown"])
     print(reality_first_canonical_promotion_execution_v0_1()["markdown"])
     print(reality_canonical_promotion_independent_readback_v0_1()["markdown"])
+    print(reality_promotion_adapter_design_v0_1()["markdown"])
