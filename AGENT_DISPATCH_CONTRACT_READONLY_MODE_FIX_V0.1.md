@@ -25,19 +25,18 @@
    changes repository files and must therefore carry a non-empty `expected_files`
    allowlist; every changed file must match that allowlist. `OBSERVED` against
    `scripts/task_contract.py:37-48` and `scripts/scope_guard.py:64-66`.
-3. This release documents the fix and records the exact behavior the two Gates must
-   preserve. It **does not change the Gates themselves**, because any Gate/code change
-   would fall outside this task's single-file allowlist and would touch
-   `.github/workflows/`-adjacent release machinery. `OBSERVED`.
-4. The current `task_contract.py` requires a non-empty `expected_files` for *every*
-   task, so a pure readonly observation task that declares `expected_files = []` is
-   rejected by Gate 1 today. The accepted fix resolves this by making the empty
-   allowlist lawful **only** for readonly mode, while keeping the non-empty allowlist
-   mandatory for write mode. The Gate adaptation is called out in §4 for a separately
-   authorized change task. `OBSERVED`/`INFERRED`.
+3. The original release documented the fix and recorded the exact behavior the two
+   Gates must preserve. The **Gate adaptation is now implemented** in
+   `scripts/task_contract.py` and `scripts/scope_guard.py` by the bounded follow-up
+   `AGENT_DISPATCH_CONTRACT_READONLY_MODE_GATE_ADAPTATION_V0.1`, so the dual-mode
+   contract is live rather than documented-only. `OBSERVED`.
+4. `task_contract.py` and `scope_guard.py` now accept an empty `expected_files` list
+   **only** for an explicitly readonly task (`mode: readonly`), while write mode —
+   and a missing `mode`, which defaults to **write** — still requires a non-empty
+   allowlist. The per-entry forbidden/unsafe checks remain in force in both modes and
+   an empty readonly allowlist matches no path, so any change fails closed. `OBSERVED`.
 5. No Canonical mutation, no production Worker mutation, no secret/token/credential
-   change, no binding or schema change, and no `.github/workflows/` edit occurred in
-   this release. `OBSERVED`.
+   change, no binding or schema change, and no `.github/workflows/` edit occurred. `OBSERVED`.
 
 ---
 
@@ -58,8 +57,10 @@
   `scripts/scope_guard.py`).
 - Editing Personal AI Canonical records, the production Worker (`worker/index.js`),
   secrets, bindings, or schemas.
-- Changing `scripts/task_contract.py` / `scripts/scope_guard.py` in this release; the
-  Gate adaptation is a separately authorized follow-up (§4).
+- Broadening the adaptation beyond the readonly/write mode decision: the forbidden
+  prefix/substring sets, unsafe-path checks, and deletion prohibition are unchanged.
+- Editing `.github/workflows/` — the Gate adaptation is confined to the two Gate
+  scripts and their focused tests (§4).
 
 ---
 
@@ -123,11 +124,12 @@ explicit mode signal (for example a `mode: readonly` contract field):
 
 ### 3.2 Gate 2 — `scripts/scope_guard.py` (modification scope enforcement)
 
-- The guard loads `expected_files` and currently raises
-  `expected_files must be a non-empty list` when it is empty. `OBSERVED` `:64-66`.
-- Under the fix, a readonly contract's empty allowlist must be honored: the guard
-  runs, sees zero allowlisted patterns, and passes only when the diff contains **no
-  changed files**; any changed or new file is reported as
+- The guard resolves the allowlist through `resolve_allowlist`, which honors an empty
+  allowlist **only** for `mode: readonly`; write mode (and a missing mode) raises
+  `expected_files must be a non-empty list for write mode`. `OBSERVED`.
+- For a readonly contract the empty allowlist is honored: the guard runs, sees zero
+  allowlisted patterns, and passes only when the diff contains **no changed files**;
+  any changed or new file is reported as
   `modification outside task allowlist` / `new file outside task allowlist`.
 - Write-mode behavior is unchanged: a non-empty allowlist is required and every
   changed file must match it.
@@ -140,54 +142,55 @@ explicit mode signal (for example a `mode: readonly` contract field):
   the existing Gate 1 rules (non-empty `expected_files`, LOW risk, non-empty
   instructions and acceptance). `OBSERVED`.
 - `readonly/write contract 行为保持测试通过` — the pinned pytest coverage in §5 proves
-  the dual-mode behavior.
+  the dual-mode behavior. `OBSERVED`.
 
 ---
 
-## 4. Gate adaptation required for full readonly support (separately authorized)
+## 4. Gate adaptation for full readonly support (implemented)
 
-The dual-mode contract above is the accepted fix. The current Gate implementations
-still hard-require a non-empty `expected_files`, so a readonly task with
-`expected_files = []` is not yet runnable end to end. The minimal, fail-closed
-adaptation is:
+The dual-mode contract above is the accepted fix. The bounded follow-up
+`AGENT_DISPATCH_CONTRACT_READONLY_MODE_GATE_ADAPTATION_V0.1` implements the
+fail-closed adaptation:
 
-| File | Location | Required change |
+| File | Required change | Status |
 | --- | --- | --- |
-| `scripts/task_contract.py` | `:37-48` | Accept `expected_files == []` **only** when the task is explicitly readonly; keep the non-empty requirement for write tasks. Never skip the per-entry forbidden/unsafe checks when entries are present. |
-| `scripts/scope_guard.py` | `:64-66` | Accept an empty allowlist for an explicitly readonly contract; run the diff scan with zero matched patterns so any change fails closed. Keep the non-empty requirement for write tasks. |
+| `scripts/task_contract.py` | `task_mode()` resolves an explicit mode with missing/empty defaulting to write; an empty `expected_files` is accepted **only** for readonly mode, while write mode keeps the non-empty requirement. Per-entry forbidden/unsafe checks are never skipped when entries are present. | Implemented |
+| `scripts/scope_guard.py` | `task_mode()` / `resolve_allowlist()` accept an empty allowlist for an explicitly readonly contract and otherwise require a non-empty one; the diff scan then runs with zero matched patterns so any change fails closed. | Implemented |
 
-Both changes remain inside the non-workflow Gate scripts and cannot relax the
-`.github/workflows/` prohibition or the forbidden-target checks. They are **not**
-performed in this release because they fall outside the single-file allowlist; they
-are the exactly-bounded follow-up.
+Both changes remain inside the non-workflow Gate scripts: they cannot relax the
+`.github/workflows/` prohibition, the forbidden-target checks, or the deletion
+prohibition. Readonly is never an unbounded write grant.
 
 ---
 
 ## 5. Acceptance tests (pinned)
 
 The following behavior is pinned by pytest so the contract cannot silently regress.
-Tests assert the contract against the **verbatim production Gate sources** (the tests
-read `scripts/task_contract.py` / `scripts/scope_guard.py` as executed), so they fail
-if the Gates diverge from the released contract.
+The tests load and execute the **production Gate modules** (`scripts/task_contract.py`
+in `tests/test_task_contract.py`, `scripts/scope_guard.py` in
+`tests/test_scope_guard.py`) and additionally drive the scope guard end-to-end inside
+scratch git repositories, so they fail if the Gates diverge from the released contract.
 
-1. The release document exists and names the readonly/write dual mode and the
-   `expected_files = []` readonly rule.
-2. Gate 1 requires all six fields and rejects non-`LOW`/`MEDIUM` risk.
-3. Gate 1 write mode requires a non-empty `expected_files` and rejects
-   `.github/workflows/` and secret-class paths.
-4. Gate 1 rejects unsafe absolute / `..` expected files.
-5. Gate 2 write mode requires a non-empty allowlist and blocks modifications outside
-   it.
-6. Gate 2 readonly semantics: an empty allowlist matches no path, so any change is a
-   violation (readonly is not an unbounded write grant).
-7. The forbidden-prefix and forbidden-substring sets are shared by both Gates.
+1. Gate 1 requires all six fields and rejects non-`LOW`/`MEDIUM` risk.
+2. Gate 1 readonly mode accepts `expected_files = []` (including mode aliases).
+3. Gate 1 write mode — and a missing mode, which defaults to write — rejects an empty
+   `expected_files`.
+4. Gate 1 still rejects `.github/workflows/`, secret-class, unsafe absolute, and `..`
+   expected files in both modes.
+5. Gate 2 readonly mode with an empty allowlist passes only when no file changes, and
+   blocks any changed or newly created file (readonly is not an unbounded write grant).
+6. Gate 2 write mode (and a missing mode) rejects an empty allowlist and blocks
+   modifications outside the non-empty allowlist.
+7. The forbidden-prefix and forbidden-substring sets, and the deletion prohibition,
+   are preserved by both Gates.
 
 ---
 
 ## 6. Safety / scope statement
 
-- Released **only** `AGENT_DISPATCH_CONTRACT_READONLY_MODE_FIX_V0.1.md` (the task's
-  single `expected_files` entry).
+- Gate adaptation released **only** in `scripts/task_contract.py`,
+  `scripts/scope_guard.py`, their focused tests (`tests/test_task_contract.py`,
+  `tests/test_scope_guard.py`), and this document — exactly the task allowlist.
 - **No** `.github/workflows/` edit; **no** Personal AI Canonical mutation; **no**
   production Worker change; **no** secret/token/credential change; **no** binding or
   schema change; **no** deletion.
@@ -203,26 +206,24 @@ if the Gates diverge from the released contract.
 | Question | Answer |
 | --- | --- |
 | Released fix | `AGENT_DISPATCH_CONTRACT_READONLY_MODE_FIX_V0.1` |
+| Gate adaptation | `AGENT_DISPATCH_CONTRACT_READONLY_MODE_GATE_ADAPTATION_V0.1` — implemented in `scripts/task_contract.py` / `scripts/scope_guard.py`. `OBSERVED` |
 | Dual mode | readonly allows `expected_files = []`; write requires a non-empty allowlist. `OBSERVED` |
-| Gate 1 requirement | Non-empty allowlist required today; empty allowed only for explicit readonly (adaptation §4). `OBSERVED` |
-| Gate 2 requirement | Non-empty allowlist required today; empty readonly allowlist must fail closed on any change (adaptation §4). `OBSERVED` |
+| Gate 1 requirement | Empty allowlist accepted only for explicit readonly (`mode: readonly`); write and missing mode require a non-empty allowlist. `OBSERVED` |
+| Gate 2 requirement | Empty readonly allowlist passes only with no changes and fails closed on any change; write and missing mode require and enforce a non-empty allowlist. `OBSERVED` |
 | Canonical mutation | None. |
 | Production Worker change | None. |
 | Workflow mutation | None. |
-| Tests | Focused dual-mode contract coverage in `tests/test_agent_dispatch_contract_readonly_mode.py`. |
+| Tests | Focused dual-mode contract coverage in `tests/test_task_contract.py` and `tests/test_scope_guard.py`. |
 | Deployment / production side effects | None. |
 
 ### Exactly one bounded next_action
 
 ```
-next_action = AGENT_DISPATCH_CONTRACT_READONLY_MODE_GATE_ADAPTATION_V0.1
+next_action = NONE
 ```
 
-A single, bounded, LOW-risk follow-up task: (a) teach `scripts/task_contract.py` to
-accept `expected_files = []` for an explicitly readonly contract while keeping the
-non-empty requirement for write mode; (b) teach `scripts/scope_guard.py` to honor the
-empty readonly allowlist and still fail closed on any change; (c) add Gate-level
-tests. It must not edit `.github/workflows/`, must not touch Canonical or the
-production Worker, and must preserve the forbidden-target checks.
+The readonly/write Gate adaptation is complete: both Gates are mode-aware, fail
+closed on any change under an empty readonly allowlist, and keep the non-empty
+changed-files allowlist for write mode.
 
-`final_status`: `READONLY_MODE_FIX_RELEASED`
+`final_status`: `READONLY_MODE_GATE_ADAPTATION_RELEASED`

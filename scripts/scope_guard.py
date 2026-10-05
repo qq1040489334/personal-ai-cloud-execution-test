@@ -12,6 +12,9 @@ FORBIDDEN_PREFIXES = (".github/workflows/",)
 FORBIDDEN_SUBSTRINGS = ("secret", "token", "credential", ".env", ".pem", ".key")
 IGNORED = (".pytest_cache", "__pycache__")
 
+READONLY_MODES = {"readonly", "read_only", "read-only"}
+WRITE_MODES = {"write", "readwrite", "read_write", "read-write"}
+
 
 def git(*args: str) -> str:
     result = subprocess.run(["git", *args], capture_output=True, text=True)
@@ -20,6 +23,38 @@ def git(*args: str) -> str:
 
 def normalize(path: str) -> str:
     return path.strip().replace("\\", "/")
+
+
+def task_mode(contract) -> str:
+    """Resolve the explicit execution mode; missing/empty defaults to write.
+
+    Raises ``ValueError`` for an unrecognized mode so the guard fails closed.
+    """
+    raw = contract.get("mode", "write") if isinstance(contract, dict) else "write"
+    if raw is None or str(raw).strip() == "":
+        return "write"
+    mode = str(raw).strip().lower()
+    if mode in READONLY_MODES:
+        return "readonly"
+    if mode in WRITE_MODES:
+        return "write"
+    raise ValueError(f"unknown mode: {raw} (allowed: readonly, write)")
+
+
+def resolve_allowlist(contract) -> set[str]:
+    """Return the normalized allowlist for the contract's mode.
+
+    Readonly mode is the only mode permitted to leave ``expected_files`` empty;
+    write mode (and a missing mode, which defaults to write) must supply a
+    non-empty allowlist.
+    """
+    mode = task_mode(contract)
+    raw = contract.get("expected_files", [])
+    if not isinstance(raw, list):
+        raise ValueError("expected_files must be a list")
+    if not raw and mode != "readonly":
+        raise ValueError("expected_files must be a non-empty list for write mode")
+    return {normalize(str(p)) for p in raw}
 
 
 def unsafe_pattern(path: str) -> bool:
@@ -61,10 +96,8 @@ def main() -> int:
         contract = json.loads(open(contract_path, encoding="utf-8").read())
         if isinstance(contract, str):
             contract = json.loads(contract)
-        raw = contract.get("expected_files", [])
-        if not isinstance(raw, list) or not raw:
-            raise ValueError("expected_files must be a non-empty list")
-        allowlist = {normalize(str(p)) for p in raw}
+        allowlist = resolve_allowlist(contract)
+        mode = task_mode(contract)
     except (OSError, ValueError, TypeError) as exc:
         print(f"BLOCK: cannot load task allowlist: {exc}")
         return 1
@@ -106,7 +139,7 @@ def main() -> int:
         elif not matches(path, allowlist):
             violations.append(f"new file outside task allowlist: {path}")
 
-    print(f"=== SCOPE_GUARD RESULT (base={base}) ===")
+    print(f"=== SCOPE_GUARD RESULT (base={base}, mode={mode}) ===")
     print("task allowlist:")
     for p in sorted(allowlist):
         print(f"  {p}")

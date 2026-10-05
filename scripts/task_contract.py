@@ -14,6 +14,25 @@ REQUIRED = ("task_id", "goal", "instructions", "risk_level", "expected_files", "
 FORBIDDEN_PREFIXES = (".github/workflows/",)
 FORBIDDEN_SUBSTRINGS = ("secret", "token", "credential", ".env", ".pem", ".key")
 
+READONLY_MODES = {"readonly", "read_only", "read-only"}
+WRITE_MODES = {"write", "readwrite", "read_write", "read-write"}
+
+
+def task_mode(data) -> str | None:
+    """Resolve the explicit execution mode; missing/empty defaults to write.
+
+    Returns ``None`` for an unrecognized mode so callers can fail closed.
+    """
+    raw = data.get("mode", "write") if isinstance(data, dict) else "write"
+    if raw is None or str(raw).strip() == "":
+        return "write"
+    mode = str(raw).strip().lower()
+    if mode in READONLY_MODES:
+        return "readonly"
+    if mode in WRITE_MODES:
+        return "write"
+    return None
+
 
 def load(path: str):
     data = json.loads(open(path, encoding="utf-8").read())
@@ -34,9 +53,17 @@ def evaluate(data) -> list[str]:
     if risk not in ALLOWED_RISK:
         errors.append(f"risk_level not acceptable: {risk} (allowed: LOW, MEDIUM)")
 
+    mode = task_mode(data)
+    readonly = mode == "readonly"
+    if mode is None:
+        errors.append(f"mode not acceptable: {data.get('mode')} (allowed: readonly, write)")
+
     files = data.get("expected_files")
-    if not isinstance(files, list) or not files:
-        errors.append("expected_files must be a non-empty list")
+    if not isinstance(files, list):
+        errors.append("expected_files must be a list")
+    elif not files:
+        if not readonly:
+            errors.append("expected_files must be a non-empty list for write mode")
     else:
         for path in files:
             low = str(path).lower()
