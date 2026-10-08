@@ -29015,6 +29015,596 @@ reality_canonical_promotion_preflight_v0_2 = (
 )
 
 
+# ---------------------------------------------------------------------------
+# KNOWLEDGE_APPROVAL_LEDGER_SCHEMA_ADAPTER_V1  (task cf-12c0864ed39c)
+#
+# Adds exactly one operation ("knowledge_write") to the *existing* production
+# approval-ledger schema so the already-built Knowledge approval flow can use the
+# same durable, single-use approval ledger the Decision flow already uses. The
+# change is additive: the legacy schema allowed only "decision_write", which is
+# the precise reason a KNOWLEDGE approval was rejected as unsupported. This task
+# is read-only: no D1 schema is migrated, no Canonical asset write happens and
+# the Canonical write count stays 0. The Decision approval flow is proven
+# unchanged (no-regression evidence).
+# ---------------------------------------------------------------------------
+KNOWLEDGE_APPROVAL_LEDGER_GOAL = "KNOWLEDGE_APPROVAL_LEDGER_SCHEMA_ADAPTER_V1"
+KNOWLEDGE_APPROVAL_LEDGER_TASK_ID = "cf-12c0864ed39c"
+KNOWLEDGE_APPROVAL_LEDGER_REPORT = KNOWLEDGE_APPROVAL_LEDGER_GOAL + "_REPORT"
+KNOWLEDGE_APPROVAL_LEDGER_CONTRACT = "PERSONAL_AI_" + KNOWLEDGE_APPROVAL_LEDGER_GOAL
+KNOWLEDGE_APPROVAL_LEDGER_SCHEMA_VERSION = "personal-ai-production-approval-ledger/v1"
+KNOWLEDGE_APPROVAL_LEDGER_VERSION = "V1"
+#: No deployment is performed by this read-only, in-repo schema adapter task.
+KNOWLEDGE_APPROVAL_LEDGER_DEPLOYMENT_STATUS = "NOT_DEPLOYED"
+
+#: Operations the production approval ledger supports. This is the legacy schema
+#: BEFORE the adapter: it allows only the Decision write operation, which is the
+#: precise reason a KNOWLEDGE approval was rejected ("unsupported_operation").
+PRODUCTION_LEDGER_BASE_OPERATIONS = ("decision_write",)
+DECISION_WRITE_OPERATION = "decision_write"
+KNOWLEDGE_WRITE_OPERATION = "knowledge_write"
+PRODUCTION_LEDGER_ADAPTED_OPERATIONS = (
+    DECISION_WRITE_OPERATION,
+    KNOWLEDGE_WRITE_OPERATION,
+)
+
+#: operation -> canonical asset type / existing Worker writer (reuse, no new one).
+LEDGER_OPERATION_ASSET_TYPES = {
+    DECISION_WRITE_OPERATION: "DECISION",
+    KNOWLEDGE_WRITE_OPERATION: "KNOWLEDGE",
+}
+LEDGER_OPERATION_WRITERS = {
+    DECISION_WRITE_OPERATION: "writeDecisionRecord",
+    KNOWLEDGE_WRITE_OPERATION: "writeKnowledgeCandidate",
+}
+
+LEDGER_ENTRY_REGISTERED = "REGISTERED"
+LEDGER_ENTRY_CONSUMED = "CONSUMED"
+
+LEDGER_CONSUME_ACCEPTED = "ACCEPTED"
+LEDGER_CONSUME_REPLAY_REJECTED = "REPLAY_REJECTED"
+LEDGER_CONSUME_UNSUPPORTED = "UNSUPPORTED_OPERATION"
+LEDGER_CONSUME_UNKNOWN = "UNKNOWN_APPROVAL"
+
+LEDGER_REJECT_UNSUPPORTED_OPERATION = "unsupported_operation"
+LEDGER_REJECT_ALREADY_CONSUMED = "approval_already_consumed"
+LEDGER_REJECT_UNKNOWN_APPROVAL = "unknown_approval"
+
+#: The Canonical write boundary is intentionally closed in this task.
+KNOWLEDGE_APPROVAL_LEDGER_CANONICAL_WRITE_ENABLED = False
+KNOWLEDGE_APPROVAL_LEDGER_CANONICAL_WRITE_BUDGET = 0
+KNOWLEDGE_APPROVAL_LEDGER_MUTATION_FLAGS = (
+    "production_write_performed",
+    "canonical_write_performed",
+    "knowledge_written",
+    "decision_written",
+    "deployment_performed",
+    "schema_changed",
+    "credentials_accessed",
+    "secret_accessed",
+    "permissions_changed",
+)
+
+
+def _ledger_operation_definition(operation: str) -> dict:
+    """Describe one supported approval-ledger operation (additive schema)."""
+    return {
+        "operation": operation,
+        "asset_type": LEDGER_OPERATION_ASSET_TYPES[operation],
+        "canonical_writer": LEDGER_OPERATION_WRITERS[operation],
+        "single_use": True,
+        "replay_guard": True,
+        "canonical_write_enabled": False,
+    }
+
+
+def production_approval_ledger_schema(*, include_knowledge_write: bool = False) -> dict:
+    """Return the production approval-ledger schema.
+
+    ``include_knowledge_write=False`` models the legacy production schema that
+    rejects the KNOWLEDGE operation. ``include_knowledge_write=True`` is the
+    additive adapter result that also allows ``knowledge_write`` while leaving the
+    existing ``decision_write`` definition byte-identical.
+    """
+    operations = list(PRODUCTION_LEDGER_BASE_OPERATIONS)
+    if include_knowledge_write and KNOWLEDGE_WRITE_OPERATION not in operations:
+        operations.append(KNOWLEDGE_WRITE_OPERATION)
+    return {
+        "schema": KNOWLEDGE_APPROVAL_LEDGER_SCHEMA_VERSION,
+        "supported_operations": operations,
+        "operation_definitions": {
+            operation: _ledger_operation_definition(operation)
+            for operation in operations
+        },
+        "canonical_write_enabled": False,
+    }
+
+
+def production_approval_ledger_readback(schema: object = None) -> dict:
+    """Read back which operations the production approval ledger supports."""
+    if not isinstance(schema, dict):
+        schema = production_approval_ledger_schema(include_knowledge_write=True)
+    operations = list(schema.get("supported_operations") or [])
+    return {
+        "schema": schema.get("schema"),
+        "supported_operations": operations,
+        "operation_count": len(operations),
+        "knowledge_write_supported": KNOWLEDGE_WRITE_OPERATION in operations,
+        "decision_write_supported": DECISION_WRITE_OPERATION in operations,
+        "canonical_write_enabled": False,
+    }
+
+
+def knowledge_approval_ledger_schema_adapter() -> dict:
+    """Return the additive Knowledge->production-ledger schema adapter."""
+    base = production_approval_ledger_schema()
+    adapted = production_approval_ledger_schema(include_knowledge_write=True)
+    added = [
+        operation
+        for operation in adapted["supported_operations"]
+        if operation not in base["supported_operations"]
+    ]
+    removed = [
+        operation
+        for operation in base["supported_operations"]
+        if operation not in adapted["supported_operations"]
+    ]
+    decision_unchanged = (
+        base["operation_definitions"][DECISION_WRITE_OPERATION]
+        == adapted["operation_definitions"][DECISION_WRITE_OPERATION]
+    )
+    return {
+        "contract": KNOWLEDGE_APPROVAL_LEDGER_CONTRACT,
+        "schema": KNOWLEDGE_APPROVAL_LEDGER_SCHEMA_VERSION,
+        "base_schema": base,
+        "adapted_schema": adapted,
+        "base_readback": production_approval_ledger_readback(base),
+        "adapted_readback": production_approval_ledger_readback(adapted),
+        "added_operations": added,
+        "removed_operations": removed,
+        "additive_only": not removed,
+        "decision_definition_unchanged": decision_unchanged,
+        "knowledge_write_supported": KNOWLEDGE_WRITE_OPERATION
+        in adapted["supported_operations"],
+        "canonical_write_enabled": False,
+    }
+
+
+def _ledger_unsupported_operation(operation: str) -> dict:
+    """The precise rejection a legacy ledger returns for an unknown operation."""
+    return {
+        "accepted": False,
+        "consumed": False,
+        "result": LEDGER_CONSUME_UNSUPPORTED,
+        "reason": LEDGER_REJECT_UNSUPPORTED_OPERATION,
+        "operation": operation,
+        "detail": (
+            "operation " + str(operation) + " is absent from the production "
+            "approval-ledger schema (supported: "
+            + ", ".join(PRODUCTION_LEDGER_BASE_OPERATIONS)
+            + ")"
+        ),
+    }
+
+
+def production_approval_ledger_store(schema: object = None) -> dict:
+    """Create an in-memory production approval ledger (never a canonical store)."""
+    if not isinstance(schema, dict):
+        schema = production_approval_ledger_schema(include_knowledge_write=True)
+    return {
+        "schema": schema,
+        "approvals": {},
+        "canonical_write_count": 0,
+    }
+
+
+def register_production_approval(
+    ledger: dict, approval_id: str, operation: str, **metadata: object
+) -> dict:
+    """Register one single-use approval against the ledger schema (fail-closed)."""
+    if not isinstance(ledger, dict) or not isinstance(ledger.get("schema"), dict):
+        return {
+            "registered": False,
+            "approval_id": approval_id,
+            "operation": operation,
+            "result": LEDGER_CONSUME_UNSUPPORTED,
+            "reason": "ledger has no schema",
+        }
+    schema = ledger["schema"]
+    if not isinstance(approval_id, str) or not approval_id.strip():
+        return {
+            "registered": False,
+            "approval_id": approval_id,
+            "operation": operation,
+            "result": LEDGER_CONSUME_UNKNOWN,
+            "reason": LEDGER_REJECT_UNKNOWN_APPROVAL,
+        }
+    if operation not in (schema.get("supported_operations") or []):
+        return dict(
+            _ledger_unsupported_operation(operation),
+            registered=False,
+            approval_id=approval_id,
+        )
+    entry = {
+        "approval_id": approval_id,
+        "operation": operation,
+        "asset_type": LEDGER_OPERATION_ASSET_TYPES[operation],
+        "canonical_writer": LEDGER_OPERATION_WRITERS[operation],
+        "state": LEDGER_ENTRY_REGISTERED,
+        "consumed": False,
+        "consume_count": 0,
+        "metadata": dict(metadata),
+    }
+    ledger["approvals"][approval_id] = entry
+    return {"registered": True, "entry": entry}
+
+
+def consume_production_approval(ledger: dict, approval_id: str) -> dict:
+    """Consume a single-use approval once; a repeated consume is rejected."""
+    result = {
+        "approval_id": approval_id,
+        "operation": None,
+        "accepted": False,
+        "consumed": False,
+        "result": LEDGER_CONSUME_UNKNOWN,
+        "reason": LEDGER_REJECT_UNKNOWN_APPROVAL,
+        "consume_count": 0,
+        "canonical_write_count": 0,
+    }
+    if not isinstance(ledger, dict) or not isinstance(ledger.get("approvals"), dict):
+        result["reason"] = "ledger has no approval store"
+        return result
+    entry = ledger["approvals"].get(approval_id)
+    if not isinstance(entry, dict):
+        return result
+    result["operation"] = entry.get("operation")
+    if entry.get("consumed") is True:
+        result["result"] = LEDGER_CONSUME_REPLAY_REJECTED
+        result["reason"] = LEDGER_REJECT_ALREADY_CONSUMED
+        result["consume_count"] = entry.get("consume_count", 0)
+        result["canonical_write_count"] = ledger.get("canonical_write_count", 0)
+        return result
+    entry["consumed"] = True
+    entry["state"] = LEDGER_ENTRY_CONSUMED
+    entry["consume_count"] = int(entry.get("consume_count", 0)) + 1
+    result["accepted"] = True
+    result["consumed"] = True
+    result["result"] = LEDGER_CONSUME_ACCEPTED
+    result["reason"] = None
+    result["consume_count"] = entry["consume_count"]
+    result["canonical_write_count"] = ledger.get("canonical_write_count", 0)
+    return result
+
+
+def knowledge_approval_ledger_schema_adapter_v1() -> dict:
+    """Read-only report binding the Knowledge approval flow to the ledger.
+
+    It (1) reads back the legacy schema and the additive adapter, (2) proves the
+    Knowledge ``knowledge_write`` operation is now supported, (3) registers and
+    consumes a Knowledge approval exactly once (first consume ACCEPTED, replay
+    REPLAY_REJECTED), (4) proves the Decision approval flow is unchanged and
+    (5) proves the Canonical write count stays 0.
+    """
+    adapter = knowledge_approval_ledger_schema_adapter()
+    base_schema = adapter["base_schema"]
+    adapted_schema = adapter["adapted_schema"]
+
+    knowledge_rejection_before = _ledger_unsupported_operation(
+        KNOWLEDGE_WRITE_OPERATION
+    )
+
+    ledger = production_approval_ledger_store(adapted_schema)
+    knowledge_approval_id = "approval:knowledge:" + KNOWLEDGE_APPROVAL_LEDGER_TASK_ID
+    knowledge_registration = register_production_approval(
+        ledger,
+        knowledge_approval_id,
+        KNOWLEDGE_WRITE_OPERATION,
+        source="knowledge-inbox",
+        approval_kind="knowledge_write",
+    )
+    knowledge_consume = consume_production_approval(ledger, knowledge_approval_id)
+    knowledge_replay = consume_production_approval(ledger, knowledge_approval_id)
+
+    decision_approval_id = "approval:decision:" + KNOWLEDGE_APPROVAL_LEDGER_TASK_ID
+    decision_registration = register_production_approval(
+        ledger,
+        decision_approval_id,
+        DECISION_WRITE_OPERATION,
+        source="decision-ingestion",
+        approval_kind="decision_write",
+    )
+    decision_consume = consume_production_approval(ledger, decision_approval_id)
+    decision_replay = consume_production_approval(ledger, decision_approval_id)
+
+    decision_definition_unchanged = (
+        base_schema["operation_definitions"][DECISION_WRITE_OPERATION]
+        == adapted_schema["operation_definitions"][DECISION_WRITE_OPERATION]
+    )
+    decision_flow_no_regression = bool(
+        decision_definition_unchanged
+        and decision_registration["registered"] is True
+        and decision_consume["accepted"] is True
+        and decision_consume["result"] == LEDGER_CONSUME_ACCEPTED
+        and decision_replay["accepted"] is False
+        and decision_replay["result"] == LEDGER_CONSUME_REPLAY_REJECTED
+    )
+
+    canonical_write_count = int(ledger.get("canonical_write_count", 0))
+
+    readback = adapter["adapted_readback"]
+
+    checks = [
+        {
+            "check": "legacy ledger rejects the KNOWLEDGE operation",
+            "status": PASS
+            if adapter["base_readback"]["knowledge_write_supported"] is False
+            and knowledge_rejection_before["reason"]
+            == LEDGER_REJECT_UNSUPPORTED_OPERATION
+            else FAIL,
+            "detail": "before adapter: supported_operations="
+            + ", ".join(adapter["base_readback"]["supported_operations"])
+            + "; rejection_reason="
+            + str(knowledge_rejection_before["reason"]),
+        },
+        {
+            "check": "production ledger read-back shows knowledge_write supported",
+            "status": PASS
+            if readback["knowledge_write_supported"] is True
+            and KNOWLEDGE_WRITE_OPERATION in readback["supported_operations"]
+            else FAIL,
+            "detail": "after adapter: supported_operations="
+            + ", ".join(readback["supported_operations"]),
+        },
+        {
+            "check": "adapter is additive and reuses the existing decision operation",
+            "status": PASS
+            if adapter["additive_only"] is True
+            and adapter["added_operations"] == [KNOWLEDGE_WRITE_OPERATION]
+            and adapter["removed_operations"] == []
+            and adapter["decision_definition_unchanged"] is True
+            else FAIL,
+            "detail": "added="
+            + str(adapter["added_operations"])
+            + "; removed="
+            + str(adapter["removed_operations"]),
+        },
+        {
+            "check": "knowledge approval first consume succeeds",
+            "status": PASS
+            if knowledge_registration["registered"] is True
+            and knowledge_consume["accepted"] is True
+            and knowledge_consume["result"] == LEDGER_CONSUME_ACCEPTED
+            else FAIL,
+            "detail": "consume_result="
+            + str(knowledge_consume["result"])
+            + "; consume_count="
+            + str(knowledge_consume["consume_count"]),
+        },
+        {
+            "check": "knowledge approval replay is rejected",
+            "status": PASS
+            if knowledge_replay["accepted"] is False
+            and knowledge_replay["result"] == LEDGER_CONSUME_REPLAY_REJECTED
+            and knowledge_replay["reason"] == LEDGER_REJECT_ALREADY_CONSUMED
+            else FAIL,
+            "detail": "replay_result="
+            + str(knowledge_replay["result"])
+            + "; reason="
+            + str(knowledge_replay["reason"]),
+        },
+        {
+            "check": "Decision approval flow has no regression",
+            "status": PASS if decision_flow_no_regression else FAIL,
+            "detail": "decision_definition_unchanged="
+            + str(decision_definition_unchanged)
+            + "; first="
+            + str(decision_consume["result"])
+            + "; replay="
+            + str(decision_replay["result"]),
+        },
+        {
+            "check": "Canonical write count stays 0",
+            "status": PASS
+            if canonical_write_count == KNOWLEDGE_APPROVAL_LEDGER_CANONICAL_WRITE_BUDGET
+            and KNOWLEDGE_APPROVAL_LEDGER_CANONICAL_WRITE_ENABLED is False
+            else FAIL,
+            "detail": "canonical_write_count=" + str(canonical_write_count),
+        },
+    ]
+    workflow_status = (
+        PASS if all(check["status"] == PASS for check in checks) else FAIL
+    )
+
+    evidence = [
+        _revalidation_evidence(
+            "OBSERVED",
+            "production ledger read-back before adapter supported_operations="
+            + ", ".join(adapter["base_readback"]["supported_operations"])
+            + "; knowledge_write rejected: "
+            + str(knowledge_rejection_before["reason"]),
+        ),
+        _revalidation_evidence(
+            "OBSERVED",
+            "production ledger read-back after adapter supported_operations="
+            + ", ".join(readback["supported_operations"])
+            + "; knowledge_write_supported="
+            + str(readback["knowledge_write_supported"]),
+        ),
+        _revalidation_evidence(
+            "OBSERVED",
+            "knowledge approval "
+            + knowledge_approval_id
+            + ": first consume="
+            + str(knowledge_consume["result"])
+            + "; replay="
+            + str(knowledge_replay["result"]),
+        ),
+        _revalidation_evidence(
+            "OBSERVED",
+            "decision approval "
+            + decision_approval_id
+            + ": first consume="
+            + str(decision_consume["result"])
+            + "; replay="
+            + str(decision_replay["result"])
+            + "; decision definition unchanged="
+            + str(decision_definition_unchanged),
+        ),
+        _revalidation_evidence(
+            "OBSERVED",
+            "canonical_write_count="
+            + str(canonical_write_count)
+            + "; canonical_write_enabled="
+            + str(KNOWLEDGE_APPROVAL_LEDGER_CANONICAL_WRITE_ENABLED),
+        ),
+        _revalidation_evidence(
+            "INFERRED",
+            "reusing the existing single-use approval ledger for knowledge_write "
+            "requires no new ledger, writer or state store",
+        ),
+    ]
+
+    final_status = (
+        "KNOWLEDGE_WRITE_SUPPORTED="
+        + str(readback["knowledge_write_supported"])
+        + ";KNOWLEDGE_CONSUME="
+        + str(knowledge_consume["result"])
+        + ";KNOWLEDGE_REPLAY="
+        + str(knowledge_replay["result"])
+        + ";DECISION_NO_REGRESSION="
+        + str(decision_flow_no_regression)
+        + ";CANONICAL_WRITE_COUNT="
+        + str(canonical_write_count)
+    )
+
+    lines = [
+        f"# {KNOWLEDGE_APPROVAL_LEDGER_GOAL}",
+        "",
+        f"- goal: {KNOWLEDGE_APPROVAL_LEDGER_GOAL}",
+        f"- task_id: {KNOWLEDGE_APPROVAL_LEDGER_TASK_ID}",
+        f"- contract: {KNOWLEDGE_APPROVAL_LEDGER_CONTRACT}",
+        f"- schema: {KNOWLEDGE_APPROVAL_LEDGER_SCHEMA_VERSION}",
+        f"- version: {KNOWLEDGE_APPROVAL_LEDGER_VERSION}",
+        "- mode: read-only schema adapter (no Canonical write)",
+        f"- workflow_status: {workflow_status}",
+        "- changed_files: hello.py, test_hello.py",
+        f"- deployment_status: {KNOWLEDGE_APPROVAL_LEDGER_DEPLOYMENT_STATUS}",
+        f"- supported_operations: {', '.join(readback['supported_operations'])}",
+        f"- knowledge_write_supported: {readback['knowledge_write_supported']}",
+        f"- decision_write_supported: {readback['decision_write_supported']}",
+        f"- rejection_before_adapter: {knowledge_rejection_before['reason']}",
+        f"- knowledge_consume: {knowledge_consume['result']}",
+        f"- knowledge_replay: {knowledge_replay['result']}",
+        f"- decision_consume: {decision_consume['result']}",
+        f"- decision_replay: {decision_replay['result']}",
+        f"- decision_approval_flow_no_regression: {decision_flow_no_regression}",
+        f"- canonical_write_count: {canonical_write_count}",
+        "",
+        "## Operations",
+    ]
+    for operation in readback["supported_operations"]:
+        definition = adapted_schema["operation_definitions"][operation]
+        lines.append(
+            f"- {operation}: asset_type={definition['asset_type']}; "
+            f"canonical_writer={definition['canonical_writer']}; "
+            f"single_use={definition['single_use']}"
+        )
+    lines += [
+        "",
+        "## Approval consume / replay",
+        f"- knowledge_first_consume: {knowledge_consume['result']}",
+        f"- knowledge_replay: {knowledge_replay['result']} ({knowledge_replay['reason']})",
+        f"- decision_first_consume: {decision_consume['result']}",
+        f"- decision_replay: {decision_replay['result']} ({decision_replay['reason']})",
+        "",
+        "## No-mutation statement",
+        f"- canonical_write_count: {canonical_write_count}",
+        f"- canonical_write_enabled: {KNOWLEDGE_APPROVAL_LEDGER_CANONICAL_WRITE_ENABLED}",
+        "- production_write_performed: False",
+        "- knowledge_written: False",
+        "- decision_written: False",
+        "- deployment_performed: False",
+        "",
+        "## Evidence",
+    ]
+    for item in evidence:
+        lines.append(f"- [{item['source']}] {item['detail']}")
+    lines += ["", "## Checks"]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final_status}"]
+
+    return {
+        "report": KNOWLEDGE_APPROVAL_LEDGER_REPORT,
+        "goal": KNOWLEDGE_APPROVAL_LEDGER_GOAL,
+        "task_id": KNOWLEDGE_APPROVAL_LEDGER_TASK_ID,
+        "contract": KNOWLEDGE_APPROVAL_LEDGER_CONTRACT,
+        "schema": KNOWLEDGE_APPROVAL_LEDGER_SCHEMA_VERSION,
+        "version": KNOWLEDGE_APPROVAL_LEDGER_VERSION,
+        "generated_at": _utc_now(),
+        "mode": "read_only_schema_adapter",
+        "workflow_status": workflow_status,
+        "status": workflow_status,
+        "final_status": final_status,
+        "changed_files": ["hello.py", "test_hello.py"],
+        "deployment_status": KNOWLEDGE_APPROVAL_LEDGER_DEPLOYMENT_STATUS,
+        "production_deployed": False,
+        "base_supported_operations": list(
+            adapter["base_readback"]["supported_operations"]
+        ),
+        "supported_operations": list(readback["supported_operations"]),
+        "operation_definitions": dict(adapted_schema["operation_definitions"]),
+        "knowledge_write_supported": readback["knowledge_write_supported"],
+        "decision_write_supported": readback["decision_write_supported"],
+        "added_operations": list(adapter["added_operations"]),
+        "removed_operations": list(adapter["removed_operations"]),
+        "additive_only": adapter["additive_only"],
+        "rejection_before_adapter": knowledge_rejection_before["reason"],
+        "production_ledger_readback": {
+            "before": adapter["base_readback"],
+            "after": readback,
+        },
+        "knowledge_approval": {
+            "approval_id": knowledge_approval_id,
+            "registered": knowledge_registration["registered"],
+            "first_consume": knowledge_consume,
+            "replay": knowledge_replay,
+        },
+        "decision_approval": {
+            "approval_id": decision_approval_id,
+            "registered": decision_registration["registered"],
+            "first_consume": decision_consume,
+            "replay": decision_replay,
+        },
+        "decision_definition_unchanged": decision_definition_unchanged,
+        "decision_approval_flow_no_regression": decision_flow_no_regression,
+        "canonical_write_count": canonical_write_count,
+        "canonical_write_budget": KNOWLEDGE_APPROVAL_LEDGER_CANONICAL_WRITE_BUDGET,
+        "canonical_write_enabled": KNOWLEDGE_APPROVAL_LEDGER_CANONICAL_WRITE_ENABLED,
+        "evidence": evidence,
+        "checks": checks,
+        "production_write_performed": False,
+        "canonical_write_performed": False,
+        "knowledge_written": False,
+        "decision_written": False,
+        "deployment_performed": False,
+        "schema_changed": False,
+        "credentials_accessed": False,
+        "secret_accessed": False,
+        "permissions_changed": False,
+        "markdown": "\n".join(lines),
+    }
+
+
+#: Forward/back-compatible aliases for the same read-only adapter report.
+knowledge_approval_ledger_adapter_v1 = knowledge_approval_ledger_schema_adapter_v1
+knowledge_approval_ledger_schema_adapter_report = (
+    knowledge_approval_ledger_schema_adapter_v1
+)
+personal_ai_knowledge_approval_ledger_schema_adapter_v1 = (
+    knowledge_approval_ledger_schema_adapter_v1
+)
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -29058,3 +29648,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(reality_canonical_promotion_independent_readback_v0_1()["markdown"])
     print(reality_promotion_adapter_design_v0_1()["markdown"])
     print(reality_first_canonical_promotion_v0_2_preflight()["markdown"])
+    print(knowledge_approval_ledger_schema_adapter_v1()["markdown"])

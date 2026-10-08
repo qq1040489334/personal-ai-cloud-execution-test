@@ -11058,3 +11058,115 @@ def test_v02_preflight_markdown_and_entrypoint() -> None:
         hello_module.reality_first_canonical_promotion_preflight_v0_2
         is hello_module.reality_first_canonical_promotion_v0_2_preflight
     )
+
+
+# --- KNOWLEDGE_APPROVAL_LEDGER_SCHEMA_ADAPTER_V1 ---------------------------
+
+
+def test_knowledge_approval_ledger_adapter_constants() -> None:
+    assert (
+        hello_module.KNOWLEDGE_APPROVAL_LEDGER_GOAL
+        == "KNOWLEDGE_APPROVAL_LEDGER_SCHEMA_ADAPTER_V1"
+    )
+    assert hello_module.KNOWLEDGE_APPROVAL_LEDGER_TASK_ID == "cf-12c0864ed39c"
+    assert hello_module.KNOWLEDGE_WRITE_OPERATION == "knowledge_write"
+    assert hello_module.DECISION_WRITE_OPERATION == "decision_write"
+    assert hello_module.PRODUCTION_LEDGER_BASE_OPERATIONS == ("decision_write",)
+    assert hello_module.KNOWLEDGE_APPROVAL_LEDGER_CANONICAL_WRITE_ENABLED is False
+    assert hello_module.KNOWLEDGE_APPROVAL_LEDGER_CANONICAL_WRITE_BUDGET == 0
+
+
+def test_knowledge_approval_ledger_legacy_rejects_knowledge_operation() -> None:
+    base = hello_module.production_approval_ledger_schema()
+    readback = hello_module.production_approval_ledger_readback(base)
+
+    assert readback["decision_write_supported"] is True
+    assert readback["knowledge_write_supported"] is False
+    rejected = hello_module._ledger_unsupported_operation(
+        hello_module.KNOWLEDGE_WRITE_OPERATION
+    )
+    assert rejected["accepted"] is False
+    assert rejected["reason"] == hello_module.LEDGER_REJECT_UNSUPPORTED_OPERATION
+
+
+def test_knowledge_approval_ledger_readback_supports_knowledge_write() -> None:
+    report = hello_module.knowledge_approval_ledger_schema_adapter_v1()
+
+    assert hello_module.KNOWLEDGE_WRITE_OPERATION in report["supported_operations"]
+    assert report["knowledge_write_supported"] is True
+    assert report["decision_write_supported"] is True
+    assert report["production_ledger_readback"]["after"][
+        "knowledge_write_supported"
+    ] is True
+    assert report["rejection_before_adapter"] == (
+        hello_module.LEDGER_REJECT_UNSUPPORTED_OPERATION
+    )
+
+
+def test_knowledge_approval_ledger_adapter_is_additive() -> None:
+    adapter = hello_module.knowledge_approval_ledger_schema_adapter()
+
+    assert adapter["additive_only"] is True
+    assert adapter["added_operations"] == [hello_module.KNOWLEDGE_WRITE_OPERATION]
+    assert adapter["removed_operations"] == []
+    assert adapter["decision_definition_unchanged"] is True
+
+
+def test_knowledge_approval_ledger_first_consume_succeeds() -> None:
+    report = hello_module.knowledge_approval_ledger_schema_adapter_v1()
+    knowledge = report["knowledge_approval"]
+
+    assert knowledge["registered"] is True
+    assert knowledge["first_consume"]["accepted"] is True
+    assert knowledge["first_consume"]["result"] == hello_module.LEDGER_CONSUME_ACCEPTED
+    assert knowledge["first_consume"]["consumed"] is True
+    assert knowledge["first_consume"]["consume_count"] == 1
+
+
+def test_knowledge_approval_ledger_replay_is_rejected() -> None:
+    report = hello_module.knowledge_approval_ledger_schema_adapter_v1()
+    replay = report["knowledge_approval"]["replay"]
+
+    assert replay["accepted"] is False
+    assert replay["result"] == hello_module.LEDGER_CONSUME_REPLAY_REJECTED
+    assert replay["reason"] == hello_module.LEDGER_REJECT_ALREADY_CONSUMED
+
+
+def test_knowledge_approval_ledger_decision_no_regression() -> None:
+    report = hello_module.knowledge_approval_ledger_schema_adapter_v1()
+    decision = report["decision_approval"]
+
+    assert report["decision_definition_unchanged"] is True
+    assert report["decision_approval_flow_no_regression"] is True
+    assert decision["registered"] is True
+    assert decision["first_consume"]["result"] == hello_module.LEDGER_CONSUME_ACCEPTED
+    assert decision["replay"]["result"] == hello_module.LEDGER_CONSUME_REPLAY_REJECTED
+
+
+def test_knowledge_approval_ledger_canonical_write_count_zero() -> None:
+    report = hello_module.knowledge_approval_ledger_schema_adapter_v1()
+
+    assert report["canonical_write_count"] == 0
+    assert report["canonical_write_enabled"] is False
+    for flag in hello_module.KNOWLEDGE_APPROVAL_LEDGER_MUTATION_FLAGS:
+        assert report[flag] is False, flag
+
+
+def test_knowledge_approval_ledger_checks_markdown_and_entrypoint() -> None:
+    report = hello_module.knowledge_approval_ledger_schema_adapter_v1()
+
+    assert report["workflow_status"] == "PASS"
+    assert report["checks"]
+    for check in report["checks"]:
+        assert check["status"] == "PASS"
+    assert "hello.py, test_hello.py" in report["markdown"]
+    assert f"- canonical_write_count: {report['canonical_write_count']}" in report["markdown"]
+    assert f"FINAL_STATUS={report['final_status']}" in report["markdown"]
+
+    source = inspect.getsource(hello_module)
+    assert "def knowledge_approval_ledger_schema_adapter_v1(" in source
+    assert callable(hello_module.knowledge_approval_ledger_schema_adapter_v1)
+    assert (
+        hello_module.knowledge_approval_ledger_adapter_v1
+        is hello_module.knowledge_approval_ledger_schema_adapter_v1
+    )
