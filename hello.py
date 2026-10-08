@@ -30412,6 +30412,823 @@ personal_ai_knowledge_golden_write_execution_01 = (
 )
 
 
+# ---------------------------------------------------------------------------
+# REALITY_ASSET_RECOVERY_BATCH_01  (task cf-5bb7b3b0c06a)
+#
+# Read-only triage of the recently backlogged Reality inputs (AI video
+# breakdown, AI Radar, book distillation) into an asset-candidate list for a
+# later KNOWLEDGE / SKILL / DECISION ingestion. It distils, de-duplicates and
+# value-judges each candidate. It performs NO Canonical write and creates NO
+# second state store; the backlog itself is treated as immutable evidence.
+# ---------------------------------------------------------------------------
+REALITY_ASSET_RECOVERY_BATCH_GOAL = "REALITY_ASSET_RECOVERY_BATCH_01"
+REALITY_ASSET_RECOVERY_BATCH_TASK_ID = "cf-5bb7b3b0c06a"
+REALITY_ASSET_RECOVERY_BATCH_PROJECT_ID = "cloud-assets-activation"
+REALITY_ASSET_RECOVERY_BATCH_REPORT = (
+    REALITY_ASSET_RECOVERY_BATCH_GOAL + "_REPORT"
+)
+REALITY_ASSET_RECOVERY_BATCH_CONTRACT = (
+    "PERSONAL_AI_" + REALITY_ASSET_RECOVERY_BATCH_GOAL
+)
+REALITY_ASSET_RECOVERY_BATCH_VERSION = "V0.1"
+REALITY_ASSET_RECOVERY_BATCH_MODE = "READONLY_ASSET_TRIAGE"
+
+#: Input classes explicitly named in the task contract.
+REALITY_INPUT_AI_VIDEO_BREAKDOWN = "AI_VIDEO_BREAKDOWN"
+REALITY_INPUT_AI_RADAR = "AI_RADAR"
+REALITY_INPUT_BOOK_DISTILLATION = "BOOK_DISTILLATION"
+REALITY_ASSET_INPUT_SOURCES = (
+    REALITY_INPUT_AI_VIDEO_BREAKDOWN,
+    REALITY_INPUT_AI_RADAR,
+    REALITY_INPUT_BOOK_DISTILLATION,
+)
+
+#: Recommended long-term asset types (the task's classification vocabulary).
+REALITY_ASSET_TYPE_KNOWLEDGE = "KNOWLEDGE"
+REALITY_ASSET_TYPE_SKILL = "SKILL"
+REALITY_ASSET_TYPE_DECISION = "DECISION"
+REALITY_ASSET_TYPE_WATCH = "WATCH"
+REALITY_ASSET_TYPE_DISCARD = "DISCARD"
+REALITY_ASSET_TYPES = (
+    REALITY_ASSET_TYPE_KNOWLEDGE,
+    REALITY_ASSET_TYPE_SKILL,
+    REALITY_ASSET_TYPE_DECISION,
+    REALITY_ASSET_TYPE_WATCH,
+    REALITY_ASSET_TYPE_DISCARD,
+)
+
+#: Disposition of an asset candidate.
+DISPOSITION_PROMOTION_CANDIDATE = "PROMOTION_CANDIDATE"
+DISPOSITION_WATCH = "WATCH"
+DISPOSITION_DISCARD = "DISCARD"
+REALITY_ASSET_DISPOSITIONS = (
+    DISPOSITION_PROMOTION_CANDIDATE,
+    DISPOSITION_WATCH,
+    DISPOSITION_DISCARD,
+)
+
+#: Asset types worth a future KNOWLEDGE/SKILL/DECISION ingestion.
+REALITY_ASSET_PROMOTABLE_TYPES = (
+    REALITY_ASSET_TYPE_KNOWLEDGE,
+    REALITY_ASSET_TYPE_SKILL,
+    REALITY_ASSET_TYPE_DECISION,
+)
+
+#: Open evidence gates. They keep the batch at PARTIAL and block promotion.
+REALITY_ASSET_RECOVERY_SOURCE_GAPS = (
+    "SOURCE_BREAKDOWN_PARTIAL: 0/12 original breakdown texts available; only "
+    "candidate topics/talking points, never reconstructed as transcripts",
+    "FULL_CANONICAL_DEDUP_BLOCKED: 17/20 canonical bodies unread; mechanism-"
+    "level overlap only, no full-text (L2) comparison",
+)
+
+#: Every forbidden side effect the triage must never perform.
+REALITY_ASSET_RECOVERY_MUTATION_FLAGS = (
+    "canonical_write_performed",
+    "knowledge_written",
+    "skill_written",
+    "decision_written",
+    "second_state_store_created",
+    "production_write_performed",
+    "deployment_performed",
+    "credentials_accessed",
+    "secret_accessed",
+    "file_deleted",
+    "github_workflow_modified",
+)
+
+#: Required per-candidate fields (task acceptance: source + distilled content +
+#: classification suggestion + reason).
+REALITY_ASSET_CANDIDATE_FIELDS = (
+    "candidate_id",
+    "title",
+    "input_source",
+    "source",
+    "source_refs",
+    "core_insight",
+    "long_term_value",
+    "asset_type",
+    "disposition",
+    "reason",
+    "dedup_key",
+)
+
+#: The recovered backlog, distilled and de-duplicated. Frozen, deterministic
+#: data: it is the triage output of the batch, not a new source of truth.
+REALITY_ASSET_RECOVERY_CANDIDATES = (
+    {
+        "candidate_id": "RAR-01",
+        "title": "Behavior-change design: identity + habit loop + environment",
+        "input_source": REALITY_INPUT_BOOK_DISTILLATION,
+        "source": "《原子习惯》 book distillation (KP-05) via Batch-12 N1",
+        "source_refs": (
+            "outputs/distilled-knowledge.md#KP-05",
+            "outputs/batch12-v3-candidate-verdict.md#N1",
+        ),
+        "core_insight": (
+            "Design behavior change at three layers: identity ('who am I'), the "
+            "habit loop (cue/craving/response/reward) and environment/friction; "
+            "the identity layer is the increment over the existing "
+            "system-over-willpower principle."
+        ),
+        "long_term_value": (
+            "Reusable personal-agent coaching principle for habit and goal "
+            "workflows; survives source retirement because it is an operational "
+            "design, not a news item."
+        ),
+        "asset_type": REALITY_ASSET_TYPE_KNOWLEDGE,
+        "disposition": DISPOSITION_PROMOTION_CANDIDATE,
+        "reason": (
+            "Novel candidate (N1) with grade-A primary-author support; no "
+            "confirmed canonical overlap. Worth long-term Personal AI assets, "
+            "but promotion waits on the open gates."
+        ),
+        "dedup_key": "behavior-change-design",
+    },
+    {
+        "candidate_id": "RAR-02",
+        "title": "Structured learning & transfer loop (human-in-the-loop)",
+        "input_source": REALITY_INPUT_BOOK_DISTILLATION,
+        "source": (
+            "十步速学 book distillation (KP-08) + transfer literature (KP-11) "
+            "via Batch-12 N2"
+        ),
+        "source_refs": (
+            "outputs/distilled-knowledge.md#KP-08",
+            "outputs/distilled-knowledge.md#KP-11",
+            "outputs/batch12-v3-candidate-verdict.md#N2",
+        ),
+        "core_insight": (
+            "A structured learning loop: multi-perspective -> contradiction map "
+            "-> compress to a brief -> <=5 curated resources -> difficulty "
+            "ladder -> active recall -> Feynman/one-pager, with an explicit "
+            "far-transfer boundary and mandatory real human answers."
+        ),
+        "long_term_value": (
+            "Operational procedure (SKILL) that the personal agent can offer "
+            "repeatedly; the far-transfer boundary prevents over-claiming."
+        ),
+        "asset_type": REALITY_ASSET_TYPE_SKILL,
+        "disposition": DISPOSITION_PROMOTION_CANDIDATE,
+        "reason": (
+            "Novel candidate (N2); the loop is an executable procedure and the "
+            "transfer boundary is evidence-backed. Promotion waits on the open "
+            "gates and on measured outcomes."
+        ),
+        "dedup_key": "structured-learning-transfer",
+    },
+    {
+        "candidate_id": "RAR-03",
+        "title": "Promotion evidence gate: independent evidence + full-text dedup",
+        "input_source": REALITY_INPUT_AI_VIDEO_BREAKDOWN,
+        "source": "Recurring Batch-12 blocker pattern (V4 promotion gates)",
+        "source_refs": (
+            "outputs/batch12-v4-promotion-gates.md#2",
+            "outputs/batch12-v4-canonical-body-delta.md#4",
+        ),
+        "core_insight": (
+            "No Reality item may be promoted to Canonical on self-reported or "
+            "vendor metrics: promotion requires independent (non-vendor) "
+            "evidence AND a full-text canonical dedup, otherwise the item stays "
+            "WATCH."
+        ),
+        "long_term_value": (
+            "A durable governance decision for the asset pipeline; it prevents "
+            "future batches from promoting noise and is reusable across domains."
+        ),
+        "asset_type": REALITY_ASSET_TYPE_DECISION,
+        "disposition": DISPOSITION_PROMOTION_CANDIDATE,
+        "reason": (
+            "A policy decision (not a knowledge claim) distilled from the same "
+            "blocker repeating across candidates; distinct from K10 evidence-vs-"
+            "value. Worth a DECISION asset after human review."
+        ),
+        "dedup_key": "promotion-evidence-gate",
+    },
+    {
+        "candidate_id": "RAR-04",
+        "title": "Verification-before-trust / evidence-gate principle",
+        "input_source": REALITY_INPUT_AI_VIDEO_BREAKDOWN,
+        "source": "Batch-12 M4 cluster (T03/T04/T06/T12)",
+        "source_refs": (
+            "outputs/dedup-canonical-review.md#A.1",
+            "outputs/batch12-canonical-inventory-v2.md#K10",
+        ),
+        "core_insight": (
+            "Trust an output only after independent verification; keep one "
+            "cross-cutting 'verify provenance and output' mechanism instead of "
+            "one asset per example."
+        ),
+        "long_term_value": (
+            "High, but it is already the governing mechanism of existing "
+            "canonical assets (K13/K10); a second copy would fragment the rule."
+        ),
+        "asset_type": REALITY_ASSET_TYPE_WATCH,
+        "disposition": DISPOSITION_WATCH,
+        "reason": (
+            "Mechanism-level duplicate of an existing canonical principle; "
+            "monitor for refinements rather than create a new asset."
+        ),
+        "dedup_key": "verify-provenance-and-output",
+    },
+    {
+        "candidate_id": "RAR-05",
+        "title": "Compiled knowledge-wiki loop (ingest->query->lint->promote)",
+        "input_source": REALITY_INPUT_AI_VIDEO_BREAKDOWN,
+        "source": "Batch-12 T06/T07 (GBrain / LLM Wiki pattern)",
+        "source_refs": (
+            "outputs/distilled-knowledge.md#KP-06",
+            "outputs/batch12-canonical-inventory-v2.md#K16",
+        ),
+        "core_insight": (
+            "Keep immutable raw sources, an LLM-maintained markdown wiki and a "
+            "schema layer; file good query outputs back so knowledge compounds "
+            "instead of being re-derived per query."
+        ),
+        "long_term_value": (
+            "Useful operational loop, but it operationalises the existing "
+            "scoped-knowledge/index-as-access-mechanism principle."
+        ),
+        "asset_type": REALITY_ASSET_TYPE_WATCH,
+        "disposition": DISPOSITION_WATCH,
+        "reason": (
+            "High overlap with scoped-knowledge layering (K16/K08); retain as a "
+            "WATCH reference loop, not a separate principle."
+        ),
+        "dedup_key": "compiled-knowledge-loop",
+    },
+    {
+        "candidate_id": "RAR-06",
+        "title": "Official-statistic vs speculation data hygiene",
+        "input_source": REALITY_INPUT_AI_RADAR,
+        "source": "AI Radar macro/industry input (T09 NBS statistics)",
+        "source_refs": (
+            "outputs/distilled-knowledge.md#KP-09",
+            "outputs/batch12-v3-candidate-verdict.md#N3",
+        ),
+        "core_insight": (
+            "Classify every quantitative statement as OFFICIAL_STATISTIC / "
+            "INDEPENDENT_RESEARCH / SELF_REPORTED / SPECULATION and never "
+            "promote the last two as facts."
+        ),
+        "long_term_value": (
+            "Useful reference checklist, but the canonical duplicity is "
+            "unresolved because most canonical bodies are unread."
+        ),
+        "asset_type": REALITY_ASSET_TYPE_WATCH,
+        "disposition": DISPOSITION_WATCH,
+        "reason": (
+            "Reference checklist (N3), not a new principle; keep on WATCH until "
+            "the corpus can be read full-text."
+        ),
+        "dedup_key": "data-hygiene-reference",
+    },
+    {
+        "candidate_id": "RAR-07",
+        "title": "AI adoption-vs-liability checklist",
+        "input_source": REALITY_INPUT_AI_RADAR,
+        "source": "AI Radar industry input (Instinct T10)",
+        "source_refs": (
+            "outputs/distilled-knowledge.md#KP-10",
+            "outputs/batch12-v3-candidate-verdict.md#T10",
+        ),
+        "core_insight": (
+            "Meeting users inside existing chat apps plus a cloud computer "
+            "drives adoption, but the same breadth creates retention, training-"
+            "ToS, liability-cap and privacy exposure."
+        ),
+        "long_term_value": (
+            "Reference example feeding the governance/authorization mechanism; "
+            "the concrete figures are not promotion-grade."
+        ),
+        "asset_type": REALITY_ASSET_TYPE_WATCH,
+        "disposition": DISPOSITION_WATCH,
+        "reason": (
+            "Grade-B reference (metrics self-reported); keep for later "
+            "enrichment, do not promote now."
+        ),
+        "dedup_key": "adoption-liability-reference",
+    },
+    {
+        "candidate_id": "RAR-08",
+        "title": "External-execution authorization & confirmation boundary",
+        "input_source": REALITY_INPUT_AI_VIDEO_BREAKDOWN,
+        "source": "Batch-12 M1 cluster (T01/T07/T10/T12)",
+        "source_refs": (
+            "outputs/dedup-canonical-review.md#A.1",
+            "outputs/batch12-v4-canonical-body-delta.md#1",
+        ),
+        "core_insight": (
+            "An agent acts on an external surface only within an explicit "
+            "authorization/scope and with confirmation before irreversible "
+            "actions."
+        ),
+        "long_term_value": (
+            "Important boundary, already carried by canonical governance K13; a "
+            "new DECISION would duplicate it."
+        ),
+        "asset_type": REALITY_ASSET_TYPE_WATCH,
+        "disposition": DISPOSITION_WATCH,
+        "reason": (
+            "Merge target K13 already covers this; monitor the external-surface "
+            "examples rather than split them into assets."
+        ),
+        "dedup_key": "gated-external-execution",
+    },
+    {
+        "candidate_id": "RAR-09",
+        "title": "Personal-agent memory -> brief -> confirmed-execution loop",
+        "input_source": REALITY_INPUT_AI_VIDEO_BREAKDOWN,
+        "source": "Batch-12 T07 (Today AI) personal-agent shape",
+        "source_refs": (
+            "outputs/distilled-knowledge.md#KP-07",
+            "outputs/batch12-v3-candidate-verdict.md#T07",
+        ),
+        "core_insight": (
+            "Long-term user-visible memory + proactive briefs + confirmed "
+            "multi-step execution is the useful personal-agent loop; the cost "
+            "of a wrong memory scales with proactivity."
+        ),
+        "long_term_value": (
+            "Good design reference, closely tied to existing personal-agent "
+            "memory/governance assets."
+        ),
+        "asset_type": REALITY_ASSET_TYPE_WATCH,
+        "disposition": DISPOSITION_WATCH,
+        "reason": (
+            "Reference loop with self-reported supporting evidence; watch until "
+            "an independent benchmark exists."
+        ),
+        "dedup_key": "personal-agent-memory-loop",
+    },
+    {
+        "candidate_id": "RAR-10",
+        "title": "Vendor self-reported novelty metrics",
+        "input_source": REALITY_INPUT_AI_VIDEO_BREAKDOWN,
+        "source": (
+            "Batch-12 T06 GBrain metrics, T08 10x/25% learning multipliers"
+        ),
+        "source_refs": (
+            "outputs/batch12-v3-candidate-verdict.md#3.4",
+            "outputs/distilled-knowledge.md#KP-08",
+        ),
+        "core_insight": (
+            "Claims such as GBrain page counts / P@5 gains and '10x speed' / "
+            "'25% memory' are vendor- or author-self-reported and cannot be "
+            "treated as facts."
+        ),
+        "long_term_value": "None as an asset; harmful if promoted as fact.",
+        "asset_type": REALITY_ASSET_TYPE_DISCARD,
+        "disposition": DISPOSITION_DISCARD,
+        "reason": (
+            "Self-reported/unverifiable metrics; explicit REJECT list in the "
+            "batch verdict."
+        ),
+        "dedup_key": "self-reported-vendor-metrics",
+    },
+    {
+        "candidate_id": "RAR-11",
+        "title": "Self-reported commercial figures (Instinct GMV / card ratio)",
+        "input_source": REALITY_INPUT_AI_RADAR,
+        "source": "AI Radar industry input (Instinct T10)",
+        "source_refs": (
+            "outputs/batch12-v3-candidate-verdict.md#3.4",
+            "outputs/distilled-knowledge.md#KP-10",
+        ),
+        "core_insight": (
+            "$1B GMV / $2.5B valuation / '40% of users hand over a card' are "
+            "founder or press figures without an independent audit."
+        ),
+        "long_term_value": (
+            "None as an asset; the adoption-vs-liability mechanism is kept "
+            "separately under RAR-07."
+        ),
+        "asset_type": REALITY_ASSET_TYPE_DISCARD,
+        "disposition": DISPOSITION_DISCARD,
+        "reason": (
+            "Unaudited self-reported figures; folding the usable mechanism into "
+            "RAR-07 instead of creating a second asset."
+        ),
+        "dedup_key": "self-reported-commercial-figures",
+    },
+    {
+        "candidate_id": "RAR-12",
+        "title": "Non-existent named skill repo + unverified tooling claim",
+        "input_source": REALITY_INPUT_AI_VIDEO_BREAKDOWN,
+        "source": "Batch-12 T04 (MATLAB skills)",
+        "source_refs": (
+            "outputs/source-manifest.md#SRC-GH-API-MATLAB",
+            "outputs/batch12-v3-candidate-verdict.md#T04",
+        ),
+        "core_insight": (
+            "The named repo 'SamuelQQ/matlab-skills' returns 404 and the claim "
+            "that MATLAB beats Python/Excel for sales data has no head-to-head "
+            "evidence."
+        ),
+        "long_term_value": "None; retained only as a negative provenance case.",
+        "asset_type": REALITY_ASSET_TYPE_DISCARD,
+        "disposition": DISPOSITION_DISCARD,
+        "reason": "Named source does not exist and the comparative claim is "
+        "unevidenced.",
+        "dedup_key": "nonexistent-named-source",
+    },
+    {
+        "candidate_id": "RAR-13",
+        "title": "Unverified compatibility / version framing",
+        "input_source": REALITY_INPUT_AI_VIDEO_BREAKDOWN,
+        "source": "Batch-12 T01 (小艺帮帮忙 A2A/Hermes, HarmonyOS 7)",
+        "source_refs": (
+            "outputs/distilled-knowledge.md#KP-01",
+            "outputs/batch12-v4-canonical-body-delta.md#5",
+        ),
+        "core_insight": (
+            "The A2A/Hermes direct-compatibility claim is JS-gated and "
+            "unverified, and the vendor contradicts the 'HarmonyOS 7 feature' "
+            "framing (6.0 agent not offered on new 7.0 models)."
+        ),
+        "long_term_value": "None as stated; the bounded vendor facts stay as a "
+        "reference only.",
+        "asset_type": REALITY_ASSET_TYPE_DISCARD,
+        "disposition": DISPOSITION_DISCARD,
+        "reason": "Contradicted by the vendor page and blocked by JS-gated "
+        "specs.",
+        "dedup_key": "unverified-compatibility-claim",
+    },
+    {
+        "candidate_id": "RAR-14",
+        "title": "Unevidenced macro narratives",
+        "input_source": REALITY_INPUT_AI_RADAR,
+        "source": "AI Radar macro input (T09)",
+        "source_refs": (
+            "outputs/distilled-knowledge.md#KP-09",
+            "outputs/batch12-v3-candidate-verdict.md#3.4",
+        ),
+        "core_insight": (
+            "'Irreversible cognitive decline', 'celebrity-children device "
+            "limits' and causal 'AI dividend' claims are not found in any read "
+            "source; only the official statistics survive."
+        ),
+        "long_term_value": "None; official statistics are kept under RAR-06.",
+        "asset_type": REALITY_ASSET_TYPE_DISCARD,
+        "disposition": DISPOSITION_DISCARD,
+        "reason": "No source supports the strong claims; promoting them would "
+        "be fabrication.",
+        "dedup_key": "unevidenced-macro-narrative",
+    },
+)
+
+#: Explicit de-duplication map: fold the duplicate into the canonical item so a
+#: single idea is never split into several assets.
+REALITY_ASSET_RECOVERY_DUPLICATE_MAP = (
+    {
+        "duplicate_candidate": "RAR-11",
+        "canonical_candidate": "RAR-07",
+        "shared_mechanism": "adoption-vs-liability",
+        "action": "fold the usable liability mechanism into RAR-07; discard the "
+        "self-reported figures",
+    },
+    {
+        "duplicate_candidate": "RAR-04",
+        "canonical_candidate": "RAR-03",
+        "shared_mechanism": "verification-before-trust / evidence gates",
+        "action": "keep one governance decision (RAR-03) and one WATCH "
+        "principle (RAR-04); do not open a third verification asset",
+    },
+    {
+        "duplicate_candidate": "RAR-14",
+        "canonical_candidate": "RAR-06",
+        "shared_mechanism": "data hygiene",
+        "action": "retain only the official-statistics checklist (RAR-06); "
+        "discard the unevidenced macro claims",
+    },
+)
+
+
+def _reality_asset_recovery_candidate_view(candidate: dict) -> dict:
+    """Return a normalised, JSON-safe view of one asset candidate."""
+    return {
+        "candidate_id": candidate["candidate_id"],
+        "title": candidate["title"],
+        "input_source": candidate["input_source"],
+        "source": candidate["source"],
+        "source_refs": list(candidate["source_refs"]),
+        "core_insight": candidate["core_insight"],
+        "long_term_value": candidate["long_term_value"],
+        "asset_type": candidate["asset_type"],
+        "disposition": candidate["disposition"],
+        "reason": candidate["reason"],
+        "dedup_key": candidate["dedup_key"],
+    }
+
+
+def _reality_asset_recovery_expected_disposition(asset_type: str) -> str:
+    """Map an asset type to its disposition (single source of truth)."""
+    if asset_type in REALITY_ASSET_PROMOTABLE_TYPES:
+        return DISPOSITION_PROMOTION_CANDIDATE
+    if asset_type == REALITY_ASSET_TYPE_WATCH:
+        return DISPOSITION_WATCH
+    if asset_type == REALITY_ASSET_TYPE_DISCARD:
+        return DISPOSITION_DISCARD
+    raise ValueError("unknown asset type: " + str(asset_type))
+
+
+def reality_asset_recovery_batch_01() -> dict:
+    """Build the REALITY_ASSET_RECOVERY_BATCH_01 triage report.
+
+    Read-only. Distils the backlogged Reality inputs (AI video breakdown, AI
+    Radar, book distillation) into asset candidates, each with its source,
+    distilled content, long-term value, recommended asset type and reason;
+    de-duplicates shared mechanisms; and separates ``PROMOTION_CANDIDATE`` from
+    ``DISCARD``. It performs **no** Canonical write and creates **no** second
+    state store, and it never fabricates evidence for the still-open gaps.
+    """
+    now_iso = _utc_now()
+    candidates = [
+        _reality_asset_recovery_candidate_view(dict(candidate))
+        for candidate in REALITY_ASSET_RECOVERY_CANDIDATES
+    ]
+    by_id = {candidate["candidate_id"]: candidate for candidate in candidates}
+
+    promotion_candidates = [
+        candidate["candidate_id"]
+        for candidate in candidates
+        if candidate["disposition"] == DISPOSITION_PROMOTION_CANDIDATE
+    ]
+    watch_items = [
+        candidate["candidate_id"]
+        for candidate in candidates
+        if candidate["disposition"] == DISPOSITION_WATCH
+    ]
+    discard_items = [
+        candidate["candidate_id"]
+        for candidate in candidates
+        if candidate["disposition"] == DISPOSITION_DISCARD
+    ]
+
+    duplicate_findings = []
+    for entry in REALITY_ASSET_RECOVERY_DUPLICATE_MAP:
+        canonical = by_id.get(entry["canonical_candidate"])
+        duplicate = by_id.get(entry["duplicate_candidate"])
+        duplicate_findings.append(
+            {
+                "duplicate_candidate": entry["duplicate_candidate"],
+                "canonical_candidate": entry["canonical_candidate"],
+                "shared_mechanism": entry["shared_mechanism"],
+                "action": entry["action"],
+                "resolved": bool(
+                    canonical is not None and duplicate is not None
+                ),
+                "duplicate_is_promoted": bool(
+                    duplicate is not None
+                    and duplicate["disposition"]
+                    == DISPOSITION_PROMOTION_CANDIDATE
+                ),
+            }
+        )
+
+    input_sources_present = sorted(
+        {candidate["input_source"] for candidate in candidates}
+    )
+
+    fields_ok = all(
+        all(
+            field in candidate and candidate[field] not in (None, "", [], ())
+            for field in REALITY_ASSET_CANDIDATE_FIELDS
+        )
+        for candidate in candidates
+    )
+    types_ok = all(
+        candidate["asset_type"] in REALITY_ASSET_TYPES for candidate in candidates
+    )
+    dispositions_ok = all(
+        candidate["disposition"]
+        == _reality_asset_recovery_expected_disposition(candidate["asset_type"])
+        for candidate in candidates
+    )
+    ids_unique = len(by_id) == len(candidates)
+    disjoint = not (
+        set(promotion_candidates) & set(discard_items)
+        or set(promotion_candidates) & set(watch_items)
+        or set(watch_items) & set(discard_items)
+    )
+    dedup_ok = all(
+        finding["resolved"] and not finding["duplicate_is_promoted"]
+        for finding in duplicate_findings
+    )
+
+    checks = [
+        {
+            "check": "all backlogged input classes are covered",
+            "status": PASS
+            if set(input_sources_present) == set(REALITY_ASSET_INPUT_SOURCES)
+            else FAIL,
+            "detail": "input sources: " + ", ".join(input_sources_present),
+        },
+        {
+            "check": "every candidate has source/core_insight/value/type/reason",
+            "status": PASS if fields_ok else FAIL,
+            "detail": "required fields: "
+            + ", ".join(REALITY_ASSET_CANDIDATE_FIELDS),
+        },
+        {
+            "check": "candidate ids are unique",
+            "status": PASS if ids_unique else FAIL,
+            "detail": "candidates="
+            + str(len(candidates))
+            + "; unique="
+            + str(len(by_id)),
+        },
+        {
+            "check": "asset types come from the allowed vocabulary",
+            "status": PASS if types_ok else FAIL,
+            "detail": "allowed types: " + ", ".join(REALITY_ASSET_TYPES),
+        },
+        {
+            "check": "disposition agrees with the recommended asset type",
+            "status": PASS if dispositions_ok else FAIL,
+            "detail": "promotable=" + ", ".join(REALITY_ASSET_PROMOTABLE_TYPES),
+        },
+        {
+            "check": "promotion candidates identified",
+            "status": PASS if promotion_candidates else FAIL,
+            "detail": "promotion candidates: "
+            + (", ".join(promotion_candidates) or "(none)"),
+        },
+        {
+            "check": "discard items identified",
+            "status": PASS if discard_items else FAIL,
+            "detail": "discard items: " + (", ".join(discard_items) or "(none)"),
+        },
+        {
+            "check": "promotion / watch / discard are disjoint",
+            "status": PASS if disjoint else FAIL,
+            "detail": "promotion="
+            + str(len(promotion_candidates))
+            + "; watch="
+            + str(len(watch_items))
+            + "; discard="
+            + str(len(discard_items)),
+        },
+        {
+            "check": "duplicate content is folded, not split into new assets",
+            "status": PASS if dedup_ok else FAIL,
+            "detail": "duplicate findings: " + str(len(duplicate_findings)),
+        },
+        {
+            "check": "no Canonical write performed",
+            "status": PASS,
+            "detail": "canonical_write_performed=False; knowledge/skill/"
+            "decision_written=False",
+        },
+        {
+            "check": "no second state store created",
+            "status": PASS,
+            "detail": "second_state_store_created=False",
+        },
+    ]
+    report_status = (
+        PASS if all(check["status"] == PASS for check in checks) else FAIL
+    )
+    final_status = (
+        "PARTIAL_SOURCE_GAP"
+        if report_status == PASS and REALITY_ASSET_RECOVERY_SOURCE_GAPS
+        else report_status
+    )
+
+    source_coverage = {
+        source: [
+            candidate["candidate_id"]
+            for candidate in candidates
+            if candidate["input_source"] == source
+        ]
+        for source in REALITY_ASSET_INPUT_SOURCES
+    }
+
+    lines = [
+        f"# {REALITY_ASSET_RECOVERY_BATCH_GOAL}",
+        "",
+        f"- goal: {REALITY_ASSET_RECOVERY_BATCH_GOAL}",
+        f"- task_id: {REALITY_ASSET_RECOVERY_BATCH_TASK_ID}",
+        f"- project_id: {REALITY_ASSET_RECOVERY_BATCH_PROJECT_ID}",
+        f"- contract: {REALITY_ASSET_RECOVERY_BATCH_CONTRACT}",
+        f"- version: {REALITY_ASSET_RECOVERY_BATCH_VERSION}",
+        f"- mode: {REALITY_ASSET_RECOVERY_BATCH_MODE} (no Canonical write)",
+        f"- report_status: {report_status}",
+        f"- final_status: {final_status}",
+        f"- candidates: {len(candidates)}",
+        f"- promotion_candidates: {', '.join(promotion_candidates) or '(none)'}",
+        f"- watch_items: {', '.join(watch_items) or '(none)'}",
+        f"- discard_items: {', '.join(discard_items) or '(none)'}",
+        "",
+        "## Input coverage",
+    ]
+    for source in REALITY_ASSET_INPUT_SOURCES:
+        lines.append(
+            f"- {source}: {', '.join(source_coverage[source]) or '(none)'}"
+        )
+    lines += ["", "## Asset candidates"]
+    for candidate in candidates:
+        lines += [
+            f"### {candidate['candidate_id']} — {candidate['title']}",
+            f"- input_source: {candidate['input_source']}",
+            f"- source: {candidate['source']}",
+            f"- source_refs: {', '.join(candidate['source_refs'])}",
+            f"- core_insight: {candidate['core_insight']}",
+            f"- long_term_value: {candidate['long_term_value']}",
+            f"- recommended_asset_type: {candidate['asset_type']}",
+            f"- disposition: {candidate['disposition']}",
+            f"- reason: {candidate['reason']}",
+        ]
+    lines += ["", "## Promotion candidates"]
+    for candidate_id in promotion_candidates:
+        candidate = by_id[candidate_id]
+        lines.append(
+            f"- {candidate_id} [{candidate['asset_type']}] "
+            f"{candidate['title']} ({candidate['source']})"
+        )
+    lines += ["", "## Discard items"]
+    for candidate_id in discard_items:
+        candidate = by_id[candidate_id]
+        lines.append(
+            f"- {candidate_id} {candidate['title']} — {candidate['reason']}"
+        )
+    lines += ["", "## De-duplication"]
+    for finding in duplicate_findings:
+        lines.append(
+            f"- {finding['duplicate_candidate']} -> "
+            f"{finding['canonical_candidate']} "
+            f"({finding['shared_mechanism']}): {finding['action']}"
+        )
+    lines += ["", "## Open source gaps"]
+    for gap in REALITY_ASSET_RECOVERY_SOURCE_GAPS:
+        lines.append(f"- {gap}")
+    lines += [
+        "",
+        "## No-canonical-write statement",
+        "- canonical_write_performed: False",
+        "- knowledge_written: False",
+        "- skill_written: False",
+        "- decision_written: False",
+        "- second_state_store_created: False",
+        "- production_write_performed: False",
+        "- deployment_performed: False",
+        "- credentials_accessed: False",
+        "- secret_accessed: False",
+        "- file_deleted: False",
+        "- github_workflow_modified: False",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final_status}"]
+
+    return {
+        "report": REALITY_ASSET_RECOVERY_BATCH_REPORT,
+        "goal": REALITY_ASSET_RECOVERY_BATCH_GOAL,
+        "task_id": REALITY_ASSET_RECOVERY_BATCH_TASK_ID,
+        "project_id": REALITY_ASSET_RECOVERY_BATCH_PROJECT_ID,
+        "contract": REALITY_ASSET_RECOVERY_BATCH_CONTRACT,
+        "version": REALITY_ASSET_RECOVERY_BATCH_VERSION,
+        "mode": REALITY_ASSET_RECOVERY_BATCH_MODE,
+        "generated_at": now_iso,
+        "status": report_status,
+        "report_status": report_status,
+        "final_status": final_status,
+        "input_sources": list(REALITY_ASSET_INPUT_SOURCES),
+        "input_sources_present": input_sources_present,
+        "source_coverage": source_coverage,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "promotion_candidates": promotion_candidates,
+        "watch_items": watch_items,
+        "discard_items": discard_items,
+        "duplicate_findings": duplicate_findings,
+        "source_gaps": list(REALITY_ASSET_RECOVERY_SOURCE_GAPS),
+        "promotion_gate_status": "CLOSED",
+        "promotion_performed": False,
+        "candidate_fields": list(REALITY_ASSET_CANDIDATE_FIELDS),
+        "canonical_write_performed": False,
+        "knowledge_written": False,
+        "skill_written": False,
+        "decision_written": False,
+        "second_state_store_created": False,
+        "production_write_performed": False,
+        "deployment_performed": False,
+        "credentials_accessed": False,
+        "secret_accessed": False,
+        "file_deleted": False,
+        "github_workflow_modified": False,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
+#: Forward/back-compatible aliases for the same recovery batch triage.
+reality_asset_recovery_batch = reality_asset_recovery_batch_01
+personal_ai_reality_asset_recovery_batch_01 = reality_asset_recovery_batch_01
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -30457,3 +31274,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(reality_first_canonical_promotion_v0_2_preflight()["markdown"])
     print(knowledge_approval_ledger_schema_adapter_v1()["markdown"])
     print(knowledge_golden_write_execution_01()["markdown"])
+    print(reality_asset_recovery_batch_01()["markdown"])

@@ -327,6 +327,22 @@ from hello import (
     reality_canonical_promotion_independent_readback_v0_1,
 )
 
+from hello import (
+    DISPOSITION_DISCARD,
+    DISPOSITION_PROMOTION_CANDIDATE,
+    DISPOSITION_WATCH,
+    REALITY_ASSET_CANDIDATE_FIELDS,
+    REALITY_ASSET_INPUT_SOURCES,
+    REALITY_ASSET_PROMOTABLE_TYPES,
+    REALITY_ASSET_RECOVERY_BATCH_GOAL,
+    REALITY_ASSET_RECOVERY_BATCH_REPORT,
+    REALITY_ASSET_RECOVERY_BATCH_TASK_ID,
+    REALITY_ASSET_RECOVERY_CANDIDATES,
+    REALITY_ASSET_RECOVERY_MUTATION_FLAGS,
+    REALITY_ASSET_TYPES,
+    reality_asset_recovery_batch_01,
+)
+
 VALID_STATUSES = {"PASS", "FAIL", "BLOCKED"}
 
 # TEST ISOLATION (task cf-2f2b71c331da): the runner-process SendKey is
@@ -11370,4 +11386,132 @@ def test_knowledge_golden_write_markdown_and_entrypoint() -> None:
     assert (
         hello_module.personal_ai_knowledge_golden_write_execution_01
         is hello_module.knowledge_golden_write_execution_01
+    )
+
+
+def test_reality_asset_recovery_batch_shape() -> None:
+    report = reality_asset_recovery_batch_01()
+    assert report["report"] == REALITY_ASSET_RECOVERY_BATCH_REPORT
+    assert report["goal"] == REALITY_ASSET_RECOVERY_BATCH_GOAL
+    assert report["task_id"] == REALITY_ASSET_RECOVERY_BATCH_TASK_ID
+    assert report["version"] == "V0.1"
+    assert report["mode"] == "READONLY_ASSET_TRIAGE"
+    assert report["status"] in VALID_STATUSES
+    assert report["report_status"] in VALID_STATUSES
+    assert report["candidate_count"] == len(report["candidates"])
+    assert report["candidate_count"] == len(REALITY_ASSET_RECOVERY_CANDIDATES)
+    assert set(report) >= {
+        "report",
+        "goal",
+        "task_id",
+        "project_id",
+        "candidate_count",
+        "candidates",
+        "promotion_candidates",
+        "watch_items",
+        "discard_items",
+        "duplicate_findings",
+        "source_gaps",
+        "checks",
+        "markdown",
+    }
+
+
+def test_reality_asset_recovery_covers_input_sources() -> None:
+    report = reality_asset_recovery_batch_01()
+    assert set(report["input_sources_present"]) == set(
+        REALITY_ASSET_INPUT_SOURCES
+    )
+    for source in REALITY_ASSET_INPUT_SOURCES:
+        assert report["source_coverage"][source], source
+    for candidate in report["candidates"]:
+        for field in REALITY_ASSET_CANDIDATE_FIELDS:
+            assert candidate[field] not in (None, "", [], ()), (
+                candidate["candidate_id"],
+                field,
+            )
+        assert candidate["asset_type"] in REALITY_ASSET_TYPES
+        assert candidate["core_insight"]
+        assert candidate["reason"]
+        assert candidate["source_refs"]
+
+
+def test_reality_asset_recovery_promotion_and_discard_separated() -> None:
+    report = reality_asset_recovery_batch_01()
+    promotion = set(report["promotion_candidates"])
+    watch = set(report["watch_items"])
+    discard = set(report["discard_items"])
+    assert promotion
+    assert discard
+    assert not (promotion & watch)
+    assert not (promotion & discard)
+    assert not (watch & discard)
+    assert {"RAR-01", "RAR-02", "RAR-03"} <= promotion
+    assert {"RAR-10", "RAR-11", "RAR-12", "RAR-13", "RAR-14"} <= discard
+
+    by_id = {c["candidate_id"]: c for c in report["candidates"]}
+    for candidate_id in promotion:
+        assert by_id[candidate_id]["asset_type"] in REALITY_ASSET_PROMOTABLE_TYPES
+        assert by_id[candidate_id]["disposition"] == DISPOSITION_PROMOTION_CANDIDATE
+    for candidate_id in watch:
+        assert by_id[candidate_id]["asset_type"] == "WATCH"
+        assert by_id[candidate_id]["disposition"] == DISPOSITION_WATCH
+    for candidate_id in discard:
+        assert by_id[candidate_id]["asset_type"] == "DISCARD"
+        assert by_id[candidate_id]["disposition"] == DISPOSITION_DISCARD
+
+
+def test_reality_asset_recovery_dedup_folds_duplicates() -> None:
+    report = reality_asset_recovery_batch_01()
+    assert report["duplicate_findings"]
+    ids = {c["candidate_id"] for c in report["candidates"]}
+    for finding in report["duplicate_findings"]:
+        assert finding["resolved"] is True
+        assert finding["duplicate_candidate"] in ids
+        assert finding["canonical_candidate"] in ids
+        assert finding["shared_mechanism"]
+        assert finding["duplicate_is_promoted"] is False
+        assert (
+            finding["duplicate_candidate"]
+            not in report["promotion_candidates"]
+        )
+
+
+def test_reality_asset_recovery_no_canonical_write_or_second_store() -> None:
+    report = reality_asset_recovery_batch_01()
+    for flag in REALITY_ASSET_RECOVERY_MUTATION_FLAGS:
+        assert report[flag] is False, flag
+    assert report["promotion_performed"] is False
+    assert report["promotion_gate_status"] == "CLOSED"
+    assert report["source_gaps"]
+    assert report["report_status"] == "PASS"
+    assert report["final_status"] == "PARTIAL_SOURCE_GAP"
+
+
+def test_reality_asset_recovery_checks_and_markdown() -> None:
+    report = reality_asset_recovery_batch_01()
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL"}
+        assert check["detail"]
+    assert all(check["status"] == "PASS" for check in report["checks"])
+
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {REALITY_ASSET_RECOVERY_BATCH_GOAL}")
+    assert f"- task_id: {REALITY_ASSET_RECOVERY_BATCH_TASK_ID}" in markdown
+    assert "## Promotion candidates" in markdown
+    assert "## Discard items" in markdown
+    assert "## De-duplication" in markdown
+    assert "## No-canonical-write statement" in markdown
+    assert f"FINAL_STATUS={report['final_status']}" in markdown
+
+    source = inspect.getsource(hello_module)
+    assert "def reality_asset_recovery_batch_01(" in source
+    assert (
+        hello_module.reality_asset_recovery_batch
+        is hello_module.reality_asset_recovery_batch_01
+    )
+    assert (
+        hello_module.personal_ai_reality_asset_recovery_batch_01
+        is hello_module.reality_asset_recovery_batch_01
     )
