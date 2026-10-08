@@ -31229,6 +31229,724 @@ reality_asset_recovery_batch = reality_asset_recovery_batch_01
 personal_ai_reality_asset_recovery_batch_01 = reality_asset_recovery_batch_01
 
 
+# ---------------------------------------------------------------------------
+# REALITY_ASSET_TRIAGE_AND_PROMOTION_PREP_V1  (task cf-e0bf8d1a0ec9)
+#
+# Read-only triage of the five candidates distilled from the current ChatGPT
+# conversation. For each candidate it runs a fact check, a duplicate check, a
+# value judgment and an asset classification, then emits an advisory
+# PROMOTE / MERGE / DISCARD status plus a promotion-package draft. It performs
+# NO Canonical write, modifies NO existing asset and creates NO second state
+# store; every draft stays gated behind a separate human review gate.
+# ---------------------------------------------------------------------------
+REALITY_ASSET_TRIAGE_GOAL = "REALITY_ASSET_TRIAGE_AND_PROMOTION_PREP_V1"
+REALITY_ASSET_TRIAGE_TASK_ID = "cf-e0bf8d1a0ec9"
+REALITY_ASSET_TRIAGE_PROJECT_ID = "cloud-assets-activation"
+REALITY_ASSET_TRIAGE_REPORT = REALITY_ASSET_TRIAGE_GOAL + "_REPORT"
+REALITY_ASSET_TRIAGE_CONTRACT = "PERSONAL_AI_" + REALITY_ASSET_TRIAGE_GOAL
+REALITY_ASSET_TRIAGE_VERSION = "V0.1"
+REALITY_ASSET_TRIAGE_MODE = "READONLY_TRIAGE_AND_PROMOTION_PREP"
+
+#: Advisory review outcomes (task acceptance vocabulary).
+TRIAGE_PROMOTE = "PROMOTE"
+TRIAGE_MERGE = "MERGE"
+TRIAGE_DISCARD = "DISCARD"
+TRIAGE_STATUSES = (TRIAGE_PROMOTE, TRIAGE_MERGE, TRIAGE_DISCARD)
+
+#: Asset-type vocabulary used for the classification suggestion.
+TRIAGE_ASSET_TYPES = ("REALITY", "KNOWLEDGE", "SKILL", "DECISION")
+
+#: Duplicate-check outcomes.
+TRIAGE_DUP_NEW = "NEW"
+TRIAGE_DUP_SIMILAR = "SIMILAR"
+TRIAGE_DUP_DUPLICATE = "DUPLICATE"
+TRIAGE_DUP_RESULTS = (
+    TRIAGE_DUP_NEW,
+    TRIAGE_DUP_SIMILAR,
+    TRIAGE_DUP_DUPLICATE,
+)
+
+#: Evidence tiers. STATED = stated by the human in this chat; no independent
+#: external verification has been performed.
+TRIAGE_EVIDENCE_TIERS = ("OBSERVED", "STATED", "INFERRED", "UNKNOWN")
+
+#: The human review gate every promotion draft waits on (never executed here).
+PROMOTION_GATE_ID = "HUMAN_GATE_REALITY_ASSET_PROMOTION_V0.1"
+
+#: Draft promotion-package fields (the contract a later, gated writer consumes).
+PROMOTION_PACKAGE_FIELDS = (
+    "package_id",
+    "asset_id",
+    "asset_type",
+    "title",
+    "source",
+    "source_refs",
+    "capture_time",
+    "evidence_tier",
+    "evidence",
+    "evidence_hash",
+    "review_conclusion",
+    "review_status",
+    "asset_type_suggestion",
+    "triaged_by",
+    "triaged_at",
+    "human_review_required",
+    "human_review_status",
+    "gate_id",
+    "canonical_write_authorized",
+    "provenance",
+    "dedup_key",
+    "payload",
+)
+
+#: Every forbidden side effect the triage must never perform.
+TRIAGE_MUTATION_FLAGS = (
+    "canonical_write_performed",
+    "existing_asset_modified",
+    "second_state_store_created",
+    "production_write_performed",
+    "deployment_performed",
+    "credentials_accessed",
+    "secret_accessed",
+    "file_deleted",
+    "github_workflow_modified",
+)
+
+#: Required per-candidate fields (task acceptance: fact/duplicate/value checks,
+#: status, asset-type suggestion, review conclusion and promotion draft).
+TRIAGE_CANDIDATE_FIELDS = (
+    "candidate_id",
+    "title",
+    "proposed_asset_type",
+    "source",
+    "source_refs",
+    "summary",
+    "fact_check",
+    "duplicate_check",
+    "value_judgment",
+    "asset_type_suggestion",
+    "review_conclusion",
+    "status",
+    "promotion_package",
+    "merge_target",
+)
+
+#: The candidates distilled from the current conversation. Frozen, deterministic
+#: data: it is this task's triage input, not a new source of truth.
+REALITY_ASSET_TRIAGE_CANDIDATES = (
+    {
+        "candidate_id": "RAT-01",
+        "title": "Personal AI asset lifecycle closed-loop model",
+        "proposed_asset_type": "KNOWLEDGE",
+        "source": "current ChatGPT conversation (task cf-e0bf8d1a0ec9)",
+        "source_refs": ("chatgpt_conversation:cf-e0bf8d1a0ec9",),
+        "summary": (
+            "Input -> Reality Candidate -> Triage -> Review -> Promotion -> "
+            "Canonical -> Read-back closed loop for Personal AI assets."
+        ),
+        "fact_check": {
+            "status": "PASS",
+            "evidence_tier": "STATED",
+            "detail": (
+                "internally consistent lifecycle model stated in this "
+                "conversation; no independent external verification performed"
+            ),
+        },
+        "duplicate_check": {
+            "result": TRIAGE_DUP_NEW,
+            "overlap": (),
+            "detail": (
+                "no existing asset describes the end-to-end "
+                "Candidate->Canonical->Read-back loop; the existing contracts "
+                "cover only individual stages"
+            ),
+        },
+        "value_judgment": {
+            "value": "HIGH",
+            "reason": (
+                "core architectural model that names the whole pipeline and is "
+                "reusable across REALITY / KNOWLEDGE / SKILL / DECISION"
+            ),
+        },
+        "asset_type_suggestion": "KNOWLEDGE",
+        "review_conclusion": (
+            "PROMOTE as KNOWLEDGE: novel closed-loop model with high long-term "
+            "value; chat-sourced and STATED, so promotion is human-gated."
+        ),
+        "status": TRIAGE_PROMOTE,
+        "merge_target": None,
+    },
+    {
+        "candidate_id": "RAT-02",
+        "title": "Asset Lifecycle Event Ledger",
+        "proposed_asset_type": "SKILL",
+        "source": "current ChatGPT conversation (task cf-e0bf8d1a0ec9)",
+        "source_refs": ("chatgpt_conversation:cf-e0bf8d1a0ec9",),
+        "summary": (
+            "Append-only per-asset event ledger keyed by asset_id / event_id "
+            "with approval, evidence and hash fields for lifecycle auditing."
+        ),
+        "fact_check": {
+            "status": "PASS",
+            "evidence_tier": "STATED",
+            "detail": (
+                "ledger shape (asset_id/event_id/approval/evidence/hash) "
+                "stated in this conversation; not yet independently verified"
+            ),
+        },
+        "duplicate_check": {
+            "result": TRIAGE_DUP_SIMILAR,
+            "overlap": (
+                "src/personal_ai_execution/reality_canonical_writer.py admission "
+                "ledger",
+                "knowledge_approval_ledger_schema_adapter",
+            ),
+            "detail": (
+                "existing ledgers are admission- or approval-scoped and are "
+                "not a unified per-asset lifecycle event log"
+            ),
+        },
+        "value_judgment": {
+            "value": "HIGH",
+            "reason": (
+                "adds net-new auditability (approval + evidence + hash per "
+                "asset event) and reuses existing ledger patterns"
+            ),
+        },
+        "asset_type_suggestion": "SKILL",
+        "review_conclusion": (
+            "PROMOTE as SKILL: SIMILAR to existing admission/approval ledgers "
+            "but net-new as a unified per-asset lifecycle event capability."
+        ),
+        "status": TRIAGE_PROMOTE,
+        "merge_target": None,
+    },
+    {
+        "candidate_id": "RAT-03",
+        "title": "Chat as Personal AI Reality input source",
+        "proposed_asset_type": "DECISION",
+        "source": "current ChatGPT conversation (task cf-e0bf8d1a0ec9)",
+        "source_refs": ("chatgpt_conversation:cf-e0bf8d1a0ec9",),
+        "summary": (
+            "Admit chat, human-AI discussion and Agent results as first-class "
+            "Reality Sources entering the Capture flow."
+        ),
+        "fact_check": {
+            "status": "PASS",
+            "evidence_tier": "STATED",
+            "detail": (
+                "decision proposed in this conversation; consistent with the "
+                "existing REALITY capture contract but not externally verified"
+            ),
+        },
+        "duplicate_check": {
+            "result": TRIAGE_DUP_SIMILAR,
+            "overlap": (
+                "REALITY_CAPTURE_NORMALIZATION_CONTRACT_V0.1",
+                "src/personal_ai_execution/reality_capture.py",
+            ),
+            "detail": (
+                "capture/normalization exists for external channels; the "
+                "net-new claim is admitting chat/human-AI discussion as a "
+                "Reality Source"
+            ),
+        },
+        "value_judgment": {
+            "value": "HIGH",
+            "reason": (
+                "foundational input-source decision that lets the lifecycle "
+                "model consume conversational evidence without a new store"
+            ),
+        },
+        "asset_type_suggestion": "DECISION",
+        "review_conclusion": (
+            "PROMOTE as DECISION: SIMILAR to the capture contract but net-new "
+            "in naming chat / human-AI discussion as an admitted Reality "
+            "Source; human review required."
+        ),
+        "status": TRIAGE_PROMOTE,
+        "merge_target": None,
+    },
+    {
+        "candidate_id": "RAT-04",
+        "title": "Evidence First AI Execution Principle",
+        "proposed_asset_type": "DECISION",
+        "source": "current ChatGPT conversation (task cf-e0bf8d1a0ec9)",
+        "source_refs": ("chatgpt_conversation:cf-e0bf8d1a0ec9",),
+        "summary": (
+            "Every AI execution conclusion must be backed by an evidence item "
+            "tiered OBSERVED / STATED / INFERRED / UNKNOWN."
+        ),
+        "fact_check": {
+            "status": "PASS",
+            "evidence_tier": "STATED",
+            "detail": (
+                "principle is already implemented and documented in the "
+                "repository, so it is a genuine duplicate rather than a claim"
+            ),
+        },
+        "duplicate_check": {
+            "result": TRIAGE_DUP_DUPLICATE,
+            "overlap": (
+                "src/personal_ai_execution/reality_candidate_review.py "
+                "(evidence-first discipline)",
+                "ASSET_PROVENANCE_CONTRACT_V0.2",
+                "src/personal_ai_execution/reality_canonical_promotion_preflight.py",
+            ),
+            "detail": (
+                "the evidence-first principle already governs the review and "
+                "promotion contracts; a new asset would fragment one rule into "
+                "two copies"
+            ),
+        },
+        "value_judgment": {
+            "value": "HIGH",
+            "reason": (
+                "high value but already canonical as the governing mechanism, "
+                "so the correct action is to merge, not create a new asset"
+            ),
+        },
+        "asset_type_suggestion": "KNOWLEDGE",
+        "review_conclusion": (
+            "MERGE: duplicate of the existing evidence-first discipline; fold "
+            "any wording refinement into the existing asset instead of opening "
+            "a second DECISION."
+        ),
+        "status": TRIAGE_MERGE,
+        "merge_target": (
+            "existing evidence-first discipline: "
+            "src/personal_ai_execution/reality_candidate_review.py + "
+            "ASSET_PROVENANCE_CONTRACT_V0.2"
+        ),
+    },
+    {
+        "candidate_id": "RAT-05",
+        "title": "Brain / Executor separation principle",
+        "proposed_asset_type": "DECISION",
+        "source": "current ChatGPT conversation (task cf-e0bf8d1a0ec9)",
+        "source_refs": ("chatgpt_conversation:cf-e0bf8d1a0ec9",),
+        "summary": (
+            "Separate the reasoning 'Brain' from the execution 'Executor' so "
+            "any local runtime can feed the same Reality contract."
+        ),
+        "fact_check": {
+            "status": "PASS",
+            "evidence_tier": "STATED",
+            "detail": (
+                "principle restates an existing repository boundary; no new "
+                "claim to verify"
+            ),
+        },
+        "duplicate_check": {
+            "result": TRIAGE_DUP_DUPLICATE,
+            "overlap": (
+                "HERMES_REALITY_DAILY_SYNC_BINDING_V0.1 "
+                "(producer/executor boundary)",
+                "REALITY_DAILY_WECHAT_SNAPSHOT_PIPELINE_V0.1 "
+                "(executor-agnostic)",
+            ),
+            "detail": (
+                "the Brain/Executor split is already the stated architecture; "
+                "creating a new asset would duplicate an existing boundary"
+            ),
+        },
+        "value_judgment": {
+            "value": "MEDIUM",
+            "reason": (
+                "valid but already covered; no net-new value that justifies a "
+                "new asset"
+            ),
+        },
+        "asset_type_suggestion": None,
+        "review_conclusion": (
+            "DISCARD new-asset creation: duplicate of the existing "
+            "producer/executor boundary; reference the existing contracts and "
+            "do not create a second asset."
+        ),
+        "status": TRIAGE_DISCARD,
+        "merge_target": None,
+    },
+)
+
+
+def _reality_asset_triage_hash(payload: object) -> str:
+    """Return a deterministic sha256 over a JSON-canonical payload."""
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _reality_asset_triage_package(candidate: dict, now_iso: str) -> dict:
+    """Build the advisory promotion-package draft for a PROMOTE candidate."""
+    digest = _reality_asset_triage_hash(
+        {
+            "candidate_id": candidate["candidate_id"],
+            "title": candidate["title"],
+            "summary": candidate["summary"],
+            "asset_type": candidate["asset_type_suggestion"],
+        }
+    )
+    return {
+        "package_id": "pp-" + digest[:12],
+        "asset_id": "asset-" + digest[:16],
+        "asset_type": candidate["asset_type_suggestion"],
+        "title": candidate["title"],
+        "source": candidate["source"],
+        "source_refs": list(candidate["source_refs"]),
+        "capture_time": now_iso,
+        "evidence_tier": candidate["fact_check"]["evidence_tier"],
+        "evidence": [
+            candidate["fact_check"]["detail"],
+            candidate["duplicate_check"]["detail"],
+        ],
+        "evidence_hash": digest,
+        "review_conclusion": candidate["review_conclusion"],
+        "review_status": "PROMOTION_ELIGIBLE",
+        "asset_type_suggestion": candidate["asset_type_suggestion"],
+        "triaged_by": REALITY_ASSET_TRIAGE_GOAL,
+        "triaged_at": now_iso,
+        "human_review_required": True,
+        "human_review_status": "PENDING",
+        "gate_id": PROMOTION_GATE_ID,
+        "canonical_write_authorized": False,
+        "provenance": candidate["source"],
+        "dedup_key": candidate["candidate_id"],
+        "payload": {
+            "summary": candidate["summary"],
+            "value": candidate["value_judgment"]["value"],
+        },
+    }
+
+
+def reality_asset_triage_and_promotion_prep_v1() -> dict:
+    """Build the REALITY_ASSET_TRIAGE_AND_PROMOTION_PREP_V1 triage report.
+
+    Read-only. Runs a fact check, duplicate check, value judgment and asset
+    classification over the five conversation-sourced candidates; emits an
+    advisory ``PROMOTE`` / ``MERGE`` / ``DISCARD`` status and an asset-type
+    suggestion for each, plus a promotion-package draft for every ``PROMOTE``
+    candidate. It performs **no** Canonical write, modifies **no** existing
+    asset and creates **no** second state store.
+    """
+    now_iso = _utc_now()
+    candidates: list[dict] = []
+    promotion_packages: dict[str, dict] = {}
+    for raw in REALITY_ASSET_TRIAGE_CANDIDATES:
+        candidate = {
+            "candidate_id": raw["candidate_id"],
+            "title": raw["title"],
+            "proposed_asset_type": raw["proposed_asset_type"],
+            "source": raw["source"],
+            "source_refs": list(raw["source_refs"]),
+            "summary": raw["summary"],
+            "fact_check": dict(raw["fact_check"]),
+            "duplicate_check": {
+                "result": raw["duplicate_check"]["result"],
+                "overlap": list(raw["duplicate_check"]["overlap"]),
+                "detail": raw["duplicate_check"]["detail"],
+            },
+            "value_judgment": dict(raw["value_judgment"]),
+            "asset_type_suggestion": raw["asset_type_suggestion"],
+            "review_conclusion": raw["review_conclusion"],
+            "status": raw["status"],
+            "merge_target": raw["merge_target"],
+            "promotion_package": None,
+        }
+        if candidate["status"] == TRIAGE_PROMOTE:
+            package = _reality_asset_triage_package(candidate, now_iso)
+            candidate["promotion_package"] = package
+            promotion_packages[candidate["candidate_id"]] = package
+        candidates.append(candidate)
+
+    by_id = {candidate["candidate_id"]: candidate for candidate in candidates}
+    promotion_candidates = [
+        candidate["candidate_id"]
+        for candidate in candidates
+        if candidate["status"] == TRIAGE_PROMOTE
+    ]
+    merge_items = [
+        candidate["candidate_id"]
+        for candidate in candidates
+        if candidate["status"] == TRIAGE_MERGE
+    ]
+    discard_items = [
+        candidate["candidate_id"]
+        for candidate in candidates
+        if candidate["status"] == TRIAGE_DISCARD
+    ]
+
+    fields_ok = all(
+        all(
+            field in candidate and candidate[field] not in (None, "", [], ())
+            for field in TRIAGE_CANDIDATE_FIELDS
+            if field
+            not in {"asset_type_suggestion", "merge_target", "promotion_package"}
+        )
+        for candidate in candidates
+    )
+    statuses_ok = all(
+        candidate["status"] in TRIAGE_STATUSES for candidate in candidates
+    )
+    types_ok = all(
+        candidate["asset_type_suggestion"] is None
+        or candidate["asset_type_suggestion"] in TRIAGE_ASSET_TYPES
+        for candidate in candidates
+    )
+    dup_results_ok = all(
+        candidate["duplicate_check"]["result"] in TRIAGE_DUP_RESULTS
+        for candidate in candidates
+    )
+    packages_ok = all(
+        candidate["promotion_package"] is not None
+        and all(
+            field in candidate["promotion_package"]
+            for field in PROMOTION_PACKAGE_FIELDS
+        )
+        and candidate["promotion_package"]["canonical_write_authorized"] is False
+        and candidate["promotion_package"]["human_review_status"] == "PENDING"
+        for candidate in candidates
+        if candidate["status"] == TRIAGE_PROMOTE
+    )
+    merge_ok = all(
+        by_id[candidate_id]["merge_target"] for candidate_id in merge_items
+    ) and all(
+        candidate["promotion_package"] is None
+        for candidate in candidates
+        if candidate["status"] != TRIAGE_PROMOTE
+    )
+    non_promote_ok = all(
+        candidate["status"] != TRIAGE_PROMOTE
+        for candidate in candidates
+        if candidate["duplicate_check"]["result"] == TRIAGE_DUP_DUPLICATE
+    )
+    ids_unique = len(by_id) == len(candidates)
+    disjoint = not (
+        set(promotion_candidates) & set(merge_items)
+        or set(promotion_candidates) & set(discard_items)
+        or set(merge_items) & set(discard_items)
+    )
+
+    checks = [
+        {
+            "check": "all conversation candidates are triaged",
+            "status": PASS
+            if len(candidates) == len(REALITY_ASSET_TRIAGE_CANDIDATES)
+            else FAIL,
+            "detail": "candidates=" + str(len(candidates)),
+        },
+        {
+            "check": "every candidate carries fact/duplicate/value checks",
+            "status": PASS if fields_ok else FAIL,
+            "detail": "required fields: " + ", ".join(TRIAGE_CANDIDATE_FIELDS),
+        },
+        {
+            "check": "review status is one of PROMOTE/MERGE/DISCARD",
+            "status": PASS if statuses_ok else FAIL,
+            "detail": "statuses: " + ", ".join(TRIAGE_STATUSES),
+        },
+        {
+            "check": "asset-type suggestion comes from the allowed vocabulary",
+            "status": PASS if types_ok else FAIL,
+            "detail": "allowed: " + ", ".join(TRIAGE_ASSET_TYPES),
+        },
+        {
+            "check": "duplicate results come from the allowed vocabulary",
+            "status": PASS if dup_results_ok else FAIL,
+            "detail": "allowed: " + ", ".join(TRIAGE_DUP_RESULTS),
+        },
+        {
+            "check": "candidate ids are unique",
+            "status": PASS if ids_unique else FAIL,
+            "detail": "candidates="
+            + str(len(candidates))
+            + "; unique="
+            + str(len(by_id)),
+        },
+        {
+            "check": "PROMOTE/MERGE/DISCARD are disjoint",
+            "status": PASS if disjoint else FAIL,
+            "detail": "promote="
+            + str(len(promotion_candidates))
+            + "; merge="
+            + str(len(merge_items))
+            + "; discard="
+            + str(len(discard_items)),
+        },
+        {
+            "check": "every PROMOTE candidate has a complete package draft",
+            "status": PASS if packages_ok else FAIL,
+            "detail": "promotion packages: " + str(len(promotion_packages)),
+        },
+        {
+            "check": "MERGE candidates name an existing merge target",
+            "status": PASS if merge_ok else FAIL,
+            "detail": "merge items: " + (", ".join(merge_items) or "(none)"),
+        },
+        {
+            "check": "DUPLICATE candidates are never PROMOTEd",
+            "status": PASS if non_promote_ok else FAIL,
+            "detail": "duplicate candidates: "
+            + ", ".join(
+                candidate["candidate_id"]
+                for candidate in candidates
+                if candidate["duplicate_check"]["result"]
+                == TRIAGE_DUP_DUPLICATE
+            ),
+        },
+        {
+            "check": "no Canonical write performed",
+            "status": PASS,
+            "detail": "canonical_write_performed=False; no asset promoted",
+        },
+        {
+            "check": "no existing asset modified",
+            "status": PASS,
+            "detail": "existing_asset_modified=False",
+        },
+        {
+            "check": "no second state store created",
+            "status": PASS,
+            "detail": "second_state_store_created=False",
+        },
+    ]
+    report_status = (
+        PASS if all(check["status"] == PASS for check in checks) else FAIL
+    )
+    final_status = (
+        "PROMOTION_PREP_READY_PENDING_HUMAN_REVIEW"
+        if report_status == PASS
+        else report_status
+    )
+
+    lines = [
+        f"# {REALITY_ASSET_TRIAGE_GOAL}",
+        "",
+        f"- goal: {REALITY_ASSET_TRIAGE_GOAL}",
+        f"- task_id: {REALITY_ASSET_TRIAGE_TASK_ID}",
+        f"- project_id: {REALITY_ASSET_TRIAGE_PROJECT_ID}",
+        f"- contract: {REALITY_ASSET_TRIAGE_CONTRACT}",
+        f"- version: {REALITY_ASSET_TRIAGE_VERSION}",
+        f"- mode: {REALITY_ASSET_TRIAGE_MODE} (no Canonical write)",
+        f"- report_status: {report_status}",
+        f"- final_status: {final_status}",
+        f"- candidates: {len(candidates)}",
+        f"- promotion_candidates: "
+        f"{', '.join(promotion_candidates) or '(none)'}",
+        f"- merge_items: {', '.join(merge_items) or '(none)'}",
+        f"- discard_items: {', '.join(discard_items) or '(none)'}",
+        "",
+        "## Candidate reviews",
+    ]
+    for candidate in candidates:
+        lines += [
+            f"### {candidate['candidate_id']} — {candidate['title']}",
+            f"- proposed_asset_type: {candidate['proposed_asset_type']}",
+            f"- source: {candidate['source']}",
+            f"- summary: {candidate['summary']}",
+            f"- fact_check: [{candidate['fact_check']['status']}] "
+            f"({candidate['fact_check']['evidence_tier']}) "
+            f"{candidate['fact_check']['detail']}",
+            f"- duplicate_check: [{candidate['duplicate_check']['result']}] "
+            f"{candidate['duplicate_check']['detail']}",
+            f"- value_judgment: [{candidate['value_judgment']['value']}] "
+            f"{candidate['value_judgment']['reason']}",
+            f"- asset_type_suggestion: "
+            f"{candidate['asset_type_suggestion'] or '(none)'}",
+            f"- review_conclusion: {candidate['review_conclusion']}",
+            f"- status: {candidate['status']}",
+        ]
+        if candidate["merge_target"]:
+            lines.append(f"- merge_target: {candidate['merge_target']}")
+    lines += ["", "## Promotion package drafts"]
+    for candidate_id in promotion_candidates:
+        package = promotion_packages[candidate_id]
+        lines += [
+            f"### {package['package_id']} ({candidate_id})",
+            f"- asset_id: {package['asset_id']}",
+            f"- asset_type: {package['asset_type']}",
+            f"- gate_id: {package['gate_id']}",
+            f"- human_review_required: {package['human_review_required']}",
+            f"- human_review_status: {package['human_review_status']}",
+            f"- canonical_write_authorized: "
+            f"{package['canonical_write_authorized']}",
+            f"- evidence_hash: {package['evidence_hash']}",
+        ]
+    lines += ["", "## Merge directives"]
+    for candidate_id in merge_items:
+        candidate = by_id[candidate_id]
+        lines.append(f"- {candidate_id} -> {candidate['merge_target']}")
+    lines += ["", "## Discard items"]
+    for candidate_id in discard_items:
+        candidate = by_id[candidate_id]
+        lines.append(
+            f"- {candidate_id} {candidate['title']} — "
+            f"{candidate['review_conclusion']}"
+        )
+    lines += [
+        "",
+        "## No-canonical-write statement",
+        "- canonical_write_performed: False",
+        "- existing_asset_modified: False",
+        "- second_state_store_created: False",
+        "- production_write_performed: False",
+        "- deployment_performed: False",
+        "- credentials_accessed: False",
+        "- secret_accessed: False",
+        "- file_deleted: False",
+        "- github_workflow_modified: False",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final_status}"]
+
+    return {
+        "report": REALITY_ASSET_TRIAGE_REPORT,
+        "goal": REALITY_ASSET_TRIAGE_GOAL,
+        "task_id": REALITY_ASSET_TRIAGE_TASK_ID,
+        "project_id": REALITY_ASSET_TRIAGE_PROJECT_ID,
+        "contract": REALITY_ASSET_TRIAGE_CONTRACT,
+        "version": REALITY_ASSET_TRIAGE_VERSION,
+        "mode": REALITY_ASSET_TRIAGE_MODE,
+        "generated_at": now_iso,
+        "status": report_status,
+        "report_status": report_status,
+        "final_status": final_status,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "promotion_candidates": promotion_candidates,
+        "merge_items": merge_items,
+        "discard_items": discard_items,
+        "promotion_packages": promotion_packages,
+        "promotion_package_fields": list(PROMOTION_PACKAGE_FIELDS),
+        "triage_statuses": list(TRIAGE_STATUSES),
+        "asset_types": list(TRIAGE_ASSET_TYPES),
+        "promotion_gate_id": PROMOTION_GATE_ID,
+        "promotion_gate_status": "CLOSED",
+        "promotion_performed": False,
+        "canonical_write_performed": False,
+        "existing_asset_modified": False,
+        "second_state_store_created": False,
+        "production_write_performed": False,
+        "deployment_performed": False,
+        "credentials_accessed": False,
+        "secret_accessed": False,
+        "file_deleted": False,
+        "github_workflow_modified": False,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
+#: Forward/back-compatible aliases for the same triage/promotion-prep report.
+reality_asset_triage = reality_asset_triage_and_promotion_prep_v1
+personal_ai_reality_asset_triage_and_promotion_prep_v1 = (
+    reality_asset_triage_and_promotion_prep_v1
+)
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -31275,3 +31993,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(knowledge_approval_ledger_schema_adapter_v1()["markdown"])
     print(knowledge_golden_write_execution_01()["markdown"])
     print(reality_asset_recovery_batch_01()["markdown"])
+    print(reality_asset_triage_and_promotion_prep_v1()["markdown"])

@@ -340,7 +340,21 @@ from hello import (
     REALITY_ASSET_RECOVERY_CANDIDATES,
     REALITY_ASSET_RECOVERY_MUTATION_FLAGS,
     REALITY_ASSET_TYPES,
+    REALITY_ASSET_TRIAGE_GOAL,
+    REALITY_ASSET_TRIAGE_REPORT,
+    REALITY_ASSET_TRIAGE_TASK_ID,
+    PROMOTION_GATE_ID,
+    PROMOTION_PACKAGE_FIELDS,
+    TRIAGE_ASSET_TYPES,
+    TRIAGE_DISCARD,
+    TRIAGE_DUP_DUPLICATE,
+    TRIAGE_DUP_RESULTS,
+    TRIAGE_MERGE,
+    TRIAGE_MUTATION_FLAGS,
+    TRIAGE_PROMOTE,
+    TRIAGE_STATUSES,
     reality_asset_recovery_batch_01,
+    reality_asset_triage_and_promotion_prep_v1,
 )
 
 VALID_STATUSES = {"PASS", "FAIL", "BLOCKED"}
@@ -11514,4 +11528,121 @@ def test_reality_asset_recovery_checks_and_markdown() -> None:
     assert (
         hello_module.personal_ai_reality_asset_recovery_batch_01
         is hello_module.reality_asset_recovery_batch_01
+    )
+
+
+# ---------------------------------------------------------------------------
+# REALITY_ASSET_TRIAGE_AND_PROMOTION_PREP_V1 (task cf-e0bf8d1a0ec9)
+# ---------------------------------------------------------------------------
+
+
+def test_reality_asset_triage_shape() -> None:
+    report = reality_asset_triage_and_promotion_prep_v1()
+    assert report["report"] == REALITY_ASSET_TRIAGE_REPORT
+    assert report["goal"] == REALITY_ASSET_TRIAGE_GOAL
+    assert report["task_id"] == REALITY_ASSET_TRIAGE_TASK_ID == "cf-e0bf8d1a0ec9"
+    assert report["mode"] == "READONLY_TRIAGE_AND_PROMOTION_PREP"
+    assert report["candidate_count"] == len(report["candidates"]) == 5
+    assert report["report_status"] == "PASS"
+    assert report["final_status"] == "PROMOTION_PREP_READY_PENDING_HUMAN_REVIEW"
+    assert list(report["triage_statuses"]) == list(TRIAGE_STATUSES)
+    assert list(report["asset_types"]) == list(TRIAGE_ASSET_TYPES)
+
+
+def test_reality_asset_triage_review_conclusion_per_candidate() -> None:
+    report = reality_asset_triage_and_promotion_prep_v1()
+    for candidate in report["candidates"]:
+        assert candidate["review_conclusion"]
+        assert candidate["status"] in TRIAGE_STATUSES
+        assert candidate["duplicate_check"]["result"] in TRIAGE_DUP_RESULTS
+        assert candidate["fact_check"]["status"] in {"PASS", "FAIL"}
+        assert candidate["value_judgment"]["value"] in {"HIGH", "MEDIUM", "LOW"}
+        assert candidate["asset_type_suggestion"] in TRIAGE_ASSET_TYPES or (
+            candidate["asset_type_suggestion"] is None
+        )
+
+
+def test_reality_asset_triage_promote_merge_discard_partition() -> None:
+    report = reality_asset_triage_and_promotion_prep_v1()
+    by_id = {c["candidate_id"]: c for c in report["candidates"]}
+    assert report["promotion_candidates"] == ["RAT-01", "RAT-02", "RAT-03"]
+    assert report["merge_items"] == ["RAT-04"]
+    assert report["discard_items"] == ["RAT-05"]
+    for candidate_id in report["promotion_candidates"]:
+        assert by_id[candidate_id]["status"] == TRIAGE_PROMOTE
+    assert by_id["RAT-04"]["status"] == TRIAGE_MERGE
+    assert by_id["RAT-04"]["merge_target"]
+    assert by_id["RAT-05"]["status"] == TRIAGE_DISCARD
+    assert by_id["RAT-05"]["merge_target"] is None
+    assert by_id["RAT-05"]["promotion_package"] is None
+    for candidate in report["candidates"]:
+        if candidate["duplicate_check"]["result"] == TRIAGE_DUP_DUPLICATE:
+            assert candidate["status"] != TRIAGE_PROMOTE
+
+
+def test_reality_asset_triage_promotion_packages() -> None:
+    report = reality_asset_triage_and_promotion_prep_v1()
+    packages = report["promotion_packages"]
+    assert set(packages) == set(report["promotion_candidates"])
+    for candidate_id, package in packages.items():
+        for field in PROMOTION_PACKAGE_FIELDS:
+            assert field in package, field
+        assert package["asset_type"] in TRIAGE_ASSET_TYPES
+        assert package["canonical_write_authorized"] is False
+        assert package["human_review_required"] is True
+        assert package["human_review_status"] == "PENDING"
+        assert package["gate_id"] == PROMOTION_GATE_ID
+        assert package["evidence"]
+        assert package["evidence_hash"]
+        assert package["review_conclusion"]
+
+
+def test_reality_asset_triage_asset_type_suggestions() -> None:
+    report = reality_asset_triage_and_promotion_prep_v1()
+    by_id = {c["candidate_id"]: c for c in report["candidates"]}
+    assert by_id["RAT-01"]["asset_type_suggestion"] == "KNOWLEDGE"
+    assert by_id["RAT-02"]["asset_type_suggestion"] == "SKILL"
+    assert by_id["RAT-03"]["asset_type_suggestion"] == "DECISION"
+    assert by_id["RAT-04"]["asset_type_suggestion"] == "KNOWLEDGE"
+    assert by_id["RAT-05"]["asset_type_suggestion"] is None
+
+
+def test_reality_asset_triage_no_canonical_write() -> None:
+    report = reality_asset_triage_and_promotion_prep_v1()
+    for flag in TRIAGE_MUTATION_FLAGS:
+        assert report[flag] is False, flag
+    assert report["canonical_write_performed"] is False
+    assert report["existing_asset_modified"] is False
+    assert report["second_state_store_created"] is False
+    assert report["promotion_performed"] is False
+    assert report["promotion_gate_status"] == "CLOSED"
+
+
+def test_reality_asset_triage_checks_and_markdown() -> None:
+    report = reality_asset_triage_and_promotion_prep_v1()
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL"}
+        assert check["detail"]
+    assert all(check["status"] == "PASS" for check in report["checks"])
+
+    markdown = report["markdown"]
+    assert markdown.startswith(f"# {REALITY_ASSET_TRIAGE_GOAL}")
+    assert f"- task_id: {REALITY_ASSET_TRIAGE_TASK_ID}" in markdown
+    assert "## Candidate reviews" in markdown
+    assert "## Promotion package drafts" in markdown
+    assert "## Merge directives" in markdown
+    assert "## Discard items" in markdown
+    assert "## No-canonical-write statement" in markdown
+    assert f"FINAL_STATUS={report['final_status']}" in markdown
+
+    source = inspect.getsource(hello_module)
+    assert "def reality_asset_triage_and_promotion_prep_v1(" in source
+    assert (
+        hello_module.reality_asset_triage
+        is hello_module.reality_asset_triage_and_promotion_prep_v1
+    )
+    assert (
+        hello_module.personal_ai_reality_asset_triage_and_promotion_prep_v1
+        is hello_module.reality_asset_triage_and_promotion_prep_v1
     )
