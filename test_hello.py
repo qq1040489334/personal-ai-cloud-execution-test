@@ -11646,3 +11646,289 @@ def test_reality_asset_triage_checks_and_markdown() -> None:
         hello_module.personal_ai_reality_asset_triage_and_promotion_prep_v1
         is hello_module.reality_asset_triage_and_promotion_prep_v1
     )
+
+
+# ---------------------------------------------------------------------------
+# REALITY_PROMOTION_EXECUTION_BATCH_01 (task cf-99c39700bc46)
+# ---------------------------------------------------------------------------
+
+
+def _promotion_approval(
+    candidate_id: str,
+    asset_type: str,
+    *,
+    gate: str = None,
+    human: bool = True,
+    approver: str = "human-operator",
+    decision: str = None,
+    approved: bool = True,
+    candidate: str = None,
+) -> dict:
+    if gate is None:
+        gate = hello_module.REALITY_PROMOTION_EXECUTION_HUMAN_GATE
+    if decision is None:
+        decision = hello_module.REALITY_PROMOTION_EXECUTION_APPROVED
+    return {
+        "approval_id": "approval:promotion:" + candidate_id,
+        "gate": gate,
+        "decision": decision,
+        "approved": approved,
+        "human": human,
+        "approver": approver,
+        "candidate_id": candidate if candidate is not None else candidate_id,
+        "asset_type": asset_type,
+    }
+
+
+def test_reality_promotion_execution_constants() -> None:
+    assert (
+        hello_module.REALITY_PROMOTION_EXECUTION_BATCH_GOAL
+        == "REALITY_PROMOTION_EXECUTION_BATCH_01"
+    )
+    assert hello_module.REALITY_PROMOTION_EXECUTION_BATCH_TASK_ID == "cf-99c39700bc46"
+    assert (
+        hello_module.REALITY_PROMOTION_EXECUTION_BATCH_PROJECT_ID
+        == "cloud-assets-activation"
+    )
+    assert hello_module.REALITY_PROMOTION_EXECUTION_CANDIDATE_IDS == (
+        "RAT-01",
+        "RAT-02",
+        "RAT-03",
+    )
+    assert hello_module.REALITY_PROMOTION_EXECUTION_STATUSES == (
+        "READY",
+        "BLOCKED",
+        "WRITTEN",
+    )
+    assert hello_module.REALITY_PROMOTION_EXECUTION_WRITERS["KNOWLEDGE"] == (
+        "writeKnowledgeCandidate"
+    )
+    assert hello_module.REALITY_PROMOTION_EXECUTION_WRITERS["DECISION"] == (
+        "writeDecisionRecord"
+    )
+    for flag in hello_module.REALITY_PROMOTION_EXECUTION_MUTATION_FLAGS:
+        assert isinstance(flag, str) and flag
+
+
+def test_reality_promotion_execution_default_ready_no_write() -> None:
+    store: dict = {}
+    report = hello_module.reality_promotion_execution_batch_01(
+        canonical_store=store
+    )
+
+    assert report["workflow_status"] == "PASS"
+    assert report["human_gate_bypassed"] is False
+    assert report["ready_candidates"] == ["RAT-01", "RAT-02", "RAT-03"]
+    assert report["written_candidates"] == []
+    assert report["blocked_candidates"] == []
+    assert report["write_count"] == 0
+    assert store == {}
+    for candidate in report["candidates"]:
+        assert candidate["status"] == hello_module.REALITY_PROMOTION_READY
+        assert candidate["package_complete"] is True
+        assert candidate["write_performed"] is False
+        assert candidate["blocked_reason"] is None
+        assert (
+            candidate["pending_reason"]
+            == hello_module.REALITY_PROMOTION_EXECUTION_AWAITING
+        )
+
+
+def test_reality_promotion_execution_candidate_statuses_are_valid() -> None:
+    report = hello_module.reality_promotion_execution_batch_01()
+
+    assert report["candidate_count"] == 3
+    assert [c["candidate_id"] for c in report["candidates"]] == [
+        "RAT-01",
+        "RAT-02",
+        "RAT-03",
+    ]
+    for candidate in report["candidates"]:
+        assert (
+            candidate["status"]
+            in hello_module.REALITY_PROMOTION_EXECUTION_STATUSES
+        )
+        for field in hello_module.REALITY_PROMOTION_EXECUTION_RESULT_FIELDS:
+            assert field in candidate
+
+
+def test_reality_promotion_execution_approved_write_returns_required_fields() -> None:
+    store: dict = {}
+    approvals = {
+        "RAT-01": _promotion_approval("RAT-01", "KNOWLEDGE"),
+        "RAT-02": _promotion_approval("RAT-02", "SKILL"),
+        "RAT-03": _promotion_approval("RAT-03", "DECISION"),
+    }
+    report = hello_module.reality_promotion_execution_batch_01(
+        approvals=approvals, canonical_store=store
+    )
+
+    assert report["workflow_status"] == "PASS"
+    assert report["written_candidates"] == ["RAT-01", "RAT-02", "RAT-03"]
+    assert report["ready_candidates"] == []
+    assert report["blocked_candidates"] == []
+    assert report["write_count"] == 3
+    for write in report["writes"]:
+        for field in hello_module.REALITY_PROMOTION_EXECUTION_WRITE_FIELDS:
+            assert write[field] is not None, field
+        assert write["content_hash"]
+        assert isinstance(write["provenance"], dict)
+        assert write["read_back"]["found"] is True
+        assert write["read_back_consistent"] is True
+        assert write["canonical_id"] in store
+        assert store[write["canonical_id"]]["version"] == write["version"]
+
+
+def test_reality_promotion_execution_writes_only_approved_scope() -> None:
+    store: dict = {}
+    approvals = {"RAT-02": _promotion_approval("RAT-02", "SKILL")}
+    report = hello_module.reality_promotion_execution_batch_01(
+        approvals=approvals, canonical_store=store
+    )
+
+    assert report["written_candidates"] == ["RAT-02"]
+    assert report["ready_candidates"] == ["RAT-01", "RAT-03"]
+    assert len(store) == 1
+    for candidate in report["candidates"]:
+        if candidate["candidate_id"] != "RAT-02":
+            assert candidate["status"] == hello_module.REALITY_PROMOTION_READY
+            assert candidate["write_performed"] is False
+    assert report["candidates"][1]["canonical_writer"] == "writeSkillCandidate"
+
+
+def test_reality_promotion_execution_blocks_on_wrong_gate() -> None:
+    store: dict = {}
+    approvals = {
+        "RAT-01": _promotion_approval("RAT-01", "KNOWLEDGE", gate="WRONG_GATE")
+    }
+    report = hello_module.reality_promotion_execution_batch_01(
+        approvals=approvals, canonical_store=store
+    )
+
+    blocked = [
+        c for c in report["candidates"] if c["candidate_id"] == "RAT-01"
+    ][0]
+    assert blocked["status"] == hello_module.REALITY_PROMOTION_BLOCKED
+    assert blocked["blocked_reason"].startswith(
+        hello_module.REALITY_PROMOTION_GATE_MISMATCH
+    )
+    assert blocked["write_performed"] is False
+    assert store == {}
+
+
+def test_reality_promotion_execution_blocks_on_non_human_approver() -> None:
+    store: dict = {}
+    approvals = {
+        "RAT-01": _promotion_approval("RAT-01", "KNOWLEDGE", human=False)
+    }
+    report = hello_module.reality_promotion_execution_batch_01(
+        approvals=approvals, canonical_store=store
+    )
+
+    blocked = [
+        c for c in report["candidates"] if c["candidate_id"] == "RAT-01"
+    ][0]
+    assert blocked["status"] == hello_module.REALITY_PROMOTION_BLOCKED
+    assert blocked["blocked_reason"].startswith(
+        hello_module.REALITY_PROMOTION_GATE_NOT_HUMAN
+    )
+    assert blocked["human_gate_approved"] is False
+    assert blocked["write_performed"] is False
+    assert store == {}
+
+
+def test_reality_promotion_execution_no_human_gate_bypass() -> None:
+    report = hello_module.reality_promotion_execution_batch_01()
+
+    assert report["human_gate_enforced"] is True
+    assert report["human_gate_bypassed"] is False
+    assert report["human_gate_bypass_probe"]["blocked"] is True
+    assert report["human_gate_bypass_probe"]["write_performed"] is False
+    assert report["final_status"].endswith("HUMAN_GATE_BYPASSED=False")
+
+
+def test_reality_promotion_execution_single_use_approval() -> None:
+    store: dict = {}
+    approvals = {"RAT-03": _promotion_approval("RAT-03", "DECISION")}
+    report = hello_module.reality_promotion_execution_batch_01(
+        approvals=approvals, canonical_store=store
+    )
+
+    written = [
+        c for c in report["candidates"] if c["candidate_id"] == "RAT-03"
+    ][0]
+    assert written["approval_consume"]["result"] == (
+        hello_module.LEDGER_CONSUME_ACCEPTED
+    )
+    assert written["approval_replay"]["result"] == (
+        hello_module.LEDGER_CONSUME_REPLAY_REJECTED
+    )
+    assert written["approval_single_use"] is True
+
+
+def test_reality_promotion_execution_no_unrelated_asset_modified() -> None:
+    store = {
+        "knowledge:existing-asset": {
+            "canonical_id": "knowledge:existing-asset",
+            "version": 4,
+            "content_hash": "deadbeef",
+        }
+    }
+    before = dict(store["knowledge:existing-asset"])
+    approvals = {"RAT-01": _promotion_approval("RAT-01", "KNOWLEDGE")}
+    report = hello_module.reality_promotion_execution_batch_01(
+        approvals=approvals, canonical_store=store
+    )
+
+    assert report["existing_asset_modified"] is False
+    assert report["unrelated_assets_modified"] is False
+    assert store["knowledge:existing-asset"] == before
+    assert report["write_count"] == 1
+
+
+def test_reality_promotion_execution_no_forbidden_mutation() -> None:
+    report = hello_module.reality_promotion_execution_batch_01()
+
+    for flag in hello_module.REALITY_PROMOTION_EXECUTION_MUTATION_FLAGS:
+        assert report[flag] is False, flag
+    assert report["second_state_store_created"] is False
+    assert report["production_write_performed"] is False
+    assert report["existing_asset_modified"] is False
+
+
+def test_reality_promotion_execution_checks_and_markdown() -> None:
+    report = hello_module.reality_promotion_execution_batch_01(
+        approvals={"RAT-01": _promotion_approval("RAT-01", "KNOWLEDGE")}
+    )
+    for check in report["checks"]:
+        assert set(check) >= {"check", "status", "detail"}
+        assert check["status"] in {"PASS", "FAIL"}
+        assert check["detail"]
+    assert all(check["status"] == "PASS" for check in report["checks"])
+
+    markdown = report["markdown"]
+    assert markdown.startswith(
+        f"# {hello_module.REALITY_PROMOTION_EXECUTION_BATCH_GOAL}"
+    )
+    assert (
+        f"- task_id: {hello_module.REALITY_PROMOTION_EXECUTION_BATCH_TASK_ID}"
+        in markdown
+    )
+    assert "## Candidate statuses" in markdown
+    assert "## Write evidence" in markdown
+    assert "## Human Gate" in markdown
+    assert "## No-forbidden-mutation statement" in markdown
+    assert f"FINAL_STATUS={report['final_status']}" in markdown
+    assert report["changed_files"] == ["hello.py", "test_hello.py"]
+
+    source = inspect.getsource(hello_module)
+    assert "def reality_promotion_execution_batch_01(" in source
+    assert callable(hello_module.reality_promotion_execution_batch_01)
+    assert (
+        hello_module.reality_promotion_execution_batch
+        is hello_module.reality_promotion_execution_batch_01
+    )
+    assert (
+        hello_module.personal_ai_reality_promotion_execution_batch_01
+        is hello_module.reality_promotion_execution_batch_01
+    )

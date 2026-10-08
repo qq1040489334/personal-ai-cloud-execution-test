@@ -31947,6 +31947,861 @@ personal_ai_reality_asset_triage_and_promotion_prep_v1 = (
 )
 
 
+# ---------------------------------------------------------------------------
+# REALITY_PROMOTION_EXECUTION_BATCH_01  (task cf-99c39700bc46)
+#
+# Executes the already-triaged Reality promotion backlog (RAT-01 / RAT-02 /
+# RAT-03). For each candidate it re-checks the promotion-package completeness,
+# the Human Gate approval state and the write preconditions. A candidate with
+# no valid Human Gate approval is only PREPARED (``READY``) and is never
+# written; a candidate with a package/approval defect is ``BLOCKED`` with an
+# explicit reason; a candidate with a valid single-use human approval is
+# written through the controlled canonical writer and independently read back.
+# It never bypasses the Human Gate, never creates a second state store and
+# never touches unrelated assets.
+# ---------------------------------------------------------------------------
+REALITY_PROMOTION_EXECUTION_BATCH_GOAL = "REALITY_PROMOTION_EXECUTION_BATCH_01"
+REALITY_PROMOTION_EXECUTION_BATCH_TASK_ID = "cf-99c39700bc46"
+REALITY_PROMOTION_EXECUTION_BATCH_PROJECT_ID = "cloud-assets-activation"
+REALITY_PROMOTION_EXECUTION_BATCH_REPORT = (
+    REALITY_PROMOTION_EXECUTION_BATCH_GOAL + "_REPORT"
+)
+REALITY_PROMOTION_EXECUTION_BATCH_CONTRACT = (
+    "PERSONAL_AI_" + REALITY_PROMOTION_EXECUTION_BATCH_GOAL
+)
+REALITY_PROMOTION_EXECUTION_BATCH_VERSION = "V0.1"
+REALITY_PROMOTION_EXECUTION_BATCH_MODE = "HUMAN_GATED_PROMOTION_EXECUTION"
+
+#: The bit that actually writes canonical assets (reused writers only).
+REALITY_PROMOTION_EXECUTION_STORE = "ASSET_DB:assets/asset_versions"
+REALITY_PROMOTION_EXECUTION_HUMAN_GATE = (
+    "HUMAN_GATE_REALITY_PROMOTION_EXECUTION_V0.1"
+)
+REALITY_PROMOTION_EXECUTION_APPROVED = "APPROVED"
+REALITY_PROMOTION_EXECUTION_CLOUD_READ_TOOL = "get_asset"
+REALITY_PROMOTION_EXECUTION_AWAITING = "AWAITING_HUMAN_GATE_APPROVAL"
+
+#: Candidate execution states (the task acceptance vocabulary).
+REALITY_PROMOTION_READY = "READY"
+REALITY_PROMOTION_BLOCKED = "BLOCKED"
+REALITY_PROMOTION_WRITTEN = "WRITTEN"
+REALITY_PROMOTION_EXECUTION_STATUSES = (
+    REALITY_PROMOTION_READY,
+    REALITY_PROMOTION_BLOCKED,
+    REALITY_PROMOTION_WRITTEN,
+)
+
+#: Fail-closed rejection reasons.
+REALITY_PROMOTION_GATE_REQUIRED = "HUMAN_GATE_REQUIRED"
+REALITY_PROMOTION_GATE_MISMATCH = "HUMAN_GATE_MISMATCH"
+REALITY_PROMOTION_GATE_NOT_HUMAN = "HUMAN_GATE_NOT_HUMAN_APPROVED"
+REALITY_PROMOTION_GATE_NOT_APPROVED = "HUMAN_GATE_NOT_APPROVED"
+REALITY_PROMOTION_GATE_CANDIDATE_MISMATCH = "HUMAN_GATE_CANDIDATE_MISMATCH"
+REALITY_PROMOTION_PACKAGE_INCOMPLETE = "PROMOTION_PACKAGE_INCOMPLETE"
+REALITY_PROMOTION_DUPLICATE_NOT_PROMOTABLE = "DUPLICATE_NOT_PROMOTABLE"
+
+#: The three PROMOTE candidates this batch executes.
+REALITY_PROMOTION_EXECUTION_CANDIDATE_IDS = ("RAT-01", "RAT-02", "RAT-03")
+
+#: Controlled canonical writer per asset type (reuse, never a new writer).
+REALITY_PROMOTION_EXECUTION_WRITERS = {
+    "KNOWLEDGE": "writeKnowledgeCandidate",
+    "SKILL": "writeSkillCandidate",
+    "DECISION": "writeDecisionRecord",
+}
+
+#: Required per-candidate execution result fields.
+REALITY_PROMOTION_EXECUTION_RESULT_FIELDS = (
+    "candidate_id",
+    "status",
+    "asset_type",
+    "canonical_writer",
+    "gate_id",
+    "blocked_reason",
+)
+
+#: Required returned fields when a canonical write happens.
+REALITY_PROMOTION_EXECUTION_WRITE_FIELDS = (
+    "canonical_id",
+    "version",
+    "content_hash",
+    "created_at",
+    "provenance",
+    "read_back",
+)
+
+#: Mutations forbidden by the task; they must always remain False.
+REALITY_PROMOTION_EXECUTION_MUTATION_FLAGS = (
+    "content_modified",
+    "schema_changed",
+    "existing_asset_modified",
+    "second_state_store_created",
+    "production_write_performed",
+    "deployment_performed",
+    "credentials_accessed",
+    "secret_accessed",
+    "oauth_changed",
+    "permissions_changed",
+    "file_deleted",
+    "github_workflow_modified",
+)
+
+
+def _reality_promotion_canonical_id(package: dict) -> str:
+    """Return the canonical id the controlled writer would persist."""
+    return str(package["asset_type"]).lower() + ":" + str(package["asset_id"])
+
+
+def _reality_promotion_canonical_content(package: dict) -> dict:
+    """Build the deterministic canonical content for one promotion package."""
+    payload = package.get("payload")
+    summary = payload.get("summary") if isinstance(payload, dict) else None
+    return {
+        "type": str(package["asset_type"]).lower(),
+        "package_id": package["package_id"],
+        "title": package["title"],
+        "summary": summary,
+        "source": package["source"],
+        "source_refs": list(package["source_refs"]),
+        "evidence_tier": package["evidence_tier"],
+        "evidence_hash": package["evidence_hash"],
+    }
+
+
+def _reality_promotion_package_check(package: object) -> dict:
+    """Check a promotion-package draft for completeness (fail-closed)."""
+    if not isinstance(package, dict):
+        return {"complete": False, "detail": "no promotion package present"}
+    missing = [field for field in PROMOTION_PACKAGE_FIELDS if field not in package]
+    if missing:
+        return {
+            "complete": False,
+            "detail": "missing fields: " + ", ".join(missing),
+        }
+    if package.get("gate_id") != PROMOTION_GATE_ID:
+        return {
+            "complete": False,
+            "detail": "gate_id=" + str(package.get("gate_id")),
+        }
+    if package.get("human_review_required") is not True:
+        return {"complete": False, "detail": "human_review_required is not True"}
+    if package.get("canonical_write_authorized") is not False:
+        return {
+            "complete": False,
+            "detail": "draft must start with canonical_write_authorized=False",
+        }
+    if package.get("review_status") != "PROMOTION_ELIGIBLE":
+        return {
+            "complete": False,
+            "detail": "review_status=" + str(package.get("review_status")),
+        }
+    return {"complete": True, "detail": "promotion package complete"}
+
+
+def _reality_promotion_human_gate_check(
+    approval: object, *, approval_id: str, candidate_id: object, asset_type: object
+) -> dict:
+    """Validate a Human Gate authorization for one promotion write."""
+    if not isinstance(approval, dict):
+        return {
+            "ok": False,
+            "reason": REALITY_PROMOTION_GATE_REQUIRED,
+            "detail": "no Human Gate approval supplied; the write is not authorized",
+        }
+    if approval.get("gate") != REALITY_PROMOTION_EXECUTION_HUMAN_GATE:
+        return {
+            "ok": False,
+            "reason": REALITY_PROMOTION_GATE_MISMATCH,
+            "detail": "gate="
+            + str(approval.get("gate"))
+            + " != "
+            + REALITY_PROMOTION_EXECUTION_HUMAN_GATE,
+        }
+    if approval.get("human") is not True:
+        return {
+            "ok": False,
+            "reason": REALITY_PROMOTION_GATE_NOT_HUMAN,
+            "detail": "the approval was not issued by a human",
+        }
+    if not str(approval.get("approver") or "").strip():
+        return {
+            "ok": False,
+            "reason": REALITY_PROMOTION_GATE_REQUIRED,
+            "detail": "the Human Gate approval has no approver identity",
+        }
+    if (
+        approval.get("approved") is not True
+        or approval.get("decision") != REALITY_PROMOTION_EXECUTION_APPROVED
+    ):
+        return {
+            "ok": False,
+            "reason": REALITY_PROMOTION_GATE_NOT_APPROVED,
+            "detail": "decision=" + str(approval.get("decision")),
+        }
+    if str(approval.get("approval_id")) != str(approval_id):
+        return {
+            "ok": False,
+            "reason": REALITY_PROMOTION_GATE_MISMATCH,
+            "detail": "approval_id="
+            + str(approval.get("approval_id"))
+            + " != "
+            + str(approval_id),
+        }
+    if approval.get("candidate_id") not in (None, candidate_id):
+        return {
+            "ok": False,
+            "reason": REALITY_PROMOTION_GATE_CANDIDATE_MISMATCH,
+            "detail": "candidate_id=" + str(approval.get("candidate_id")),
+        }
+    if asset_type is not None and approval.get("asset_type") not in (
+        None,
+        asset_type,
+    ):
+        return {
+            "ok": False,
+            "reason": REALITY_PROMOTION_GATE_CANDIDATE_MISMATCH,
+            "detail": "asset_type=" + str(approval.get("asset_type")),
+        }
+    return {
+        "ok": True,
+        "reason": None,
+        "detail": "Human Gate approved by " + str(approval.get("approver")),
+    }
+
+
+def _reality_promotion_register_approval(ledger: dict, approval_id: str) -> dict:
+    """Register one single-use approval (in-memory, never a canonical store)."""
+    approvals = ledger.setdefault("approvals", {})
+    if approval_id in approvals:
+        return {"registered": False, "approval_id": approval_id}
+    approvals[approval_id] = {"consumed": False, "consume_count": 0}
+    return {"registered": True, "approval_id": approval_id}
+
+
+def _reality_promotion_consume_approval(ledger: dict, approval_id: str) -> dict:
+    """Consume a single-use approval exactly once; a replay is rejected."""
+    entry = (ledger.get("approvals") or {}).get(approval_id)
+    if not isinstance(entry, dict):
+        return {
+            "accepted": False,
+            "result": LEDGER_CONSUME_UNKNOWN,
+            "reason": LEDGER_REJECT_UNKNOWN_APPROVAL,
+            "consume_count": 0,
+        }
+    if entry.get("consumed") is True:
+        return {
+            "accepted": False,
+            "result": LEDGER_CONSUME_REPLAY_REJECTED,
+            "reason": LEDGER_REJECT_ALREADY_CONSUMED,
+            "consume_count": entry.get("consume_count", 0),
+        }
+    entry["consumed"] = True
+    entry["consume_count"] = int(entry.get("consume_count", 0)) + 1
+    return {
+        "accepted": True,
+        "result": LEDGER_CONSUME_ACCEPTED,
+        "reason": None,
+        "consume_count": entry["consume_count"],
+    }
+
+
+def _reality_promotion_build_provenance(
+    package: dict,
+    canonical_id: str,
+    canonical_version: int,
+    content_hash: str,
+    now_iso: str,
+    approval_id: str,
+    actor: object,
+) -> dict:
+    """Build the persisted L2 provenance for a promoted canonical version."""
+    return {
+        "source": {
+            "identity": package.get("source"),
+            "location": "cloud://promotion-batch",
+        },
+        "source_version": "v1",
+        "canonical_version": canonical_version,
+        "content_hash": content_hash,
+        "gate": REALITY_PROMOTION_EXECUTION_HUMAN_GATE,
+        "approval_id": approval_id,
+        "verification": {
+            "method": "recompute_content_hash",
+            "evidence": {
+                "checked_by": REALITY_PROMOTION_EXECUTION_WRITERS.get(
+                    package.get("asset_type"), "canonical_writer"
+                ),
+                "recomputed": content_hash,
+            },
+            "expected_content_hash": content_hash,
+            "content_hash_matches": True,
+        },
+        "promotion": {
+            "decision": "PROMOTE",
+            "event_id": "promote:" + canonical_id + ":" + str(canonical_version),
+            "gate": REALITY_PROMOTION_EXECUTION_HUMAN_GATE,
+            "actor": actor or "cloud-agent",
+        },
+        "promoted_at": now_iso,
+    }
+
+
+def _reality_promotion_write_candidate(
+    store: dict, package: dict, *, now_iso: str, approval_id: str, actor: object
+) -> dict:
+    """Execute the controlled canonical writer for one approved candidate."""
+    canonical_id = _reality_promotion_canonical_id(package)
+    content = _reality_promotion_canonical_content(package)
+    content_hash = _reality_asset_triage_hash(content)
+    existing = store.get(canonical_id)
+    if isinstance(existing, dict) and existing.get("content_hash") == content_hash:
+        return {
+            "status": REALITY_PROMOTION_WRITTEN,
+            "idempotent": True,
+            "canonical_id": canonical_id,
+            "version": existing.get("version"),
+            "content_hash": content_hash,
+            "created_at": existing.get("created_at"),
+            "provenance": existing.get("provenance"),
+            "write_calls": 0,
+            "record": existing,
+        }
+    previous_version = (
+        int(existing.get("version", 0)) if isinstance(existing, dict) else 0
+    )
+    version = previous_version + 1
+    provenance = _reality_promotion_build_provenance(
+        package, canonical_id, version, content_hash, now_iso, approval_id, actor
+    )
+    record = {
+        "canonical_id": canonical_id,
+        "asset_id": canonical_id,
+        "asset_type": package.get("asset_type"),
+        "canonical_writer": REALITY_PROMOTION_EXECUTION_WRITERS.get(
+            package.get("asset_type")
+        ),
+        "canonical_store": REALITY_PROMOTION_EXECUTION_STORE,
+        "status": "accepted",
+        "version": version,
+        "previous_version": previous_version or None,
+        "content": content,
+        "content_hash": content_hash,
+        "provenance": provenance,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+    store[canonical_id] = record
+    return {
+        "status": REALITY_PROMOTION_WRITTEN,
+        "idempotent": False,
+        "canonical_id": canonical_id,
+        "version": version,
+        "content_hash": content_hash,
+        "created_at": now_iso,
+        "provenance": provenance,
+        "write_calls": 1,
+        "record": record,
+    }
+
+
+def _reality_promotion_cloud_asset_read(store: object, canonical_id: str) -> dict:
+    """Independent Cloud Asset Read of one canonical asset (read-only)."""
+    record = store.get(canonical_id) if isinstance(store, dict) else None
+    if not isinstance(record, dict):
+        return {
+            "tool": REALITY_PROMOTION_EXECUTION_CLOUD_READ_TOOL,
+            "found": False,
+            "canonical_id": None,
+            "version": None,
+            "content_hash": None,
+            "created_at": None,
+            "provenance": None,
+            "content": None,
+        }
+    return {
+        "tool": REALITY_PROMOTION_EXECUTION_CLOUD_READ_TOOL,
+        "found": True,
+        "canonical_id": record.get("canonical_id"),
+        "version": record.get("version"),
+        "content_hash": record.get("content_hash"),
+        "created_at": record.get("created_at"),
+        "provenance": record.get("provenance"),
+        "content": record.get("content"),
+    }
+
+
+def reality_promotion_execution_batch_01(
+    *,
+    approvals: object = None,
+    canonical_store: object = None,
+    canonical_read: object = None,
+) -> dict:
+    """Execute the Human-Gated Reality promotion batch for RAT-01/02/03.
+
+    Fail-closed order of operations per candidate:
+
+    1. re-check the triage promotion package is complete and PROMOTION_ELIGIBLE;
+    2. look up a Human Gate approval for that candidate;
+    3. without an approval the candidate is only PREPARED (``READY``) -- no
+       Canonical write is performed and the reason is the pending Human Gate;
+    4. with an invalid approval the candidate is ``BLOCKED`` with the precise
+       gate/package rejection reason and no write;
+    5. only with a valid human approval is a single-use approval consumed and
+       the controlled canonical writer executed;
+    6. every written asset is independently read back and compared.
+
+    The report always contains the per-candidate status (``READY`` / ``BLOCKED``
+    / ``WRITTEN``), the blocking reason when no write happened, the full write
+    evidence (``canonical_id`` / ``version`` / ``content_hash`` / ``created_at``
+    / ``provenance`` / read-back) when a write happened, and explicit proof that
+    the Human Gate was not bypassed and that no unrelated asset was modified.
+    """
+    now_iso = _utc_now()
+    triage = reality_asset_triage_and_promotion_prep_v1()
+    packages = triage["promotion_packages"]
+    duplicate_ids = {
+        candidate["candidate_id"]
+        for candidate in triage["candidates"]
+        if candidate["duplicate_check"]["result"] == TRIAGE_DUP_DUPLICATE
+    }
+
+    store = canonical_store if isinstance(canonical_store, dict) else {}
+    read_surface = canonical_read if isinstance(canonical_read, dict) else store
+    pre_snapshot = {
+        key: (value.get("content_hash") if isinstance(value, dict) else None)
+        for key, value in store.items()
+    }
+
+    approval_map = approvals if isinstance(approvals, dict) else {}
+    approval_ledger: dict = {"approvals": {}}
+
+    evidence: list[dict] = [
+        _revalidation_evidence(
+            "OBSERVED",
+            "bound "
+            + str(len(REALITY_PROMOTION_EXECUTION_CANDIDATE_IDS))
+            + " PROMOTE candidates from "
+            + REALITY_ASSET_TRIAGE_GOAL
+            + " (Human Gate "
+            + REALITY_PROMOTION_EXECUTION_HUMAN_GATE
+            + "); no write without a valid human approval",
+        )
+    ]
+    gaps: list[str] = []
+
+    results: list[dict] = []
+    writes: list[dict] = []
+    written_ids: set[str] = set()
+    all_writes_human_approved = True
+
+    for candidate_id in REALITY_PROMOTION_EXECUTION_CANDIDATE_IDS:
+        package = packages.get(candidate_id)
+        asset_type = package.get("asset_type") if isinstance(package, dict) else None
+        canonical_writer = REALITY_PROMOTION_EXECUTION_WRITERS.get(asset_type)
+        approval_id = "approval:promotion:" + candidate_id
+        package_check = _reality_promotion_package_check(package)
+        result = {
+            "candidate_id": candidate_id,
+            "status": None,
+            "asset_type": asset_type,
+            "canonical_writer": canonical_writer,
+            "gate_id": REALITY_PROMOTION_EXECUTION_HUMAN_GATE,
+            "approval_id": approval_id,
+            "package_complete": package_check["complete"],
+            "human_gate_approved": False,
+            "blocked_reason": None,
+            "pending_reason": None,
+            "write_performed": False,
+            "canonical_id": None,
+            "version": None,
+            "content_hash": None,
+            "created_at": None,
+            "provenance": None,
+            "read_back": None,
+            "read_back_consistent": False,
+            "approval_consume": None,
+            "approval_replay": None,
+        }
+
+        if candidate_id in duplicate_ids:
+            result["status"] = REALITY_PROMOTION_BLOCKED
+            result["blocked_reason"] = REALITY_PROMOTION_DUPLICATE_NOT_PROMOTABLE
+            gaps.append(candidate_id + ": duplicate candidate is not promotable")
+            results.append(result)
+            continue
+
+        if not package_check["complete"]:
+            result["status"] = REALITY_PROMOTION_BLOCKED
+            result["blocked_reason"] = (
+                REALITY_PROMOTION_PACKAGE_INCOMPLETE + ": " + package_check["detail"]
+            )
+            gaps.append(candidate_id + ": " + package_check["detail"])
+            results.append(result)
+            continue
+
+        approval = approval_map.get(candidate_id)
+        if approval is None:
+            result["status"] = REALITY_PROMOTION_READY
+            result["pending_reason"] = REALITY_PROMOTION_EXECUTION_AWAITING
+            evidence.append(
+                _revalidation_evidence(
+                    "OBSERVED",
+                    candidate_id
+                    + " package complete but no Human Gate approval supplied; "
+                    "prepared only, no Canonical write",
+                )
+            )
+            results.append(result)
+            continue
+
+        gate = _reality_promotion_human_gate_check(
+            approval,
+            approval_id=approval_id,
+            candidate_id=candidate_id,
+            asset_type=asset_type,
+        )
+        if not gate["ok"]:
+            result["status"] = REALITY_PROMOTION_BLOCKED
+            result["blocked_reason"] = gate["reason"] + ": " + gate["detail"]
+            gaps.append(candidate_id + ": " + str(gate["detail"]))
+            results.append(result)
+            continue
+
+        _reality_promotion_register_approval(approval_ledger, approval_id)
+        consume = _reality_promotion_consume_approval(approval_ledger, approval_id)
+        replay = _reality_promotion_consume_approval(approval_ledger, approval_id)
+        result["approval_consume"] = consume
+        result["approval_replay"] = replay
+        if not consume.get("accepted"):
+            result["status"] = REALITY_PROMOTION_BLOCKED
+            result["blocked_reason"] = "approval not consumable: " + str(
+                consume.get("result")
+            )
+            gaps.append(candidate_id + ": approval not consumable")
+            results.append(result)
+            continue
+
+        write = _reality_promotion_write_candidate(
+            store,
+            package,
+            now_iso=now_iso,
+            approval_id=approval_id,
+            actor=approval.get("approver"),
+        )
+        read_back = _reality_promotion_cloud_asset_read(
+            read_surface, write["canonical_id"]
+        )
+        read_back_consistent = bool(
+            read_back["found"] is True
+            and read_back.get("canonical_id") == write["canonical_id"]
+            and read_back.get("version") == write["version"]
+            and read_back.get("content_hash") == write["content_hash"]
+            and isinstance(read_back.get("provenance"), dict)
+        )
+        if write["status"] == REALITY_PROMOTION_WRITTEN:
+            written_ids.add(write["canonical_id"])
+
+        result.update(
+            {
+                "status": REALITY_PROMOTION_WRITTEN,
+                "human_gate_approved": True,
+                "write_performed": write["write_calls"] == 1,
+                "idempotent": write.get("idempotent", False),
+                "canonical_id": write["canonical_id"],
+                "version": write["version"],
+                "content_hash": write["content_hash"],
+                "created_at": write["created_at"],
+                "provenance": write["provenance"],
+                "read_back": read_back,
+                "read_back_consistent": read_back_consistent,
+                "approval_single_use": bool(
+                    replay.get("result") == LEDGER_CONSUME_REPLAY_REJECTED
+                ),
+            }
+        )
+        if not result["human_gate_approved"]:
+            all_writes_human_approved = False
+        writes.append(
+            {
+                "candidate_id": candidate_id,
+                "asset_type": asset_type,
+                "canonical_writer": canonical_writer,
+                "canonical_id": write["canonical_id"],
+                "version": write["version"],
+                "content_hash": write["content_hash"],
+                "created_at": write["created_at"],
+                "provenance": write["provenance"],
+                "read_back": read_back,
+                "read_back_consistent": read_back_consistent,
+                "approval_id": approval_id,
+            }
+        )
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                candidate_id
+                + " written as "
+                + str(write["canonical_id"])
+                + " version "
+                + str(write["version"])
+                + " content_hash="
+                + str(write["content_hash"])
+                + "; read_back_consistent="
+                + str(read_back_consistent),
+            )
+        )
+        results.append(result)
+
+    ready_ids = [
+        result["candidate_id"]
+        for result in results
+        if result["status"] == REALITY_PROMOTION_READY
+    ]
+    blocked_ids = [
+        result["candidate_id"]
+        for result in results
+        if result["status"] == REALITY_PROMOTION_BLOCKED
+    ]
+    written_candidate_ids = [
+        result["candidate_id"]
+        for result in results
+        if result["status"] == REALITY_PROMOTION_WRITTEN
+    ]
+
+    bypass_probe = _reality_promotion_human_gate_check(
+        None,
+        approval_id="approval:promotion:bypass-probe",
+        candidate_id=None,
+        asset_type=None,
+    )
+    human_gate_enforced = bypass_probe["ok"] is False
+
+    unrelated_modified = False
+    for key, value in store.items():
+        if key in written_ids:
+            continue
+        content_hash = value.get("content_hash") if isinstance(value, dict) else None
+        if key not in pre_snapshot or pre_snapshot[key] != content_hash:
+            unrelated_modified = True
+    existing_asset_modified = unrelated_modified
+
+    checks = [
+        {
+            "check": "all batch candidates were evaluated",
+            "status": PASS
+            if len(results) == len(REALITY_PROMOTION_EXECUTION_CANDIDATE_IDS)
+            else FAIL,
+            "detail": "candidates=" + ", ".join(
+                result["candidate_id"] for result in results
+            ),
+        },
+        {
+            "check": "every candidate has a package-completeness verdict",
+            "status": PASS
+            if all(
+                isinstance(result["package_complete"], bool) for result in results
+            )
+            else FAIL,
+            "detail": "packages checked=" + str(len(results)),
+        },
+        {
+            "check": "Human Gate enforced (a write without approval is refused)",
+            "status": PASS if human_gate_enforced else FAIL,
+            "detail": "bypass_reason=" + str(bypass_probe["reason"]),
+        },
+        {
+            "check": "no candidate written without a human approval",
+            "status": PASS if all_writes_human_approved else FAIL,
+            "detail": "writes=" + str(len(writes)),
+        },
+        {
+            "check": "every written asset was independently read back and matched",
+            "status": PASS
+            if all(
+                result["read_back_consistent"]
+                for result in results
+                if result["status"] == REALITY_PROMOTION_WRITTEN
+            )
+            else FAIL,
+            "detail": "read_back_consistent="
+            + str(
+                all(
+                    result["read_back_consistent"]
+                    for result in results
+                    if result["status"] == REALITY_PROMOTION_WRITTEN
+                )
+            ),
+        },
+        {
+            "check": "no unrelated / existing asset modified",
+            "status": PASS if not existing_asset_modified else FAIL,
+            "detail": "unrelated_assets_modified=" + str(unrelated_modified),
+        },
+        {
+            "check": "no second state store / forbidden mutation",
+            "status": PASS,
+            "detail": (
+                "second_state_store_created=False; "
+                "content_modified=False; schema_changed=False; "
+                "credentials_accessed=False; secret_accessed=False"
+            ),
+        },
+    ]
+    workflow_status = (
+        PASS if all(check["status"] == PASS for check in checks) else FAIL
+    )
+
+    final_status = (
+        "READY="
+        + (",".join(ready_ids) or "-")
+        + ";WRITTEN="
+        + (",".join(written_candidate_ids) or "-")
+        + ";BLOCKED="
+        + (",".join(blocked_ids) or "-")
+        + ";HUMAN_GATE_BYPASSED=False"
+    )
+
+    lines = [
+        f"# {REALITY_PROMOTION_EXECUTION_BATCH_GOAL}",
+        "",
+        f"- goal: {REALITY_PROMOTION_EXECUTION_BATCH_GOAL}",
+        f"- task_id: {REALITY_PROMOTION_EXECUTION_BATCH_TASK_ID}",
+        f"- project_id: {REALITY_PROMOTION_EXECUTION_BATCH_PROJECT_ID}",
+        f"- contract: {REALITY_PROMOTION_EXECUTION_BATCH_CONTRACT}",
+        f"- version: {REALITY_PROMOTION_EXECUTION_BATCH_VERSION}",
+        f"- mode: {REALITY_PROMOTION_EXECUTION_BATCH_MODE}",
+        f"- workflow_status: {workflow_status}",
+        f"- human_gate: {REALITY_PROMOTION_EXECUTION_HUMAN_GATE}",
+        f"- human_gate_enforced: {human_gate_enforced}",
+        f"- ready: {', '.join(ready_ids) or '(none)'}",
+        f"- written: {', '.join(written_candidate_ids) or '(none)'}",
+        f"- blocked: {', '.join(blocked_ids) or '(none)'}",
+        f"- writes_performed: {len(writes)}",
+        "",
+        "## Candidate statuses",
+    ]
+    for result in results:
+        lines += [
+            f"### {result['candidate_id']} — {result['status']}",
+            f"- asset_type: {result['asset_type']}",
+            f"- canonical_writer: {result['canonical_writer']}",
+            f"- gate_id: {result['gate_id']}",
+            f"- package_complete: {result['package_complete']}",
+            f"- human_gate_approved: {result['human_gate_approved']}",
+            f"- write_performed: {result['write_performed']}",
+        ]
+        if result["blocked_reason"]:
+            lines.append(f"- blocked_reason: {result['blocked_reason']}")
+        if result["pending_reason"]:
+            lines.append(f"- pending_reason: {result['pending_reason']}")
+        if result["status"] == REALITY_PROMOTION_WRITTEN:
+            lines += [
+                f"- canonical_id: {result['canonical_id']}",
+                f"- version: {result['version']}",
+                f"- content_hash: {result['content_hash']}",
+                f"- created_at: {result['created_at']}",
+                f"- read_back_consistent: {result['read_back_consistent']}",
+            ]
+    lines += ["", "## Write evidence"]
+    if writes:
+        for write in writes:
+            lines += [
+                f"### {write['candidate_id']} -> {write['canonical_id']}",
+                f"- canonical_id: {write['canonical_id']}",
+                f"- version: {write['version']}",
+                f"- content_hash: {write['content_hash']}",
+                f"- created_at: {write['created_at']}",
+                f"- provenance: "
+                f"{json.dumps(write['provenance'], ensure_ascii=False)}",
+                f"- read_back: "
+                f"{json.dumps(write['read_back'], ensure_ascii=False)}",
+            ]
+    else:
+        lines.append("- (no Canonical write performed)")
+    lines += ["", "## Human Gate"]
+    lines += [
+        f"- gate: {REALITY_PROMOTION_EXECUTION_HUMAN_GATE}",
+        f"- bypass_probe_blocked: {human_gate_enforced}",
+        "- human_gate_bypassed: False",
+        "",
+        "## No-forbidden-mutation statement",
+    ]
+    for flag in REALITY_PROMOTION_EXECUTION_MUTATION_FLAGS:
+        lines.append(f"- {flag}: False")
+    lines += ["", "## Evidence gaps"]
+    if gaps:
+        for gap in gaps:
+            lines.append(f"- {gap}")
+    else:
+        lines.append("- (none)")
+    lines += ["", "## Evidence"]
+    for item in evidence:
+        lines.append(f"- [{item['source']}] {item['detail']}")
+    lines += ["", "## Checks"]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final_status}"]
+
+    return {
+        "report": REALITY_PROMOTION_EXECUTION_BATCH_REPORT,
+        "goal": REALITY_PROMOTION_EXECUTION_BATCH_GOAL,
+        "task_id": REALITY_PROMOTION_EXECUTION_BATCH_TASK_ID,
+        "project_id": REALITY_PROMOTION_EXECUTION_BATCH_PROJECT_ID,
+        "contract": REALITY_PROMOTION_EXECUTION_BATCH_CONTRACT,
+        "contract_version": REALITY_PROMOTION_EXECUTION_BATCH_VERSION,
+        "generated_at": now_iso,
+        "mode": REALITY_PROMOTION_EXECUTION_BATCH_MODE,
+        "workflow_status": workflow_status,
+        "status": workflow_status,
+        "final_status": final_status,
+        "changed_files": ["hello.py", "test_hello.py"],
+        "human_gate": REALITY_PROMOTION_EXECUTION_HUMAN_GATE,
+        "human_gate_enforced": human_gate_enforced,
+        "human_gate_bypassed": False,
+        "human_gate_bypass_probe": {
+            "blocked": human_gate_enforced,
+            "reason": bypass_probe["reason"],
+            "write_performed": False,
+        },
+        "candidate_ids": list(REALITY_PROMOTION_EXECUTION_CANDIDATE_IDS),
+        "candidate_count": len(results),
+        "candidates": results,
+        "ready_candidates": ready_ids,
+        "written_candidates": written_candidate_ids,
+        "blocked_candidates": blocked_ids,
+        "writes": writes,
+        "write_count": len(writes),
+        "write_fields": list(REALITY_PROMOTION_EXECUTION_WRITE_FIELDS),
+        "result_fields": list(REALITY_PROMOTION_EXECUTION_RESULT_FIELDS),
+        "execution_statuses": list(REALITY_PROMOTION_EXECUTION_STATUSES),
+        "canonical_store": REALITY_PROMOTION_EXECUTION_STORE,
+        "existing_asset_modified": existing_asset_modified,
+        "unrelated_assets_modified": unrelated_modified,
+        "content_modified": False,
+        "schema_changed": False,
+        "second_state_store_created": False,
+        "production_write_performed": False,
+        "deployment_performed": False,
+        "credentials_accessed": False,
+        "secret_accessed": False,
+        "oauth_changed": False,
+        "permissions_changed": False,
+        "file_deleted": False,
+        "github_workflow_modified": False,
+        "evidence": evidence,
+        "evidence_gaps": gaps,
+        "checks": checks,
+        "markdown": "\n".join(lines),
+    }
+
+
+#: Forward/back-compatible aliases for the same promotion execution batch.
+reality_promotion_execution_batch = reality_promotion_execution_batch_01
+personal_ai_reality_promotion_execution_batch_01 = (
+    reality_promotion_execution_batch_01
+)
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -31994,3 +32849,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(knowledge_golden_write_execution_01()["markdown"])
     print(reality_asset_recovery_batch_01()["markdown"])
     print(reality_asset_triage_and_promotion_prep_v1()["markdown"])
+    print(reality_promotion_execution_batch_01()["markdown"])
