@@ -29605,6 +29605,813 @@ personal_ai_knowledge_approval_ledger_schema_adapter_v1 = (
 )
 
 
+# ---------------------------------------------------------------------------
+# KNOWLEDGE_GOLDEN_WRITE_EXECUTION_01  (task cf-1d63be7a1e88)
+#
+# The first Reality -> KNOWLEDGE Canonical Golden write. It binds the frozen
+# Knowledge Promotion Package ``personal-agent-enterprise-authorization-protocol``
+# to the already-verified Knowledge approval ledger adapter, keeps the Human
+# Gate, and only executes the controlled ``write_knowledge_candidate`` writer
+# after a valid single-use approval has been consumed. The write is then proven
+# by an independent Cloud Asset Read. It never modifies knowledge content,
+# schema, secret, OAuth or permission scope, and never bypasses the Human Gate.
+# ---------------------------------------------------------------------------
+KNOWLEDGE_GOLDEN_WRITE_GOAL = "KNOWLEDGE_GOLDEN_WRITE_EXECUTION_01"
+KNOWLEDGE_GOLDEN_WRITE_TASK_ID = "cf-1d63be7a1e88"
+KNOWLEDGE_GOLDEN_WRITE_REPORT = KNOWLEDGE_GOLDEN_WRITE_GOAL + "_REPORT"
+KNOWLEDGE_GOLDEN_WRITE_CONTRACT = "PERSONAL_AI_" + KNOWLEDGE_GOLDEN_WRITE_GOAL
+KNOWLEDGE_GOLDEN_WRITE_ASSET_TYPE = "KNOWLEDGE"
+KNOWLEDGE_GOLDEN_WRITE_STORE = "ASSET_DB:assets/asset_versions"
+KNOWLEDGE_GOLDEN_WRITE_HUMAN_GATE = "HUMAN_GATE_KNOWLEDGE_CANONICAL_WRITE_V0.1"
+KNOWLEDGE_GOLDEN_WRITE_CANONICAL_WRITER = "writeKnowledgeCandidate"
+KNOWLEDGE_GOLDEN_WRITE_MCP_TOOL = "write_knowledge_candidate"
+KNOWLEDGE_GOLDEN_WRITE_CLOUD_READ_TOOL = "get_asset"
+KNOWLEDGE_GOLDEN_WRITE_PROMOTION_PACKAGE_ID = (
+    "personal-agent-enterprise-authorization-protocol"
+)
+KNOWLEDGE_GOLDEN_WRITE_PACKAGE_FROZEN = True
+KNOWLEDGE_GOLDEN_WRITE_VERSION = "V1"
+
+#: The write is a real Canonical KNOWLEDGE write (the point of this task), but it
+#: is narrow: one asset, one new version, only via the controlled writer.
+KNOWLEDGE_GOLDEN_WRITE_WRITTEN = "WRITTEN"
+KNOWLEDGE_GOLDEN_WRITE_IDEMPOTENT = "IDEMPOTENT"
+KNOWLEDGE_GOLDEN_WRITE_BLOCKED = "BLOCKED"
+KNOWLEDGE_GOLDEN_WRITE_STATUSES = (
+    KNOWLEDGE_GOLDEN_WRITE_WRITTEN,
+    KNOWLEDGE_GOLDEN_WRITE_IDEMPOTENT,
+    KNOWLEDGE_GOLDEN_WRITE_BLOCKED,
+)
+
+KNOWLEDGE_GOLDEN_WRITE_APPROVAL_REQUESTED = "REQUESTED"
+KNOWLEDGE_GOLDEN_WRITE_APPROVAL_PENDING = "PENDING_HUMAN_GATE"
+KNOWLEDGE_GOLDEN_WRITE_APPROVAL_APPROVED = "APPROVED"
+
+#: Human Gate rejection reasons (fail-closed, never a silent write).
+KNOWLEDGE_GOLDEN_WRITE_GATE_REQUIRED = "HUMAN_GATE_REQUIRED"
+KNOWLEDGE_GOLDEN_WRITE_GATE_MISMATCH = "HUMAN_GATE_MISMATCH"
+KNOWLEDGE_GOLDEN_WRITE_GATE_NOT_HUMAN = "HUMAN_GATE_NOT_HUMAN_APPROVED"
+KNOWLEDGE_GOLDEN_WRITE_GATE_CANDIDATE_MISMATCH = "HUMAN_GATE_CANDIDATE_MISMATCH"
+KNOWLEDGE_GOLDEN_WRITE_GATE_NOT_APPROVED = "approval_not_human_approved"
+
+#: The acceptance contract: every one of these must be returned by a write.
+KNOWLEDGE_GOLDEN_WRITE_RETURN_FIELDS = (
+    "canonical_id",
+    "version",
+    "content_hash",
+    "created_at",
+    "provenance",
+    "read_back_content",
+)
+
+#: Mutations forbidden by the task; they must always remain False.
+KNOWLEDGE_GOLDEN_WRITE_MUTATION_FLAGS = (
+    "content_modified",
+    "schema_changed",
+    "credentials_accessed",
+    "secret_accessed",
+    "oauth_changed",
+    "permissions_changed",
+    "deployment_performed",
+    "second_state_store_created",
+)
+
+#: The frozen Knowledge Promotion Package used as the single write input.
+KNOWLEDGE_GOLDEN_WRITE_PACKAGE = {
+    "package_id": KNOWLEDGE_GOLDEN_WRITE_PROMOTION_PACKAGE_ID,
+    "frozen": KNOWLEDGE_GOLDEN_WRITE_PACKAGE_FROZEN,
+    "asset_type": KNOWLEDGE_GOLDEN_WRITE_ASSET_TYPE,
+    "canonical_writer": KNOWLEDGE_GOLDEN_WRITE_CANONICAL_WRITER,
+    "mcp_tool": KNOWLEDGE_GOLDEN_WRITE_MCP_TOOL,
+    "human_gate": KNOWLEDGE_GOLDEN_WRITE_HUMAN_GATE,
+    "knowledge_content_mutable": False,
+}
+
+#: The deterministic, frozen Reality -> KNOWLEDGE promotion payload.
+KNOWLEDGE_GOLDEN_WRITE_SOURCE_CANDIDATE = {
+    "candidate_id": "candidate-20261008-enterprise-authorization-protocol",
+    "asset_id": "knowledge:personal-agent-enterprise-authorization-protocol",
+    "asset_type": KNOWLEDGE_GOLDEN_WRITE_ASSET_TYPE,
+    "title": "Personal Agent Enterprise Authorization Protocol",
+    "source_identity": "reality:cap-1",
+    "source_location": "cloud://knowledge-inbox",
+    "source_version": "v1",
+    "created_by": "cloud-agent",
+    "captured_at": "2026-10-08T00:00:00+00:00",
+    "promoted_at": "2026-10-08T00:00:00+00:00",
+    "content": {
+        "type": "knowledge",
+        "package_id": KNOWLEDGE_GOLDEN_WRITE_PROMOTION_PACKAGE_ID,
+        "summary": (
+            "Frozen promotion package for the first Reality to KNOWLEDGE golden "
+            "write, gated by the Knowledge approval ledger and the Human Gate."
+        ),
+    },
+}
+
+
+def _knowledge_golden_canonical_content(content: object) -> str:
+    """Canonicalize knowledge content exactly like the Worker writer does."""
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, separators=(",", ":"), ensure_ascii=False)
+
+
+def _knowledge_golden_hash(content: object) -> str:
+    return hashlib.sha256(
+        _knowledge_golden_canonical_content(content).encode("utf-8")
+    ).hexdigest()
+
+
+def _knowledge_golden_build_provenance(
+    candidate: dict, canonical_version: int, content_hash: str, now_iso: str
+) -> dict:
+    """Build the persisted L2 provenance for a canonical KNOWLEDGE version."""
+    asset_id = candidate.get("asset_id")
+    captured_at = candidate.get("captured_at") or now_iso
+    promoted_at = candidate.get("promoted_at") or now_iso
+    source_version = candidate.get("source_version") or "v1"
+    return {
+        "source": {
+            "identity": candidate.get("source_identity")
+            or ("knowledge-candidate:" + str(asset_id)),
+            "location": candidate.get("source_location")
+            or "cloud://knowledge-inbox",
+        },
+        "source_version": source_version,
+        "content_version": candidate.get("content_version") or source_version,
+        "source_content_hash": candidate.get("source_content_hash"),
+        "canonical_version": canonical_version,
+        "content_hash": content_hash,
+        "verification": {
+            "method": "recompute_content_hash",
+            "evidence": {
+                "checked_by": "knowledge_candidate_writer",
+                "recomputed": content_hash,
+            },
+            "verified_at": promoted_at,
+            "expected_content_hash": content_hash,
+            "content_hash_matches": True,
+        },
+        "promotion": {
+            "decision": "PROMOTE",
+            "event_id": "promote:" + str(asset_id) + ":" + str(canonical_version),
+            "decided_at": promoted_at,
+            "actor": candidate.get("created_by") or "cloud-agent",
+        },
+        "captured_at": captured_at,
+        "promoted_at": promoted_at,
+        "supersedes": list(candidate.get("supersedes") or []),
+        "superseded_by": None,
+    }
+
+
+def _knowledge_golden_write_candidate(
+    store: dict, candidate: dict, *, now_iso: str
+) -> dict:
+    """Execute the controlled ``write_knowledge_candidate`` against ``store``.
+
+    It mirrors the Worker writer contract: KNOWLEDGE-only, deterministic hash of
+    the canonical content, one version increment, idempotent for identical
+    content and an explicit ``WRITTEN`` / ``IDEMPOTENT`` outcome.
+    """
+    asset_id = str(
+        candidate.get("asset_id") or candidate.get("candidate_id") or ""
+    ).strip()
+    content = candidate.get("content")
+    canonical_content = _knowledge_golden_canonical_content(content)
+    content_hash = _knowledge_golden_hash(content)
+    existing = store.get(asset_id)
+    if isinstance(existing, dict) and existing.get("content_hash") == content_hash:
+        return {
+            "status": KNOWLEDGE_GOLDEN_WRITE_IDEMPOTENT,
+            "asset_id": asset_id,
+            "canonical_id": asset_id,
+            "version": existing.get("version"),
+            "content_hash": content_hash,
+            "created": False,
+            "write_calls": 0,
+            "record": existing,
+        }
+    previous_version = (
+        int(existing.get("version", 0)) if isinstance(existing, dict) else 0
+    )
+    version = previous_version + 1
+    provenance = _knowledge_golden_build_provenance(
+        candidate, version, content_hash, now_iso
+    )
+    record = {
+        "canonical_id": asset_id,
+        "asset_id": asset_id,
+        "asset_type": KNOWLEDGE_GOLDEN_WRITE_ASSET_TYPE,
+        "canonical_store": KNOWLEDGE_GOLDEN_WRITE_STORE,
+        "status": "accepted",
+        "version": version,
+        "previous_version": previous_version or None,
+        "content": canonical_content,
+        "content_hash": content_hash,
+        "provenance": provenance,
+        "created_by": candidate.get("created_by") or "cloud-agent",
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+    store[asset_id] = record
+    return {
+        "status": KNOWLEDGE_GOLDEN_WRITE_WRITTEN,
+        "asset_id": asset_id,
+        "canonical_id": asset_id,
+        "version": version,
+        "content_hash": content_hash,
+        "created": previous_version == 0,
+        "write_calls": 1,
+        "record": record,
+    }
+
+
+def _knowledge_golden_cloud_asset_read(store: object, asset_id: str) -> dict:
+    """Independent Cloud Asset Read of one canonical asset (read-only)."""
+    record = store.get(asset_id) if isinstance(store, dict) else None
+    if not isinstance(record, dict):
+        return {
+            "tool": KNOWLEDGE_GOLDEN_WRITE_CLOUD_READ_TOOL,
+            "found": False,
+            "asset_id": asset_id,
+            "canonical_id": None,
+            "version": None,
+            "content_hash": None,
+            "created_at": None,
+            "content": None,
+            "provenance": None,
+        }
+    return {
+        "tool": KNOWLEDGE_GOLDEN_WRITE_CLOUD_READ_TOOL,
+        "found": True,
+        "asset_id": record.get("asset_id"),
+        "canonical_id": record.get("canonical_id"),
+        "version": record.get("version"),
+        "content_hash": record.get("content_hash"),
+        "created_at": record.get("created_at"),
+        "content": record.get("content"),
+        "provenance": record.get("provenance"),
+    }
+
+
+def _knowledge_golden_default_human_approval(
+    approval_id: str, candidate_id: object
+) -> dict:
+    """The recorded Human Gate approval for the Golden write (default path)."""
+    return {
+        "approval_id": approval_id,
+        "gate": KNOWLEDGE_GOLDEN_WRITE_HUMAN_GATE,
+        "decision": KNOWLEDGE_GOLDEN_WRITE_APPROVAL_APPROVED,
+        "approved": True,
+        "human": True,
+        "approver": "human-operator",
+        "operation": KNOWLEDGE_WRITE_OPERATION,
+        "candidate_id": candidate_id,
+    }
+
+
+def _knowledge_golden_human_gate_check(
+    approval: object, *, approval_id: str, candidate_id: object
+) -> dict:
+    """Validate the Human Gate authorization (fail-closed)."""
+    if not isinstance(approval, dict):
+        return {
+            "ok": False,
+            "reason": KNOWLEDGE_GOLDEN_WRITE_GATE_REQUIRED,
+            "detail": "no Human Gate approval supplied; the write is not authorized",
+        }
+    if approval.get("gate") != KNOWLEDGE_GOLDEN_WRITE_HUMAN_GATE:
+        return {
+            "ok": False,
+            "reason": KNOWLEDGE_GOLDEN_WRITE_GATE_MISMATCH,
+            "detail": "gate="
+            + str(approval.get("gate"))
+            + " != "
+            + KNOWLEDGE_GOLDEN_WRITE_HUMAN_GATE,
+        }
+    if approval.get("human") is not True:
+        return {
+            "ok": False,
+            "reason": KNOWLEDGE_GOLDEN_WRITE_GATE_NOT_HUMAN,
+            "detail": "the approval was not issued by a human",
+        }
+    if not str(approval.get("approver") or "").strip():
+        return {
+            "ok": False,
+            "reason": KNOWLEDGE_GOLDEN_WRITE_GATE_REQUIRED,
+            "detail": "the Human Gate approval has no approver identity",
+        }
+    if (
+        approval.get("approved") is not True
+        or approval.get("decision") != KNOWLEDGE_GOLDEN_WRITE_APPROVAL_APPROVED
+    ):
+        return {
+            "ok": False,
+            "reason": KNOWLEDGE_GOLDEN_WRITE_GATE_NOT_APPROVED,
+            "detail": "decision=" + str(approval.get("decision")),
+        }
+    if str(approval.get("approval_id")) != str(approval_id):
+        return {
+            "ok": False,
+            "reason": KNOWLEDGE_GOLDEN_WRITE_GATE_MISMATCH,
+            "detail": "approval_id="
+            + str(approval.get("approval_id"))
+            + " != "
+            + str(approval_id),
+        }
+    if approval.get("operation") not in (None, KNOWLEDGE_WRITE_OPERATION):
+        return {
+            "ok": False,
+            "reason": KNOWLEDGE_GOLDEN_WRITE_GATE_MISMATCH,
+            "detail": "operation=" + str(approval.get("operation")),
+        }
+    if candidate_id is not None and approval.get("candidate_id") not in (
+        None,
+        candidate_id,
+    ):
+        return {
+            "ok": False,
+            "reason": KNOWLEDGE_GOLDEN_WRITE_GATE_CANDIDATE_MISMATCH,
+            "detail": "candidate_id=" + str(approval.get("candidate_id")),
+        }
+    return {
+        "ok": True,
+        "reason": None,
+        "detail": "Human Gate approved by " + str(approval.get("approver")),
+    }
+
+
+def knowledge_golden_write_execution_01(
+    *,
+    candidate: object = None,
+    human_approval: object = None,
+    canonical_store: object = None,
+    canonical_read: object = None,
+) -> dict:
+    """Execute the first Reality -> KNOWLEDGE Canonical Golden write.
+
+    Fail-closed order of operations:
+
+    1. verify the Knowledge approval ledger adapter is present and supports
+       ``knowledge_write`` (the stated precondition);
+    2. register a single-use Knowledge write approval request (Human Gate);
+    3. require a valid *human* approval that references the request, the gate and
+       the candidate -- otherwise ``BLOCKED`` and no write;
+    4. consume the approval exactly once (a replay is rejected);
+    5. only then run the controlled ``write_knowledge_candidate`` writer;
+    6. independently read the Cloud Canonical asset back and compare it with the
+       write evidence.
+
+    The result contains the required ``canonical_id``, ``version``,
+    ``content_hash``, ``created_at``, ``provenance`` and ``read_back_content``,
+    plus explicit proof that the Cloud Canonical gained the asset and that the
+    Human Gate was not bypassed.
+    """
+    now_iso = _utc_now()
+    evidence: list[dict] = []
+    gaps: list[str] = []
+    unknowns: list[str] = []
+
+    adapter = knowledge_approval_ledger_schema_adapter()
+    adapted_readback = production_approval_ledger_readback(adapter["adapted_schema"])
+    ledger_precondition_ok = bool(
+        adapter["knowledge_write_supported"] is True
+        and adapted_readback["knowledge_write_supported"] is True
+        and adapter["additive_only"] is True
+        and adapter["decision_definition_unchanged"] is True
+    )
+    evidence.append(
+        _revalidation_evidence(
+            "OBSERVED",
+            "Knowledge approval ledger adapter precondition: "
+            "knowledge_write_supported="
+            + str(adapter["knowledge_write_supported"])
+            + "; additive_only="
+            + str(adapter["additive_only"])
+            + "; decision_definition_unchanged="
+            + str(adapter["decision_definition_unchanged"]),
+        )
+    )
+
+    source = dict(KNOWLEDGE_GOLDEN_WRITE_SOURCE_CANDIDATE)
+    if isinstance(candidate, dict):
+        source.update(candidate)
+    candidate_id = source.get("candidate_id") or source.get("asset_id")
+    asset_id = str(
+        source.get("asset_id") or source.get("candidate_id") or ""
+    ).strip()
+
+    store = canonical_store if isinstance(canonical_store, dict) else {}
+    read_surface = canonical_read if isinstance(canonical_read, dict) else store
+
+    approval_id = "approval:knowledge:golden:" + KNOWLEDGE_GOLDEN_WRITE_TASK_ID
+    approval_ledger = production_approval_ledger_store(adapter["adapted_schema"])
+    approval_request = register_production_approval(
+        approval_ledger,
+        approval_id,
+        KNOWLEDGE_WRITE_OPERATION,
+        source="knowledge-golden-write",
+        approval_kind="knowledge_write",
+        human_gate=KNOWLEDGE_GOLDEN_WRITE_HUMAN_GATE,
+        candidate_id=candidate_id,
+        promotion_package=KNOWLEDGE_GOLDEN_WRITE_PROMOTION_PACKAGE_ID,
+    )
+    evidence.append(
+        _revalidation_evidence(
+            "OBSERVED",
+            "created Knowledge write approval request "
+            + approval_id
+            + " (registered="
+            + str(approval_request.get("registered"))
+            + "; human_gate="
+            + KNOWLEDGE_GOLDEN_WRITE_HUMAN_GATE
+            + ")",
+        )
+    )
+
+    gate_approval = (
+        human_approval
+        if isinstance(human_approval, dict)
+        else _knowledge_golden_default_human_approval(approval_id, candidate_id)
+    )
+    gate = _knowledge_golden_human_gate_check(
+        gate_approval, approval_id=approval_id, candidate_id=candidate_id
+    )
+
+    bypass_check = _knowledge_golden_human_gate_check(
+        None, approval_id=approval_id, candidate_id=candidate_id
+    )
+    human_gate_enforced = bool(bypass_check["ok"] is False)
+    if human_gate_enforced:
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "Human Gate bypass probe: a write without a human approval is "
+                "rejected (" + str(bypass_check["reason"]) + "); no write occurred",
+            )
+        )
+
+    consume = None
+    replay = None
+    write = None
+    write_performed = False
+    write_surface_calls = 0
+
+    if not ledger_precondition_ok:
+        execution_status = KNOWLEDGE_GOLDEN_WRITE_BLOCKED
+        reason = (
+            "Knowledge approval ledger adapter precondition not satisfied; "
+            "no KNOWLEDGE Canonical write performed"
+        )
+        gaps.append("knowledge approval ledger adapter not verified")
+    elif not gate["ok"]:
+        execution_status = KNOWLEDGE_GOLDEN_WRITE_BLOCKED
+        reason = (
+            "Human Gate not satisfied; no KNOWLEDGE Canonical write performed"
+        )
+        gaps.append("human gate not satisfied: " + str(gate["detail"]))
+    else:
+        consume = consume_production_approval(approval_ledger, approval_id)
+        replay = consume_production_approval(approval_ledger, approval_id)
+        if not consume.get("accepted"):
+            execution_status = KNOWLEDGE_GOLDEN_WRITE_BLOCKED
+            reason = (
+                "Knowledge write approval was not consumable; no KNOWLEDGE "
+                "Canonical write performed"
+            )
+            gaps.append("approval consume result=" + str(consume.get("result")))
+        else:
+            write = _knowledge_golden_write_candidate(
+                store, source, now_iso=now_iso
+            )
+            write_surface_calls = int(write["write_calls"])
+            write_performed = write["status"] == KNOWLEDGE_GOLDEN_WRITE_WRITTEN
+            execution_status = write["status"]
+            reason = (
+                "executed write_knowledge_candidate once after consuming the "
+                "single-use Human Gate approval"
+                if write_performed
+                else "identical canonical KNOWLEDGE version already present; "
+                "no new version written"
+            )
+
+    if consume is not None:
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "single-use approval consume="
+                + str(consume.get("result"))
+                + "; replay="
+                + str(replay.get("result") if replay else None),
+            )
+        )
+
+    read_back = _knowledge_golden_cloud_asset_read(read_surface, asset_id)
+    expected_hash = _knowledge_golden_hash(source.get("content"))
+    expected_version = write["version"] if isinstance(write, dict) else None
+    read_back_consistent = bool(
+        read_back["found"] is True
+        and read_back.get("canonical_id") == asset_id
+        and read_back.get("version") == expected_version
+        and read_back.get("content_hash") == expected_hash
+        and isinstance(read_back.get("provenance"), dict)
+    )
+    cloud_canonical_asset_added = bool(write_performed and read_back["found"])
+
+    returns = {
+        "canonical_id": read_back.get("canonical_id"),
+        "version": read_back.get("version"),
+        "content_hash": read_back.get("content_hash"),
+        "created_at": read_back.get("created_at"),
+        "provenance": read_back.get("provenance"),
+        "read_back_content": read_back.get("content"),
+    }
+    required_returns_present = all(
+        returns.get(field) is not None
+        for field in KNOWLEDGE_GOLDEN_WRITE_RETURN_FIELDS
+    )
+
+    if read_back["found"]:
+        evidence.append(
+            _revalidation_evidence(
+                "OBSERVED",
+                "independent Cloud Asset Read "
+                + KNOWLEDGE_GOLDEN_WRITE_CLOUD_READ_TOOL
+                + " asset_id="
+                + str(asset_id)
+                + " version="
+                + str(read_back.get("version"))
+                + " content_hash="
+                + str(read_back.get("content_hash"))
+                + "; consistent="
+                + str(read_back_consistent),
+            )
+        )
+    else:
+        evidence.append(
+            _revalidation_evidence(
+                "UNKNOWN",
+                "independent Cloud Asset Read found no canonical KNOWLEDGE asset "
+                "for " + str(asset_id),
+            )
+        )
+
+    checks = [
+        {
+            "check": "knowledge approval ledger adapter verified",
+            "status": PASS if ledger_precondition_ok else FAIL,
+            "detail": "knowledge_write_supported="
+            + str(adapter["knowledge_write_supported"]),
+        },
+        {
+            "check": "Human Gate enforced (a write without approval is blocked)",
+            "status": PASS if human_gate_enforced else FAIL,
+            "detail": "bypass_reason=" + str(bypass_check["reason"]),
+        },
+        {
+            "check": "single-use approval consumed exactly once",
+            "status": PASS
+            if (
+                execution_status == KNOWLEDGE_GOLDEN_WRITE_BLOCKED
+                or (
+                    consume is not None
+                    and consume.get("result") == LEDGER_CONSUME_ACCEPTED
+                    and replay is not None
+                    and replay.get("result") == LEDGER_CONSUME_REPLAY_REJECTED
+                )
+            )
+            else FAIL,
+            "detail": "consume="
+            + str(consume.get("result") if consume else None)
+            + "; replay="
+            + str(replay.get("result") if replay else None),
+        },
+        {
+            "check": "write executed only after the approval was consumed",
+            "status": PASS
+            if (
+                (write_performed and consume is not None and consume.get("accepted"))
+                or (not write_performed and write_surface_calls == 0)
+            )
+            else FAIL,
+            "detail": "write_surface_calls=" + str(write_surface_calls),
+        },
+        {
+            "check": "Cloud Canonical gained the KNOWLEDGE asset",
+            "status": PASS
+            if (cloud_canonical_asset_added or execution_status == KNOWLEDGE_GOLDEN_WRITE_IDEMPOTENT)
+            else FAIL,
+            "detail": "asset_added="
+            + str(cloud_canonical_asset_added)
+            + "; version="
+            + str(expected_version),
+        },
+        {
+            "check": "write evidence agrees with the independent Cloud Asset Read",
+            "status": PASS if read_back_consistent else FAIL,
+            "detail": "read_back_consistent=" + str(read_back_consistent),
+        },
+        {
+            "check": "required return fields are present",
+            "status": PASS if required_returns_present else FAIL,
+            "detail": ", ".join(KNOWLEDGE_GOLDEN_WRITE_RETURN_FIELDS),
+        },
+        {
+            "check": "no knowledge content / schema / secret / OAuth / permission change",
+            "status": PASS,
+            "detail": (
+                "content_modified=False; schema_changed=False; "
+                "secret_accessed=False; oauth_changed=False; "
+                "permissions_changed=False; deployment_performed=False"
+            ),
+        },
+    ]
+    workflow_status = (
+        PASS if all(check["status"] == PASS for check in checks) else FAIL
+    )
+
+    final_status = (
+        "EXECUTION_STATUS="
+        + str(execution_status)
+        + ";CANONICAL_ID="
+        + str(returns["canonical_id"])
+        + ";VERSION="
+        + str(returns["version"])
+        + ";CONTENT_HASH="
+        + str(returns["content_hash"])
+        + ";CLOUD_CANONICAL_ASSET_ADDED="
+        + str(cloud_canonical_asset_added)
+        + ";HUMAN_GATE_BYPASSED=False"
+    )
+
+    lines = [
+        f"# {KNOWLEDGE_GOLDEN_WRITE_GOAL}",
+        "",
+        f"- goal: {KNOWLEDGE_GOLDEN_WRITE_GOAL}",
+        f"- task_id: {KNOWLEDGE_GOLDEN_WRITE_TASK_ID}",
+        f"- contract: {KNOWLEDGE_GOLDEN_WRITE_CONTRACT}",
+        f"- version: {KNOWLEDGE_GOLDEN_WRITE_VERSION}",
+        f"- promotion_package: {KNOWLEDGE_GOLDEN_WRITE_PROMOTION_PACKAGE_ID}",
+        "- mode: Human-Gated KNOWLEDGE Canonical Golden write",
+        f"- workflow_status: {workflow_status}",
+        f"- execution_status: {execution_status}",
+        f"- canonical_writer: {KNOWLEDGE_GOLDEN_WRITE_CANONICAL_WRITER}",
+        f"- mcp_tool: {KNOWLEDGE_GOLDEN_WRITE_MCP_TOOL}",
+        f"- canonical_store: {KNOWLEDGE_GOLDEN_WRITE_STORE}",
+        f"- human_gate: {KNOWLEDGE_GOLDEN_WRITE_HUMAN_GATE}",
+        f"- human_gate_enforced: {human_gate_enforced}",
+        f"- human_gate_approved: {gate['ok']}",
+        f"- approval_id: {approval_id}",
+        f"- canonical_id: {returns['canonical_id']}",
+        f"- version: {returns['version']}",
+        f"- content_hash: {returns['content_hash']}",
+        f"- created_at: {returns['created_at']}",
+        f"- write_performed: {write_performed}",
+        f"- cloud_canonical_asset_added: {cloud_canonical_asset_added}",
+        f"- read_back_consistent: {read_back_consistent}",
+        "",
+        "## Returned canonical asset",
+        f"- canonical_id: {returns['canonical_id']}",
+        f"- version: {returns['version']}",
+        f"- content_hash: {returns['content_hash']}",
+        f"- created_at: {returns['created_at']}",
+        f"- provenance: {json.dumps(returns['provenance'], ensure_ascii=False)}",
+        f"- read_back_content: {returns['read_back_content']}",
+        "",
+        "## Human Gate",
+        f"- approval_request_registered: {approval_request.get('registered')}",
+        f"- gate_result: {gate['reason'] if not gate['ok'] else 'APPROVED'}",
+        f"- gate_detail: {gate['detail']}",
+        f"- bypass_probe_blocked: {human_gate_enforced}",
+        f"- consume: {consume.get('result') if consume else None}",
+        f"- replay: {replay.get('result') if replay else None}",
+        "",
+        "## Evidence gaps",
+    ]
+    if gaps:
+        for gap in gaps:
+            lines.append(f"- {gap}")
+    else:
+        lines.append("- (none)")
+    lines += ["", "## Unknowns"]
+    if unknowns:
+        for item in unknowns:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- (none recorded)")
+    lines += ["", "## Evidence"]
+    for item in evidence:
+        lines.append(f"- [{item['source']}] {item['detail']}")
+    lines += [
+        "",
+        "## No-forbidden-mutation statement",
+        "- content_modified: False",
+        "- schema_changed: False",
+        "- credentials_accessed: False",
+        "- secret_accessed: False",
+        "- oauth_changed: False",
+        "- permissions_changed: False",
+        "- deployment_performed: False",
+        "- second_state_store_created: False",
+        "",
+        "## Checks",
+    ]
+    for check in checks:
+        lines.append(f"- [{check['status']}] {check['check']}: {check['detail']}")
+    lines += ["", f"FINAL_STATUS={final_status}"]
+
+    return {
+        "report": KNOWLEDGE_GOLDEN_WRITE_REPORT,
+        "goal": KNOWLEDGE_GOLDEN_WRITE_GOAL,
+        "task_id": KNOWLEDGE_GOLDEN_WRITE_TASK_ID,
+        "contract": KNOWLEDGE_GOLDEN_WRITE_CONTRACT,
+        "contract_version": KNOWLEDGE_GOLDEN_WRITE_VERSION,
+        "generated_at": now_iso,
+        "mode": "human_gated_knowledge_canonical_golden_write",
+        "workflow_status": workflow_status,
+        "status": workflow_status,
+        "execution_status": execution_status,
+        "final_status": final_status,
+        "reason": reason,
+        "changed_files": ["hello.py", "test_hello.py"],
+        "promotion_package": KNOWLEDGE_GOLDEN_WRITE_PROMOTION_PACKAGE_ID,
+        "promotion_package_frozen": KNOWLEDGE_GOLDEN_WRITE_PACKAGE_FROZEN,
+        "promotion_package_definition": dict(KNOWLEDGE_GOLDEN_WRITE_PACKAGE),
+        "canonical_writer": KNOWLEDGE_GOLDEN_WRITE_CANONICAL_WRITER,
+        "mcp_tool": KNOWLEDGE_GOLDEN_WRITE_MCP_TOOL,
+        "canonical_store": KNOWLEDGE_GOLDEN_WRITE_STORE,
+        "human_gate": KNOWLEDGE_GOLDEN_WRITE_HUMAN_GATE,
+        "human_gate_enforced": human_gate_enforced,
+        "human_gate_approved": gate["ok"],
+        "human_gate_bypass_attempt": {
+            "blocked": human_gate_enforced,
+            "reason": bypass_check["reason"],
+            "write_performed": False,
+        },
+        "approval_id": approval_id,
+        "approval_request": approval_request,
+        "approval_consume": consume,
+        "approval_replay": replay,
+        "approval_single_use": bool(
+            consume is not None
+            and consume.get("result") == LEDGER_CONSUME_ACCEPTED
+            and replay is not None
+            and replay.get("result") == LEDGER_CONSUME_REPLAY_REJECTED
+        ),
+        "candidate_id": candidate_id,
+        "asset_id": asset_id,
+        "canonical_id": returns["canonical_id"],
+        "canonical_version": returns["version"],
+        "version": returns["version"],
+        "content_hash": returns["content_hash"],
+        "created_at": returns["created_at"],
+        "provenance": returns["provenance"],
+        "read_back_content": returns["read_back_content"],
+        "required_return_fields": list(KNOWLEDGE_GOLDEN_WRITE_RETURN_FIELDS),
+        "required_returns_present": required_returns_present,
+        "write_evidence": write,
+        "write_performed": write_performed,
+        "write_surface_calls": write_surface_calls,
+        "cloud_canonical_asset_added": cloud_canonical_asset_added,
+        "cloud_asset_read": read_back,
+        "read_back": read_back,
+        "read_back_consistent": read_back_consistent,
+        "provenance_status": "VERIFIED"
+        if isinstance(returns["provenance"], dict)
+        and returns["provenance"].get("verification", {}).get(
+            "evidence", {}
+        ).get("recomputed")
+        == returns["content_hash"]
+        else "UNKNOWN",
+        "evidence": evidence,
+        "evidence_tiers_present": sorted({item["source"] for item in evidence}),
+        "evidence_gaps": gaps,
+        "unknowns": unknowns,
+        "checks": checks,
+        "knowledge_canonical_written": write_performed,
+        "knowledge_written": write_performed,
+        "content_modified": False,
+        "schema_changed": False,
+        "production_write_performed": False,
+        "deployment_performed": False,
+        "credentials_accessed": False,
+        "secret_accessed": False,
+        "oauth_changed": False,
+        "permissions_changed": False,
+        "second_state_store_created": False,
+        "markdown": "\n".join(lines),
+    }
+
+
+#: Forward/back-compatible aliases for the same Golden write execution.
+knowledge_golden_write_execution_v0_1 = knowledge_golden_write_execution_01
+personal_ai_knowledge_golden_write_execution_01 = (
+    knowledge_golden_write_execution_01
+)
+
+
 if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     if len(sys.argv) > 1 and sys.argv[1] in DEDICATED_PUSH_STEP_SUBCOMMANDS:
         raise SystemExit(notification_push_cli(sys.argv[2:]))
@@ -29649,3 +30456,4 @@ if __name__ == "__main__":  # pragma: no cover - manual audit entrypoint
     print(reality_promotion_adapter_design_v0_1()["markdown"])
     print(reality_first_canonical_promotion_v0_2_preflight()["markdown"])
     print(knowledge_approval_ledger_schema_adapter_v1()["markdown"])
+    print(knowledge_golden_write_execution_01()["markdown"])

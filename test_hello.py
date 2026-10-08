@@ -11170,3 +11170,204 @@ def test_knowledge_approval_ledger_checks_markdown_and_entrypoint() -> None:
         hello_module.knowledge_approval_ledger_adapter_v1
         is hello_module.knowledge_approval_ledger_schema_adapter_v1
     )
+
+
+# --- KNOWLEDGE_GOLDEN_WRITE_EXECUTION_01 -----------------------------------
+
+
+def _freeze_store() -> dict:
+    return {}
+
+
+def test_knowledge_golden_write_constants() -> None:
+    assert hello_module.KNOWLEDGE_GOLDEN_WRITE_GOAL == "KNOWLEDGE_GOLDEN_WRITE_EXECUTION_01"
+    assert hello_module.KNOWLEDGE_GOLDEN_WRITE_TASK_ID == "cf-1d63be7a1e88"
+    assert (
+        hello_module.KNOWLEDGE_GOLDEN_WRITE_PROMOTION_PACKAGE_ID
+        == "personal-agent-enterprise-authorization-protocol"
+    )
+    assert hello_module.KNOWLEDGE_GOLDEN_WRITE_PACKAGE_FROZEN is True
+    assert hello_module.KNOWLEDGE_GOLDEN_WRITE_ASSET_TYPE == "KNOWLEDGE"
+    assert hello_module.KNOWLEDGE_GOLDEN_WRITE_HUMAN_GATE == (
+        "HUMAN_GATE_KNOWLEDGE_CANONICAL_WRITE_V0.1"
+    )
+    assert hello_module.KNOWLEDGE_GOLDEN_WRITE_CANONICAL_WRITER == (
+        "writeKnowledgeCandidate"
+    )
+    assert hello_module.KNOWLEDGE_GOLDEN_WRITE_MCP_TOOL == "write_knowledge_candidate"
+    assert hello_module.KNOWLEDGE_GOLDEN_WRITE_CLOUD_READ_TOOL == "get_asset"
+    package = hello_module.KNOWLEDGE_GOLDEN_WRITE_PACKAGE
+    assert package["frozen"] is True
+    assert package["knowledge_content_mutable"] is False
+
+
+def test_knowledge_golden_write_succeeds_and_returns_required_fields() -> None:
+    report = hello_module.knowledge_golden_write_execution_01()
+
+    assert report["workflow_status"] == "PASS"
+    assert report["execution_status"] == "WRITTEN"
+    assert report["required_returns_present"] is True
+    for field in hello_module.KNOWLEDGE_GOLDEN_WRITE_RETURN_FIELDS:
+        assert report[field] is not None, field
+    assert report["canonical_id"] == (
+        "knowledge:personal-agent-enterprise-authorization-protocol"
+    )
+    assert report["version"] == 1
+    assert report["content_hash"] == report["cloud_asset_read"]["content_hash"]
+    assert report["created_at"]
+    assert isinstance(report["provenance"], dict)
+    assert report["read_back_content"]
+
+
+def test_knowledge_golden_write_content_hash_matches_canonical_content() -> None:
+    report = hello_module.knowledge_golden_write_execution_01()
+    content = hello_module.KNOWLEDGE_GOLDEN_WRITE_SOURCE_CANDIDATE["content"]
+    assert report["content_hash"] == hello_module._knowledge_golden_hash(content)
+    assert report["provenance"]["content_hash"] == report["content_hash"]
+    assert report["provenance"]["canonical_version"] == report["version"]
+    assert report["provenance_status"] == "VERIFIED"
+
+
+def test_knowledge_golden_write_adds_cloud_canonical_asset() -> None:
+    store = _freeze_store()
+    assert store == {}
+    report = hello_module.knowledge_golden_write_execution_01(canonical_store=store)
+
+    assert report["cloud_canonical_asset_added"] is True
+    assert report["write_performed"] is True
+    assert report["write_surface_calls"] == 1
+    assert report["canonical_id"] in store
+    assert store[report["canonical_id"]]["content_hash"] == report["content_hash"]
+
+
+def test_knowledge_golden_write_read_back_is_consistent() -> None:
+    store = _freeze_store()
+    report = hello_module.knowledge_golden_write_execution_01(canonical_store=store)
+    read = report["cloud_asset_read"]
+
+    assert read["tool"] == "get_asset"
+    assert read["found"] is True
+    assert read["canonical_id"] == report["canonical_id"]
+    assert read["version"] == report["version"]
+    assert read["content_hash"] == report["content_hash"]
+    assert read["provenance"] == report["provenance"]
+    assert report["read_back_consistent"] is True
+
+
+def test_knowledge_golden_write_consumes_single_use_approval() -> None:
+    report = hello_module.knowledge_golden_write_execution_01()
+
+    assert report["approval_request"]["registered"] is True
+    assert report["approval_consume"]["result"] == hello_module.LEDGER_CONSUME_ACCEPTED
+    assert report["approval_replay"]["result"] == (
+        hello_module.LEDGER_CONSUME_REPLAY_REJECTED
+    )
+    assert report["approval_single_use"] is True
+    assert report["human_gate_approved"] is True
+
+
+def test_knowledge_golden_write_never_bypasses_human_gate() -> None:
+    report = hello_module.knowledge_golden_write_execution_01()
+
+    assert report["human_gate_enforced"] is True
+    assert report["human_gate_bypass_attempt"]["blocked"] is True
+    assert report["human_gate_bypass_attempt"]["write_performed"] is False
+    assert report["final_status"].endswith("HUMAN_GATE_BYPASSED=False")
+
+
+def test_knowledge_golden_write_blocks_without_human_approval() -> None:
+    store = _freeze_store()
+    report = hello_module.knowledge_golden_write_execution_01(
+        human_approval={"approved": False},
+        canonical_store=store,
+    )
+
+    assert report["execution_status"] == "BLOCKED"
+    assert report["human_gate_approved"] is False
+    assert report["write_performed"] is False
+    assert report["write_surface_calls"] == 0
+    assert store == {}
+
+
+def test_knowledge_golden_write_blocks_on_wrong_gate() -> None:
+    approval = dict(
+        hello_module.knowledge_golden_write_execution_01()["approval_request"]["entry"]
+    )
+    wrong = {
+        "approval_id": hello_module.knowledge_golden_write_execution_01()["approval_id"],
+        "gate": "WRONG_GATE",
+        "decision": hello_module.KNOWLEDGE_GOLDEN_WRITE_APPROVAL_APPROVED,
+        "approved": True,
+        "human": True,
+        "approver": "human-operator",
+    }
+    report = hello_module.knowledge_golden_write_execution_01(human_approval=wrong)
+
+    assert report["execution_status"] == "BLOCKED"
+    assert report["human_gate_bypass_attempt"]["blocked"] is True
+    assert approval  # sanity: request entry exists
+
+
+def test_knowledge_golden_write_blocks_on_non_human_approver() -> None:
+    report = hello_module.knowledge_golden_write_execution_01(
+        human_approval={
+            "approval_id": (
+                "approval:knowledge:golden:"
+                + hello_module.KNOWLEDGE_GOLDEN_WRITE_TASK_ID
+            ),
+            "gate": hello_module.KNOWLEDGE_GOLDEN_WRITE_HUMAN_GATE,
+            "decision": hello_module.KNOWLEDGE_GOLDEN_WRITE_APPROVAL_APPROVED,
+            "approved": True,
+            "human": False,
+            "approver": "automation",
+        }
+    )
+
+    assert report["execution_status"] == "BLOCKED"
+    assert report["human_gate_approved"] is False
+    assert report["write_performed"] is False
+
+
+def test_knowledge_golden_write_is_idempotent_for_identical_content() -> None:
+    store = _freeze_store()
+    first = hello_module.knowledge_golden_write_execution_01(canonical_store=store)
+    second = hello_module.knowledge_golden_write_execution_01(canonical_store=store)
+
+    assert first["execution_status"] == "WRITTEN"
+    assert second["execution_status"] == "IDEMPOTENT"
+    assert second["write_surface_calls"] == 0
+    assert second["cloud_canonical_asset_added"] is False
+    assert store[first["canonical_id"]]["version"] == 1
+
+
+def test_knowledge_golden_write_no_forbidden_mutation() -> None:
+    report = hello_module.knowledge_golden_write_execution_01()
+
+    for flag in hello_module.KNOWLEDGE_GOLDEN_WRITE_MUTATION_FLAGS:
+        assert report[flag] is False, flag
+    assert report["knowledge_written"] is True
+    assert report["knowledge_canonical_written"] is True
+
+
+def test_knowledge_golden_write_markdown_and_entrypoint() -> None:
+    report = hello_module.knowledge_golden_write_execution_01()
+    markdown = report["markdown"]
+
+    assert markdown.startswith(f"# {hello_module.KNOWLEDGE_GOLDEN_WRITE_GOAL}")
+    assert f"- task_id: {hello_module.KNOWLEDGE_GOLDEN_WRITE_TASK_ID}" in markdown
+    assert "## Human Gate" in markdown
+    assert "## No-forbidden-mutation statement" in markdown
+    assert f"FINAL_STATUS={report['final_status']}" in markdown
+    assert report["changed_files"] == ["hello.py", "test_hello.py"]
+
+    source = inspect.getsource(hello_module)
+    assert "def knowledge_golden_write_execution_01(" in source
+    assert callable(hello_module.knowledge_golden_write_execution_01)
+    assert (
+        hello_module.knowledge_golden_write_execution_v0_1
+        is hello_module.knowledge_golden_write_execution_01
+    )
+    assert (
+        hello_module.personal_ai_knowledge_golden_write_execution_01
+        is hello_module.knowledge_golden_write_execution_01
+    )
