@@ -5,6 +5,7 @@
 - Repository: `qq1040489334/personal-ai-cloud-execution-test`
 - Original base commit: `fb01f893f0357c4c6a1289a2ca098c139203650f`
 - Stale-approval fix base commit: `e3ead9540b48f58b02fbb75af86fa763ca041923`
+- Release-candidate code commit: `9f23886927473268a18b3bc6f6bbdf75bf81d4e0`
 - Document status: **STAGED — NOT EXECUTABLE YET** (`PARTIAL`; real D1 UNVERIFIED)
 - Intended use: direct input to a **separate**, explicitly authorized production
   execution task. It requires no implicit context from the finalize run.

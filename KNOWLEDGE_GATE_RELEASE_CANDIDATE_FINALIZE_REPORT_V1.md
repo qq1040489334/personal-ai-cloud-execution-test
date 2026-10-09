@@ -8,8 +8,8 @@
   (the prior run that only produced the two reports)
 - Stale-approval fix base commit: `e3ead9540b48f58b02fbb75af86fa763ca041923`
   (business code `7908ef470baa27da7b1d9169970f4950aa4a4bb4`)
-- Release-candidate commit: recorded as git `HEAD` at publication time (see §2;
-  the `cloud agent: gpt task` commit that contains this report)
+- Release-candidate code commit: `9f23886927473268a18b3bc6f6bbdf75bf81d4e0`
+  (recorded in §2; the `cloud agent: gpt task` commit that contains this report)
 - Risk level: `LOW`
 - Mode: `IMPLEMENT_AND_TEST`
 - Production readiness: **`PARTIAL`** (implemented + isolated-verified; real
@@ -97,12 +97,13 @@ promotion receipt (WRITTEN / IDEMPOTENT / REJECTED + recovery metadata)
 | `KNOWLEDGE_GATE_PRODUCTION_RELEASE_PLAN_V1.md` | Updated production plan/runbook. |
 
 Command: `git add -A && git commit -m 'cloud agent: gpt task'`.
-Release-candidate commit SHA: recorded as git `HEAD` at publication time. The
-business/ledger implementation was frozen at
+Release-candidate code+migration+test+report commit SHA:
+`9f23886927473268a18b3bc6f6bbdf75bf81d4e0`. The business/ledger
+implementation was frozen at
 `7908ef470baa27da7b1d9169970f4950aa4a4bb4`; the stale-approval fix continues
-from `e3ead9540b48f58b02fbb75af86fa763ca041923`. The exact SHA of the
-code+migration+test+report commit produced by this run is recorded in the run's
-`agent_result.json` (a report-only refresh may follow that records this SHA).
+from `e3ead9540b48f58b02fbb75af86fa763ca041923`. A report-only refresh may
+follow to record this SHA (`9f2388...`); the final HEAD is recorded in the run's
+`agent_result.json`.
 
 ---
 
@@ -191,7 +192,7 @@ wrangler/toolchain credential exists in this environment.
 | 2 | `node --check worker/index.js` | Node v20.20.2 | 0 | syntax OK |
 | 3 | `python -m pytest -q tests/test_knowledge_candidate_golden_pipeline.py` | as above | 0 | 31 passed (6 new stale-approval tests) |
 | 4 | isolated `sqlite3` migration apply x2 | sqlite3 (via tests) | 0/0 | additive + idempotent |
-| 5 | `git rev-parse HEAD` | repo | 0 | recorded in `agent_result.json` (fix continues from `e3ead9540b48f58b02fbb75af86fa763ca041923`) |
+| 5 | `git rev-parse HEAD` | repo | 0 | `9f23886927473268a18b3bc6f6bbdf75bf81d4e0` (fix continues from `e3ead9540b48f58b02fbb75af86fa763ca041923`) |
 
 Targeted suites: `test_knowledge_candidate_golden_pipeline.py`,
 `test_decision_ingestion_writer.py`, `test_knowledge_candidate_writer.py`,
