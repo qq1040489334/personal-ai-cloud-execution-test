@@ -29042,19 +29042,31 @@ KNOWLEDGE_APPROVAL_LEDGER_DEPLOYMENT_STATUS = "NOT_DEPLOYED"
 PRODUCTION_LEDGER_BASE_OPERATIONS = ("decision_write",)
 DECISION_WRITE_OPERATION = "decision_write"
 KNOWLEDGE_WRITE_OPERATION = "knowledge_write"
+#: KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_REPAIR_V1 (task cf-0b1c56efed85): the
+#: additive promotion operation. It is *not* part of the legacy
+#: ``include_knowledge_write`` adapter schema (which existing tests pin), so it
+#: is only emitted when ``include_knowledge_promotion=True`` is requested.
+KNOWLEDGE_PROMOTION_OPERATION = "KNOWLEDGE_PROMOTION"
 PRODUCTION_LEDGER_ADAPTED_OPERATIONS = (
     DECISION_WRITE_OPERATION,
     KNOWLEDGE_WRITE_OPERATION,
+)
+PRODUCTION_LEDGER_PROMOTION_OPERATIONS = (
+    DECISION_WRITE_OPERATION,
+    KNOWLEDGE_WRITE_OPERATION,
+    KNOWLEDGE_PROMOTION_OPERATION,
 )
 
 #: operation -> canonical asset type / existing Worker writer (reuse, no new one).
 LEDGER_OPERATION_ASSET_TYPES = {
     DECISION_WRITE_OPERATION: "DECISION",
     KNOWLEDGE_WRITE_OPERATION: "KNOWLEDGE",
+    KNOWLEDGE_PROMOTION_OPERATION: "KNOWLEDGE",
 }
 LEDGER_OPERATION_WRITERS = {
     DECISION_WRITE_OPERATION: "writeDecisionRecord",
     KNOWLEDGE_WRITE_OPERATION: "writeKnowledgeCandidate",
+    KNOWLEDGE_PROMOTION_OPERATION: "writeKnowledgeCandidate",
 }
 
 LEDGER_ENTRY_REGISTERED = "REGISTERED"
@@ -29097,17 +29109,26 @@ def _ledger_operation_definition(operation: str) -> dict:
     }
 
 
-def production_approval_ledger_schema(*, include_knowledge_write: bool = False) -> dict:
+def production_approval_ledger_schema(
+    *, include_knowledge_write: bool = False, include_knowledge_promotion: bool = False
+) -> dict:
     """Return the production approval-ledger schema.
 
     ``include_knowledge_write=False`` models the legacy production schema that
     rejects the KNOWLEDGE operation. ``include_knowledge_write=True`` is the
     additive adapter result that also allows ``knowledge_write`` while leaving the
-    existing ``decision_write`` definition byte-identical.
+    existing ``decision_write`` definition byte-identical. The separate
+    ``KNOWLEDGE_PROMOTION`` operation (candidate-bound promotion) is only added
+    when ``include_knowledge_promotion=True`` so the existing
+    ``include_knowledge_write`` adapter stays byte-for-byte unchanged.
     """
     operations = list(PRODUCTION_LEDGER_BASE_OPERATIONS)
     if include_knowledge_write and KNOWLEDGE_WRITE_OPERATION not in operations:
         operations.append(KNOWLEDGE_WRITE_OPERATION)
+    if include_knowledge_promotion and KNOWLEDGE_PROMOTION_OPERATION not in operations:
+        if KNOWLEDGE_WRITE_OPERATION not in operations:
+            operations.append(KNOWLEDGE_WRITE_OPERATION)
+        operations.append(KNOWLEDGE_PROMOTION_OPERATION)
     return {
         "schema": KNOWLEDGE_APPROVAL_LEDGER_SCHEMA_VERSION,
         "supported_operations": operations,
@@ -30410,6 +30431,460 @@ knowledge_golden_write_execution_v0_1 = knowledge_golden_write_execution_01
 personal_ai_knowledge_golden_write_execution_01 = (
     knowledge_golden_write_execution_01
 )
+
+
+# ---------------------------------------------------------------------------
+# KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_REPAIR_V1  (task cf-0b1c56efed85)
+#
+# Independent Candidate staging + a candidate-bound KNOWLEDGE_PROMOTION approval
+# + a single ``validate_candidate_gate`` authorisation before the existing Golden
+# ``writeKnowledgeCandidate`` writer, followed by an authoritative Canonical
+# read-back. Candidate records live in their own staging structure (never in
+# ``assets`` / ``asset_versions``), the gate ignores any caller-supplied
+# ``promotion_decision``, a failed gate returns ``REJECTED`` with zero Golden
+# write attempts, and a repeat promotion is idempotent (no duplicate version).
+# ---------------------------------------------------------------------------
+KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_GOAL = (
+    "KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_REPAIR_V1"
+)
+KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_TASK_ID = "cf-0b1c56efed85"
+KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_REPORT = (
+    KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_GOAL + "_REPORT"
+)
+KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_CONTRACT = (
+    "PERSONAL_AI_" + KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_GOAL
+)
+KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_VERSION = "V1"
+
+#: Required candidate lifecycle states.
+KNOWLEDGE_CANDIDATE_DRAFT = "DRAFT"
+KNOWLEDGE_CANDIDATE_PENDING_REVIEW = "PENDING_REVIEW"
+KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION = "APPROVED_FOR_PROMOTION"
+KNOWLEDGE_CANDIDATE_PROMOTED = "PROMOTED"
+KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED = "CANONICAL_READBACK_VERIFIED"
+KNOWLEDGE_CANDIDATE_STATES = (
+    KNOWLEDGE_CANDIDATE_DRAFT,
+    KNOWLEDGE_CANDIDATE_PENDING_REVIEW,
+    KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION,
+    KNOWLEDGE_CANDIDATE_PROMOTED,
+    KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED,
+)
+
+KNOWLEDGE_CANDIDATE_NOT_REVIEWED = "NOT_REVIEWED"
+KNOWLEDGE_CANDIDATE_REVIEW_PASS = "PASS"
+KNOWLEDGE_CANDIDATE_REVIEW_FAIL = "FAIL"
+KNOWLEDGE_CANDIDATE_REVIEW_STATES = (
+    KNOWLEDGE_CANDIDATE_NOT_REVIEWED,
+    KNOWLEDGE_CANDIDATE_REVIEW_PASS,
+    KNOWLEDGE_CANDIDATE_REVIEW_FAIL,
+)
+
+KNOWLEDGE_PROMOTION_REJECTED = "REJECTED"
+KNOWLEDGE_PROMOTION_WRITTEN = "WRITTEN"
+KNOWLEDGE_PROMOTION_IDEMPOTENT = "IDEMPOTENT"
+
+#: Fail-closed gate rejection reasons.
+KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING = "candidate_missing"
+KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE = "candidate_state"
+KNOWLEDGE_PROMOTION_REJECT_STORED_REVIEW = "stored_review_not_pass"
+KNOWLEDGE_PROMOTION_REJECT_REVIEW = "review_not_pass"
+KNOWLEDGE_PROMOTION_REJECT_STORED_HASH = "stored_content_hash_mismatch"
+KNOWLEDGE_PROMOTION_REJECT_HASH = "content_hash_mismatch"
+KNOWLEDGE_PROMOTION_REJECT_VERSION = "candidate_version_mismatch"
+KNOWLEDGE_PROMOTION_REJECT_APPROVAL = "missing_or_expired_approval"
+
+#: Fields a KNOWLEDGE_PROMOTION approval must bind to.
+KNOWLEDGE_PROMOTION_APPROVAL_FIELDS = (
+    "candidate_id",
+    "candidate_version",
+    "content_hash",
+    "review_result",
+    "approval_receipt",
+    "approved_by",
+    "expires_at",
+)
+
+
+def new_knowledge_candidate_store() -> dict:
+    """Create an independent Candidate staging store (never Golden storage)."""
+    return {"candidates": {}, "canonical_write_attempts": 0}
+
+
+def _knowledge_candidate_hash(content: object) -> str:
+    return _knowledge_golden_hash(content)
+
+
+def stage_knowledge_candidate(
+    store: dict,
+    candidate_id: object,
+    content: object,
+    *,
+    asset_id: object = None,
+    title: object = "",
+    version: int = 1,
+    provenance: object = None,
+) -> dict:
+    """Stage a DRAFT candidate in independent storage (distinct from Golden)."""
+    candidate_id = str(candidate_id or "").strip()
+    if not candidate_id:
+        return {"staged": False, "reason": "invalid_candidate_id"}
+    if not isinstance(store, dict):
+        return {"staged": False, "reason": "invalid_store"}
+    candidates = store.setdefault("candidates", {})
+    if candidate_id in candidates:
+        return {
+            "staged": False,
+            "reason": "candidate_exists",
+            "candidate": candidates[candidate_id],
+        }
+    candidate = {
+        "candidate_id": candidate_id,
+        "asset_id": str(asset_id or candidate_id),
+        "title": str(title or ""),
+        "status": KNOWLEDGE_CANDIDATE_DRAFT,
+        "content": content,
+        "content_hash": _knowledge_candidate_hash(content),
+        "version": int(version),
+        "provenance": dict(provenance) if isinstance(provenance, dict) else {},
+        "created_at": _utc_now(),
+        "review_state": KNOWLEDGE_CANDIDATE_NOT_REVIEWED,
+    }
+    candidates[candidate_id] = candidate
+    return {"staged": True, "candidate": candidate}
+
+
+def submit_knowledge_candidate_for_review(store: dict, candidate_id: str) -> dict:
+    """Move a DRAFT candidate to PENDING_REVIEW."""
+    candidate = (
+        store.get("candidates", {}).get(candidate_id)
+        if isinstance(store, dict)
+        else None
+    )
+    if not isinstance(candidate, dict):
+        return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING}
+    if candidate.get("status") != KNOWLEDGE_CANDIDATE_DRAFT:
+        return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE}
+    candidate["status"] = KNOWLEDGE_CANDIDATE_PENDING_REVIEW
+    return {"ok": True, "candidate": candidate}
+
+
+def record_knowledge_candidate_review(
+    store: dict, candidate_id: str, review_result: str
+) -> dict:
+    """Record a review result. PASS advances to APPROVED_FOR_PROMOTION."""
+    candidate = (
+        store.get("candidates", {}).get(candidate_id)
+        if isinstance(store, dict)
+        else None
+    )
+    result = str(review_result or "").strip().upper()
+    if not isinstance(candidate, dict):
+        return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING}
+    if result not in (
+        KNOWLEDGE_CANDIDATE_REVIEW_PASS,
+        KNOWLEDGE_CANDIDATE_REVIEW_FAIL,
+    ):
+        return {"ok": False, "reason": "invalid_review_result"}
+    if candidate.get("status") not in (
+        KNOWLEDGE_CANDIDATE_DRAFT,
+        KNOWLEDGE_CANDIDATE_PENDING_REVIEW,
+    ):
+        return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE}
+    candidate["review_state"] = result
+    candidate["status"] = (
+        KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION
+        if result == KNOWLEDGE_CANDIDATE_REVIEW_PASS
+        else KNOWLEDGE_CANDIDATE_PENDING_REVIEW
+    )
+    return {"ok": True, "candidate": candidate}
+
+
+def _lookup_knowledge_promotion_approval(ledger: object, receipt: object) -> object:
+    if not isinstance(ledger, dict):
+        return None
+    approvals = ledger.get("approvals")
+    if not isinstance(approvals, dict):
+        return None
+    return approvals.get(receipt)
+
+
+def _knowledge_expiry_valid(expires_at: object, now_iso: str) -> bool:
+    if not isinstance(expires_at, str) or not expires_at.strip():
+        return False
+    try:
+        expires = datetime.fromisoformat(expires_at)
+    except ValueError:
+        return False
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    try:
+        now = datetime.fromisoformat(now_iso)
+    except ValueError:
+        now = datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return expires > now
+
+
+def register_knowledge_promotion_approval(
+    ledger: dict,
+    approval_receipt: str,
+    *,
+    candidate_id: str,
+    candidate_version: int,
+    content_hash: str,
+    review_result: str,
+    approved_by: str,
+    expires_at: str,
+) -> dict:
+    """Register a candidate-bound KNOWLEDGE_PROMOTION approval (single-use)."""
+    return register_production_approval(
+        ledger,
+        approval_receipt,
+        KNOWLEDGE_PROMOTION_OPERATION,
+        candidate_id=str(candidate_id),
+        candidate_version=int(candidate_version),
+        content_hash=str(content_hash),
+        review_result=str(review_result or "").upper(),
+        approval_receipt=str(approval_receipt),
+        approved_by=str(approved_by),
+        expires_at=str(expires_at),
+    )
+
+
+def validate_candidate_gate(
+    store: dict,
+    candidate_id: str,
+    *,
+    candidate_version: object,
+    content_hash: object,
+    review_result: object,
+    approval_receipt: object,
+    ledger: object,
+    now: object = None,
+) -> dict:
+    """Sole authorisation for a Knowledge Canonical write (fail closed).
+
+    It never reads a caller-supplied ``promotion_decision``: only the staged
+    candidate state, the recomputed/stored/supplied hash, the version and a valid
+    unexpired candidate-bound KNOWLEDGE_PROMOTION approval can authorise a write.
+    """
+    now_iso = now if isinstance(now, str) and now else _utc_now()
+    candidate = (
+        store.get("candidates", {}).get(candidate_id)
+        if isinstance(store, dict)
+        else None
+    )
+
+    def outcome(ok: bool, reason) -> dict:
+        return {"ok": ok, "reason": reason, "candidate_id": candidate_id}
+
+    if not isinstance(candidate, dict):
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING)
+    if candidate.get("status") != KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION:
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE)
+    if candidate.get("review_state") != KNOWLEDGE_CANDIDATE_REVIEW_PASS:
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_STORED_REVIEW)
+    if str(review_result or "").strip().upper() != KNOWLEDGE_CANDIDATE_REVIEW_PASS:
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_REVIEW)
+    recomputed = _knowledge_candidate_hash(candidate.get("content"))
+    if recomputed != candidate.get("content_hash"):
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_STORED_HASH)
+    if str(content_hash or "") != str(candidate.get("content_hash")):
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_HASH)
+    try:
+        version_match = int(candidate_version) == int(candidate.get("version"))
+    except (TypeError, ValueError):
+        version_match = False
+    if not version_match:
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_VERSION)
+    approval = _lookup_knowledge_promotion_approval(ledger, approval_receipt)
+    if not isinstance(approval, dict):
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
+    if approval.get("operation") != KNOWLEDGE_PROMOTION_OPERATION:
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
+    bound = approval.get("metadata")
+    bound = bound if isinstance(bound, dict) else {}
+    if str(bound.get("candidate_id")) != str(candidate.get("candidate_id")):
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
+    try:
+        bound_version = int(bound.get("candidate_version"))
+    except (TypeError, ValueError):
+        bound_version = -1
+    if bound_version != int(candidate.get("version")):
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
+    if str(bound.get("content_hash")) != str(candidate.get("content_hash")):
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
+    if str(bound.get("review_result") or "").upper() != (
+        KNOWLEDGE_CANDIDATE_REVIEW_PASS
+    ):
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
+    if not str(bound.get("approved_by") or "").strip():
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
+    if not str(bound.get("approval_receipt") or "").strip():
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
+    if approval.get("consumed") is True:
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
+    if not _knowledge_expiry_valid(bound.get("expires_at"), now_iso):
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
+    return outcome(True, None)
+
+
+def promote_knowledge_candidate(
+    store: dict,
+    candidate_id: str,
+    *,
+    candidate_version: object,
+    content_hash: object,
+    review_result: object,
+    approval_receipt: object,
+    ledger: dict,
+    golden_store: object = None,
+    promotion_decision: object = None,
+    now: object = None,
+) -> dict:
+    """Candidate -> gate -> single-use approval -> Golden writer -> read-back.
+
+    Any caller-supplied ``promotion_decision`` is recorded but never used as
+    authorisation. A failed gate returns ``REJECTED`` and makes zero Golden write
+    attempts (``canonical_write_attempts == 0``).
+    """
+    now_iso = now if isinstance(now, str) and now else _utc_now()
+    golden = golden_store if isinstance(golden_store, dict) else {}
+    candidate = (
+        store.get("candidates", {}).get(candidate_id)
+        if isinstance(store, dict)
+        else None
+    )
+    base = {
+        "candidate_id": candidate_id,
+        "canonical_write_attempts": 0,
+        "write_calls": 0,
+        "promotion_decision": promotion_decision,
+        "promotion_decision_ignored": True,
+        "tool": KNOWLEDGE_GOLDEN_WRITE_CANONICAL_WRITER,
+    }
+    if not isinstance(candidate, dict):
+        return dict(
+            base,
+            status=KNOWLEDGE_PROMOTION_REJECTED,
+            reason=KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING,
+        )
+
+    if candidate.get("status") in (
+        KNOWLEDGE_CANDIDATE_PROMOTED,
+        KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED,
+    ):
+        existing = golden.get(candidate.get("asset_id"))
+        if (
+            isinstance(existing, dict)
+            and existing.get("content_hash") == candidate.get("content_hash")
+        ):
+            candidate["status"] = KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED
+            return dict(
+                base,
+                status=KNOWLEDGE_PROMOTION_IDEMPOTENT,
+                candidate_status=KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED,
+                idempotent=True,
+                created=False,
+                asset_id=candidate.get("asset_id"),
+                version=existing.get("version"),
+                content_hash=existing.get("content_hash"),
+                read_back_verified=True,
+            )
+        return dict(
+            base,
+            status=KNOWLEDGE_PROMOTION_REJECTED,
+            reason=KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE,
+        )
+
+    gate = validate_candidate_gate(
+        store,
+        candidate_id,
+        candidate_version=candidate_version,
+        content_hash=content_hash,
+        review_result=review_result,
+        approval_receipt=approval_receipt,
+        ledger=ledger,
+        now=now_iso,
+    )
+    if not gate["ok"]:
+        return dict(
+            base,
+            status=KNOWLEDGE_PROMOTION_REJECTED,
+            reason=gate["reason"],
+            gate=gate,
+        )
+
+    consume = consume_production_approval(ledger, approval_receipt)
+    if not consume.get("accepted"):
+        return dict(
+            base,
+            status=KNOWLEDGE_PROMOTION_REJECTED,
+            reason=KNOWLEDGE_PROMOTION_REJECT_APPROVAL,
+            approval_consume=consume,
+        )
+
+    approval = _lookup_knowledge_promotion_approval(ledger, approval_receipt) or {}
+    approved_by = (approval.get("metadata") or {}).get("approved_by") or "cloud-agent"
+    base["canonical_write_attempts"] = 1
+    payload = {
+        "asset_id": candidate.get("asset_id"),
+        "candidate_id": candidate_id,
+        "title": candidate.get("title") or str(candidate_id),
+        "content": candidate.get("content"),
+        "created_by": approved_by,
+        "source_identity": "knowledge-candidate:" + str(candidate_id),
+    }
+    write = _knowledge_golden_write_candidate(golden, payload, now_iso=now_iso)
+    base["write_calls"] = int(write.get("write_calls", 0))
+    base["write"] = write
+    candidate["status"] = KNOWLEDGE_CANDIDATE_PROMOTED
+    read_back = _knowledge_golden_cloud_asset_read(golden, candidate.get("asset_id"))
+    base["read_back"] = read_back
+    read_back_verified = bool(
+        read_back.get("found") is True
+        and read_back.get("content_hash") == candidate.get("content_hash")
+        and read_back.get("version") == write.get("version")
+    )
+    if not read_back_verified:
+        return dict(
+            base,
+            status=KNOWLEDGE_PROMOTION_REJECTED,
+            reason="readback_failed",
+            candidate_status=KNOWLEDGE_CANDIDATE_PROMOTED,
+        )
+    candidate["status"] = KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED
+    return dict(
+        base,
+        status=(
+            KNOWLEDGE_PROMOTION_IDEMPOTENT
+            if write.get("status") == KNOWLEDGE_GOLDEN_WRITE_IDEMPOTENT
+            else KNOWLEDGE_PROMOTION_WRITTEN
+        ),
+        candidate_status=KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED,
+        idempotent=write.get("status") == KNOWLEDGE_GOLDEN_WRITE_IDEMPOTENT,
+        created=bool(write.get("created")),
+        asset_id=candidate.get("asset_id"),
+        version=write.get("version"),
+        content_hash=write.get("content_hash"),
+        provenance=read_back.get("provenance"),
+        read_back_verified=True,
+        operation=KNOWLEDGE_PROMOTION_OPERATION,
+    )
+
+
+def knowledge_candidate_promotion_ledger() -> dict:
+    """A promotion-capable approval ledger (decision/knowledge/promotion ops)."""
+    schema = production_approval_ledger_schema(
+        include_knowledge_write=True, include_knowledge_promotion=True
+    )
+    return production_approval_ledger_store(schema)
+
+
+#: Forward/back-compatible aliases for the candidate pipeline entry points.
+validate_knowledge_candidate_gate = validate_candidate_gate
+knowledge_candidate_golden_pipeline_v1 = promote_knowledge_candidate
 
 
 # ---------------------------------------------------------------------------

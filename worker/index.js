@@ -2970,9 +2970,268 @@ async function writeSkillCandidate(env, args) {
 }
 async function toolWriteKnowledgeCandidate(env, args) {
   try {
+    const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+    // Any write driven by an independent staged candidate is gated by
+    // validateCandidateGate via promoteKnowledgeCandidate. The legacy
+    // asset_id-only call is the low-level Golden Writer primitive.
+    if (input.candidate_id != null && String(input.candidate_id).trim()) {
+      return await promoteKnowledgeCandidate(env, args);
+    }
     return await writeKnowledgeCandidate(env, args);
   } catch (err2) {
     return { isError: true, text: `KNOWLEDGE_WRITE_FAILED: ${err2?.message || "unknown"}` };
+  }
+}
+var KNOWLEDGE_CANDIDATE_CONTRACT = "PERSONAL_AI_KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_V1";
+var KNOWLEDGE_PROMOTION_OPERATION = "KNOWLEDGE_PROMOTION";
+var KNOWLEDGE_CANDIDATE_DRAFT = "DRAFT";
+var KNOWLEDGE_CANDIDATE_PENDING_REVIEW = "PENDING_REVIEW";
+var KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION = "APPROVED_FOR_PROMOTION";
+var KNOWLEDGE_CANDIDATE_PROMOTED = "PROMOTED";
+var KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED = "CANONICAL_READBACK_VERIFIED";
+var KNOWLEDGE_CANDIDATE_STATES = [
+  KNOWLEDGE_CANDIDATE_DRAFT,
+  KNOWLEDGE_CANDIDATE_PENDING_REVIEW,
+  KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION,
+  KNOWLEDGE_CANDIDATE_PROMOTED,
+  KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED
+];
+var KNOWLEDGE_CANDIDATE_NOT_REVIEWED = "NOT_REVIEWED";
+var KNOWLEDGE_CANDIDATE_REVIEW_PASS = "PASS";
+var KNOWLEDGE_CANDIDATE_REVIEW_FAIL = "FAIL";
+var KNOWLEDGE_PROMOTION_REJECTED = "REJECTED";
+var KNOWLEDGE_PROMOTION_WRITTEN = "WRITTEN";
+var KNOWLEDGE_PROMOTION_IDEMPOTENT = "IDEMPOTENT";
+var KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING = "candidate_missing";
+var KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE = "candidate_state";
+var KNOWLEDGE_PROMOTION_REJECT_STORED_REVIEW = "stored_review_not_pass";
+var KNOWLEDGE_PROMOTION_REJECT_REVIEW = "review_not_pass";
+var KNOWLEDGE_PROMOTION_REJECT_STORED_HASH = "stored_content_hash_mismatch";
+var KNOWLEDGE_PROMOTION_REJECT_HASH = "content_hash_mismatch";
+var KNOWLEDGE_PROMOTION_REJECT_VERSION = "candidate_version_mismatch";
+var KNOWLEDGE_PROMOTION_REJECT_APPROVAL = "missing_or_expired_approval";
+// Candidate staging and the promotion-approval ledger are separate D1 tables;
+// they are intentionally distinct from Golden `assets` / `asset_versions`.
+var KNOWLEDGE_CANDIDATE_SELECT = "SELECT candidate_id, asset_id, title, status, content, content_hash, version, provenance, created_at, review_state FROM knowledge_candidates WHERE candidate_id = ?";
+var KNOWLEDGE_CANDIDATE_INSERT = "INSERT INTO knowledge_candidates (candidate_id, asset_id, title, status, content, content_hash, version, provenance, created_at, review_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+var KNOWLEDGE_CANDIDATE_REVIEW_UPDATE = "UPDATE knowledge_candidates SET status = ?, review_state = ? WHERE candidate_id = ?";
+var KNOWLEDGE_CANDIDATE_STATUS_UPDATE = "UPDATE knowledge_candidates SET status = ? WHERE candidate_id = ?";
+var KNOWLEDGE_PROMOTION_APPROVAL_SELECT = "SELECT approval_receipt, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, consumed FROM knowledge_promotion_approvals WHERE candidate_id = ? AND candidate_version = ? AND content_hash = ? ORDER BY expires_at DESC";
+var KNOWLEDGE_PROMOTION_APPROVAL_CONSUME = "UPDATE knowledge_promotion_approvals SET consumed = 1 WHERE approval_receipt = ? AND consumed = 0";
+var KNOWLEDGE_PROMOTION_APPROVAL_INSERT = "INSERT INTO knowledge_promotion_approvals (approval_receipt, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, consumed) VALUES (?, ?, ?, ?, ?, ?, ?, 0)";
+function knowledgePromotionOutcome(resultStatus, extra) {
+  const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, status: resultStatus, ...(extra || {}) };
+  return { isError: false, text: JSON.stringify(body), structuredContent: body };
+}
+// validateCandidateGate is the SOLE authorisation for a Knowledge Canonical
+// write. A caller-supplied promotion_decision is never an input here.
+function validateCandidateGate(candidate, supplied, approval, nowMs) {
+  const reject = (reason) => ({ ok: false, reason });
+  if (!candidate || typeof candidate !== "object") return reject(KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING);
+  if (String(candidate.status) !== KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION) return reject(KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE);
+  if (String(candidate.review_state) !== KNOWLEDGE_CANDIDATE_REVIEW_PASS) return reject(KNOWLEDGE_PROMOTION_REJECT_STORED_REVIEW);
+  const src = supplied && typeof supplied === "object" ? supplied : {};
+  if (String(src.recomputed_content_hash) !== String(candidate.content_hash)) return reject(KNOWLEDGE_PROMOTION_REJECT_STORED_HASH);
+  if (String(src.content_hash) !== String(candidate.content_hash)) return reject(KNOWLEDGE_PROMOTION_REJECT_HASH);
+  if (Number(src.candidate_version) !== Number(candidate.version)) return reject(KNOWLEDGE_PROMOTION_REJECT_VERSION);
+  if (String(src.review_result) !== KNOWLEDGE_CANDIDATE_REVIEW_PASS) return reject(KNOWLEDGE_PROMOTION_REJECT_REVIEW);
+  if (!approval || typeof approval !== "object") return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (String(approval.candidate_id) !== String(candidate.candidate_id)) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (Number(approval.candidate_version) !== Number(candidate.version)) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (String(approval.content_hash) !== String(candidate.content_hash)) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (String(approval.review_result) !== KNOWLEDGE_CANDIDATE_REVIEW_PASS) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (!String(approval.approval_receipt || "").trim()) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (!String(approval.approved_by || "").trim()) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (approval.consumed === true || Number(approval.consumed) === 1) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  const now = Number.isFinite(nowMs) ? Number(nowMs) : Date.now();
+  const expires = Date.parse(String(approval.expires_at));
+  if (!Number.isFinite(expires) || expires <= now) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  return { ok: true, reason: null };
+}
+async function stageKnowledgeCandidate(env, args) {
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
+  const candidateId = String(input.candidate_id ?? "").trim();
+  if (!ASSET_ID_RE.test(candidateId)) return { isError: true, text: "INVALID_ASSET_ID" };
+  const assetId = String(input.asset_id ?? candidateId).trim();
+  if (!ASSET_ID_RE.test(assetId)) return { isError: true, text: "INVALID_ASSET_ID" };
+  if (input.content == null) return { isError: true, text: "INVALID_CONTENT" };
+  const canonicalContent = canonicalKnowledgeContent(input.content);
+  if (!canonicalContent.trim()) return { isError: true, text: "INVALID_CONTENT" };
+  const contentHash = await sha256Hex(canonicalContent);
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  const version = Number.isFinite(Number(input.version)) ? Number(input.version) : 1;
+  const provenance = input.provenance && typeof input.provenance === "object" ? input.provenance : {};
+  try {
+    await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_INSERT).bind(
+      candidateId,
+      assetId,
+      String(input.title ?? "").trim(),
+      KNOWLEDGE_CANDIDATE_DRAFT,
+      canonicalContent,
+      contentHash,
+      version,
+      JSON.stringify(provenance),
+      nowIso,
+      KNOWLEDGE_CANDIDATE_NOT_REVIEWED
+    ).run();
+  } catch {
+    return { isError: true, text: "ASSET_WRITE_FAILED" };
+  }
+  const candidate = {
+    candidate_id: candidateId,
+    asset_id: assetId,
+    title: String(input.title ?? "").trim(),
+    status: KNOWLEDGE_CANDIDATE_DRAFT,
+    content: canonicalContent,
+    content_hash: contentHash,
+    version,
+    provenance,
+    created_at: nowIso,
+    review_state: KNOWLEDGE_CANDIDATE_NOT_REVIEWED
+  };
+  return { isError: false, text: JSON.stringify({ contract: KNOWLEDGE_CANDIDATE_CONTRACT, staged: true, candidate }), structuredContent: { contract: KNOWLEDGE_CANDIDATE_CONTRACT, staged: true, candidate } };
+}
+async function recordKnowledgeCandidateReview(env, args) {
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
+  const candidateId = String(input.candidate_id ?? "").trim();
+  const reviewResult = String(input.review_result ?? "").trim().toUpperCase();
+  if (![KNOWLEDGE_CANDIDATE_REVIEW_PASS, KNOWLEDGE_CANDIDATE_REVIEW_FAIL].includes(reviewResult)) {
+    return { isError: true, text: "INVALID_REVIEW_RESULT" };
+  }
+  const nextStatus = reviewResult === KNOWLEDGE_CANDIDATE_REVIEW_PASS
+    ? KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION
+    : KNOWLEDGE_CANDIDATE_PENDING_REVIEW;
+  try {
+    await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_REVIEW_UPDATE).bind(nextStatus, reviewResult, candidateId).run();
+  } catch {
+    return { isError: true, text: "ASSET_WRITE_FAILED" };
+  }
+  const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, candidate_id: candidateId, status: nextStatus, review_state: reviewResult };
+  return { isError: false, text: JSON.stringify(body), structuredContent: body };
+}
+async function registerKnowledgePromotionApproval(env, args) {
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
+  const receipt = String(input.approval_receipt ?? "").trim();
+  const approvedBy = String(input.approved_by ?? "").trim();
+  if (!receipt || !approvedBy) return { isError: true, text: "INVALID_APPROVAL" };
+  try {
+    await env.ASSET_DB.prepare(KNOWLEDGE_PROMOTION_APPROVAL_INSERT).bind(
+      receipt,
+      String(input.candidate_id ?? "").trim(),
+      Number(input.candidate_version),
+      String(input.content_hash ?? ""),
+      String(input.review_result ?? "").trim().toUpperCase(),
+      approvedBy,
+      String(input.expires_at ?? "")
+    ).run();
+  } catch {
+    return { isError: true, text: "ASSET_WRITE_FAILED" };
+  }
+  const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, operation: KNOWLEDGE_PROMOTION_OPERATION, registered: true, approval_receipt: receipt };
+  return { isError: false, text: JSON.stringify(body), structuredContent: body };
+}
+// Gated promotion: candidate -> validateCandidateGate -> single-use approval
+// consume -> Golden Writer (writeKnowledgeCandidate) -> authoritative read-back.
+async function promoteKnowledgeCandidate(env, args) {
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
+  const db = env.ASSET_DB;
+  const candidateId = String(input.candidate_id ?? "").trim();
+  if (!ASSET_ID_RE.test(candidateId)) return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING, write_calls: 0 });
+  let candidate;
+  try {
+    candidate = await db.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind(candidateId).first();
+  } catch {
+    return { isError: true, text: "ASSET_WRITE_FAILED" };
+  }
+  if (!candidate) return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING, write_calls: 0 });
+  const assetId = String(candidate.asset_id || candidateId).trim();
+  const canonicalContent = canonicalKnowledgeContent(candidate.content);
+  const recomputed = await sha256Hex(canonicalContent);
+  const supplied = {
+    candidate_version: input.candidate_version,
+    content_hash: input.content_hash,
+    review_result: String(input.review_result ?? "").trim().toUpperCase(),
+    recomputed_content_hash: recomputed
+  };
+  if (String(candidate.status) === KNOWLEDGE_CANDIDATE_PROMOTED || String(candidate.status) === KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED) {
+    const present = await verifyKnowledgeVersion(db, assetId, Number(candidate.version), recomputed, canonicalContent);
+    if (present) {
+      return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_IDEMPOTENT, {
+        candidate_id: candidateId,
+        candidate_status: KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED,
+        asset_id: assetId,
+        version: Number(candidate.version),
+        content_hash: recomputed,
+        idempotent: true,
+        created: false,
+        write_calls: 0,
+        read_back_verified: true
+      });
+    }
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE, write_calls: 0 });
+  }
+  let approval = null;
+  try {
+    approval = await db.prepare(KNOWLEDGE_PROMOTION_APPROVAL_SELECT).bind(candidateId, Number(candidate.version), String(candidate.content_hash)).first();
+  } catch {
+    approval = null;
+  }
+  const gate = validateCandidateGate(candidate, supplied, approval, Date.parse(String(input.now ?? "")) || Date.now());
+  if (!gate.ok) {
+    // Fail closed BEFORE any Golden/Canonical write attempt.
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: gate.reason, write_calls: 0, candidate_id: candidateId });
+  }
+  let consumed = 0;
+  try {
+    const consumedResult = await db.prepare(KNOWLEDGE_PROMOTION_APPROVAL_CONSUME).bind(String(approval.approval_receipt)).run();
+    consumed = consumedResult && consumedResult.meta ? Number(consumedResult.meta.changes) || 0 : 0;
+  } catch {
+    consumed = 0;
+  }
+  if (consumed < 1) return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_APPROVAL, write_calls: 0, candidate_id: candidateId });
+  const writeOutcome = await writeKnowledgeCandidate(env, {
+    asset_id: assetId,
+    title: String(candidate.title ?? "").trim() || "candidate",
+    content: candidate.content,
+    source_identity: `knowledge-candidate:${candidateId}`,
+    created_by: String(input.approved_by ?? approval.approved_by ?? "cloud-agent")
+  });
+  if (writeOutcome.isError) return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: "ASSET_WRITE_FAILED", write_calls: 1, candidate_id: candidateId });
+  const write = writeOutcome.structuredContent || {};
+  try {
+    await db.prepare(KNOWLEDGE_CANDIDATE_STATUS_UPDATE).bind(KNOWLEDGE_CANDIDATE_PROMOTED, candidateId).run();
+  } catch {
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: "ASSET_WRITE_FAILED", write_calls: 1, candidate_id: candidateId });
+  }
+  const readBack = await verifyKnowledgeVersion(db, assetId, Number(write.version), recomputed, canonicalContent);
+  if (!readBack) return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: "ASSET_WRITE_FAILED", write_calls: 1, candidate_id: candidateId });
+  try {
+    await db.prepare(KNOWLEDGE_CANDIDATE_STATUS_UPDATE).bind(KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED, candidateId).run();
+  } catch {
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: "ASSET_WRITE_FAILED", write_calls: 1, candidate_id: candidateId });
+  }
+  return knowledgePromotionOutcome(write.idempotent ? KNOWLEDGE_PROMOTION_IDEMPOTENT : KNOWLEDGE_PROMOTION_WRITTEN, {
+    candidate_id: candidateId,
+    candidate_status: KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED,
+    asset_id: assetId,
+    version: Number(write.version),
+    content_hash: recomputed,
+    idempotent: Boolean(write.idempotent),
+    created: Boolean(write.created),
+    write_calls: 1,
+    read_back_verified: true,
+    operation: KNOWLEDGE_PROMOTION_OPERATION
+  });
+}
+async function toolPromoteKnowledgeCandidate(env, args) {
+  try {
+    return await promoteKnowledgeCandidate(env, args);
+  } catch (err2) {
+    return { isError: true, text: `KNOWLEDGE_PROMOTION_FAILED: ${err2?.message || "unknown"}` };
   }
 }
 var DECISION_WRITE_CONTRACT = "PERSONAL_AI_DECISION_WRITER_V0.1";
