@@ -2971,13 +2971,24 @@ async function writeSkillCandidate(env, args) {
 async function toolWriteKnowledgeCandidate(env, args) {
   try {
     const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
-    // Any write driven by an independent staged candidate is gated by
-    // validateCandidateGate via promoteKnowledgeCandidate. The legacy
-    // asset_id-only call is the low-level Golden Writer primitive.
-    if (input.candidate_id != null && String(input.candidate_id).trim()) {
-      return await promoteKnowledgeCandidate(env, args);
+    // The public Knowledge route never writes a non-KNOWLEDGE asset type.
+    const assetType = String(input.asset_type ?? KNOWLEDGE_ASSET_TYPE).trim().toUpperCase();
+    if (assetType !== KNOWLEDGE_ASSET_TYPE) return { isError: true, text: "INVALID_ASSET_TYPE" };
+    // The publicly reachable Knowledge write route is fail-closed: a Canonical
+    // write is ONLY authorised through the independent staged-candidate
+    // promotion gate (validateCandidateGate via promoteKnowledgeCandidate). A
+    // legacy asset_id-only call carries no candidate, no review state, and no
+    // bound approval, so it is rejected before any DB read, Canonical writer
+    // call, or mutation. A caller-supplied promotion_decision never authorises
+    // the write.
+    const candidateId = input.candidate_id == null ? "" : String(input.candidate_id).trim();
+    if (!candidateId) {
+      return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
+        reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING,
+        write_calls: 0
+      });
     }
-    return await writeKnowledgeCandidate(env, args);
+    return await promoteKnowledgeCandidate(env, args);
   } catch (err2) {
     return { isError: true, text: `KNOWLEDGE_WRITE_FAILED: ${err2?.message || "unknown"}` };
   }

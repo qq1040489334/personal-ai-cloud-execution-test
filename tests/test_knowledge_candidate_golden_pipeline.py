@@ -588,6 +588,119 @@ def test_worker_1_draft_rejected_zero_writes() -> None:
     assert report["candidate"]["status"] == "DRAFT"
 
 
+# ---------------------------------------------------------------------------
+# Public Knowledge write route is fail-closed (direct tool + MCP tools/call)
+#
+# The public route must not drive a Canonical write from an asset_id-only
+# request: it carries no independently staged candidate, no review state, and
+# no bound single-use approval. Both entry points below must return
+# REJECTED/candidate_missing with zero DB reads, zero DB mutations, and zero
+# Canonical writer calls, and a caller-supplied promotion_decision=PROMOTE must
+# not authorise the write.
+# ---------------------------------------------------------------------------
+
+PUBLIC_ROUTE_INSTRUMENT = r"""
+let dbReads = 0;
+let dbMutations = 0;
+let writerCalls = 0;
+const _origMakeD1 = makeD1;
+makeD1 = function() {
+  const db = _origMakeD1();
+  const origPrepare = db.prepare;
+  db.prepare = function(sql) {
+    const stmt = origPrepare.call(db, sql);
+    const origBind = stmt.bind;
+    stmt.bind = function(...args) {
+      const bound = origBind.apply(stmt, args);
+      const origRun = bound.run;
+      const origFirst = bound.first;
+      const origAll = bound.all;
+      bound.run = async function(...a) { dbMutations++; return origRun.apply(bound, a); };
+      bound.first = async function(...a) { dbReads++; return origFirst.apply(bound, a); };
+      bound.all = async function(...a) { dbReads++; return origAll.apply(bound, a); };
+      return bound;
+    };
+    return stmt;
+  };
+  if (db.batch) {
+    const origBatch = db.batch;
+    db.batch = async function(...a) { dbMutations++; return origBatch.apply(db, a); };
+  }
+  return db;
+};
+const _origWriteKnowledgeCandidate = writeKnowledgeCandidate;
+writeKnowledgeCandidate = async function(...a) {
+  writerCalls++;
+  return _origWriteKnowledgeCandidate.apply(null, a);
+};
+"""
+
+ASSET_ID_ONLY_ARGS = {
+    "asset_id": "knowledge:inbox:1",
+    "title": "Panama DIY notes",
+    "content": {"type": "note", "text": "deepseek v4.1"},
+    "promotion_decision": "PROMOTE",
+}
+
+
+def _assert_public_route_rejected(report: dict, structured: dict) -> None:
+    assert structured["contract"] == "PERSONAL_AI_KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_V1"
+    assert structured["status"] == "REJECTED"
+    assert structured["reason"] == "candidate_missing"
+    assert structured["write_calls"] == 0
+    assert report["dbReads"] == 0
+    assert report["dbMutations"] == 0
+    assert report["writerCalls"] == 0
+    assert report["assets"] == []
+    assert report["versions"] == []
+
+
+def test_public_direct_tool_asset_id_only_is_rejected_zero_io() -> None:
+    script = (
+        "\n"
+        + PUBLIC_ROUTE_INSTRUMENT
+        + "\nconst env = { ASSET_DB: makeD1() };\n"
+        + "const outcome = await toolWriteKnowledgeCandidate(env, "
+        + json.dumps(ASSET_ID_ONLY_ARGS)
+        + ");\n"
+        + "console.log(JSON.stringify({ outcome, dbReads, dbMutations, writerCalls, "
+        + "assets: Array.from(assetRows.values()), "
+        + "versions: Array.from(versionRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    _assert_public_route_rejected(report, report["outcome"]["structuredContent"])
+
+
+def test_public_mcp_tools_call_asset_id_only_is_rejected_zero_io() -> None:
+    message = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "write_knowledge_candidate",
+            "arguments": ASSET_ID_ONLY_ARGS,
+        },
+    }
+    script = (
+        "\n"
+        + PUBLIC_ROUTE_INSTRUMENT
+        + "\nconst env = { ASSET_DB: makeD1() };\n"
+        + "const auth = { scopes: ['mcp'] };\n"
+        + "const req = new Request('https://worker.example/mcp', { method: 'POST', "
+        + "headers: { 'Content-Type': 'application/json' }, body: JSON.stringify("
+        + json.dumps(message)
+        + ") });\n"
+        + "const res = await handleMcp(req, env, {}, auth);\n"
+        + "const body = await res.json();\n"
+        + "console.log(JSON.stringify({ body, dbReads, dbMutations, writerCalls, "
+        + "assets: Array.from(assetRows.values()), "
+        + "versions: Array.from(versionRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    result = report["body"]["result"]
+    _assert_public_route_rejected(report, result["structuredContent"])
+
+
 def test_worker_2_forged_decision_without_approval_rejected() -> None:
     script = (
         "\n"

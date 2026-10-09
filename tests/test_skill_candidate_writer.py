@@ -444,6 +444,10 @@ def test_knowledge_tool_registration_and_dispatch_unchanged() -> None:
         "KNOWLEDGE"
     ]
 
+    # The public Knowledge write route is fail-closed: a legacy asset_id-only
+    # call carries no staged candidate, so it must be REJECTED before any
+    # Canonical writer call rather than silently driving the flat Golden
+    # writer. A caller-supplied promotion_decision does not authorise it.
     call = mcp_probe(
         "tools/call",
         {
@@ -452,14 +456,18 @@ def test_knowledge_tool_registration_and_dispatch_unchanged() -> None:
                 "asset_id": "knowledge:inbox:1",
                 "title": "Panama DIY notes",
                 "content": {"type": "note", "text": "deepseek v4.1"},
+                "promotion_decision": "PROMOTE",
             },
         },
         WRITE_SCOPE,
     )
     result = call["body"]["result"]
-    assert result["isError"] is False
-    assert result["structuredContent"]["asset_type"] == "KNOWLEDGE"
-    assert result["structuredContent"]["status"] == "WRITTEN"
+    structured_content = result["structuredContent"]
+    assert structured_content["status"] == "REJECTED"
+    assert structured_content["reason"] == "candidate_missing"
+    assert structured_content["write_calls"] == 0
+    assert call["assets"] == []
+    assert call["versions"] == []
 
 
 def test_knowledge_tool_still_rejects_skill() -> None:
