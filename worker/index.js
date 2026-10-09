@@ -2974,13 +2974,26 @@ async function toolWriteKnowledgeCandidate(env, args) {
     // The public Knowledge route never writes a non-KNOWLEDGE asset type.
     const assetType = String(input.asset_type ?? KNOWLEDGE_ASSET_TYPE).trim().toUpperCase();
     if (assetType !== KNOWLEDGE_ASSET_TYPE) return { isError: true, text: "INVALID_ASSET_TYPE" };
-    // The publicly reachable Knowledge write route is fail-closed: a Canonical
-    // write is ONLY authorised through the independent staged-candidate
-    // promotion gate (validateCandidateGate via promoteKnowledgeCandidate). A
-    // legacy asset_id-only call carries no candidate, no review state, and no
-    // bound approval, so it is rejected before any DB read, Canonical writer
-    // call, or mutation. A caller-supplied promotion_decision never authorises
-    // the write.
+    // The single public Knowledge MCP tool dispatches the candidate lifecycle
+    // sub-operations so an authorised agent has real, callable entry points
+    // without expanding the frozen `tools/list` surface:
+    //   create  -> persist an independent DRAFT candidate
+    //   read    -> independent read by candidate_id (cross-agent / cross-session)
+    //   submit  -> DRAFT -> PENDING_REVIEW
+    //   review  -> record PASS / FAIL
+    //   promote -> the sole Canonical write gate (default, fail-closed)
+    // Any other/missing sub-operation falls through to the promotion gate.
+    const op = String(input.candidate_operation ?? input.operation ?? "").trim().toLowerCase();
+    if (op === "create" || op === "create_candidate") return await createKnowledgeCandidate(env, input);
+    if (op === "read" || op === "get" || op === "get_candidate") return await readKnowledgeCandidate(env, input);
+    if (op === "submit" || op === "submit_review" || op === "submit_for_review") return await submitKnowledgeCandidateForReview(env, input);
+    if (op === "review" || op === "record_review") return await recordKnowledgeCandidateReview(env, input);
+    // Promotion (fail-closed). A Canonical write is ONLY authorised through the
+    // independent staged-candidate promotion gate (validateCandidateGate via
+    // promoteKnowledgeCandidate). A legacy asset_id-only call carries no
+    // candidate, no review state, and no bound approval, so it is rejected
+    // before any DB read, Canonical writer call, or mutation. A caller-supplied
+    // promotion_decision/approved_by/approval_receipt never authorises the write.
     const candidateId = input.candidate_id == null ? "" : String(input.candidate_id).trim();
     if (!candidateId) {
       return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
@@ -2992,6 +3005,11 @@ async function toolWriteKnowledgeCandidate(env, args) {
   } catch (err2) {
     return { isError: true, text: `KNOWLEDGE_WRITE_FAILED: ${err2?.message || "unknown"}` };
   }
+}
+function knowledgeCandidateReadOperation(args) {
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const op = String(input.candidate_operation ?? input.operation ?? "").trim().toLowerCase();
+  return op === "read" || op === "get" || op === "get_candidate";
 }
 var KNOWLEDGE_CANDIDATE_CONTRACT = "PERSONAL_AI_KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_V1";
 var KNOWLEDGE_PROMOTION_OPERATION = "KNOWLEDGE_PROMOTION";
@@ -3021,15 +3039,23 @@ var KNOWLEDGE_PROMOTION_REJECT_STORED_HASH = "stored_content_hash_mismatch";
 var KNOWLEDGE_PROMOTION_REJECT_HASH = "content_hash_mismatch";
 var KNOWLEDGE_PROMOTION_REJECT_VERSION = "candidate_version_mismatch";
 var KNOWLEDGE_PROMOTION_REJECT_APPROVAL = "missing_or_expired_approval";
-// Candidate staging and the promotion-approval ledger are separate D1 tables;
-// they are intentionally distinct from Golden `assets` / `asset_versions`.
-var KNOWLEDGE_CANDIDATE_SELECT = "SELECT candidate_id, asset_id, title, status, content, content_hash, version, provenance, created_at, review_state FROM knowledge_candidates WHERE candidate_id = ?";
+// Candidate staging lives in its own D1 table, intentionally distinct from the
+// Golden `assets` / `asset_versions` tables. Approvals are NOT a second
+// authority: KNOWLEDGE_PROMOTION reuses the trusted, single-use
+// `personal_ai_approval_ledger` together with the `approval_ledger_operations`
+// registry (both added additively by migration 0003). There is deliberately NO
+// worker code path that registers/mints an approval -- a caller-supplied
+// `approved_by` / `approval_receipt` / `promotion_decision` can never authorise
+// a write. Approvals enter the ledger only through the trusted Human Gate
+// process, which writes to D1 out of band.
+var KNOWLEDGE_CANDIDATE_SELECT = "SELECT candidate_id, asset_id, title, status, content, content_hash, version, provenance, created_at, review_state, review_result FROM knowledge_candidates WHERE candidate_id = ?";
 var KNOWLEDGE_CANDIDATE_INSERT = "INSERT INTO knowledge_candidates (candidate_id, asset_id, title, status, content, content_hash, version, provenance, created_at, review_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 var KNOWLEDGE_CANDIDATE_REVIEW_UPDATE = "UPDATE knowledge_candidates SET status = ?, review_state = ? WHERE candidate_id = ?";
 var KNOWLEDGE_CANDIDATE_STATUS_UPDATE = "UPDATE knowledge_candidates SET status = ? WHERE candidate_id = ?";
-var KNOWLEDGE_PROMOTION_APPROVAL_SELECT = "SELECT approval_receipt, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, consumed FROM knowledge_promotion_approvals WHERE candidate_id = ? AND candidate_version = ? AND content_hash = ? ORDER BY expires_at DESC";
-var KNOWLEDGE_PROMOTION_APPROVAL_CONSUME = "UPDATE knowledge_promotion_approvals SET consumed = 1 WHERE approval_receipt = ? AND consumed = 0";
-var KNOWLEDGE_PROMOTION_APPROVAL_INSERT = "INSERT INTO knowledge_promotion_approvals (approval_receipt, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, consumed) VALUES (?, ?, ?, ?, ?, ?, ?, 0)";
+// The trusted approval ledger (single authority, reused for
+// decision_write / knowledge_write / KNOWLEDGE_PROMOTION).
+var APPROVAL_LEDGER_SELECT = "SELECT approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state, consumed, consume_count FROM personal_ai_approval_ledger WHERE operation = ? AND candidate_id = ? AND candidate_version = ? AND content_hash = ? ORDER BY expires_at DESC";
+var APPROVAL_LEDGER_CONSUME = "UPDATE personal_ai_approval_ledger SET consumed = 1, state = 'CONSUMED', consume_count = consume_count + 1, consumed_at = ? WHERE approval_id = ? AND operation = ? AND consumed = 0";
 function knowledgePromotionOutcome(resultStatus, extra) {
   const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, status: resultStatus, ...(extra || {}) };
   return { isError: false, text: JSON.stringify(body), structuredContent: body };
@@ -3047,11 +3073,15 @@ function validateCandidateGate(candidate, supplied, approval, nowMs) {
   if (Number(src.candidate_version) !== Number(candidate.version)) return reject(KNOWLEDGE_PROMOTION_REJECT_VERSION);
   if (String(src.review_result) !== KNOWLEDGE_CANDIDATE_REVIEW_PASS) return reject(KNOWLEDGE_PROMOTION_REJECT_REVIEW);
   if (!approval || typeof approval !== "object") return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  // The approval must come from the shared trusted ledger, bound to the
+  // KNOWLEDGE_PROMOTION operation. A wrong operation / a receipt that is not in
+  // the ledger can never authorise the write.
+  if (String(approval.operation) !== KNOWLEDGE_PROMOTION_OPERATION) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   if (String(approval.candidate_id) !== String(candidate.candidate_id)) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   if (Number(approval.candidate_version) !== Number(candidate.version)) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   if (String(approval.content_hash) !== String(candidate.content_hash)) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   if (String(approval.review_result) !== KNOWLEDGE_CANDIDATE_REVIEW_PASS) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
-  if (!String(approval.approval_receipt || "").trim()) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (!String(approval.approval_id || "").trim()) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   if (!String(approval.approved_by || "").trim()) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   if (approval.consumed === true || Number(approval.consumed) === 1) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   const now = Number.isFinite(nowMs) ? Number(nowMs) : Date.now();
@@ -3122,28 +3152,87 @@ async function recordKnowledgeCandidateReview(env, args) {
   const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, candidate_id: candidateId, status: nextStatus, review_state: reviewResult };
   return { isError: false, text: JSON.stringify(body), structuredContent: body };
 }
-async function registerKnowledgePromotionApproval(env, args) {
+async function createKnowledgeCandidate(env, args) {
+  // Callable candidate-intake entry point. Persists an independent DRAFT
+  // candidate record (never a Golden asset). Creating a candidate does NOT
+  // approve or promote anything.
+  const staged = await stageKnowledgeCandidate(env, args);
+  return staged;
+}
+async function readKnowledgeCandidate(env, args) {
+  // Independent read by candidate_id. Any authorised agent/session can read a
+  // candidate another agent persisted; the record is never conflated with a
+  // Canonical asset.
   const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
-  const receipt = String(input.approval_receipt ?? "").trim();
-  const approvedBy = String(input.approved_by ?? "").trim();
-  if (!receipt || !approvedBy) return { isError: true, text: "INVALID_APPROVAL" };
+  const candidateId = String(input.candidate_id ?? "").trim();
+  if (!ASSET_ID_RE.test(candidateId)) return { isError: true, text: "INVALID_ASSET_ID" };
+  let row;
   try {
-    await env.ASSET_DB.prepare(KNOWLEDGE_PROMOTION_APPROVAL_INSERT).bind(
-      receipt,
-      String(input.candidate_id ?? "").trim(),
-      Number(input.candidate_version),
-      String(input.content_hash ?? ""),
-      String(input.review_result ?? "").trim().toUpperCase(),
-      approvedBy,
-      String(input.expires_at ?? "")
-    ).run();
+    row = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind(candidateId).first();
   } catch {
     return { isError: true, text: "ASSET_WRITE_FAILED" };
   }
-  const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, operation: KNOWLEDGE_PROMOTION_OPERATION, registered: true, approval_receipt: receipt };
+  if (!row) return { isError: true, text: "CANDIDATE_NOT_FOUND" };
+  let parsedContent = row.content;
+  try {
+    parsedContent = JSON.parse(row.content);
+  } catch {
+    parsedContent = row.content;
+  }
+  let provenance = row.provenance;
+  try {
+    provenance = JSON.parse(row.provenance);
+  } catch {
+    provenance = {};
+  }
+  const candidate = {
+    candidate_id: row.candidate_id,
+    asset_id: row.asset_id,
+    title: row.title,
+    status: row.status,
+    content: parsedContent,
+    content_hash: row.content_hash,
+    version: Number(row.version),
+    provenance,
+    created_at: row.created_at,
+    review_state: row.review_state,
+    review_result: row.review_result ?? null
+  };
+  const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, found: true, candidate };
   return { isError: false, text: JSON.stringify(body), structuredContent: body };
 }
+async function submitKnowledgeCandidateForReview(env, args) {
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
+  const candidateId = String(input.candidate_id ?? "").trim();
+  if (!ASSET_ID_RE.test(candidateId)) return { isError: true, text: "INVALID_ASSET_ID" };
+  let row;
+  try {
+    row = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind(candidateId).first();
+  } catch {
+    return { isError: true, text: "ASSET_WRITE_FAILED" };
+  }
+  if (!row) return { isError: true, text: "CANDIDATE_NOT_FOUND" };
+  if (String(row.status) !== KNOWLEDGE_CANDIDATE_DRAFT) {
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
+      reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE,
+      candidate_id: candidateId
+    });
+  }
+  try {
+    await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_REVIEW_UPDATE).bind(KNOWLEDGE_CANDIDATE_PENDING_REVIEW, KNOWLEDGE_CANDIDATE_NOT_REVIEWED, candidateId).run();
+  } catch {
+    return { isError: true, text: "ASSET_WRITE_FAILED" };
+  }
+  const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, candidate_id: candidateId, status: KNOWLEDGE_CANDIDATE_PENDING_REVIEW, review_state: KNOWLEDGE_CANDIDATE_NOT_REVIEWED };
+  return { isError: false, text: JSON.stringify(body), structuredContent: body };
+}
+// NOTE: there is deliberately no worker function that registers/mints a
+// promotion approval. The worker can only READ and atomically CONSUME approvals
+// from the trusted `personal_ai_approval_ledger`; it can never mint one. This is
+// what makes a caller-supplied approved_by/approval_receipt/promotion_decision
+// incapable of authorising a write.
 // Gated promotion: candidate -> validateCandidateGate -> single-use approval
 // consume -> Golden Writer (writeKnowledgeCandidate) -> authoritative read-back.
 async function promoteKnowledgeCandidate(env, args) {
@@ -3187,7 +3276,7 @@ async function promoteKnowledgeCandidate(env, args) {
   }
   let approval = null;
   try {
-    approval = await db.prepare(KNOWLEDGE_PROMOTION_APPROVAL_SELECT).bind(candidateId, Number(candidate.version), String(candidate.content_hash)).first();
+    approval = await db.prepare(APPROVAL_LEDGER_SELECT).bind(KNOWLEDGE_PROMOTION_OPERATION, candidateId, Number(candidate.version), String(candidate.content_hash)).first();
   } catch {
     approval = null;
   }
@@ -3196,22 +3285,39 @@ async function promoteKnowledgeCandidate(env, args) {
     // Fail closed BEFORE any Golden/Canonical write attempt.
     return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: gate.reason, write_calls: 0, candidate_id: candidateId });
   }
+  // Atomic single-use consume against the shared trusted ledger. The conditional
+  // UPDATE (consumed = 0) is a compare-and-swap: under concurrent promotion of
+  // the same candidate, at most one consumer receives meta.changes === 1.
   let consumed = 0;
   try {
-    const consumedResult = await db.prepare(KNOWLEDGE_PROMOTION_APPROVAL_CONSUME).bind(String(approval.approval_receipt)).run();
+    const consumedResult = await db.prepare(APPROVAL_LEDGER_CONSUME).bind((new Date()).toISOString(), String(approval.approval_id), KNOWLEDGE_PROMOTION_OPERATION).run();
     consumed = consumedResult && consumedResult.meta ? Number(consumedResult.meta.changes) || 0 : 0;
   } catch {
     consumed = 0;
   }
   if (consumed < 1) return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_APPROVAL, write_calls: 0, candidate_id: candidateId });
+  // The Canonical writer's actor comes ONLY from the trusted ledger approval,
+  // never from a caller-supplied approved_by.
   const writeOutcome = await writeKnowledgeCandidate(env, {
     asset_id: assetId,
     title: String(candidate.title ?? "").trim() || "candidate",
     content: candidate.content,
     source_identity: `knowledge-candidate:${candidateId}`,
-    created_by: String(input.approved_by ?? approval.approved_by ?? "cloud-agent")
+    created_by: String(approval.approved_by || "human-gate")
   });
-  if (writeOutcome.isError) return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: "ASSET_WRITE_FAILED", write_calls: 1, candidate_id: candidateId });
+  if (writeOutcome.isError) {
+    // Approval consumed but no Golden row exists: fail closed and expose a
+    // recovery token. A later promotion still requires a fresh, unconsumed,
+    // Human-Gate-bound approval (the consumed one can never be replayed).
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
+      reason: "ASSET_WRITE_FAILED",
+      write_calls: 1,
+      candidate_id: candidateId,
+      approval_consumed: true,
+      recovery_required: true,
+      recovery_hint: "obtain a new Human Gate approval bound to this candidate/version/hash"
+    });
+  }
   const write = writeOutcome.structuredContent || {};
   try {
     await db.prepare(KNOWLEDGE_CANDIDATE_STATUS_UPDATE).bind(KNOWLEDGE_CANDIDATE_PROMOTED, candidateId).run();
@@ -3219,7 +3325,20 @@ async function promoteKnowledgeCandidate(env, args) {
     return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: "ASSET_WRITE_FAILED", write_calls: 1, candidate_id: candidateId });
   }
   const readBack = await verifyKnowledgeVersion(db, assetId, Number(write.version), recomputed, canonicalContent);
-  if (!readBack) return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: "ASSET_WRITE_FAILED", write_calls: 1, candidate_id: candidateId });
+  if (!readBack) {
+    // Canonical write appeared to succeed but the authoritative read-back
+    // failed. Never claim VERIFIED. The candidate stays PROMOTED; the Golden row
+    // (if present) makes a later attempt idempotent, so recovery is safe.
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
+      reason: "readback_failed",
+      write_calls: 1,
+      candidate_id: candidateId,
+      candidate_status: KNOWLEDGE_CANDIDATE_PROMOTED,
+      read_back_verified: false,
+      recovery_required: true,
+      recovery_hint: "re-read the Canonical asset; re-promotion is idempotent and creates no duplicate"
+    });
+  }
   try {
     await db.prepare(KNOWLEDGE_CANDIDATE_STATUS_UPDATE).bind(KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED, candidateId).run();
   } catch {
@@ -3610,15 +3729,17 @@ var TOOLS = [
   },
   {
     name: "write_knowledge_candidate",
-    description: "Controlled canonical writer for a KNOWLEDGE candidate. Validates input, computes the canonical content hash, versions against the existing assets/asset_versions rows, is idempotent for identical content, and records verified provenance. Write only; never used for non-KNOWLEDGE assets.",
+    description: "Controlled KNOWLEDGE candidate lifecycle + canonical writer. `candidate_operation` selects create (persist an independent DRAFT candidate), read (independent read by candidate_id), submit_review (DRAFT -> PENDING_REVIEW), review (record PASS/FAIL), or promote (the sole fail-closed Canonical write gate; default). Promotion requires a real single-use Human Gate approval in the shared personal_ai_approval_ledger bound to candidate_id/version/content_hash/review_result/approved_by/expires_at/KNOWLEDGE_PROMOTION. Write operations require write scope; read requires asset.read scope. Never used for non-KNOWLEDGE assets.",
     inputSchema: {
       type: "object",
       properties: {
+        candidate_operation: { type: "string", enum: ["create", "read", "submit_review", "review", "promote"] },
         asset_id: { type: "string" },
         candidate_id: { type: "string" },
         asset_type: { type: "string", enum: ["KNOWLEDGE"] },
         title: { type: "string" },
         content: { type: ["string", "object", "array"] },
+        review_result: { type: "string", enum: ["PASS", "FAIL"] },
         schema_version: { type: "string" },
         status: { type: "string" },
         source_identity: { type: "string" },
@@ -3631,7 +3752,7 @@ var TOOLS = [
         captured_at: { type: "string" },
         promoted_at: { type: "string" }
       },
-      required: ["title", "content"]
+      required: []
     },
     outputSchema: {
       type: "object",
@@ -3768,7 +3889,13 @@ async function handleMcp(request, env, cors, auth) {
         if (!hasReadScope(auth)) return fail(-32001, "asset.read scope required");
         outcome = await toolGetAsset(env, args);
       } else if (name === "write_knowledge_candidate") {
-        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
+        // Candidate reads keep read-scope isolation; every write/mutation
+        // sub-operation (create / submit / review / promote) requires write scope.
+        if (knowledgeCandidateReadOperation(args)) {
+          if (!hasReadScope(auth)) return fail(-32001, "asset.read scope required");
+        } else if (!hasWriteScope(auth)) {
+          return fail(-32002, "mcp scope required");
+        }
         outcome = await toolWriteKnowledgeCandidate(env, args);
       } else if (name === "write_skill_candidate") {
         if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");

@@ -1,310 +1,276 @@
 # KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_REPORT_V1
 
-- Task ID: `cf-88666f9c9147`
+- Task ID: `cf-00bcf790b680`
 - Goal: `KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_V1`
 - Repository: `qq1040489334/personal-ai-cloud-execution-test`
-- Base commit: `fb01f893f0357c4c6a1289a2ca098c139203650f`
-- Verified HEAD at execution: `fb01f893f0357c4c6a1289a2ca098c139203650f`
+- Original base commit: `fb01f893f0357c4c6a1289a2ca098c139203650f`
+- Continuation start commit: `66878d94107a0e828697f2a3138e5087deb59aab`
+  (the prior run that only produced the two reports)
+- Release-candidate commit: recorded as git `HEAD` at publication time (see §2)
 - Risk level: `LOW`
-- Mode: `IMPLEMENT_AND_TEST` (bounded by the injected allowlist, see §2)
-- Production readiness: **`BLOCKED`** (not `READY_FOR_HUMAN_APPROVAL`; see §8 and §10)
+- Mode: `IMPLEMENT_AND_TEST`
+- Production readiness: **`PARTIAL`** (implemented + isolated-verified; real
+  Cloudflare D1 concurrency and production deploy/migration remain `UNVERIFIED`)
 
-> **Hard-hold attestation.** No production deploy, no production D1 migration, no
-> Canonical write, no production approval create/consume, and no
-> secret/OAuth/permission/binding change was performed. No file was deleted.
-> Everything below is either a repository reading or an executed in-repo test.
-> Anything not traceable to an executed command is marked `UNVERIFIED`.
-
----
-
-## 1. Executive Summary
-
-The task asked for four P0 repairs (reuse the existing approval ledger, add
-callable candidate persistence entry points, unblock the migration, and produce
-a unified release/rollback runbook), plus green tests and a Release Candidate.
-
-**The repository at the pinned baseline does not meet the §7 acceptance
-conditions, and this execution was not permitted to change the files required to
-meet them.** The injected workflow allowlist for this run restricts repository
-writes to exactly two files:
-
-```
-KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_REPORT_V1.md   (this report)
-KNOWLEDGE_GATE_PRODUCTION_RELEASE_PLAN_V1.md
-```
-
-Every code artifact required by the task (`worker/index.js`,
-`worker/migrations/*.sql`, `tests/*.py`) is **outside** that allowlist, so the
-implementation portion of the contract could not be legally performed in this
-run. The task's own §5 `FORBID` list also forbids production D1 migration and
-production deploy, which is compatible with the hard-hold, but the allowlist is
-stricter still.
-
-The baseline contents were nevertheless fully audited and tested. Concrete,
-still-open P0 gaps were found (see §3), so the correct verdict is **`BLOCKED`**
-with a precise minimum fix plan, not `READY_FOR_HUMAN_APPROVAL` and not
-`PARTIAL` (there is a hard authorization/allowed-scope blocker, not merely a
-residual technical risk).
-
-No code PASS is represented here as a production closed-loop PASS.
+> **Hard-hold attestation.** No production deploy, no production D1 migration,
+> no Canonical write, no production approval create/consume, and no
+> secret/OAuth/permission/binding change was performed. No file was deleted and
+> no path outside the corrected allowlist was modified. Everything below is
+> either a repository reading or an executed in-repo/isolated test. Items that
+> could not be executed are marked `UNVERIFIED`.
+>
+> **Test PASS is not production PASS.** A green `python -m pytest` proves no
+> regression against an in-repo/isolated environment, not that a production
+> closed loop works.
 
 ---
 
-## 2. Scope Constraint Collision (root cause of BLOCKED)
+## 1. Fixed architecture
 
-| Source | Permitted writes |
+```
+MCP tools/call -> write_knowledge_candidate   (single public Knowledge tool,
+   |                                            frozen tools/list = 11 entries)
+   |  candidate_operation = create            -> knowledge_candidates (DRAFT)
+   |  candidate_operation = read  [read scope]-> independent read by candidate_id
+   |  candidate_operation = submit_review     -> PENDING_REVIEW
+   |  candidate_operation = review            -> review_state PASS/FAIL
+   |  candidate_operation = promote (default) -> validateCandidateGate
+   |                                                |
+   |                                                v
+   |                          personal_ai_approval_ledger (operation =
+   |                          KNOWLEDGE_PROMOTION, bound to
+   |                          candidate_id/version/content_hash/review_result/
+   |                          approved_by/expires_at). Conditional CAS consume.
+   |                                                |
+   |                                                v
+   |                          writeKnowledgeCandidate (existing Golden writer)
+   |                                                |
+   |                                                v
+   |                          verifyKnowledgeVersion (authoritative read-back)
+   v
+promotion receipt (WRITTEN / IDEMPOTENT / REJECTED + recovery metadata)
+```
+
+- **P0-A (single approval authority).** `KNOWLEDGE_PROMOTION` is registered in
+  the shared trusted ledger `personal_ai_approval_ledger`, whose operation
+  registry `approval_ledger_operations` also carries `decision_write` and
+  `knowledge_write`. The second authority `knowledge_promotion_approvals` is
+  removed. The Worker has **no** approval-minting path: a caller-supplied
+  `approved_by`, `approval_receipt` or `promotion_decision` cannot authorise a
+  write. Approvals only enter the ledger out of band (trusted Human Gate).
+- **P0-B (callable persistence).** `create`/`read`/`submit_review`/`review`/
+  `promote` sub-operations are reachable through the MCP tool, backed by real
+  table writes; an independent reader/session can read a candidate another agent
+  persisted. `create` never promotes.
+- **P0-C (migration).** `worker/migrations/0003_knowledge_candidate_golden_pipeline.sql`
+  is committed, additive-only and idempotent. The historical freeze tests were
+  converted to additive-safety assertions (0001/0002 immutable, no
+  `assets`/`asset_versions` mutation, no ungated write path).
+- **P0-D (runbook).** `KNOWLEDGE_GATE_PRODUCTION_RELEASE_PLAN_V1.md` holds the
+  unified release + rollback runbook; it is updated to the shipped code.
+
+---
+
+## 2. Files changed and commit
+
+| File | Change |
 |---|---|
-| Task §5 `ALLOW` | Worker/MCP/ledger code, new candidate tools, new migration, revise outdated test constraints, new regression tests, commit |
-| Injected workflow hard rule | **Only** `task.expected_files` (`…FINALIZE_REPORT_V1.md`, `…PRODUCTION_RELEASE_PLAN_V1.md`) |
-| Task §5 `FORBID` | Production deploy / migration / Canonical write / production approval consume / second Canonical / restore flat writer |
+| `worker/index.js` | P0-A: ledger constants now target `personal_ai_approval_ledger`; removed `knowledge_promotion_approvals` SQL and the approval-mint function. P0-B: added `createKnowledgeCandidate`, `readKnowledgeCandidate`, `submitKnowledgeCandidateForReview`, `knowledgeCandidateReadOperation` and `candidate_operation` routing + permission isolation in the MCP dispatch. `promoteKnowledgeCandidate` now selects/consumes the trusted ledger atomically and takes the writer actor from the ledger approval. |
+| `hello.py` | Added `read_knowledge_candidate` plus a durable, isolated-SQLite candidate/ledger harness (`knowledge_candidate_sqlite_connect`, `sqlite_stage_knowledge_candidate`, `sqlite_read_knowledge_candidate`, `sqlite_submit_...`, `sqlite_record_...`, `sqlite_register_knowledge_promotion_approval`, `sqlite_consume_promotion_approval`) that applies the real migration 0003 and performs the same CAS consume. |
+| `worker/migrations/0003_knowledge_candidate_golden_pipeline.sql` | New additive migration: `knowledge_candidates`, `approval_ledger_operations`, `personal_ai_approval_ledger` + indexes. |
+| `tests/test_knowledge_candidate_golden_pipeline.py` | Rewritten to the ledger-reuse architecture; added MCP lifecycle, candidate-bound/single-use approval, read-back-failure, canonical-write-failure recovery, and isolated-SQLite migration/persistence/CAS tests. |
+| `tests/test_decision_ingestion_writer.py` | `test_no_new_migration_added` converted to `test_migration_set_is_additive_only_and_immutable_history`. |
+| `tests/test_knowledge_candidate_writer.py` | Scope assertion updated for the read/write sub-operation isolation. |
+| `KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_REPORT_V1.md` | This report. |
+| `KNOWLEDGE_GATE_PRODUCTION_RELEASE_PLAN_V1.md` | Updated production plan/runbook. |
 
-The injected hard rule is part of the execution contract given to this agent and
-overrides the task body where they conflict. The task body requires modifying
-`worker/index.js`, `worker/migrations/`, and `tests/*.py`; that is disallowed
-here. This is an authorization blocker that requires a follow-up task/allowlist
-widening, or a human decision to relax the hard rule. It is reported as
-`BLOCKED`, not silently worked around.
-
----
-
-## 3. Findings at Baseline (P0 gaps, with evidence)
-
-### 3.1 P0-A — Approval Ledger is NOT reused (second approval authority exists)
-
-- The Worker defines its **own** promotion approval table
-  `knowledge_promotion_approvals` (`worker/index.js:3030–3032`), separate from
-  the trusted `personal_ai_approval_ledger`.
-- A repository-wide search finds **no** use of `personal_ai_approval_ledger` in
-  `worker/index.js`; the ledger implementation lives in `hello.py`
-  (`hello.py:29112` `production_approval_ledger_schema`, including an
-  `include_knowledge_promotion` adapter at `hello.py:29128`). The Worker does not
-  call or consult it.
-- `registerKnowledgePromotionApproval` (`worker/index.js:3125–3146`) accepts a
-  **caller-supplied** `approval_receipt` and `approved_by` and inserts them as a
-  valid, consumable approval. This directly conflicts with task requirement
-  P0-A#5 ("Agent 自行提供的 `approved_by`、`approval_receipt` … 不得成为有效授权").
-- Net effect: two potential approval authorities, and an agent-supplied receipt
-  is accepted as authorization by the internal registration path.
-
-### 3.2 P0-B — No callable candidate persistence entry points
-
-- The MCP `tools/call` dispatcher (`worker/index.js:3768–3790`) exposes only
-  `write_knowledge_candidate` for Knowledge writes. There is **no**
-  `create_candidate`, `submit_for_review`, `register_promotion_approval`, or
-  `promote_knowledge_candidate` tool.
-- `stageKnowledgeCandidate` (`worker/index.js:3062`),
-  `recordKnowledgeCandidateReview` (`worker/index.js:3106`), and
-  `registerKnowledgePromotionApproval` (`worker/index.js:3125`) are **not called
-  by any dispatch path**; they are reachable only from the Node test harness
-  (`tests/test_knowledge_candidate_golden_pipeline.py:542,548,558`). They are
-  dead code from a production standpoint.
-- Because promotion reads only `knowledge_promotion_approvals`
-  (`worker/index.js:3190`) and nothing populates it through a trusted,
-  agent-callable path, the pipeline as shipped is either permanently
-  fail-closed (no promotion possible) or, if the internal registration function
-  were exposed, self-approvable. Either way it is not a usable authorized flow.
-- The required cross-session/cross-agent persistence test cannot exist because
-  the persistence entry points do not. The current tests validate in-process
-  behavior through an injected fake D1, not real D1 persistence.
-
-### 3.3 P0-C — Migration blocker unresolved
-
-- `worker/migrations/` contains only `0001_asset_provenance_v0_2.sql` and
-  `0002_dispatch_idempotency.sql`. There is **no**
-  `0003_knowledge_candidate_golden_pipeline.sql`.
-- The freeze test is still active and unmodified:
-  `tests/test_decision_ingestion_writer.py:993 test_no_new_migration_added`
-  asserts the migration set is exactly `{0001, 0002}`.
-- The pipeline regression also pins that:
-  `tests/test_knowledge_candidate_golden_pipeline.py:379
-  test_no_new_migration_artifact_added_and_plan_documented` asserts no new
-  migration file and that the DDL stays an unexecuted plan in the repair report.
-- The required migration artifact, isolation-D1 execution, idempotency and
-  compatibility verification cannot be delivered while those tests are frozen
-  and outside the allowlist. The `knowledge_candidates` /
-  `knowledge_promotion_approvals` tables therefore **do not exist in any D1
-  environment**, including production.
-
-### 3.4 P0-D — Release runbook
-
-A unified Release Runbook and rollback plan are provided as
-`KNOWLEDGE_GATE_PRODUCTION_RELEASE_PLAN_V1.md`. They are **provisional**: they
-gate on the blockers above and must not be executed until §10 items are cleared.
-The runbook is written so a later task can consume it without this run's
-implicit context.
+Command: `git add -A && git commit -m 'cloud agent: gpt task'`.
+Release-candidate commit SHA: `HEAD` (recorded in the execution result JSON).
 
 ---
 
-## 4. Executed Verification Evidence
+## 3. Approval Ledger integration evidence
+
+- Worker SQL constants now reference `personal_ai_approval_ledger`:
+  - `APPROVAL_LEDGER_SELECT` selects the operation-bound row for
+    `(operation, candidate_id, candidate_version, content_hash)`.
+  - `APPROVAL_LEDGER_CONSUME` is a compare-and-swap:
+    `UPDATE personal_ai_approval_ledger SET consumed = 1, state='CONSUMED',
+    consume_count = consume_count + 1, consumed_at = ? WHERE approval_id = ?
+    AND operation = ? AND consumed = 0` (at most one `meta.changes === 1`).
+- `validateCandidateGate` verifies `operation == KNOWLEDGE_PROMOTION` and the
+  candidate/version/hash/review/approver/expiry binding before any write.
+- No worker path inserts into the ledger (grep-verifiable absence of a mint
+  function and of `knowledge_promotion_approvals`).
+- Tests: `test_worker_approval_is_candidate_bound_and_single_use`,
+  `test_worker_2_forged_decision_without_approval_rejected`,
+  `test_worker_gate_rejects_expired_and_consumed_approval`,
+  `test_isolated_sqlite_atomic_approval_consume_is_single_use`.
+
+---
+
+## 4. Candidate create / independent-read / submit / review entry points
+
+| Sub-operation | Scope | Effect |
+|---|---|---|
+| `create` | write (`mcp`) | INSERT independent DRAFT row in `knowledge_candidates` |
+| `read` | read (`asset.read`) | SELECT by `candidate_id` (cross-agent / cross-session) |
+| `submit_review` | write | DRAFT -> PENDING_REVIEW (state checked) |
+| `review` | write | record PASS/FAIL; PASS -> APPROVED_FOR_PROMOTION |
+| `promote` | write | gate + CAS consume + Golden write + read-back |
+
+Permission isolation: read requires `asset.read`; every mutation requires `mcp`
+write scope. Tests: `test_worker_callable_candidate_lifecycle_cross_agent`
+(MCP `tools/call`, Agent A create / Agent B read / no-scope rejection) and
+`test_isolated_sqlite_cross_agent_candidate_persistence` (two separate
+connections to an isolated DB file).
+
+---
+
+## 5. Migration SQL and isolated-environment evidence
+
+`worker/migrations/0003_knowledge_candidate_golden_pipeline.sql`:
+
+- `CREATE TABLE IF NOT EXISTS knowledge_candidates` (independent staging;
+  PK `candidate_id`; status/review_state/version/hash/provenance).
+- `CREATE TABLE IF NOT EXISTS approval_ledger_operations` (operation registry;
+  `decision_write`, `knowledge_write`, `KNOWLEDGE_PROMOTION`).
+- `CREATE TABLE IF NOT EXISTS personal_ai_approval_ledger` (single-use,
+  operation-bound, FK to the registry; CAS consumption).
+- Additive only: no `ALTER`/`DROP`/`DELETE`; never references `assets` /
+  `asset_versions` writes.
+
+Isolated verification (SQLite, NOT production D1):
+
+| Check | Command | Result |
+|---|---|---|
+| Apply 0001 + 0002 + 0003 | `sqlite3 mig_test.db < 000{1,2,3}...sql` | exit 0 |
+| Re-apply 0003 (idempotency) | same file twice | exit 0 |
+| Existing rows preserved | seeded `assets`/`asset_versions` rows byte-identical after double apply | PASS (`test_isolated_sqlite_migration_is_idempotent_and_preserves_history`) |
+| CAS single-use | two connections consume one approval | exactly one accepted (`test_isolated_sqlite_atomic_approval_consume_is_single_use`) |
+| Operation registry FK | insert unknown operation | `IntegrityError` (rejected) |
+| Cross-connection persistence | create on conn A, read on conn B | PASS (`test_isolated_sqlite_cross_agent_candidate_persistence`) |
+
+Real Cloudflare D1 (remote) migration: **`UNVERIFIED` / NOT APPLIED** — no
+wrangler/toolchain credential exists in this environment.
+
+---
+
+## 6. Full test and CI results
 
 | # | Command | Environment | Exit | Result |
 |---|---|---|---|---|
-| 1 | `git rev-parse HEAD` | runner container, baseline `fb01f89…` | 0 | `fb01f893f0357c4c6a1289a2ca098c139203650f` |
-| 2 | `python -m pytest -q` | Python 3.11, pytest 9.1.1 | 0 | **1552 passed, 1 skipped** (56.66s) |
-| 3 | `grep` worker for ledger/promotion symbols | repo | 0 | `knowledge_promotion_approvals` independent table present; no `personal_ai_approval_ledger` use |
-| 4 | `grep` migrations | repo | 0 | only `0001`, `0002` |
-| 5 | MCP dispatcher inspection (`worker/index.js:3768–3790`) | repo | 0 | no candidate/review/promote tools |
-| 6 | Freeze tests inspection (`test_decision_ingestion_writer.py:993`, `test_knowledge_candidate_golden_pipeline.py:379`) | repo | 0 | still enforce no-new-migration |
+| 1 | `python -m pytest -q` | Python 3.11.17, pytest 9.1.1 | 0 | **1560 passed, 1 skipped** (61.64s) |
+| 2 | `node --input-type=module --check < worker/index.js` | Node v20.20.2 | 0 | syntax OK |
+| 3 | `python -m pytest -q <5 targeted suites>` | as above | 0 | 161 passed |
+| 4 | isolated `sqlite3` migration apply x2 | sqlite3 | 0/0 | additive + idempotent |
+| 5 | `git rev-parse HEAD` | repo | 0 | RC SHA (see result JSON) |
 
-- **Targeted pipeline suite** (from the prior baseline report, unchanged at this
-  commit): `python -m pytest -q tests/test_knowledge_candidate_golden_pipeline.py
-  tests/test_skill_candidate_writer.py tests/test_knowledge_candidate_writer.py
-  tests/test_mcp_events_golden.py` → 97 passed (as recorded at
-  `fb01f89`; the full suite above re-runs all of these green).
-- **Worker build / MCP registration check:** no `package.json` build script
-  exists at repo root; the Worker is a single ESM `worker/index.js` executed
-  directly by the Worker suite. Registration is verified by static dispatch
-  inspection (§3.2) and by `test_mcp_events_golden.py`. `UNVERIFIED` as a real
-  `wrangler deploy --dry-run` because no wrangler/toolchain credential is present.
-- **D1 migration dry-run:** `UNVERIFIED` — no migration artifact exists to dry
-  run, and no isolated D1 instance is provisioned in this environment.
-- **Approval atomic-consume under real concurrency:** `UNVERIFIED` — only a
-  single-threaded fake-D1 harness exists; real D1 concurrency semantics cannot be
-  exercised here. Per task §4 this is explicitly reported as `UNVERIFIED` and is
-  **not** replaced with a mock PASS.
+Targeted suites: `test_knowledge_candidate_golden_pipeline.py`,
+`test_decision_ingestion_writer.py`, `test_knowledge_candidate_writer.py`,
+`test_mcp_events_golden.py`, `test_skill_candidate_writer.py`.
 
-### 4.1 Test-suite green does not imply acceptance
-
-`python -m pytest -q` is green because the suite encodes the *current* (frozen)
-architecture, including the no-new-migration contract and the in-process fake-D1
-harness. Green here means "no regression against the frozen baseline", **not**
-"the §7 acceptance conditions are met". The three open P0 gaps in §3 are exactly
-the cases the frozen suite does not (and is not allowed to) assert.
+CI (`.github/workflows/ci.yml`) only runs `python -m pytest -q`; it is green at
+this commit.
 
 ---
 
-## 5. Architecture As Found (baseline `fb01f89`)
+## 7. Concurrency and failure-recovery tests
 
-```
-MCP tools/call ──► write_knowledge_candidate (worker/index.js:3612)
-                        │
-                        ├─ asset_type != KNOWLEDGE ──► INVALID_ASSET_TYPE
-                        ├─ candidate_id missing ─────► REJECTED/candidate_missing (zero I/O)
-                        └─ candidate_id present ─────► promoteKnowledgeCandidate (3149)
-                                                          │ read knowledge_candidates (3026)
-                                                          │ read knowledge_promotion_approvals (3030)
-                                                          │ validateCandidateGate (3039)
-                                                          │ single-use consume (3031)
-                                                          ▼
-                                              writeKnowledgeCandidate → assets/asset_versions
-                                                          ▼
-                                              verifyKnowledgeVersion (authoritative read-back)
+| Test | Expectation | Where |
+|---|---|---|
+| Old `asset_id` direct write | REJECTED, zero I/O | `test_public_*` |
+| No `candidate_id` | REJECTED `candidate_missing` | `test_public_*` |
+| DRAFT direct promotion | REJECTED `candidate_state` | `test_worker_1...` |
+| Review FAIL | not APPROVED_FOR_PROMOTION | `recordKnowledgeCandidateReview` |
+| Forged approval / `promotion_decision` | REJECTED | `test_worker_2...` |
+| Expired approval | REJECTED | `test_worker_gate_rejects_expired...` |
+| Cross-candidate approval reuse | REJECTED | `test_worker_approval_is_candidate_bound...` |
+| Content-hash change | REJECTED | `test_worker_3...` |
+| Candidate version change | REJECTED | gate binding |
+| Approval replay | REJECTED / IDEMPOTENT no duplicate | `test_worker_5...`, SQL CAS test |
+| Concurrent approval consume | at most one success | SQL CAS; real D1 `UNVERIFIED` |
+| Two agents promote same candidate | no duplicate Golden | `test_worker_5...` |
+| Canonical write ok + read-back fail | never VERIFIED; recovery metadata | `test_worker_readback_failure_is_never_reported_verified` |
+| Canonical sink unavailable (429-class) | fail closed; no false success; consumed once | `test_worker_canonical_write_failure_consumes_once_and_stays_recoverable` |
+| Old Knowledge read | compatible | existing writer/read suites |
+| SKILL / DECISION writers | unaffected | `test_other_writers_and_legacy_reads_unaffected` |
 
-Unreachable internal helpers (tests only):
-  stageKnowledgeCandidate (3062)
-  recordKnowledgeCandidateReview (3106)
-  registerKnowledgePromotionApproval (3125)  ← accepts caller receipt/approved_by
-```
+Failure-recovery strategy: the approval is consumed before the Golden write. If
+the write/read-back then fails, the result is `REJECTED` with
+`recovery_required: true` and `approval_consumed: true`; the consumed approval
+can never be replayed, so completion requires a fresh Human-Gate-bound approval.
+If the Golden row was written but the authoritative read-back failed, the
+candidate stays `PROMOTED` (never `CANONICAL_READBACK_VERIFIED`) and a later
+attempt is idempotent (no duplicate).
 
-Target architecture required by the task (NOT achieved):
-
-```
-create_candidate ─► knowledge_candidates DRAFT persisted (real D1, migration 0003)
-      │
-      ▼  submit_for_review ─► review PASS/FAIL (controlled)
-      ▼
-Human Gate ─► existing personal_ai_approval_ledger, operation=KNOWLEDGE_PROMOTION
-      │        bound to candidate_id/version/content_hash/review_result/approved_by/expires_at
-      ▼        (agent-supplied approved_by/receipt/decision is NOT valid)
-promote ─► validateCandidateGate ─► Golden writer ─► Canonical read-back
-```
+**Real D1 concurrency is `UNVERIFIED`.** The CAS is exercised with two SQLite
+connections (SQL-level single-use) and with the Node fake-D1 single thread; per
+task §4 this is explicitly not claimed as real Cloudflare D1 concurrency.
 
 ---
 
-## 6. What Would Be Delivered Once Unblocked (minimum fix plan)
+## 8. Production deploy Runbook
 
-1. **P0-A (ledger reuse).** Replace the `knowledge_promotion_approvals` table
-   reads/writes in `worker/index.js` with the trusted
-   `personal_ai_approval_ledger` + `KNOWLEDGE_PROMOTION` operation already
-   modeled in `hello.py:29112` (`include_knowledge_promotion=True`). Remove the
-   agent-callable registration path, or make it a no-op that can never mint a
-   valid approval. Bind `candidate_id`, `candidate_version`, `content_hash`,
-   `review_result`, `approved_by`, `expires_at`, `operation`. Enforce atomic
-   single-use consumption against the ledger.
-2. **P0-B (entry points).** Register minimal MCP tools `create_candidate`,
-   `submit_for_review`, and `promote_knowledge_candidate` with permission
-   isolation (write scope + intended-scope checks), backed by real D1
-   persistence through the migration, and add an Agent A create → Agent B read →
-   review → await-human-gate cross-session test.
-3. **P0-C (migration).** Revise the freeze tests to assert *additive-only* safety
-   (0001/0002 unchanged, no `assets`/`asset_versions` mutation, no new ungated
-   write path) rather than "exactly two files"; add
-   `worker/migrations/0003_knowledge_candidate_golden_pipeline.sql`; verify
-   compatibility/idempotency on an **isolated** D1 (never production).
-4. **P0-D (runbook).** Keep the provided runbook, re-validate after (1)–(3).
+See `KNOWLEDGE_GATE_PRODUCTION_RELEASE_PLAN_V1.md` §2. Required order:
+Preflight (read-only) -> Human Gate Worker approval + Migration approval
+(separate scope, bound to commit SHA / migration hash + database_id) -> deploy
+fail-closed Worker -> verify legacy bypass rejected live -> apply approved D1
+migration `0003` -> verify Candidate storage + ledger -> controlled E2E ->
+independent Canonical read-back -> Production PASS or fail-closed.
 
----
+## 9. Security rollback Runbook
 
-## 7. Security Findings
+See `KNOWLEDGE_GATE_PRODUCTION_RELEASE_PLAN_V1.md` §4. Rollback preserves the
+gate: disable Knowledge promotion (public Knowledge writes return `REJECTED`);
+never restore the old flat writer; leave additive tables in place; never delete
+or reuse consumed approval evidence; revert only to the last gated Worker.
 
-| Item | Finding |
-|---|---|
-| Flat/`asset_id`-only public write | Closed at the public route (`worker/index.js:2984–2990`): `REJECTED/candidate_missing` with zero I/O. |
-| Second approval authority | **OPEN (P0-A).** `knowledge_promotion_approvals` is a distinct authority from `personal_ai_approval_ledger`. |
-| Agent-supplied approval accepted | **OPEN (P0-A).** `registerKnowledgePromotionApproval` (`worker/index.js:3125`) trusts caller `approval_receipt`/`approved_by`. |
-| Candidate persistence | **OPEN (P0-B).** No callable entry points; no migration; tables absent in D1. |
-| Migration freeze | **OPEN (P0-C).** New migration forbidden by frozen tests; no isolated verification. |
-| `promotion_decision` as auth | Closed: gate never reads it (`validateCandidateGate`, `worker/index.js:3039`). |
-| Read-back integrity | Present: write responses are not proof; `verifyKnowledgeVersion` required. |
-| Secret/OAuth/permission/binding | None read or changed. |
-| Production mutations | None: no deploy, migration, Canonical write, or approval consume. |
-| Deletions | None. |
+## 10. Pre/post-production consistency check method
 
-Residual risk: the independently persisted candidate/approval tables cannot be
-proven in a real D1 environment in this run; all concurrency claims are
-`UNVERIFIED` against real D1.
+Re-inventory every KNOWLEDGE asset (`asset_id`, version, content_hash, status)
+before and after; diff manifests; assert pre-existing assets are byte-identical;
+assert `assets`/`asset_versions` row counts/hashes unchanged for pre-existing
+data; assert no orphan candidates/approvals and no unconsumed validation
+approvals; assert SKILL/DECISION/REALITY tool counters unchanged.
 
 ---
 
-## 8. Production Readiness Verdict
+## 11. Not-yet-verified risks
 
-**`BLOCKED`.**
-
-- The §7 acceptance conditions are **not** met at `fb01f89`.
-- The required repairs target files outside this run's allowlist, so they could
-  not be performed here.
-- The provided release/rollback plan is documented but provisional and MUST NOT
-  be executed until §10 is cleared.
-- **No production closed-loop PASS is claimed.** All successful results are
-  in-repo test results only.
-
----
-
-## 9. Live Production Verification Status
-
-- Existing Knowledge corpus (assets / versions / provenance): `UNVERIFIED` — no
-  live Canonical read credential/transport in this environment.
-- No production write, promotion, deploy, migration, or secret access occurred.
+1. Real Cloudflare D1 concurrency semantics for the CAS consume: `UNVERIFIED`.
+2. `wrangler deploy --dry-run` / Worker bundle build: `UNVERIFIED` (no wrangler
+   toolchain in this environment); only `node --check` + in-process execution.
+3. Production D1 migration apply + idempotency on the real database:
+   `UNVERIFIED` / NOT APPLIED.
+4. Live production Canonical read-back and corpus diff: `UNVERIFIED` (no
+   credential/transport).
+5. The candidate sub-operations are exposed through the existing
+   `write_knowledge_candidate` MCP tool (to keep the frozen `tools/list`
+   contract of 11 tools intact). If a future task is allowed to change
+   `tools/list`, dedicated tools can be split out.
 
 ---
 
-## 10. Blockers and Required Human Gate Approvals
+## 12. Human Gate approvals required next
 
-| # | Blocker | Minimum resolution | Required approval |
-|---|---|---|---|
-| B1 | Allowlist forbids all code/migration/test writes | Widen `expected_files` (or provide a follow-up task) to include `worker/index.js`, `worker/migrations/0003_*.sql`, and the freeze tests | Human: authorize scope widening |
-| B2 | P0-A second approval authority + agent-supplied receipt | Implement the §6.1 ledger-reuse repair | Human: authorize worker/ledger code change |
-| B3 | P0-B no callable candidate tools | Register `create_candidate` / `submit_for_review` / `promote_knowledge_candidate` with permission isolation | Human: authorize new MCP tools |
-| B4 | P0-C frozen migration contract | Revise freeze tests to additive-only assertions; add 0003; verify on isolated D1 | Human: authorize test-contract revision + isolated D1 |
-| B5 | Real D1 concurrency / dry-run `UNVERIFIED` | Run against an isolated D1 instance | Human/external: provide isolated D1 access |
-| B6 | Production Worker deploy + D1 migration | Execute only after B1–B5 and a separate gate | Human: separate scoped deploy/migration approval |
-| B7 | Production Canonical write during E2E | Only if required; must be separately authorized | Human: separate Canonical-write approval |
+1. Scope: authorize an isolated **Cloudflare D1** environment to replace the
+   SQLite/fake-D1 `UNVERIFIED` concurrency + migration evidence.
+2. Deploy gate (1a): approve deploying the exact RC commit SHA (bound to commit
+   SHA + artifact hash).
+3. Migration gate (1b): approve applying
+   `0003_knowledge_candidate_golden_pipeline.sql` (bound to file hash +
+   `database_id`).
+4. Canonical-write gate: separate authorization only if the controlled E2E must
+   write production Canonical storage.
+5. Optional: authorize dedicated candidate MCP tools if a `tools/list` change is
+   acceptable.
 
-Next Human Gate approval items (exact): (1) scope widening for B1; (2)
-authorization to modify `worker/index.js` and `hello.py` ledger integration; (3)
-authorization to add MCP candidate tools; (4) authorization to revise the
-migration freeze tests and add `0003`; (5) isolated D1 environment access for
-compatibility/idempotency/concurrency verification.
+## 13. Status
 
----
-
-## 11. Evidence Summary
-
-| Tier | Evidence |
-|---|---|
-| Code (frozen repo) | `worker/index.js:3030–3032` (separate approval table), `:3125–3146` (agent-supplied receipt), `:3768–3790` (no candidate tools), `:3039` (gate); `worker/migrations/` (0001/0002 only); `hello.py:29112` (existing ledger). |
-| Test (executed) | `python -m pytest -q` → **1552 passed, 1 skipped**. |
-| Real Worker | Static dispatch inspection + `test_mcp_events_golden.py`; no candidate tools registered. |
-| Isolated D1 | **None** — `UNVERIFIED`. |
-| Live production | **None** — `UNVERIFIED`. |
-| Repo diff | Only this report + `KNOWLEDGE_GATE_PRODUCTION_RELEASE_PLAN_V1.md` (allowlist-limited). |
+**`PARTIAL`.** All in-scope code/migration/test/report deliverables are
+implemented and green (`1560 passed, 1 skipped`), the migration is
+isolated-verified, and no unresolved P0 **code** defect remains. The status is
+not `READY_FOR_HUMAN_APPROVAL` because §7 requires real isolated-D1 (Cloudflare)
+concurrency/migration verification, which this environment cannot perform; those
+items are `UNVERIFIED`, and no production operation was performed.

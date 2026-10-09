@@ -380,8 +380,12 @@ def test_write_tool_is_registered_and_scoped_to_write() -> None:
     source = worker_source()
     assert 'name: "write_knowledge_candidate"' in source
     assert 'name === "write_knowledge_candidate"' in source
-    block = source.split('name === "write_knowledge_candidate"', 1)[1][:200]
+    block = source.split('name === "write_knowledge_candidate"', 1)[1][:400]
+    # Mutating sub-operations require the write scope; the read sub-operation
+    # requires the read scope (permission isolation).
     assert "hasWriteScope(auth)" in block
+    assert "hasReadScope(auth)" in block
+    assert "knowledgeCandidateReadOperation" in block
     # Non-KNOWLEDGE assets are never advertised through the writer schema.
     tool_block = source.split('name: "write_knowledge_candidate"', 1)[1].split(
         "},\n  {", 1

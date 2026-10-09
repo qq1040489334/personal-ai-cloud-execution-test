@@ -1,67 +1,65 @@
 # KNOWLEDGE_GATE_PRODUCTION_RELEASE_PLAN_V1
 
-- Companion task: `cf-88666f9c9147` (`KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_V1`)
+- Companion task: `cf-00bcf790b680` (`KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_V1`)
 - Repository: `qq1040489334/personal-ai-cloud-execution-test`
-- Baseline commit analyzed: `fb01f893f0357c4c6a1289a2ca098c139203650f`
-- Document status: **STAGED — NOT EXECUTABLE YET**
+- Original base commit: `fb01f893f0357c4c6a1289a2ca098c139203650f`
+- Document status: **STAGED — NOT EXECUTABLE YET** (`PARTIAL`; real D1 UNVERIFIED)
 - Intended use: direct input to a **separate**, explicitly authorized production
-  execution task. This document requires no implicit context from the finalize
-  run.
+  execution task. It requires no implicit context from the finalize run.
 
-> **Read this first.** At the analyzed baseline the Knowledge Promotion Gate is
-> **BLOCKED** (see `KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_REPORT_V1.md` §3,
-> §8, §10). Do **not** execute any step in this plan until every precondition in
-> §1 is satisfied and independently verified. This document is a plan, not a
-> production PASS.
+> **Read this first.** The release candidate now implements the gate (ledger
+> reuse, callable candidate persistence, additive migration) and is green in
+> an in-repo/isolated environment (`1560 passed, 1 skipped`). It is **not** a
+> production PASS: real Cloudflare D1 concurrency/migration and production
+> deploy/Canonical read-back are `UNVERIFIED`. Do not execute any step below
+> until §1 is satisfied and independently verified.
 
 ---
 
 ## 0. Scope and non-negotiables
 
-In scope for the eventual production task:
-
 - Deploy the **fail-closed** Worker that gates Knowledge promotion.
 - Apply an approved, additive-only D1 migration.
 - Controlled end-to-end validation and independent Canonical read-back.
+- Hard prohibitions: no production deploy without a dedicated Worker approval;
+  no production D1 migration without a dedicated migration approval; no
+  production Canonical write without a separate explicit authorization; never
+  restore the old flat writer; do not drop/rewrite historical Knowledge data; do
+  not modify existing isolated TEST fixtures; do not affect REALITY/SKILL/
+  DECISION; no second Canonical and no second approval authority.
 
-Hard prohibitions (inherit from the task contract):
-
-- No production deploy without a dedicated Worker approval.
-- No production D1 migration without a dedicated migration approval.
-- No production Canonical write without a separate, explicit authorization.
-- Never restore or use the old flat writer as a rollback target.
-- Do not drop/rewrite historical Knowledge data.
-- Do not modify existing isolated TEST fixtures.
-- Do not touch other three assets (REALITY / SKILL / DECISION) behaviour.
-- No second Canonical and no second approval authority.
+The single public Knowledge MCP tool is `write_knowledge_candidate` with
+`candidate_operation` in {create, read, submit_review, review, promote}. The
+`tools/list` surface stays at 11 tools.
 
 ---
 
 ## 1. Preconditions (all must be true and evidenced before ANY production step)
 
-| # | Precondition | Verification |
-|---|---|---|
-| P1 | P0-A fixed: `KNOWLEDGE_PROMOTION` bound to existing `personal_ai_approval_ledger`; no `knowledge_promotion_approvals` authority; agent-supplied `approved_by`/`approval_receipt`/`promotion_decision` cannot authorize | code review + regression tests |
-| P2 | P0-B fixed: callable `create_candidate` → DRAFT persisted → `submit_for_review` → PASS/FAIL → await Human Gate → promote; cross-session read proven | cross-agent test evidence |
-| P3 | P0-C fixed: `worker/migrations/0003_knowledge_candidate_golden_pipeline.sql` committed; freeze tests revised to additive-only assertions; migration idempotent/compatible on **isolated** D1 | isolated D1 logs |
-| P4 | Full repository suite green on the exact RC commit | `python -m pytest -q` output |
-| P5 | Worker build/deploy dry-run green | wrangler dry-run output |
-| P6 | MCP tool registration/dispatch verified for candidate tools | `tools/list` + dispatch tests |
-| P7 | No unresolved P0 security defect | security review sign-off |
-| P8 | RC commit SHA frozen and recorded | git rev-parse |
+| # | Precondition | Verification | Status at RC |
+|---|---|---|---|
+| P1 | P0-A: `KNOWLEDGE_PROMOTION` uses the shared `personal_ai_approval_ledger`; no `knowledge_promotion_approvals`; worker cannot mint approvals | code review + regression tests | DONE (in-repo) |
+| P2 | P0-B: `create -> DRAFT persisted -> submit/review -> Human Gate -> promote`; cross-session read proven | MCP + isolated-DB tests | DONE (isolated SQLite) |
+| P3 | P0-C: `0003_knowledge_candidate_golden_pipeline.sql` committed; freeze tests converted to additive safety; idempotent on isolated DB | isolated-DB logs | DONE (isolated SQLite); real Cloudflare D1 `UNVERIFIED` |
+| P4 | Full repository suite green on the exact RC commit | `python -m pytest -q` | DONE (1560 passed, 1 skipped) |
+| P5 | Worker build/deploy dry-run green | wrangler dry-run | **UNVERIFIED** (no wrangler toolchain) |
+| P6 | MCP tool registration/dispatch verified | `tools/list` + dispatch tests | DONE (11 tools; sub-ops tested) |
+| P7 | No unresolved P0 security defect | security review | DONE in code; real-D1 concurrency `UNVERIFIED` |
+| P8 | RC commit SHA frozen and recorded | `git rev-parse HEAD` | DONE (see finalize report §2) |
 
-If any precondition fails: do not proceed; report `BLOCKED`.
+If any precondition fails: do not proceed; report `BLOCKED` (or `PARTIAL` when
+only external real-D1 evidence is missing).
 
 ---
 
 ## 2. Production Release Runbook (exact order)
 
-The order below is mandatory. Each step must be separately approved and recorded
-with actor, timestamp, command, and result.
+Mandatory order; each step separately approved and recorded with actor,
+timestamp, command, result.
 
 ```
 Step 0  Preflight (read-only)
-Step 1  Human Gate Approval  (Worker scope AND migration scope, separately)
+Step 1  Human Gate Approval (Worker scope AND migration scope, separately)
 Step 2  Deploy fail-closed Worker
 Step 3  Verify legacy bypass rejected (live)
 Step 4  Apply approved D1 migration
@@ -72,144 +70,112 @@ Step 8  Production PASS or fail-closed
 ```
 
 ### Step 0 — Preflight (read-only)
+1. Record production Worker version/deployment ID and D1 schema
+   (`PRAGMA table_info`).
+2. Snapshot the Knowledge corpus manifest (`asset_id`, version, content_hash,
+   status) as the pre-change baseline.
+3. Confirm no in-flight promotions and no pending approvals.
+4. Confirm `personal_ai_approval_ledger` and its `approval_ledger_operations`
+   registry match the RC (`KNOWLEDGE_PROMOTION` present).
 
-1. Record current production Worker version/deployment ID and the current D1
-   schema (read-only `PRAGMA table_info`).
-2. Snapshot the existing Knowledge corpus manifest: for every KNOWLEDGE asset,
-   record `asset_id`, current `version`, `content_hash`, status (read-only).
-   This is the pre-change consistency baseline.
-3. Confirm no in-flight Knowledge promotions (`knowledge_candidates` absent or
-   empty at this point) and no pending approvals.
-4. Confirm `personal_ai_approval_ledger` is reachable and its
-   `KNOWLEDGE_PROMOTION` operation definition matches the RC.
-
-Output: `preflight_manifest.json` + `preflight_schema.txt`.
-Gate: any anomaly (unexpected writes, unknown schema drift) → STOP.
+Output: `preflight_manifest.json` + `preflight_schema.txt`. Any anomaly -> STOP.
 
 ### Step 1 — Human Gate Approval
+Two independent approvals with distinct scope:
+- **1a. Worker deploy**: exact RC commit SHA + artifact hash.
+- **1b. Migration**: `0003` file content hash + target `database_id`.
 
-Requires **two independent approvals** with distinct scope:
-
-- **1a. Worker deploy scope.** Approve deploying the exact RC commit SHA to the
-  production Worker. Bind approval to commit SHA + artifact hash.
-- **1b. Migration scope.** Approve applying
-  `0003_knowledge_candidate_golden_pipeline.sql` to production D1. Bind approval
-  to migration file content hash + target `database_id`.
-
-Both approvals must be recorded in the trusted `personal_ai_approval_ledger`
-with operation binding, `expires_at`, and single-use semantics. An approval the
-agent minted for itself is invalid. If either is missing/expired/replayed: STOP
-(fail-closed).
+Both recorded in the trusted ledger with operation binding, `expires_at`,
+single-use. An agent-minted approval is invalid. Missing/expired/replayed ->
+STOP (fail-closed).
 
 ### Step 2 — Deploy fail-closed Worker
-
-1. Deploy the approved RC commit SHA (same artifact verified in Step 1a).
-2. The deployed Worker must default to **reject** for any Knowledge write that
-   lacks a staged, reviewed, ledger-approved candidate.
-3. Record `CLOUDFLARE_VERSION_ID` and `CLOUDFLARE_DEPLOYMENT_ID`.
-4. If deploy fails: Worker remains fail-closed; Knowledge Promotion stays
-   disabled; go to Rollback (§4). Do not enable any bypass.
+1. Deploy the approved RC SHA (same artifact as 1a).
+2. Deployed Worker defaults to **reject** for any Knowledge write lacking a
+   staged, reviewed, ledger-approved candidate.
+3. Record `CLOUDFLARE_VERSION_ID` / `CLOUDFLARE_DEPLOYMENT_ID`.
+4. On failure: stay fail-closed; go to Rollback (§4); never enable a bypass.
 
 ### Step 3 — Verify legacy bypass rejected (live)
+- `asset_id`-only -> `REJECTED`/`candidate_missing`, zero writes.
+- DRAFT direct promotion -> `REJECTED`.
+- Forged `promotion_decision`/`approved_by`/`approval_receipt` without a ledger
+  approval -> `REJECTED`.
+- Wrong hash / wrong version / expired / replayed / cross-candidate approval
+  -> `REJECTED`.
+- Concurrency: two consumes of one approval -> at most one succeeds; two
+  promotions -> no duplicate Golden.
 
-Against the live endpoint, via an authorized read/write-scope probe:
-
-- `write_knowledge_candidate` with `asset_id`-only → `REJECTED` /
-  `candidate_missing`, zero writes.
-- DRAFT candidate direct promotion → `REJECTED`.
-- Forged `promotion_decision` without ledger approval → `REJECTED`.
-- Wrong content hash / wrong version / expired approval / replayed approval /
-  cross-candidate approval reuse → `REJECTED`.
-- Concurrency: two simultaneous consumes of the same approval → at most one
-  succeeds; two simultaneous promotions → no duplicate Golden.
-
-If any probe fails: STOP; Knowledge Promotion stays disabled; Rollback §4.
+Any failure -> STOP; promotion stays disabled; Rollback §4.
 
 ### Step 4 — Apply approved D1 migration
-
-1. Apply `0003` to production D1 using the **exact** artifact approved in 1b.
-2. Migration is additive only: creates `knowledge_candidates` and (if used)
-   ledger-compatible promotion structures; never alters `assets`,
-   `asset_versions`, or existing Knowledge rows.
-3. Run the migration **once**; verify idempotent re-run is a no-op on a clone if
-   available.
+1. Apply `0003` with the exact artifact approved in 1b.
+2. Additive only: creates `knowledge_candidates`,
+   `approval_ledger_operations`, `personal_ai_approval_ledger`; never alters
+   `assets`, `asset_versions` or existing Knowledge rows.
+3. Run once; verify idempotent re-run is a no-op on a clone if available.
 4. Record `D1_MIGRATION_RESULT` and post-migration `PRAGMA table_info`.
-5. On failure: leave tables absent/unused; Knowledge Promotion stays disabled;
-   Rollback §4. Never re-enable the flat writer.
+5. On failure: leave tables absent/unused; stay disabled; Rollback §4.
 
 ### Step 5 — Verify Candidate storage / approval ledger
-
-1. Create a DRAFT candidate (authorized agent), read it back by `candidate_id`
+1. Create a DRAFT candidate (authorized agent); read it back by `candidate_id`
    from an independent session/worker.
 2. Submit for review; verify PASS/FAIL state control; verify content/version
    change invalidates prior approvals.
-3. Verify the approval is stored in the trusted ledger, bound to
+3. Verify the approval is in the trusted ledger, bound to
    candidate/version/hash/review/approver/expiry/operation.
 
 ### Step 6 — Controlled end-to-end validation
-
-1. Run one controlled promotion for a **non-production-impacting** test asset or
-   a designated validation asset (require explicit authorization if it writes
-   Canonical).
-2. Verify single-use approval consumption and Golden write exactly once.
-3. Verify other operations (DECISION / SKILL / REALITY) are unaffected.
-
-> If Step 6 requires a production Canonical write, it MUST be covered by a
-> separate Human Gate authorization (precondition B7). Without it, restrict E2E
-> to the read-only + rejection paths.
+1. Run one controlled promotion for a designated validation asset (explicit
+   authorization required if it writes Canonical).
+2. Verify single-use consumption and Golden write exactly once.
+3. Verify DECISION/SKILL/REALITY unaffected.
 
 ### Step 7 — Independent Canonical read-back
-
-1. Re-read the promoted asset from an independent path (`verifyKnowledgeVersion`)
-   and confirm `content_hash`/version match the candidate.
-2. Re-inventory the full Knowledge corpus and diff against
-   `preflight_manifest.json`: pre-existing assets must be byte-identical
-   (no silent mutation).
-3. A write response alone is **not** proof. `CANONICAL_READBACK_VERIFIED` may be
-   emitted only when the authoritative read-back succeeds.
+1. Re-read the promoted asset via `verifyKnowledgeVersion`; confirm
+   hash/version match the candidate.
+2. Diff the full corpus against `preflight_manifest.json`.
+3. A write response alone is NOT proof; emit `CANONICAL_READBACK_VERIFIED` only
+   on successful authoritative read-back.
 
 ### Step 8 — Production PASS or fail-closed
-
-- Only if Steps 0–7 all succeed may the task report production success, and it
-  must be labelled by the exact evidence collected.
-- Any failure keeps Knowledge Promotion **disabled** and reports fail-closed.
-- Never represent test-environment results as a production closed-loop PASS.
+Only if Steps 0–7 all succeed may production success be reported, labelled by
+the exact evidence. Any failure keeps promotion disabled and reports
+fail-closed. Never represent test results as a production closed-loop PASS.
 
 ---
 
 ## 3. Post-release consistency checks
 
-- Re-run Step 0 manifest and diff against pre-change baseline.
-- Confirm `assets` / `asset_versions` row counts and hashes for pre-existing
-  Knowledge unchanged.
-- Confirm no orphan candidates/approvals and no unconsumed approvals from the
-  validation.
-- Confirm DECISION/SKILL/REALITY tool counters unchanged.
+- Re-run the Step 0 manifest and diff against the pre-change baseline.
+- Confirm `assets`/`asset_versions` counts/hashes for pre-existing Knowledge
+  unchanged.
+- Confirm no orphan candidates/approvals and no unconsumed validation approvals.
+- Confirm DECISION/SKILL/REALITY counters unchanged.
 
 ---
 
 ## 4. Security Rollback Runbook
 
-Rollback **must preserve the gate**. The old flat writer is a defect and is
-never a rollback target.
+Rollback **must preserve the gate**; the old flat writer is never a rollback
+target.
 
-1. **Trigger conditions:** Step 2/4/5/6/7 failure; unauthorized approval
-   consumption; drift in pre-existing corpus; any P0 regression.
-2. **Primary rollback — fail-closed disable.** Disable the Knowledge promotion
-   path. Public Knowledge writes return `REJECTED`; no fallback to the flat
-   writer. Other assets continue normally.
-3. **Worker revert.** Revert to the last **gated** Worker version only. If the
-   only alternative is the pre-repair flat writer, do not deploy it — use the
-   fail-closed disable instead.
+1. **Triggers:** Step 2/4/5/6/7 failure; unauthorized approval consumption;
+   corpus drift; any P0 regression.
+2. **Primary rollback — fail-closed disable.** Disable Knowledge promotion;
+   public Knowledge writes return `REJECTED`; no flat-writer fallback; other
+   assets continue.
+3. **Worker revert.** Revert only to the last **gated** Worker version. If the
+   only alternative is the pre-repair flat writer, do not deploy it.
 4. **Schema rollback.** Leave additive tables in place (unused). Do not drop
-   historical data. If forcibly dropped, the gate finds no candidate/approval and
-   rejects — it never re-enables the bypass.
-5. **Ledger.** Do not delete consumed approval evidence. Record rollback in the
-   ledger as an audit event if supported; never reuse a consumed approval.
-6. **Post-rollback verification:** re-run Step 3 rejection probes and Step 0
+   historical data. If forcibly dropped, the gate finds no candidate/approval
+   and rejects; it never re-enables the bypass.
+5. **Ledger.** Do not delete consumed approval evidence; never reuse a consumed
+   approval.
+6. **Post-rollback verification:** re-run Step 3 rejection probes and the Step 0
    corpus diff.
 
-Invariant: at no point may rollback restore or recommend the old flat
+Invariant: at no point may rollback restore or recommend the old
 candidate-to-Canonical bypass.
 
 ---
@@ -229,9 +195,9 @@ candidate-to-Canonical bypass.
 
 For every step record: command, environment, exit code, pass/fail counts,
 evidence file, commit SHA, Cloudflare version/deployment IDs, D1 migration
-result. Mark unverifiable items `UNVERIFIED`. Do not convert in-repo/mock
+result. Mark unverifiable items `UNVERIFIED`. Do not convert in-repo/isolated
 results into production PASS.
 
-Final status vocabulary: `READY_FOR_HUMAN_APPROVAL` (only if
-`KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_REPORT_V1.md` §7 conditions all hold
-and are evidenced), else `PARTIAL` or `BLOCKED` with exact blockers.
+Final status vocabulary: `READY_FOR_HUMAN_APPROVAL` (only if the finalize
+report §7 conditions all hold and are evidenced), else `PARTIAL` or `BLOCKED`
+with exact blockers.

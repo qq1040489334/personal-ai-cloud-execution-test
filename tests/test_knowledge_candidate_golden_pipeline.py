@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -38,7 +39,7 @@ import hello as hello_module
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER_PATH = REPO_ROOT / "worker" / "index.js"
 MIGRATIONS_DIR = REPO_ROOT / "worker" / "migrations"
-REPORT_PATH = REPO_ROOT / "KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_REPAIR_REPORT_V1.md"
+REPORT_PATH = REPO_ROOT / "KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_REPORT_V1.md"
 
 NODE = shutil.which("node")
 
@@ -358,9 +359,13 @@ def test_worker_source_encodes_candidate_gate_and_pipeline() -> None:
         "validateCandidateGate",
         "promoteKnowledgeCandidate",
         "stageKnowledgeCandidate",
-        "registerKnowledgePromotionApproval",
+        "createKnowledgeCandidate",
+        "readKnowledgeCandidate",
+        "submitKnowledgeCandidateForReview",
         "knowledge_candidates",
-        "knowledge_promotion_approvals",
+        # P0-A: the single trusted approval authority is reused, not duplicated.
+        "personal_ai_approval_ledger",
+        "APPROVAL_LEDGER_CONSUME",
         "KNOWLEDGE_CANDIDATE_DRAFT",
         "KNOWLEDGE_CANDIDATE_PENDING_REVIEW",
         "KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION",
@@ -370,6 +375,11 @@ def test_worker_source_encodes_candidate_gate_and_pipeline() -> None:
         "content_hash_mismatch",
     ):
         assert token in source, f"worker is missing pipeline token {token}"
+    # P0-A: there must be NO second approval authority and NO agent-callable
+    # approval minting path.
+    assert "knowledge_promotion_approvals" not in source
+    assert "registerKnowledgePromotionApproval" not in source
+    assert "KNOWLEDGE_PROMOTION_APPROVAL_INSERT" not in source
     # The gate never reads a caller-supplied promotion_decision.
     gate_block = source.split("function validateCandidateGate(", 1)[1]
     gate_block = gate_block.split("async function stageKnowledgeCandidate", 1)[0]
@@ -377,22 +387,32 @@ def test_worker_source_encodes_candidate_gate_and_pipeline() -> None:
 
 
 def test_no_new_migration_artifact_added_and_plan_documented() -> None:
-    """No committed D1 migration is added.
+    """Migration 0003 is committed, additive-only and does not touch Golden.
 
-    The repository contract ``test_no_new_migration_added`` forbids adding
-    migration files, so the additive DDL for the independent candidate staging /
-    promotion-approval tables is carried as an *unexecuted* plan in the repair
-    report (never applied, never executed) rather than as a migration artifact.
+    KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_V1 (cf-00bcf790b680) approved this
+    additive migration. The independent candidate staging and the single trusted
+    approval ledger are now real, committed DDL verified in an isolated database
+    (see ``test_isolated_sqlite_migration_*`` and the finalize report) rather
+    than an unexecuted plan.
     """
     names = {path.name for path in MIGRATIONS_DIR.glob("*.sql")}
     assert names == {
         "0001_asset_provenance_v0_2.sql",
         "0002_dispatch_idempotency.sql",
+        "0003_knowledge_candidate_golden_pipeline.sql",
     }
+    sql = (
+        MIGRATIONS_DIR / "0003_knowledge_candidate_golden_pipeline.sql"
+    ).read_text(encoding="utf-8")
+    lowered = sql.lower()
+    assert "knowledge_candidates" in lowered
+    assert "personal_ai_approval_ledger" in lowered
+    assert "approval_ledger_operations" in lowered
+    assert "knowledge_promotion_approvals" not in lowered
+    for forbidden in ("drop table", "alter table", "delete from", "update assets", "update asset_versions"):
+        assert forbidden not in lowered
     report = REPORT_PATH.read_text(encoding="utf-8")
-    assert "knowledge_candidates" in report
-    assert "knowledge_promotion_approvals" in report
-    assert "Migration Plan (NOT EXECUTED)" in report
+    assert "personal_ai_approval_ledger" in report
     assert "rollback" in report.lower()
 
 
@@ -406,6 +426,9 @@ const versionRows = new Map();
 const candidateRows = new Map();
 const approvalRows = new Map();
 let ALLOW_BATCH = true;
+let FAIL_BATCH = false;
+let VERIFY_READS = 0;
+let FAIL_VERIFY_AFTER = -1;
 function vkey(a, v) { return a + ":" + v; }
 const ASSET_STATUSES = new Set(["staging", "accepted", "superseded", "retired"]);
 const KNOWN_HASH_RE = /^[0-9a-f]{64}$/;
@@ -444,7 +467,7 @@ function runStatement(sql, args) {
   }
   if (sql.indexOf("INSERT INTO knowledge_candidates") === 0) {
     if (candidateRows.has(args[0])) throw new Error("UNIQUE constraint failed: knowledge_candidates");
-    candidateRows.set(args[0], { candidate_id: args[0], asset_id: args[1], title: args[2], status: args[3], content: args[4], content_hash: args[5], version: args[6], provenance: args[7], created_at: args[8], review_state: args[9] });
+    candidateRows.set(args[0], { candidate_id: args[0], asset_id: args[1], title: args[2], status: args[3], content: args[4], content_hash: args[5], version: args[6], provenance: args[7], created_at: args[8], review_state: args[9], review_result: null });
     return { success: true, meta: { changes: 1 } };
   }
   if (sql.indexOf("UPDATE knowledge_candidates SET status = ?, review_state = ?") === 0) {
@@ -459,16 +482,17 @@ function runStatement(sql, args) {
     row.status = args[0];
     return { success: true, meta: { changes: 1 } };
   }
-  if (sql.indexOf("INSERT INTO knowledge_promotion_approvals") === 0) {
-    const [approval_receipt, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at] = args;
-    if (approvalRows.has(approval_receipt)) throw new Error("UNIQUE constraint failed: knowledge_promotion_approvals");
-    approvalRows.set(approval_receipt, { approval_receipt, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, consumed: 0 });
+  if (sql.indexOf("INSERT INTO personal_ai_approval_ledger") === 0) {
+    const [approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, created_at] = args;
+    if (approvalRows.has(approval_id)) throw new Error("UNIQUE constraint failed: personal_ai_approval_ledger");
+    approvalRows.set(approval_id, { approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state: "REGISTERED", consumed: 0, consume_count: 0, created_at });
     return { success: true, meta: { changes: 1 } };
   }
-  if (sql.indexOf("UPDATE knowledge_promotion_approvals SET consumed = 1") === 0) {
-    const row = approvalRows.get(args[0]);
-    if (!row || Number(row.consumed) === 1) return { success: true, meta: { changes: 0 } };
-    row.consumed = 1;
+  if (sql.indexOf("UPDATE personal_ai_approval_ledger SET consumed = 1") === 0) {
+    const consumed_at = args[0], approval_id = args[1], operation = args[2];
+    const row = approvalRows.get(approval_id);
+    if (!row || row.operation !== operation || Number(row.consumed) === 1) return { success: true, meta: { changes: 0 } };
+    row.consumed = 1; row.state = "CONSUMED"; row.consume_count = Number(row.consume_count) + 1; row.consumed_at = consumed_at;
     return { success: true, meta: { changes: 1 } };
   }
   throw new Error("unsupported SQL: " + sql);
@@ -477,16 +501,21 @@ function queryFirst(sql, args) {
   if (sql.indexOf("SELECT candidate_id, asset_id, title, status") === 0) {
     return candidateRows.get(args[0]) || null;
   }
-  if (sql.indexOf("SELECT approval_receipt, candidate_id") === 0) {
+  if (sql.indexOf("SELECT approval_id, operation, asset_type") === 0) {
+    let best = null;
     for (const row of approvalRows.values()) {
-      if (row.candidate_id === args[0] && Number(row.candidate_version) === Number(args[1]) && row.content_hash === args[2]) return row;
+      if (row.operation === args[0] && row.candidate_id === args[1] && Number(row.candidate_version) === Number(args[2]) && row.content_hash === args[3]) {
+        if (!best || String(row.expires_at) > String(best.expires_at)) best = row;
+      }
     }
-    return null;
+    return best || null;
   }
   if (sql.indexOf("SELECT asset_id, current_version, content_hash, updated_at FROM assets") === 0) {
     return assetRows.get(args[0]) || null;
   }
   if (sql.indexOf("SELECT a.current_version AS asset_version") === 0) {
+    VERIFY_READS++;
+    if (FAIL_VERIFY_AFTER >= 0 && VERIFY_READS > FAIL_VERIFY_AFTER) return null;
     const asset = assetRows.get(args[0]);
     if (!asset) return null;
     const version = versionRows.get(vkey(asset.asset_id, asset.current_version));
@@ -508,6 +537,7 @@ function makeD1() {
   };
   if (ALLOW_BATCH) {
     db.batch = async function(statements) {
+      if (FAIL_BATCH) throw new Error("batch failed");
       const as = new Map(assetRows), vs = new Map(versionRows);
       const results = [];
       try { for (const s of statements) results.push(runStatement(s._sql, s._args)); }
@@ -551,21 +581,19 @@ def _worker_env_setup(candidate_id: str, content: dict, *, review: bool) -> str:
 
 
 def _approve_worker(candidate_id: str, expires="2999-01-01T00:00:00.000Z") -> str:
+    # Seeds the trusted single-use approval ledger directly. This models the
+    # out-of-band Human Gate registration; the worker itself has no mint path.
+    receipt = "receipt:" + candidate_id
     return (
         "const cand = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
         + json.dumps(candidate_id)
         + ").first();\n"
-        + "await registerKnowledgePromotionApproval(env, {approval_receipt: 'receipt:"
-        + candidate_id
-        + "', candidate_id: "
-        + json.dumps(candidate_id)
-        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS', "
-        + "approved_by: 'human-operator', expires_at: "
+        + "await env.ASSET_DB.prepare('INSERT INTO personal_ai_approval_ledger (approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind("
+        + json.dumps(receipt)
+        + ", 'KNOWLEDGE_PROMOTION', 'KNOWLEDGE', cand.candidate_id, cand.version, cand.content_hash, 'PASS', 'human-operator', "
         + json.dumps(expires)
-        + "});\n"
-        + "const approval = await env.ASSET_DB.prepare(KNOWLEDGE_PROMOTION_APPROVAL_SELECT).bind("
-        + json.dumps(candidate_id)
-        + ", cand.version, cand.content_hash).first();\n"
+        + ", new Date().toISOString()).run();\n"
+        + "const approval = await env.ASSET_DB.prepare(APPROVAL_LEDGER_SELECT).bind('KNOWLEDGE_PROMOTION', cand.candidate_id, cand.version, cand.content_hash).first();\n"
     )
 
 
@@ -784,3 +812,297 @@ def test_worker_gate_rejects_expired_and_consumed_approval() -> None:
     assert report["out"]["reason"] == "missing_or_expired_approval"
     assert report["out"]["write_calls"] == 0
     assert report["assets"] == []
+
+
+# ---------------------------------------------------------------------------
+# P0-B: callable candidate entry points through the MCP tool (cross-agent)
+# ---------------------------------------------------------------------------
+
+# The public surface keeps the frozen `tools/list` (11 tools); the Knowledge
+# tool dispatches the candidate lifecycle sub-operations. This test drives the
+# real MCP `tools/call` handler for Agent A (create) and Agent B (independent
+# read), then submit -> review, using the independent candidate table.
+MCP_LIFECYCLE_SCRIPT = (
+    "\nconst env = { ASSET_DB: makeD1() };\n"
+    "async function call(name, args, scopes) {\n"
+    "  const msg = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } };\n"
+    "  const req = new Request('https://worker.example/mcp', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(msg) });\n"
+    "  const res = await handleMcp(req, env, {}, { scopes });\n"
+    "  return await res.json();\n"
+    "}\n"
+    "const create = await call('write_knowledge_candidate', { candidate_operation: 'create', candidate_id: 'cand-mcp', asset_id: 'knowledge:cand-mcp', title: 't', content: { text: 'mcp' } }, ['mcp']);\n"
+    "const readByA = await call('write_knowledge_candidate', { candidate_operation: 'read', candidate_id: 'cand-mcp' }, ['asset.read']);\n"
+    "const readNoScope = await call('write_knowledge_candidate', { candidate_operation: 'read', candidate_id: 'cand-mcp' }, []);\n"
+    "const writeNoScope = await call('write_knowledge_candidate', { candidate_operation: 'submit_review', candidate_id: 'cand-mcp' }, ['asset.read']);\n"
+    "const submit = await call('write_knowledge_candidate', { candidate_operation: 'submit_review', candidate_id: 'cand-mcp' }, ['mcp']);\n"
+    "const review = await call('write_knowledge_candidate', { candidate_operation: 'review', candidate_id: 'cand-mcp', review_result: 'PASS' }, ['mcp']);\n"
+    "const readBack = await call('write_knowledge_candidate', { candidate_operation: 'read', candidate_id: 'cand-mcp' }, ['asset.read']);\n"
+    "console.log(JSON.stringify({ create, readByA, readNoScope, writeNoScope, submit, review, readBack, assets: Array.from(assetRows.values()) }));\n"
+)
+
+
+def test_worker_callable_candidate_lifecycle_cross_agent() -> None:
+    report = run_gated_probe(MCP_LIFECYCLE_SCRIPT)
+
+    assert report["create"]["result"]["structuredContent"]["staged"] is True
+    # Creating a candidate never writes Canonical storage.
+    assert report["assets"] == []
+
+    # Agent B reads it independently (separate MCP call, read scope only).
+    candidate = report["readByA"]["result"]["structuredContent"]["candidate"]
+    assert candidate["candidate_id"] == "cand-mcp"
+    assert candidate["status"] == "DRAFT"
+    assert candidate["content"] == {"text": "mcp"}
+
+    # Permission isolation: read needs read scope; a mutating sub-operation
+    # needs write scope.
+    assert "error" in report["readNoScope"]
+    assert "error" in report["writeNoScope"]
+
+    assert report["submit"]["result"]["structuredContent"]["status"] == "PENDING_REVIEW"
+    assert report["review"]["result"]["structuredContent"]["status"] == "APPROVED_FOR_PROMOTION"
+    final = report["readBack"]["result"]["structuredContent"]["candidate"]
+    assert final["status"] == "APPROVED_FOR_PROMOTION"
+    assert final["review_state"] == "PASS"
+
+
+# ---------------------------------------------------------------------------
+# P0-A: approval is candidate-bound, single-use, and never self-mintable
+# ---------------------------------------------------------------------------
+
+
+def test_worker_approval_is_candidate_bound_and_single_use() -> None:
+    script = (
+        "\nconst env = { ASSET_DB: makeD1() };\n"
+        "await stageKnowledgeCandidate(env, { candidate_id: 'cand-7a', asset_id: 'knowledge:cand-7a', title: 't', content: { text: 'bound' } });\n"
+        "await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-7a', review_result: 'PASS' });\n"
+        "await stageKnowledgeCandidate(env, { candidate_id: 'cand-7b', asset_id: 'knowledge:cand-7b', title: 't', content: { text: 'other' } });\n"
+        "await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-7b', review_result: 'PASS' });\n"
+        + _approve_worker("cand-7a")
+        + "const first = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-7a', candidate_version: 1, content_hash: cand.content_hash, review_result: 'PASS'});\n"
+        + "const replay = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-7a', candidate_version: 1, content_hash: cand.content_hash, review_result: 'PASS', approved_by: 'agent-self', approval_receipt: 'forged'});\n"
+        + "const b = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind('cand-7b').first();\n"
+        + "const cross = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-7b', candidate_version: 1, content_hash: b.content_hash, review_result: 'PASS', approval_receipt: 'receipt:cand-7a'});\n"
+        + "const approvals = Array.from(approvalRows.values());\n"
+        + "console.log(JSON.stringify({ first: first.structuredContent, replay: replay.structuredContent, cross: cross.structuredContent, approvals, assets: Array.from(assetRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    assert report["first"]["status"] == "WRITTEN"
+    # Replay / forged receipt: candidate already verified -> idempotent, no
+    # second Golden, and the caller-supplied approved_by/'forged' receipt is
+    # ignored.
+    assert report["replay"]["status"] == "IDEMPOTENT"
+    assert report["replay"]["write_calls"] == 0
+    # Cross-candidate reuse (approval bound to 7a offered for 7b) is rejected.
+    assert report["cross"]["status"] == "REJECTED"
+    assert report["cross"]["reason"] == "missing_or_expired_approval"
+    assert report["cross"]["write_calls"] == 0
+    assert len(report["assets"]) == 1
+    # Exactly one approval exists and it is consumed once.
+    assert len(report["approvals"]) == 1
+    assert report["approvals"][0]["consumed"] == 1
+    assert report["approvals"][0]["consume_count"] == 1
+    assert report["approvals"][0]["operation"] == "KNOWLEDGE_PROMOTION"
+
+
+def test_worker_readback_failure_is_never_reported_verified() -> None:
+    script = (
+        "\n"
+        + _worker_env_setup("cand-8", {"text": "readback"}, review=True)
+        + _approve_worker("cand-8")
+        # The first verify (inside the canonical write) passes; the second
+        # (authoritative read-back) returns null.
+        + "FAIL_VERIFY_AFTER = 1;\n"
+        + "const out = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-8', candidate_version: 1, content_hash: cand.content_hash, review_result: 'PASS'});\n"
+        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind('cand-8').first();\n"
+        + "console.log(JSON.stringify({ out: out.structuredContent, candidate: candAfter, assets: Array.from(assetRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    assert report["out"]["status"] == "REJECTED"
+    assert report["out"]["reason"] == "readback_failed"
+    assert report["out"]["read_back_verified"] is False
+    assert report["out"]["recovery_required"] is True
+    # Never claims VERIFIED/canonical read-back success.
+    assert report["out"].get("candidate_status") == "PROMOTED"
+    assert report["candidate"]["status"] == "PROMOTED"
+
+
+def test_worker_canonical_write_failure_consumes_once_and_stays_recoverable() -> None:
+    script = (
+        "\n"
+        + _worker_env_setup("cand-9", {"text": "batch-fail"}, review=True)
+        + _approve_worker("cand-9")
+        # Cloudflare D1 always has batch; force the write batch to fail to model
+        # an unavailable canonical sink (e.g. a 429).
+        + "FAIL_BATCH = true;\n"
+        + "const out = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-9', candidate_version: 1, content_hash: cand.content_hash, review_result: 'PASS'});\n"
+        + "console.log(JSON.stringify({ out: out.structuredContent, assets: Array.from(assetRows.values()), approvals: Array.from(approvalRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    assert report["out"]["status"] == "REJECTED"
+    assert report["out"]["reason"] == "ASSET_WRITE_FAILED"
+    assert report["out"]["approval_consumed"] is True
+    assert report["out"]["recovery_required"] is True
+    # No Golden row and no false success; the consumed approval cannot replay.
+    assert report["assets"] == []
+    assert report["approvals"][0]["consumed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Worker source guarantee: other writers and legacy Knowledge read path intact
+# ---------------------------------------------------------------------------
+
+
+def test_other_writers_and_legacy_reads_unaffected() -> None:
+    source = worker_source()
+    # SKILL / DECISION / REALITY writers are untouched by the candidate change.
+    for token in (
+        'name: "write_skill_candidate"',
+        'name: "write_decision_record"',
+        "writeDecisionRecord",
+        "writeSkillCandidate",
+        "toolGetAsset",
+        "toolSearchAssets",
+        'new Set(["KNOWLEDGE", "SKILL", "REALITY", "DECISION"])',
+    ):
+        assert token in source, f"worker lost {token}"
+    # The trusted ledger is the ONLY approval authority (no second table).
+    assert "knowledge_promotion_approvals" not in source
+    assert "personal_ai_approval_ledger" in source
+
+
+# ---------------------------------------------------------------------------
+# P0-C: isolated-database migration verification (NOT production D1)
+# ---------------------------------------------------------------------------
+
+
+def test_isolated_sqlite_migration_is_idempotent_and_preserves_history(tmp_path) -> None:
+    import sqlite3
+
+    db_path = tmp_path / "isolated_migration.db"
+    conn = sqlite3.connect(str(db_path))
+    # Model the pre-existing canonical tables (must not be touched).
+    conn.executescript(
+        "CREATE TABLE assets (asset_id TEXT PRIMARY KEY, content_hash TEXT);"
+        "CREATE TABLE asset_versions (asset_id TEXT, version INTEGER, content TEXT);"
+        "INSERT INTO assets VALUES ('knowledge:old', 'oldhash');"
+        "INSERT INTO asset_versions VALUES ('knowledge:old', 1, 'legacy body');"
+    )
+    conn.commit()
+    migration = (
+        MIGRATIONS_DIR / "0003_knowledge_candidate_golden_pipeline.sql"
+    ).read_text(encoding="utf-8")
+    # Apply twice: the second application must be a no-op.
+    conn.executescript(migration)
+    conn.executescript(migration)
+    tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert {"knowledge_candidates", "personal_ai_approval_ledger", "approval_ledger_operations"} <= tables
+    # Existing canonical rows are byte-identical (no mutation / no rewrite).
+    assert conn.execute(
+        "SELECT content_hash FROM assets WHERE asset_id = 'knowledge:old'"
+    ).fetchone()[0] == "oldhash"
+    assert conn.execute(
+        "SELECT content FROM asset_versions WHERE asset_id = 'knowledge:old'"
+    ).fetchone()[0] == "legacy body"
+    operations = {
+        row[0] for row in conn.execute("SELECT operation FROM approval_ledger_operations")
+    }
+    assert "KNOWLEDGE_PROMOTION" in operations
+    assert "decision_write" in operations
+    # No second approval authority.
+    assert "knowledge_promotion_approvals" not in tables
+    conn.close()
+
+
+def test_isolated_sqlite_cross_agent_candidate_persistence(tmp_path) -> None:
+    # Genuine cross-connection (cross-session) persistence against an isolated
+    # database initialised from the real committed migration -- not a shared
+    # in-process object.
+    db_path = tmp_path / "isolated_candidates.db"
+    # Model the pre-existing canonical tables so we can prove candidate
+    # operations never touch them.
+    _seed = sqlite3.connect(str(db_path))
+    _seed.executescript(
+        "CREATE TABLE assets (asset_id TEXT PRIMARY KEY, content_hash TEXT);"
+        "CREATE TABLE asset_versions (asset_id TEXT, version INTEGER, content TEXT);"
+    )
+    _seed.commit()
+    _seed.close()
+
+    agent_a = hello_module.knowledge_candidate_sqlite_connect(db_path)
+    staged = hello_module.sqlite_stage_knowledge_candidate(
+        agent_a, "cand-iso", {"text": "persisted"}, asset_id="knowledge:cand-iso", title="iso"
+    )
+    assert staged["staged"] is True
+    agent_a.close()
+
+    agent_b = hello_module.knowledge_candidate_sqlite_connect(db_path)
+    read = hello_module.sqlite_read_knowledge_candidate(agent_b, "cand-iso")
+    assert read["ok"] is True
+    assert read["candidate"]["candidate_id"] == "cand-iso"
+    assert read["candidate"]["status"] == "DRAFT"
+    assert read["candidate"]["asset_id"] == "knowledge:cand-iso"
+
+    assert hello_module.sqlite_submit_knowledge_candidate_for_review(agent_b, "cand-iso")["ok"] is True
+    assert hello_module.sqlite_record_knowledge_candidate_review(agent_b, "cand-iso", "PASS")["ok"] is True
+    agent_b.close()
+
+    agent_c = hello_module.knowledge_candidate_sqlite_connect(db_path)
+    read_c = hello_module.sqlite_read_knowledge_candidate(agent_c, "cand-iso")
+    assert read_c["candidate"]["status"] == "APPROVED_FOR_PROMOTION"
+    assert read_c["candidate"]["review_state"] == "PASS"
+    # Creating / reviewing a candidate never creates a Canonical asset row.
+    assert agent_c.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
+    agent_c.close()
+
+
+def test_isolated_sqlite_atomic_approval_consume_is_single_use(tmp_path) -> None:
+    # Models the Worker's conditional consume against an isolated database using
+    # two independent connections. SQLite's single UPDATE ... WHERE consumed = 0
+    # is a compare-and-swap: at most one consumer transitions the row.
+    db_path = tmp_path / "isolated_ledger.db"
+    admin = hello_module.knowledge_candidate_sqlite_connect(db_path)
+    registered = hello_module.sqlite_register_knowledge_promotion_approval(
+        admin,
+        "ap:iso",
+        candidate_id="cand-iso",
+        candidate_version=1,
+        content_hash="a" * 64,
+        review_result="PASS",
+        approved_by="human-operator",
+        expires_at="2999-01-01T00:00:00+00:00",
+    )
+    assert registered["registered"] is True
+    admin.close()
+
+    consumer_a = hello_module.knowledge_candidate_sqlite_connect(db_path)
+    consumer_b = hello_module.knowledge_candidate_sqlite_connect(db_path)
+    result_a = hello_module.sqlite_consume_promotion_approval(consumer_a, "ap:iso")
+    result_b = hello_module.sqlite_consume_promotion_approval(consumer_b, "ap:iso")
+    accepted = [result_a["accepted"], result_b["accepted"]]
+    assert accepted.count(True) == 1
+    assert accepted.count(False) == 1
+    replay = hello_module.sqlite_consume_promotion_approval(consumer_a, "ap:iso")
+    assert replay["accepted"] is False
+    consumer_a.close()
+    consumer_b.close()
+
+    admin2 = hello_module.knowledge_candidate_sqlite_connect(db_path)
+    consumed, consume_count = admin2.execute(
+        "SELECT consumed, consume_count FROM personal_ai_approval_ledger WHERE approval_id = 'ap:iso'"
+    ).fetchone()
+    assert consumed == 1
+    assert consume_count == 1
+    # An operation absent from the trusted registry is rejected (foreign key).
+    import sqlite3
+
+    with pytest.raises(sqlite3.IntegrityError):
+        admin2.execute(
+            "INSERT INTO personal_ai_approval_ledger (approval_id, operation, asset_type, "
+            "approved_by, expires_at, created_at) VALUES ('ap:bad', 'bogus', 'X', 'h', '2999', 'now')"
+        )
+    admin2.rollback()
+    admin2.close()

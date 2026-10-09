@@ -30874,12 +30874,211 @@ def promote_knowledge_candidate(
     )
 
 
+def read_knowledge_candidate(store: dict, candidate_id: str) -> dict:
+    """Read one candidate by candidate_id from the independent staging store.
+
+    This is the callable independent-read entry point (cross-task / cross-agent):
+    it never touches Golden storage and returns the persisted record verbatim.
+    """
+    candidate = (
+        store.get("candidates", {}).get(str(candidate_id))
+        if isinstance(store, dict)
+        else None
+    )
+    if not isinstance(candidate, dict):
+        return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING}
+    return {"ok": True, "candidate": candidate}
+
+
 def knowledge_candidate_promotion_ledger() -> dict:
     """A promotion-capable approval ledger (decision/knowledge/promotion ops)."""
     schema = production_approval_ledger_schema(
         include_knowledge_write=True, include_knowledge_promotion=True
     )
     return production_approval_ledger_store(schema)
+
+
+#: Migration 0003 is the durable (D1/SQLite) expression of the same tables.
+KNOWLEDGE_CANDIDATE_MIGRATION_PATH = (
+    REPO_ROOT / "worker" / "migrations" / "0003_knowledge_candidate_golden_pipeline.sql"
+)
+
+
+def knowledge_candidate_sqlite_connect(db_path: object):
+    """Open an isolated SQLite database with the candidate/ledger migration.
+
+    This models an isolated D1 database: it applies the real committed migration
+    file (0003) additively and enables foreign keys so the operation registry is
+    enforced. It is used only by tests/verification; it is never a production
+    connection.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(
+        KNOWLEDGE_CANDIDATE_MIGRATION_PATH.read_text(encoding="utf-8")
+    )
+    conn.commit()
+    return conn
+
+
+def sqlite_stage_knowledge_candidate(
+    conn, candidate_id: str, content: object, *, asset_id=None, title="", version=1
+) -> dict:
+    """Persist an independent DRAFT candidate row (never a Golden asset)."""
+    candidate_id = str(candidate_id or "").strip()
+    canonical_content = (
+        content if isinstance(content, str) else json.dumps(content, separators=(",", ":"))
+    )
+    content_hash = hashlib.sha256(canonical_content.encode("utf-8")).hexdigest()
+    try:
+        conn.execute(
+            "INSERT INTO knowledge_candidates (candidate_id, asset_id, title, status, "
+            "content, content_hash, version, provenance, created_at, review_state) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                candidate_id,
+                str(asset_id or candidate_id),
+                str(title or ""),
+                KNOWLEDGE_CANDIDATE_DRAFT,
+                canonical_content,
+                content_hash,
+                int(version),
+                "{}",
+                _utc_now(),
+                KNOWLEDGE_CANDIDATE_NOT_REVIEWED,
+            ),
+        )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001 - surfaced to the caller
+        return {"staged": False, "reason": "candidate_exists", "error": str(exc)}
+    return {
+        "staged": True,
+        "candidate": {
+            "candidate_id": candidate_id,
+            "content_hash": content_hash,
+            "version": int(version),
+        },
+    }
+
+
+def sqlite_read_knowledge_candidate(conn, candidate_id: str) -> dict:
+    """Independent read of a candidate row by candidate_id."""
+    row = conn.execute(
+        "SELECT candidate_id, asset_id, title, status, content, content_hash, "
+        "version, review_state, review_result FROM knowledge_candidates "
+        "WHERE candidate_id = ?",
+        (str(candidate_id),),
+    ).fetchone()
+    if row is None:
+        return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING}
+    return {"ok": True, "candidate": dict(row)}
+
+
+def sqlite_submit_knowledge_candidate_for_review(conn, candidate_id: str) -> dict:
+    row = conn.execute(
+        "SELECT status FROM knowledge_candidates WHERE candidate_id = ?",
+        (str(candidate_id),),
+    ).fetchone()
+    if row is None:
+        return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING}
+    if row["status"] != KNOWLEDGE_CANDIDATE_DRAFT:
+        return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE}
+    conn.execute(
+        "UPDATE knowledge_candidates SET status = ?, review_state = ? "
+        "WHERE candidate_id = ?",
+        (KNOWLEDGE_CANDIDATE_PENDING_REVIEW, KNOWLEDGE_CANDIDATE_NOT_REVIEWED, str(candidate_id)),
+    )
+    conn.commit()
+    return {"ok": True, "status": KNOWLEDGE_CANDIDATE_PENDING_REVIEW}
+
+
+def sqlite_record_knowledge_candidate_review(
+    conn, candidate_id: str, review_result: str
+) -> dict:
+    result = str(review_result or "").strip().upper()
+    if result not in (KNOWLEDGE_CANDIDATE_REVIEW_PASS, KNOWLEDGE_CANDIDATE_REVIEW_FAIL):
+        return {"ok": False, "reason": "invalid_review_result"}
+    row = conn.execute(
+        "SELECT status FROM knowledge_candidates WHERE candidate_id = ?",
+        (str(candidate_id),),
+    ).fetchone()
+    if row is None:
+        return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING}
+    if row["status"] not in (KNOWLEDGE_CANDIDATE_DRAFT, KNOWLEDGE_CANDIDATE_PENDING_REVIEW):
+        return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE}
+    next_status = (
+        KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION
+        if result == KNOWLEDGE_CANDIDATE_REVIEW_PASS
+        else KNOWLEDGE_CANDIDATE_PENDING_REVIEW
+    )
+    conn.execute(
+        "UPDATE knowledge_candidates SET status = ?, review_state = ?, review_result = ? "
+        "WHERE candidate_id = ?",
+        (next_status, result, result, str(candidate_id)),
+    )
+    conn.commit()
+    return {"ok": True, "status": next_status, "review_state": result}
+
+
+def sqlite_register_knowledge_promotion_approval(
+    conn,
+    approval_id: str,
+    *,
+    candidate_id: str,
+    candidate_version: int,
+    content_hash: str,
+    review_result: str,
+    approved_by: str,
+    expires_at: str,
+) -> dict:
+    """Human Gate registration into the trusted ledger (out-of-band in prod)."""
+    try:
+        conn.execute(
+            "INSERT INTO personal_ai_approval_ledger (approval_id, operation, "
+            "asset_type, candidate_id, candidate_version, content_hash, review_result, "
+            "approved_by, expires_at, state, consumed, consume_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'REGISTERED', 0, 0, ?)",
+            (
+                str(approval_id),
+                KNOWLEDGE_PROMOTION_OPERATION,
+                "KNOWLEDGE",
+                str(candidate_id),
+                int(candidate_version),
+                str(content_hash),
+                str(review_result or "").upper(),
+                str(approved_by),
+                str(expires_at),
+                _utc_now(),
+            ),
+        )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        return {"registered": False, "reason": "unsupported_operation", "error": str(exc)}
+    return {"registered": True, "approval_id": str(approval_id)}
+
+
+def sqlite_consume_promotion_approval(
+    conn, approval_id: str, *, operation: str = KNOWLEDGE_PROMOTION_OPERATION
+) -> dict:
+    """Atomic single-use consume via a conditional (CAS) UPDATE.
+
+    Returns ``accepted`` only when exactly one row was transitioned from
+    unconsumed to consumed; a second/replayed or concurrent consume returns
+    ``changes == 0``. This is the same compare-and-swap the Worker uses.
+    """
+    cursor = conn.execute(
+        "UPDATE personal_ai_approval_ledger SET consumed = 1, state = 'CONSUMED', "
+        "consume_count = consume_count + 1, consumed_at = ? "
+        "WHERE approval_id = ? AND operation = ? AND consumed = 0",
+        (_utc_now(), str(approval_id), str(operation)),
+    )
+    conn.commit()
+    if cursor.rowcount == 1:
+        return {"accepted": True, "result": LEDGER_CONSUME_ACCEPTED, "changes": 1}
+    return {"accepted": False, "result": LEDGER_CONSUME_REPLAY_REJECTED, "changes": 0}
 
 
 #: Forward/back-compatible aliases for the candidate pipeline entry points.

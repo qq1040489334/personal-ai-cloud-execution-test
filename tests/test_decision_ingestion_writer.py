@@ -990,12 +990,44 @@ def test_decision_asset_type_is_already_canonical() -> None:
     assert 'var DECISION_ASSET_TYPE = "DECISION"' in source
 
 
-def test_no_new_migration_added() -> None:
-    names = {path.name for path in MIGRATIONS_DIR.glob("*.sql")}
-    assert names == {
-        "0001_asset_provenance_v0_2.sql",
-        "0002_dispatch_idempotency.sql",
-    }
+def test_migration_set_is_additive_only_and_immutable_history() -> None:
+    """Migration history is additive-only; 0001/0002 are frozen.
+
+    KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_V1 (cf-00bcf790b680) authorised a
+    single additive migration ``0003_knowledge_candidate_golden_pipeline.sql``.
+    This replaces the earlier "exactly two migrations" freeze while preserving
+    its real intent: the historical 0001/0002 artifacts must never change, and
+    every new migration must be additive schema only (no mutation of ``assets``
+    / ``asset_versions`` / existing Knowledge rows and no new ungated write
+    path).
+    """
+    migrations = {path.name: path for path in MIGRATIONS_DIR.glob("*.sql")}
+    # The original two migrations remain present and byte-stable in name.
+    assert "0001_asset_provenance_v0_2.sql" in migrations
+    assert "0002_dispatch_idempotency.sql" in migrations
+    assert "0003_knowledge_candidate_golden_pipeline.sql" in migrations
+
+    new_sql = migrations["0003_knowledge_candidate_golden_pipeline.sql"].read_text(
+        encoding="utf-8"
+    )
+    lowered = new_sql.lower()
+    # Additive/idempotent only.
+    assert "create table if not exists" in lowered
+    assert "create index if not exists" in lowered
+    # It never rewrites existing canonical storage or history.
+    assert "alter table" not in lowered
+    assert "drop table" not in lowered
+    assert "drop index" not in lowered
+    assert "delete from" not in lowered
+    assert "insert into assets" not in lowered
+    assert "insert into asset_versions" not in lowered
+    assert "update assets" not in lowered
+    assert "update asset_versions" not in lowered
+    # It creates the candidate staging + the single trusted approval ledger
+    # (no second approval authority).
+    assert "knowledge_candidates" in lowered
+    assert "personal_ai_approval_ledger" in lowered
+    assert "knowledge_promotion_approvals" not in lowered
 
 
 def test_decision_ingestion_contract_is_reused() -> None:
