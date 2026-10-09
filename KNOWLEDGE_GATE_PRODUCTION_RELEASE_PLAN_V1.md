@@ -1,22 +1,25 @@
 # KNOWLEDGE_GATE_PRODUCTION_RELEASE_PLAN_V1
 
-- Companion task: `cf-e92e0c936a1a` (stale-approval fix, continuation of
+- Companion task: `cf-eb01535abaf2` (review-FAIL vs promotion concurrency-race
+  fix; parent `cf-e92e0c936a1a` stale-approval fix, continuation of
   `cf-00bcf790b680` / `KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_V1`)
 - Repository: `qq1040489334/personal-ai-cloud-execution-test`
 - Original base commit: `fb01f893f0357c4c6a1289a2ca098c139203650f`
 - Stale-approval fix base commit: `e3ead9540b48f58b02fbb75af86fa763ca041923`
-- Release-candidate code commit: `9f23886927473268a18b3bc6f6bbdf75bf81d4e0`
+- Prior release-candidate commit: `9f23886927473268a18b3bc6f6bbdf75bf81d4e0`
+- Race-fix base commit: `46a9af6caf8f608037a7ce69726371df56a80675`
 - Document status: **STAGED — NOT EXECUTABLE YET** (`PARTIAL`; real D1 UNVERIFIED)
 - Intended use: direct input to a **separate**, explicitly authorized production
   execution task. It requires no implicit context from the finalize run.
 
 > **Read this first.** The release candidate now implements the gate (ledger
-> reuse, callable candidate persistence, additive migration, and atomic
-> FAIL-time revocation of stale approvals) and is green in an in-repo/isolated
-> environment (`1566 passed, 1 skipped`). It is **not** a production PASS: real
-> Cloudflare D1 concurrency/migration and production deploy/Canonical read-back
-> are `UNVERIFIED`. Do not execute any step below until §1 is satisfied and
-> independently verified.
+> reuse, callable candidate persistence, additive migration, atomic FAIL-time
+> revocation of stale approvals, and an atomic `PROMOTION_RESERVED` promotion
+> claim that linearizes promotion against a review FAIL) and is green in an
+> in-repo/isolated environment (`1576 passed, 1 skipped`). It is **not** a
+> production PASS: real Cloudflare D1 concurrency/migration and production
+> deploy/Canonical read-back are `UNVERIFIED`. Do not execute any step below
+> until §1 is satisfied and independently verified.
 
 ---
 
@@ -44,6 +47,19 @@ review `FAIL` atomically revokes every still-live candidate-bound
 later `PASS` requires a NEW Human-Gate-bound approval and a revoked approval can
 never be replayed.
 
+Promotion semantics enforced in code: a promotion atomically claims a
+reviewed-PASS candidate (`APPROVED_FOR_PROMOTION -> PROMOTION_RESERVED`) before
+consuming the approval or calling the Canonical writer. This is the
+linearization point against a review `FAIL`. If the FAIL wins first, the
+promotion claim loses (`changes === 0`) and the promotion is `REJECTED` with
+`write_calls: 0`, no approval consume, and no Canonical write; the live approval
+was revoked by the FAIL. If the claim wins first, the racing FAIL is `REJECTED`
+(`candidate_state`) and can neither revoke the in-use approval nor be recorded.
+Every post-claim status transition is guarded (`PROMOTION_RESERVED -> PROMOTED
+-> CANONICAL_READBACK_VERIFIED`, plus the compensating `-> APPROVED_FOR_PROMOTION`
+release on consume/writer failure), so a promotion can never overwrite a
+recorded FAIL.
+
 ---
 
 ## 1. Preconditions (all must be true and evidenced before ANY production step)
@@ -53,11 +69,12 @@ never be replayed.
 | P1 | P0-A: `KNOWLEDGE_PROMOTION` uses the shared `personal_ai_approval_ledger`; no `knowledge_promotion_approvals`; worker cannot mint approvals | code review + regression tests | DONE (in-repo) |
 | P2 | P0-B: `create -> DRAFT persisted -> submit/review -> Human Gate -> promote`; cross-session read proven | MCP + isolated-DB tests | DONE (isolated SQLite) |
 | P3 | P0-C: `0003_knowledge_candidate_golden_pipeline.sql` committed; freeze tests converted to additive safety; idempotent on isolated DB | isolated-DB logs | DONE (isolated SQLite); real Cloudflare D1 `UNVERIFIED` |
-| P4 | Full repository suite green on the exact RC commit | `python -m pytest -q` | DONE (1566 passed, 1 skipped) |
+| P4 | Full repository suite green on the exact RC commit | `python -m pytest -q` | DONE (1576 passed, 1 skipped) |
 | P5 | Worker build/deploy dry-run green | wrangler dry-run | **UNVERIFIED** (no wrangler toolchain) |
 | P6 | MCP tool registration/dispatch verified | `tools/list` + dispatch tests | DONE (11 tools; sub-ops tested) |
 | P7 | No unresolved P0 security defect (incl. stale-approval revocation) | security review | DONE in code; real-D1 concurrency `UNVERIFIED` |
 | P8 | RC commit SHA frozen and recorded | `git rev-parse HEAD` | DONE (see finalize report §2) |
+| P9 | Promotion/review-FAIL concurrency race fixed by an atomic promotion claim; deterministic interleaving tests green | code review + regression tests | DONE (in-repo/fake-D1 + isolated SQLite); real-D1 `UNVERIFIED` |
 
 If any precondition fails: do not proceed; report `BLOCKED` (or `PARTIAL` when
 only external real-D1 evidence is missing).
@@ -119,7 +136,10 @@ STOP (fail-closed).
 - PASS -> approval -> FAIL -> PASS with the pre-FAIL approval -> `REJECTED` with
   zero writes; only a fresh Human-Gate-bound approval succeeds.
 - Concurrency: two consumes of one approval -> at most one succeeds; two
-  promotions -> no duplicate Golden.
+  promotions -> no duplicate Golden; a review FAIL racing an in-flight promotion
+  either wins before the atomic claim (promotion `REJECTED`, `write_calls=0`,
+  approval revoked) or is rejected after the claim (`candidate_state`), never
+  producing a Canonical write after an accepted FAIL.
 
 Any failure -> STOP; promotion stays disabled; Rollback §4.
 
@@ -139,7 +159,13 @@ Any failure -> STOP; promotion stays disabled; Rollback §4.
    atomically revokes every unconsumed candidate-bound `KNOWLEDGE_PROMOTION`
    approval (`state='INVALIDATED'`), that the revoked row is retained, and that a
    subsequent `PASS` cannot replay it (new approval required).
-3. Verify the approval is in the trusted ledger, bound to
+3. Verify the atomic promotion claim: a reviewed-PASS candidate moves to
+   `PROMOTION_RESERVED` before approval consume / Canonical write; a review
+   `FAIL` racing the claim is either rejected (claim first) or wins with the
+   promotion failing closed at `write_calls=0` (FAIL first); the guarded
+   `PROMOTION_RESERVED -> PROMOTED -> CANONICAL_READBACK_VERIFIED` transitions
+   can never overwrite a recorded FAIL.
+4. Verify the approval is in the trusted ledger, bound to
    candidate/version/hash/review/approver/expiry/operation.
 
 ### Step 6 — Controlled end-to-end validation
@@ -190,7 +216,11 @@ target.
 5. **Ledger.** Do not delete consumed approval evidence; never reuse a consumed
    approval. Invalidated (FAIL-revoked) approvals are retained as durable
    evidence and must never be un-invalidated or reused.
-6. **Post-rollback verification:** re-run Step 3 rejection probes and the Step 0
+6. **Candidate claims.** A stale `PROMOTION_RESERVED` claim may be released only
+   to `APPROVED_FOR_PROMOTION` (guarded). If the Canonical row exists, advance
+   idempotently; never re-write. Releasing a claim must not and does not
+   authorise a write without a fresh Human-Gate-bound approval.
+7. **Post-rollback verification:** re-run Step 3 rejection probes and the Step 0
    corpus diff.
 
 Invariant: at no point may rollback restore or recommend the old

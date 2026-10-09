@@ -472,8 +472,14 @@ def test_worker_source_encodes_candidate_gate_and_pipeline() -> None:
         "KNOWLEDGE_CANDIDATE_DRAFT",
         "KNOWLEDGE_CANDIDATE_PENDING_REVIEW",
         "KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION",
+        "KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED",
         "KNOWLEDGE_CANDIDATE_PROMOTED",
         "KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED",
+        # Concurrency race fix: the atomic promotion claim and guarded lifecycle
+        # transitions that linearize promotion against a review FAIL.
+        "KNOWLEDGE_CANDIDATE_RESERVE",
+        "KNOWLEDGE_CANDIDATE_GUARDED_UPDATE",
+        "releaseKnowledgeCandidateReservation",
         "missing_or_expired_approval",
         "content_hash_mismatch",
     ):
@@ -584,6 +590,17 @@ function runStatement(sql, args) {
     const row = candidateRows.get(args[2]);
     if (!row) return { success: true, meta: { changes: 0 } };
     row.status = args[0]; row.review_state = args[1];
+    return { success: true, meta: { changes: 1 } };
+  }
+  if (sql.indexOf("UPDATE knowledge_candidates SET status = ? WHERE candidate_id = ? AND status = ?") === 0) {
+    // Guarded lifecycle transition (promotion reserve/release/advance). The
+    // expected current status (and, for the reserve, the expected review_state)
+    // is part of the compare-and-swap, so a stale claim loses with changes 0.
+    const row = candidateRows.get(args[1]);
+    if (!row) return { success: true, meta: { changes: 0 } };
+    if (String(row.status) !== String(args[2])) return { success: true, meta: { changes: 0 } };
+    if (args.length > 3 && String(row.review_state) !== String(args[3])) return { success: true, meta: { changes: 0 } };
+    row.status = args[0];
     return { success: true, meta: { changes: 1 } };
   }
   if (sql.indexOf("UPDATE knowledge_candidates SET status = ?") === 0) {
@@ -1422,4 +1439,383 @@ def test_isolated_sqlite_fail_revokes_stale_approval(tmp_path) -> None:
     )
     assert terminal["ok"] is False
     assert terminal["reason"] == hello_module.KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P0-F: review FAIL vs promotion concurrency race
+#
+# The promotion atomically claims a reviewed-PASS candidate
+# (APPROVED_FOR_PROMOTION -> PROMOTION_RESERVED) BEFORE consuming the approval
+# and calling the Canonical writer. A review FAIL whose guarded UPDATE only
+# matches pre-promotion states therefore either wins before the claim (and the
+# promotion fails closed with write_calls === 0) or is rejected after it. These
+# tests deterministically interleave the two operations at the approval-check /
+# reservation, approval-consume and writer-call boundaries and assert the final
+# Candidate state, approval state and Canonical write_calls are consistent.
+# They use the Node fake-D1 harness (single-threaded, explicitly NOT real D1).
+# ---------------------------------------------------------------------------
+
+
+def _race_env(candidate_id: str, content: dict) -> str:
+    # Stage a candidate, PASS-review it and register a live Human-Gate-bound
+    # approval; `cand` and `approval` are in scope for the caller.
+    return _worker_env_setup(candidate_id, content, review=True) + _approve_worker(
+        candidate_id
+    )
+
+
+def test_worker_race_fail_during_consume_is_rejected_and_promotion_wins() -> None:
+    cid = "cand-race-consume"
+    script = (
+        "\n"
+        + _race_env(cid, {"text": "consume"})
+        + "let injected = null;\n"
+        + "const _prep = env.ASSET_DB.prepare.bind(env.ASSET_DB);\n"
+        + "env.ASSET_DB.prepare = function(sql) {\n"
+        + "  const stmt = _prep(sql);\n"
+        + "  const _bind = stmt.bind.bind(stmt);\n"
+        + "  stmt.bind = function(...a) {\n"
+        + "    const b = _bind(...a);\n"
+        + "    if (sql.indexOf(APPROVAL_LEDGER_CONSUME) === 0) {\n"
+        + "      const _run = b.run.bind(b);\n"
+        + "      b.run = async function(...r) {\n"
+        + "        injected = await recordKnowledgeCandidateReview(env, { candidate_id: "
+        + json.dumps(cid)
+        + ", review_result: 'FAIL' });\n"
+        + "        return _run(...r);\n"
+        + "      };\n"
+        + "    }\n"
+        + "    return b;\n"
+        + "  };\n"
+        + "  return stmt;\n"
+        + "};\n"
+        + "const out = await promoteKnowledgeCandidate(env, { candidate_id: "
+        + json.dumps(cid)
+        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
+        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
+        + json.dumps(cid)
+        + ").first();\n"
+        + "console.log(JSON.stringify({ out: out.structuredContent, injected: injected && injected.structuredContent, candidate: candAfter, approvals: Array.from(approvalRows.values()), assets: Array.from(assetRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    # The promotion claim already won, so the FAIL is rejected without touching
+    # the candidate or invalidating the in-use approval.
+    assert report["injected"]["status"] == "REJECTED"
+    assert report["injected"]["reason"] == "candidate_state"
+    assert report["injected"]["review_recorded"] is False
+    # Promotion completes exactly one Canonical write and reaches terminal state.
+    assert report["out"]["status"] == "WRITTEN"
+    assert report["out"]["write_calls"] == 1
+    assert report["out"]["read_back_verified"] is True
+    assert report["candidate"]["status"] == "CANONICAL_READBACK_VERIFIED"
+    assert len(report["assets"]) == 1
+    assert report["approvals"][0]["consumed"] == 1
+    assert report["approvals"][0]["invalidated"] == 0
+
+
+def test_worker_race_fail_first_blocks_reservation_zero_writes() -> None:
+    cid = "cand-race-failfirst"
+    script = (
+        "\n"
+        + _race_env(cid, {"text": "failfirst"})
+        + "let injected = null;\n"
+        + "const _prep = env.ASSET_DB.prepare.bind(env.ASSET_DB);\n"
+        + "env.ASSET_DB.prepare = function(sql) {\n"
+        + "  const stmt = _prep(sql);\n"
+        + "  const _bind = stmt.bind.bind(stmt);\n"
+        + "  stmt.bind = function(...a) {\n"
+        + "    const b = _bind(...a);\n"
+        + "    if (sql.indexOf(KNOWLEDGE_CANDIDATE_RESERVE) === 0) {\n"
+        + "      const _run = b.run.bind(b);\n"
+        + "      b.run = async function(...r) {\n"
+        + "        injected = await recordKnowledgeCandidateReview(env, { candidate_id: "
+        + json.dumps(cid)
+        + ", review_result: 'FAIL' });\n"
+        + "        return _run(...r);\n"
+        + "      };\n"
+        + "    }\n"
+        + "    return b;\n"
+        + "  };\n"
+        + "  return stmt;\n"
+        + "};\n"
+        + "const out = await promoteKnowledgeCandidate(env, { candidate_id: "
+        + json.dumps(cid)
+        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
+        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
+        + json.dumps(cid)
+        + ").first();\n"
+        + "console.log(JSON.stringify({ out: out.structuredContent, injected: injected && injected.structuredContent, candidate: candAfter, approvals: Array.from(approvalRows.values()), assets: Array.from(assetRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    # The FAIL won the claim: it recorded, revoked the live approval, and the
+    # promotion failed closed before consuming/writing.
+    assert report["injected"]["status"] == "PENDING_REVIEW"
+    assert report["injected"]["review_state"] == "FAIL"
+    assert report["injected"]["approvals_invalidated"] == 1
+    assert report["out"]["status"] == "REJECTED"
+    assert report["out"]["reason"] == "candidate_state"
+    assert report["out"]["write_calls"] == 0
+    assert report["candidate"]["status"] == "PENDING_REVIEW"
+    assert report["assets"] == []
+    assert report["approvals"][0]["consumed"] == 0
+    assert report["approvals"][0]["invalidated"] == 1
+
+
+def test_worker_race_fail_during_writer_call_is_rejected() -> None:
+    cid = "cand-race-writer"
+    script = (
+        "\n"
+        + _race_env(cid, {"text": "writer"})
+        + "let injected = null;\n"
+        + "const _origWrite = writeKnowledgeCandidate;\n"
+        + "writeKnowledgeCandidate = async function(...a) {\n"
+        + "  injected = await recordKnowledgeCandidateReview(env, { candidate_id: "
+        + json.dumps(cid)
+        + ", review_result: 'FAIL' });\n"
+        + "  return _origWrite.apply(null, a);\n"
+        + "};\n"
+        + "const out = await promoteKnowledgeCandidate(env, { candidate_id: "
+        + json.dumps(cid)
+        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
+        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
+        + json.dumps(cid)
+        + ").first();\n"
+        + "console.log(JSON.stringify({ out: out.structuredContent, injected: injected && injected.structuredContent, candidate: candAfter, approvals: Array.from(approvalRows.values()), assets: Array.from(assetRows.values()), versions: Array.from(versionRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    # The exact original bug window (approval consumed, writer running): the FAIL
+    # can no longer be accepted, so no Canonical write follows an accepted FAIL.
+    assert report["injected"]["status"] == "REJECTED"
+    assert report["injected"]["reason"] == "candidate_state"
+    assert report["out"]["status"] == "WRITTEN"
+    assert report["out"]["write_calls"] == 1
+    assert report["candidate"]["status"] == "CANONICAL_READBACK_VERIFIED"
+    assert len(report["assets"]) == 1
+    assert len(report["versions"]) == 1
+    assert report["approvals"][0]["consumed"] == 1
+    assert report["approvals"][0]["invalidated"] == 0
+
+
+def test_worker_race_fail_after_write_before_status_update_is_rejected() -> None:
+    cid = "cand-race-postwrite"
+    script = (
+        "\n"
+        + _race_env(cid, {"text": "postwrite"})
+        + "let injected = null;\n"
+        + "const _prep = env.ASSET_DB.prepare.bind(env.ASSET_DB);\n"
+        + "env.ASSET_DB.prepare = function(sql) {\n"
+        + "  const stmt = _prep(sql);\n"
+        + "  const _bind = stmt.bind.bind(stmt);\n"
+        + "  stmt.bind = function(...a) {\n"
+        + "    const b = _bind(...a);\n"
+        + "    if (sql.indexOf(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE) === 0 && a[0] === KNOWLEDGE_CANDIDATE_PROMOTED) {\n"
+        + "      const _run = b.run.bind(b);\n"
+        + "      b.run = async function(...r) {\n"
+        + "        injected = await recordKnowledgeCandidateReview(env, { candidate_id: "
+        + json.dumps(cid)
+        + ", review_result: 'FAIL' });\n"
+        + "        return _run(...r);\n"
+        + "      };\n"
+        + "    }\n"
+        + "    return b;\n"
+        + "  };\n"
+        + "  return stmt;\n"
+        + "};\n"
+        + "const out = await promoteKnowledgeCandidate(env, { candidate_id: "
+        + json.dumps(cid)
+        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
+        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
+        + json.dumps(cid)
+        + ").first();\n"
+        + "console.log(JSON.stringify({ out: out.structuredContent, injected: injected && injected.structuredContent, candidate: candAfter, approvals: Array.from(approvalRows.values()), assets: Array.from(assetRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    # The candidate is still PROMOTION_RESERVED, so the FAIL is rejected and the
+    # guarded PROMOTED transition cannot be overwritten by it.
+    assert report["injected"]["status"] == "REJECTED"
+    assert report["out"]["status"] == "WRITTEN"
+    assert report["out"]["write_calls"] == 1
+    assert report["candidate"]["status"] == "CANONICAL_READBACK_VERIFIED"
+    assert len(report["assets"]) == 1
+
+
+def test_worker_stale_reservation_without_canonical_fails_closed() -> None:
+    cid = "cand-stale-res"
+    script = (
+        "\n"
+        + _race_env(cid, {"text": "stale-res"})
+        + "await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE).bind(KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED, "
+        + json.dumps(cid)
+        + ", KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION).run();\n"
+        + "const out = await promoteKnowledgeCandidate(env, { candidate_id: "
+        + json.dumps(cid)
+        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
+        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
+        + json.dumps(cid)
+        + ").first();\n"
+        + "console.log(JSON.stringify({ out: out.structuredContent, candidate: candAfter, approvals: Array.from(approvalRows.values()), assets: Array.from(assetRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    assert report["out"]["status"] == "REJECTED"
+    assert report["out"]["reason"] == "promotion_reserved"
+    assert report["out"]["write_calls"] == 0
+    assert report["candidate"]["status"] == "PROMOTION_RESERVED"
+    # No approval consumed and no Canonical write attempted.
+    assert report["approvals"][0]["consumed"] == 0
+    assert report["assets"] == []
+
+
+def test_worker_stale_reservation_with_canonical_advances_without_new_write() -> None:
+    cid = "cand-stale-rec"
+    script = (
+        "\n"
+        + _race_env(cid, {"text": "stale-rec"})
+        + "const first = await promoteKnowledgeCandidate(env, { candidate_id: "
+        + json.dumps(cid)
+        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
+        + "await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE).bind(KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED, "
+        + json.dumps(cid)
+        + ", KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED).run();\n"
+        + "const second = await promoteKnowledgeCandidate(env, { candidate_id: "
+        + json.dumps(cid)
+        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
+        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
+        + json.dumps(cid)
+        + ").first();\n"
+        + "console.log(JSON.stringify({ first: first.structuredContent, second: second.structuredContent, candidate: candAfter, assets: Array.from(assetRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    assert report["first"]["status"] == "WRITTEN"
+    assert report["second"]["status"] == "IDEMPOTENT"
+    assert report["second"]["write_calls"] == 0
+    assert report["candidate"]["status"] == "CANONICAL_READBACK_VERIFIED"
+    # No duplicate Canonical write.
+    assert len(report["assets"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Python model: reservation / release semantics
+# ---------------------------------------------------------------------------
+
+
+def test_python_reservation_blocks_concurrent_review_fail() -> None:
+    store, ledger, candidate, receipt, _ = _approved_candidate(candidate_id="cand-res-py")
+    assert hello_module.reserve_knowledge_candidate_promotion(store, "cand-res-py") is True
+    assert candidate["status"] == hello_module.KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED
+
+    # A FAIL that races a claimed promotion is rejected and does NOT revoke the
+    # in-use approval.
+    fail = hello_module.record_knowledge_candidate_review(
+        store, "cand-res-py", "FAIL", ledger=ledger
+    )
+    assert fail["ok"] is False
+    assert fail["reason"] == hello_module.KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE
+    assert candidate["status"] == hello_module.KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED
+    assert ledger["approvals"][receipt]["invalidated"] is False
+    assert ledger["approvals"][receipt]["consumed"] is False
+
+    # Releasing the claim keeps the lifecycle recoverable: a later FAIL records
+    # and revokes the still-live approval.
+    assert hello_module.release_knowledge_candidate_promotion(store, "cand-res-py") is True
+    assert candidate["status"] == hello_module.KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION
+    fail2 = hello_module.record_knowledge_candidate_review(
+        store, "cand-res-py", "FAIL", ledger=ledger
+    )
+    assert fail2["ok"] is True
+    assert ledger["approvals"][receipt]["invalidated"] is True
+
+
+def test_python_release_then_promote_succeeds() -> None:
+    store, ledger, candidate, receipt, _ = _approved_candidate(candidate_id="cand-rel-py")
+    golden: dict = {}
+    assert hello_module.reserve_knowledge_candidate_promotion(store, "cand-rel-py") is True
+    assert hello_module.release_knowledge_candidate_promotion(store, "cand-rel-py") is True
+    assert candidate["status"] == hello_module.KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION
+
+    report = hello_module.promote_knowledge_candidate(
+        store,
+        "cand-rel-py",
+        candidate_version=candidate["version"],
+        content_hash=candidate["content_hash"],
+        review_result="PASS",
+        approval_receipt=receipt,
+        ledger=ledger,
+        golden_store=golden,
+    )
+    assert report["status"] == hello_module.KNOWLEDGE_PROMOTION_WRITTEN
+    assert report["write_calls"] == 1
+    assert candidate["status"] == hello_module.KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED
+
+
+# ---------------------------------------------------------------------------
+# Isolated SQLite: reservation CAS vs review FAIL (two connections)
+# ---------------------------------------------------------------------------
+
+
+def _seed_reviewed_candidate_sqlite(conn, candidate_id: str, approval_id: str) -> str:
+    staged = hello_module.sqlite_stage_knowledge_candidate(
+        conn, candidate_id, {"text": candidate_id}, asset_id="knowledge:" + candidate_id, title=candidate_id
+    )
+    assert staged["staged"] is True
+    assert hello_module.sqlite_submit_knowledge_candidate_for_review(conn, candidate_id)["ok"] is True
+    assert hello_module.sqlite_record_knowledge_candidate_review(conn, candidate_id, "PASS")["ok"] is True
+    assert hello_module.sqlite_register_knowledge_promotion_approval(
+        conn,
+        approval_id,
+        candidate_id=candidate_id,
+        candidate_version=1,
+        content_hash=staged["candidate"]["content_hash"],
+        review_result="PASS",
+        approved_by="human-operator",
+        expires_at="2999-01-01T00:00:00+00:00",
+    )["registered"] is True
+    return staged["candidate"]["content_hash"]
+
+
+def test_isolated_sqlite_reservation_blocks_review_fail(tmp_path) -> None:
+    db_path = tmp_path / "isolated_reservation.db"
+    conn = hello_module.knowledge_candidate_sqlite_connect(db_path)
+    _seed_reviewed_candidate_sqlite(conn, "cand-res-iso", "ap:res-iso")
+
+    # Promotion claims first (guarded CAS).
+    assert hello_module.sqlite_reserve_knowledge_candidate_promotion(conn, "cand-res-iso") is True
+    # A FAIL racing the claim is rejected and cannot revoke the in-use approval.
+    fail = hello_module.sqlite_record_knowledge_candidate_review(conn, "cand-res-iso", "FAIL")
+    assert fail["ok"] is False
+    assert fail["reason"] == hello_module.KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE
+    row = conn.execute(
+        "SELECT invalidated, consumed FROM personal_ai_approval_ledger WHERE approval_id = 'ap:res-iso'"
+    ).fetchone()
+    assert row["invalidated"] == 0
+    assert row["consumed"] == 0
+    assert hello_module.sqlite_read_knowledge_candidate(conn, "cand-res-iso")["candidate"][
+        "status"
+    ] == hello_module.KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED
+
+    # Release restores recoverability; the approval is then consumed once.
+    assert hello_module.sqlite_release_knowledge_candidate_promotion(conn, "cand-res-iso") is True
+    assert hello_module.sqlite_consume_promotion_approval(conn, "ap:res-iso")["accepted"] is True
+    conn.close()
+
+
+def test_isolated_sqlite_fail_first_blocks_promotion_reservation(tmp_path) -> None:
+    db_path = tmp_path / "isolated_failfirst.db"
+    conn = hello_module.knowledge_candidate_sqlite_connect(db_path)
+    _seed_reviewed_candidate_sqlite(conn, "cand-ff-iso", "ap:ff-iso")
+
+    # FAIL wins first: it records and revokes the live approval.
+    fail = hello_module.sqlite_record_knowledge_candidate_review(conn, "cand-ff-iso", "FAIL")
+    assert fail["ok"] is True
+    assert fail["approvals_invalidated"] == 1
+    # The promotion can no longer claim the candidate.
+    assert hello_module.sqlite_reserve_knowledge_candidate_promotion(conn, "cand-ff-iso") is False
+    row = conn.execute(
+        "SELECT invalidated, consumed FROM personal_ai_approval_ledger WHERE approval_id = 'ap:ff-iso'"
+    ).fetchone()
+    assert row["invalidated"] == 1
+    assert row["consumed"] == 0
+    assert hello_module.sqlite_read_knowledge_candidate(conn, "cand-ff-iso")["candidate"][
+        "status"
+    ] == hello_module.KNOWLEDGE_CANDIDATE_PENDING_REVIEW
     conn.close()

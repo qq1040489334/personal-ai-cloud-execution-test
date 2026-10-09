@@ -3016,12 +3016,22 @@ var KNOWLEDGE_PROMOTION_OPERATION = "KNOWLEDGE_PROMOTION";
 var KNOWLEDGE_CANDIDATE_DRAFT = "DRAFT";
 var KNOWLEDGE_CANDIDATE_PENDING_REVIEW = "PENDING_REVIEW";
 var KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION = "APPROVED_FOR_PROMOTION";
+// Transient promotion claim. A promotion atomically moves the candidate from
+// APPROVED_FOR_PROMOTION to PROMOTION_RESERVED before it consumes the approval
+// or calls the Canonical writer. This is the linearization point that competes
+// with a review FAIL: once reserved, a FAIL's guarded UPDATE (which only matches
+// pre-promotion states) makes zero changes, so an accepted FAIL can never race
+// ahead of an in-flight promotion, and a promotion can never overwrite a
+// recorded FAIL. Only `recordKnowledgeCandidateReview` (and promotion itself)
+// transitions out of a pre-promotion state, so no extra column is required.
+var KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED = "PROMOTION_RESERVED";
 var KNOWLEDGE_CANDIDATE_PROMOTED = "PROMOTED";
 var KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED = "CANONICAL_READBACK_VERIFIED";
 var KNOWLEDGE_CANDIDATE_STATES = [
   KNOWLEDGE_CANDIDATE_DRAFT,
   KNOWLEDGE_CANDIDATE_PENDING_REVIEW,
   KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION,
+  KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED,
   KNOWLEDGE_CANDIDATE_PROMOTED,
   KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED
 ];
@@ -3039,6 +3049,7 @@ var KNOWLEDGE_PROMOTION_REJECT_STORED_HASH = "stored_content_hash_mismatch";
 var KNOWLEDGE_PROMOTION_REJECT_HASH = "content_hash_mismatch";
 var KNOWLEDGE_PROMOTION_REJECT_VERSION = "candidate_version_mismatch";
 var KNOWLEDGE_PROMOTION_REJECT_APPROVAL = "missing_or_expired_approval";
+var KNOWLEDGE_PROMOTION_REJECT_RESERVED = "promotion_reserved";
 // Candidate staging lives in its own D1 table, intentionally distinct from the
 // Golden `assets` / `asset_versions` tables. Approvals are NOT a second
 // authority: KNOWLEDGE_PROMOTION reuses the trusted, single-use
@@ -3056,6 +3067,19 @@ var KNOWLEDGE_CANDIDATE_REVIEW_UPDATE = "UPDATE knowledge_candidates SET status 
 // CANONICAL_READBACK_VERIFIED candidate can never be regressed back to
 // APPROVED_FOR_PROMOTION through the review tool (changes === 0 -> rejected).
 var KNOWLEDGE_CANDIDATE_REVIEW_RECORD = "UPDATE knowledge_candidates SET status = ?, review_state = ?, review_result = ?, reviewed_at = ? WHERE candidate_id = ? AND status IN ('DRAFT', 'PENDING_REVIEW', 'APPROVED_FOR_PROMOTION')";
+// The single atomic promotion claim. Only a candidate that is still in the
+// reviewed-PASS pre-promotion state can be claimed; a concurrent review FAIL
+// (which moves the candidate to PENDING_REVIEW) or a competing promotion makes
+// this compare-and-swap return changes === 0, so the loser fails closed BEFORE
+// consuming an approval or calling the Canonical writer.
+var KNOWLEDGE_CANDIDATE_RESERVE = "UPDATE knowledge_candidates SET status = ? WHERE candidate_id = ? AND status = ? AND review_state = ?";
+// Guarded lifecycle transitions. The promotion only ever advances a candidate it
+// still owns (PROMOTION_RESERVED -> PROMOTED -> CANONICAL_READBACK_VERIFIED) and
+// can release a failed claim (PROMOTION_RESERVED -> APPROVED_FOR_PROMOTION).
+// Because each guarded UPDATE pins the expected current status, a promotion can
+// never overwrite a concurrently recorded state (e.g. a FAIL) and a terminal
+// candidate can never be regressed.
+var KNOWLEDGE_CANDIDATE_GUARDED_UPDATE = "UPDATE knowledge_candidates SET status = ? WHERE candidate_id = ? AND status = ?";
 var KNOWLEDGE_CANDIDATE_STATUS_UPDATE = "UPDATE knowledge_candidates SET status = ? WHERE candidate_id = ?";
 // The trusted approval ledger (single authority, reused for
 // decision_write / knowledge_write / KNOWLEDGE_PROMOTION).
@@ -3310,8 +3334,24 @@ async function submitKnowledgeCandidateForReview(env, args) {
 // from the trusted `personal_ai_approval_ledger`; it can never mint one. This is
 // what makes a caller-supplied approved_by/approval_receipt/promotion_decision
 // incapable of authorising a write.
-// Gated promotion: candidate -> validateCandidateGate -> single-use approval
-// consume -> Golden Writer (writeKnowledgeCandidate) -> authoritative read-back.
+// Gated promotion: candidate -> validateCandidateGate -> atomic promotion
+// reservation -> single-use approval consume -> Golden Writer
+// (writeKnowledgeCandidate) -> guarded status transitions -> authoritative
+// read-back.
+//
+// The reservation is the linearization point against a review FAIL. A promotion
+// that cannot atomically claim a reviewed-PASS candidate fails closed with
+// write_calls === 0 (no approval consume, no Canonical write), and a review FAIL
+// that arrives after the claim is rejected because its guarded UPDATE only
+// matches pre-promotion states.
+async function releaseKnowledgeCandidateReservation(db, candidateId) {
+  try {
+    const result = await db.prepare(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE).bind(KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION, candidateId, KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED).run();
+    return result && result.meta ? Number(result.meta.changes) || 0 : 0;
+  } catch {
+    return 0;
+  }
+}
 async function promoteKnowledgeCandidate(env, args) {
   const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
@@ -3351,6 +3391,40 @@ async function promoteKnowledgeCandidate(env, args) {
     }
     return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE, write_calls: 0 });
   }
+  if (String(candidate.status) === KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED) {
+    // A prior promotion claimed this candidate. If the Canonical write already
+    // landed (write succeeded but the process died before the guarded status
+    // transition), advance it without a new write. Otherwise fail closed: no
+    // approval consume and no second Canonical write. Recovery is re-driven by
+    // a fresh Human Gate approval once the stale claim is released.
+    const present = await verifyKnowledgeVersion(db, assetId, Number(candidate.version), recomputed, canonicalContent);
+    if (present) {
+      try {
+        await db.prepare(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE).bind(KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED, candidateId, KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED).run();
+      } catch {
+        return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: "ASSET_WRITE_FAILED", write_calls: 0, candidate_id: candidateId });
+      }
+      return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_IDEMPOTENT, {
+        candidate_id: candidateId,
+        candidate_status: KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED,
+        asset_id: assetId,
+        version: Number(candidate.version),
+        content_hash: recomputed,
+        idempotent: true,
+        created: false,
+        write_calls: 0,
+        read_back_verified: true
+      });
+    }
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
+      reason: KNOWLEDGE_PROMOTION_REJECT_RESERVED,
+      write_calls: 0,
+      candidate_id: candidateId,
+      candidate_status: KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED,
+      recovery_required: true,
+      recovery_hint: "a prior promotion claim is unresolved; obtain a fresh Human Gate approval after the claim is cleared"
+    });
+  }
   let approval = null;
   try {
     approval = await db.prepare(APPROVAL_LEDGER_SELECT).bind(KNOWLEDGE_PROMOTION_OPERATION, candidateId, Number(candidate.version), String(candidate.content_hash)).first();
@@ -3362,6 +3436,25 @@ async function promoteKnowledgeCandidate(env, args) {
     // Fail closed BEFORE any Golden/Canonical write attempt.
     return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: gate.reason, write_calls: 0, candidate_id: candidateId });
   }
+  // Atomic promotion claim: compete with a concurrent review FAIL on the same
+  // candidate status. Only a reviewed-PASS candidate still in
+  // APPROVED_FOR_PROMOTION is claimed; a FAIL that already moved the candidate
+  // to PENDING_REVIEW (or a competing promotion) makes changes === 0. This is
+  // the atomic boundary: the approval is never consumed and the writer is never
+  // called unless the claim succeeds, so an accepted FAIL can never be followed
+  // by a Canonical write and a FAIL can never be recorded after the claim.
+  let reserved = 0;
+  try {
+    const reserveResult = await db.prepare(KNOWLEDGE_CANDIDATE_RESERVE).bind(KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED, candidateId, KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION, KNOWLEDGE_CANDIDATE_REVIEW_PASS).run();
+    reserved = reserveResult && reserveResult.meta ? Number(reserveResult.meta.changes) || 0 : 0;
+  } catch {
+    reserved = 0;
+  }
+  if (reserved < 1) {
+    // A concurrent review FAIL (or competing promotion) won the claim. Fail
+    // closed before any approval consume / Canonical write.
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE, write_calls: 0, candidate_id: candidateId });
+  }
   // Atomic single-use consume against the shared trusted ledger. The conditional
   // UPDATE (consumed = 0) is a compare-and-swap: under concurrent promotion of
   // the same candidate, at most one consumer receives meta.changes === 1.
@@ -3372,7 +3465,12 @@ async function promoteKnowledgeCandidate(env, args) {
   } catch {
     consumed = 0;
   }
-  if (consumed < 1) return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_APPROVAL, write_calls: 0, candidate_id: candidateId });
+  if (consumed < 1) {
+    // Release the claim so the lifecycle is recoverable; no write occurred and
+    // the (dead) approval can never authorise a later write.
+    await releaseKnowledgeCandidateReservation(db, candidateId);
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_APPROVAL, write_calls: 0, candidate_id: candidateId });
+  }
   // The Canonical writer's actor comes ONLY from the trusted ledger approval,
   // never from a caller-supplied approved_by.
   const writeOutcome = await writeKnowledgeCandidate(env, {
@@ -3384,8 +3482,10 @@ async function promoteKnowledgeCandidate(env, args) {
   });
   if (writeOutcome.isError) {
     // Approval consumed but no Golden row exists: fail closed and expose a
-    // recovery token. A later promotion still requires a fresh, unconsumed,
-    // Human-Gate-bound approval (the consumed one can never be replayed).
+    // recovery token. Release the claim so the candidate is not dead-ended; a
+    // later promotion still requires a fresh, unconsumed, Human-Gate-bound
+    // approval (the consumed one can never be replayed).
+    await releaseKnowledgeCandidateReservation(db, candidateId);
     return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
       reason: "ASSET_WRITE_FAILED",
       write_calls: 1,
@@ -3396,9 +3496,17 @@ async function promoteKnowledgeCandidate(env, args) {
     });
   }
   const write = writeOutcome.structuredContent || {};
+  // Guarded transition PROMOTION_RESERVED -> PROMOTED. It pins the expected
+  // current status, so a promotion can never overwrite a concurrently recorded
+  // review state.
+  let promoted = 0;
   try {
-    await db.prepare(KNOWLEDGE_CANDIDATE_STATUS_UPDATE).bind(KNOWLEDGE_CANDIDATE_PROMOTED, candidateId).run();
+    const promotedResult = await db.prepare(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE).bind(KNOWLEDGE_CANDIDATE_PROMOTED, candidateId, KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED).run();
+    promoted = promotedResult && promotedResult.meta ? Number(promotedResult.meta.changes) || 0 : 0;
   } catch {
+    promoted = 0;
+  }
+  if (promoted < 1) {
     return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: "ASSET_WRITE_FAILED", write_calls: 1, candidate_id: candidateId });
   }
   const readBack = await verifyKnowledgeVersion(db, assetId, Number(write.version), recomputed, canonicalContent);
@@ -3416,9 +3524,14 @@ async function promoteKnowledgeCandidate(env, args) {
       recovery_hint: "re-read the Canonical asset; re-promotion is idempotent and creates no duplicate"
     });
   }
+  let verified = 0;
   try {
-    await db.prepare(KNOWLEDGE_CANDIDATE_STATUS_UPDATE).bind(KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED, candidateId).run();
+    const verifiedResult = await db.prepare(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE).bind(KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED, candidateId, KNOWLEDGE_CANDIDATE_PROMOTED).run();
+    verified = verifiedResult && verifiedResult.meta ? Number(verifiedResult.meta.changes) || 0 : 0;
   } catch {
+    verified = 0;
+  }
+  if (verified < 1) {
     return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: "ASSET_WRITE_FAILED", write_calls: 1, candidate_id: candidateId });
   }
   return knowledgePromotionOutcome(write.idempotent ? KNOWLEDGE_PROMOTION_IDEMPOTENT : KNOWLEDGE_PROMOTION_WRITTEN, {

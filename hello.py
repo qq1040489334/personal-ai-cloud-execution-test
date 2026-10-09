@@ -30468,12 +30468,19 @@ KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_VERSION = "V1"
 KNOWLEDGE_CANDIDATE_DRAFT = "DRAFT"
 KNOWLEDGE_CANDIDATE_PENDING_REVIEW = "PENDING_REVIEW"
 KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION = "APPROVED_FOR_PROMOTION"
+#: Transient atomic promotion claim (the linearization point against a review
+#: FAIL). A promotion moves APPROVED_FOR_PROMOTION -> PROMOTION_RESERVED before
+#: consuming the approval / calling the writer; a review FAIL's guarded update
+#: only matches pre-promotion states, so it can never overwrite the claim and a
+#: promotion can never overwrite a recorded FAIL.
+KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED = "PROMOTION_RESERVED"
 KNOWLEDGE_CANDIDATE_PROMOTED = "PROMOTED"
 KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED = "CANONICAL_READBACK_VERIFIED"
 KNOWLEDGE_CANDIDATE_STATES = (
     KNOWLEDGE_CANDIDATE_DRAFT,
     KNOWLEDGE_CANDIDATE_PENDING_REVIEW,
     KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION,
+    KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED,
     KNOWLEDGE_CANDIDATE_PROMOTED,
     KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED,
 )
@@ -30500,6 +30507,7 @@ KNOWLEDGE_PROMOTION_REJECT_STORED_HASH = "stored_content_hash_mismatch"
 KNOWLEDGE_PROMOTION_REJECT_HASH = "content_hash_mismatch"
 KNOWLEDGE_PROMOTION_REJECT_VERSION = "candidate_version_mismatch"
 KNOWLEDGE_PROMOTION_REJECT_APPROVAL = "missing_or_expired_approval"
+KNOWLEDGE_PROMOTION_REJECT_RESERVED = "promotion_reserved"
 
 #: Fields a KNOWLEDGE_PROMOTION approval must bind to.
 KNOWLEDGE_PROMOTION_APPROVAL_FIELDS = (
@@ -30793,6 +30801,50 @@ def validate_candidate_gate(
     return outcome(True, None)
 
 
+def reserve_knowledge_candidate_promotion(store: dict, candidate_id: str) -> bool:
+    """Atomically claim a reviewed-PASS pre-promotion candidate.
+
+    Returns ``True`` only when the candidate was still
+    ``APPROVED_FOR_PROMOTION`` with a ``PASS`` review. A concurrent review
+    ``FAIL`` (which moves the candidate to ``PENDING_REVIEW``) makes the claim a
+    no-op, so the promotion fails closed before consuming an approval or calling
+    the writer.
+    """
+    candidate = (
+        store.get("candidates", {}).get(candidate_id)
+        if isinstance(store, dict)
+        else None
+    )
+    if not isinstance(candidate, dict):
+        return False
+    if candidate.get("status") != KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION:
+        return False
+    if candidate.get("review_state") != KNOWLEDGE_CANDIDATE_REVIEW_PASS:
+        return False
+    candidate["status"] = KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED
+    return True
+
+
+def release_knowledge_candidate_promotion(store: dict, candidate_id: str) -> bool:
+    """Release a failed promotion claim back to REVIEWED-PASS pre-promotion.
+
+    Only a still-``PROMOTION_RESERVED`` candidate is released; this keeps the
+    lifecycle recoverable (a fresh Human Gate approval can re-drive promotion)
+    without ever overwriting a concurrently recorded review state.
+    """
+    candidate = (
+        store.get("candidates", {}).get(candidate_id)
+        if isinstance(store, dict)
+        else None
+    )
+    if not isinstance(candidate, dict):
+        return False
+    if candidate.get("status") != KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED:
+        return False
+    candidate["status"] = KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION
+    return True
+
+
 def promote_knowledge_candidate(
     store: dict,
     candidate_id: str,
@@ -30861,6 +30913,34 @@ def promote_knowledge_candidate(
             reason=KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE,
         )
 
+    if candidate.get("status") == KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED:
+        # A prior promotion claim is unresolved. If the Canonical row already
+        # landed, advance idempotently; otherwise fail closed (no new write).
+        existing = golden.get(candidate.get("asset_id"))
+        if (
+            isinstance(existing, dict)
+            and existing.get("content_hash") == candidate.get("content_hash")
+        ):
+            candidate["status"] = KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED
+            return dict(
+                base,
+                status=KNOWLEDGE_PROMOTION_IDEMPOTENT,
+                candidate_status=KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED,
+                idempotent=True,
+                created=False,
+                asset_id=candidate.get("asset_id"),
+                version=existing.get("version"),
+                content_hash=existing.get("content_hash"),
+                read_back_verified=True,
+            )
+        return dict(
+            base,
+            status=KNOWLEDGE_PROMOTION_REJECTED,
+            reason=KNOWLEDGE_PROMOTION_REJECT_RESERVED,
+            candidate_status=KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED,
+            recovery_required=True,
+        )
+
     gate = validate_candidate_gate(
         store,
         candidate_id,
@@ -30879,8 +30959,19 @@ def promote_knowledge_candidate(
             gate=gate,
         )
 
+    # Atomic promotion claim: compete with a concurrent review FAIL on the same
+    # candidate status. Fail closed (no approval consume, no writer call) if the
+    # claim is lost.
+    if not reserve_knowledge_candidate_promotion(store, candidate_id):
+        return dict(
+            base,
+            status=KNOWLEDGE_PROMOTION_REJECTED,
+            reason=KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE,
+        )
+
     consume = consume_production_approval(ledger, approval_receipt)
     if not consume.get("accepted"):
+        release_knowledge_candidate_promotion(store, candidate_id)
         return dict(
             base,
             status=KNOWLEDGE_PROMOTION_REJECTED,
@@ -31104,7 +31195,7 @@ def sqlite_record_knowledge_candidate_review(
     )
     invalidated = 0
     try:
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE knowledge_candidates SET status = ?, review_state = ?, "
             "review_result = ?, reviewed_at = ? "
             "WHERE candidate_id = ? AND status IN (?, ?, ?)",
@@ -31119,6 +31210,12 @@ def sqlite_record_knowledge_candidate_review(
                 KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION,
             ),
         )
+        if cursor.rowcount == 0:
+            # The candidate left the reviewable pre-promotion set under us (e.g.
+            # a promotion claimed it). Fail closed: no review is recorded and no
+            # approval is revoked.
+            conn.rollback()
+            return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE}
         if result == KNOWLEDGE_CANDIDATE_REVIEW_FAIL:
             invalidated = sqlite_invalidate_unconsumed_promotion_approvals(
                 conn, str(candidate_id)
@@ -31133,6 +31230,42 @@ def sqlite_record_knowledge_candidate_review(
         "review_state": result,
         "approvals_invalidated": invalidated,
     }
+
+
+def sqlite_reserve_knowledge_candidate_promotion(conn, candidate_id: str) -> bool:
+    """Atomic promotion claim via a guarded compare-and-swap UPDATE.
+
+    Only a reviewed-PASS candidate still in ``APPROVED_FOR_PROMOTION`` is
+    claimed. A concurrent review FAIL (which moved it to ``PENDING_REVIEW``)
+    makes this return ``False`` (``rowcount == 0``), so promotion fails closed.
+    """
+    cursor = conn.execute(
+        "UPDATE knowledge_candidates SET status = ? "
+        "WHERE candidate_id = ? AND status = ? AND review_state = ?",
+        (
+            KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED,
+            str(candidate_id),
+            KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION,
+            KNOWLEDGE_CANDIDATE_REVIEW_PASS,
+        ),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def sqlite_release_knowledge_candidate_promotion(conn, candidate_id: str) -> bool:
+    """Release a failed claim back to the reviewed-PASS pre-promotion state."""
+    cursor = conn.execute(
+        "UPDATE knowledge_candidates SET status = ? "
+        "WHERE candidate_id = ? AND status = ?",
+        (
+            KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION,
+            str(candidate_id),
+            KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED,
+        ),
+    )
+    conn.commit()
+    return cursor.rowcount == 1
 
 
 def sqlite_register_knowledge_promotion_approval(

@@ -9,6 +9,15 @@
 --      hash, the review state and the lifecycle status so a later authorised
 --      promotion can be gated and read back.
 --
+--      ``status`` is free-form TEXT (no CHECK constraint), so the promotion
+--      race fix adds the transient lifecycle value ``PROMOTION_RESERVED``
+--      without any DDL change. A promotion atomically claims a reviewed-PASS
+--      candidate (``APPROVED_FOR_PROMOTION`` -> ``PROMOTION_RESERVED``) before
+--      consuming the approval / calling the Canonical writer; a concurrent
+--      review ``FAIL`` only matches the pre-promotion states and therefore can
+--      never overwrite the claim (or be overwritten by it). This migration
+--      remains purely additive and idempotent.
+--
 --   2. approval_ledger_operations -- the trusted operation registry. It declares
 --      which operations the single approval authority
 --      (``personal_ai_approval_ledger``) supports and which canonical writer each
