@@ -85,7 +85,9 @@ promotion receipt (WRITTEN / IDEMPOTENT / REJECTED + recovery metadata)
 | `KNOWLEDGE_GATE_PRODUCTION_RELEASE_PLAN_V1.md` | Updated production plan/runbook. |
 
 Command: `git add -A && git commit -m 'cloud agent: gpt task'`.
-Release-candidate commit SHA: `HEAD` (recorded in the execution result JSON).
+Release-candidate commit SHA: `7908ef470baa27da7b1d9169970f4950aa4a4bb4`
+(the code/migration/test commit; the report-only refresh that records this SHA
+is the subsequent commit).
 
 ---
 
@@ -164,7 +166,7 @@ wrangler/toolchain credential exists in this environment.
 | 2 | `node --input-type=module --check < worker/index.js` | Node v20.20.2 | 0 | syntax OK |
 | 3 | `python -m pytest -q <5 targeted suites>` | as above | 0 | 161 passed |
 | 4 | isolated `sqlite3` migration apply x2 | sqlite3 | 0/0 | additive + idempotent |
-| 5 | `git rev-parse HEAD` | repo | 0 | RC SHA (see result JSON) |
+| 5 | `git rev-parse HEAD` | repo | 0 | `7908ef470baa27da7b1d9169970f4950aa4a4bb4` |
 
 Targeted suites: `test_knowledge_candidate_golden_pipeline.py`,
 `test_decision_ingestion_writer.py`, `test_knowledge_candidate_writer.py`,
