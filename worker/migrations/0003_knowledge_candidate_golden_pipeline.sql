@@ -21,7 +21,10 @@
 --      candidate_id / candidate_version / content_hash / review_result /
 --      approved_by / expires_at / operation. Consumption is a conditional
 --      compare-and-swap (``... WHERE approval_id = ? AND consumed = 0``) so at
---      most one concurrent consumer can win.
+--      most one concurrent consumer can win. ``invalidated`` / ``invalidated_at``
+--      record a FAIL-revoked stale approval permanently (revocation is additive:
+--      the row is never deleted), and both the gate read and the consume CAS
+--      exclude invalidated rows so a revoked approval can never be replayed.
 --
 -- Additive only and idempotent (CREATE TABLE/INDEX IF NOT EXISTS + INSERT OR
 -- IGNORE). It never alters or drops ``assets``, ``asset_versions`` or any
@@ -79,6 +82,8 @@ CREATE TABLE IF NOT EXISTS personal_ai_approval_ledger (
   state TEXT NOT NULL DEFAULT 'REGISTERED',
   consumed INTEGER NOT NULL DEFAULT 0,
   consume_count INTEGER NOT NULL DEFAULT 0,
+  invalidated INTEGER NOT NULL DEFAULT 0,
+  invalidated_at TEXT,
   created_at TEXT NOT NULL,
   consumed_at TEXT,
   FOREIGN KEY (operation) REFERENCES approval_ledger_operations (operation)
@@ -89,4 +94,4 @@ CREATE INDEX IF NOT EXISTS idx_approval_ledger_binding
     (operation, candidate_id, candidate_version, content_hash);
 
 CREATE INDEX IF NOT EXISTS idx_approval_ledger_state
-  ON personal_ai_approval_ledger (operation, consumed);
+  ON personal_ai_approval_ledger (operation, consumed, invalidated);

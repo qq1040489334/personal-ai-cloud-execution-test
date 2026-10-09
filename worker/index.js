@@ -3051,11 +3051,24 @@ var KNOWLEDGE_PROMOTION_REJECT_APPROVAL = "missing_or_expired_approval";
 var KNOWLEDGE_CANDIDATE_SELECT = "SELECT candidate_id, asset_id, title, status, content, content_hash, version, provenance, created_at, review_state, review_result FROM knowledge_candidates WHERE candidate_id = ?";
 var KNOWLEDGE_CANDIDATE_INSERT = "INSERT INTO knowledge_candidates (candidate_id, asset_id, title, status, content, content_hash, version, provenance, created_at, review_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 var KNOWLEDGE_CANDIDATE_REVIEW_UPDATE = "UPDATE knowledge_candidates SET status = ?, review_state = ? WHERE candidate_id = ?";
+// Recording a review may only act on a pre-promotion candidate. The guarded
+// UPDATE makes the legal lifecycle transition atomic: a PROMOTED /
+// CANONICAL_READBACK_VERIFIED candidate can never be regressed back to
+// APPROVED_FOR_PROMOTION through the review tool (changes === 0 -> rejected).
+var KNOWLEDGE_CANDIDATE_REVIEW_RECORD = "UPDATE knowledge_candidates SET status = ?, review_state = ?, review_result = ?, reviewed_at = ? WHERE candidate_id = ? AND status IN ('DRAFT', 'PENDING_REVIEW', 'APPROVED_FOR_PROMOTION')";
 var KNOWLEDGE_CANDIDATE_STATUS_UPDATE = "UPDATE knowledge_candidates SET status = ? WHERE candidate_id = ?";
 // The trusted approval ledger (single authority, reused for
 // decision_write / knowledge_write / KNOWLEDGE_PROMOTION).
-var APPROVAL_LEDGER_SELECT = "SELECT approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state, consumed, consume_count FROM personal_ai_approval_ledger WHERE operation = ? AND candidate_id = ? AND candidate_version = ? AND content_hash = ? ORDER BY expires_at DESC";
-var APPROVAL_LEDGER_CONSUME = "UPDATE personal_ai_approval_ledger SET consumed = 1, state = 'CONSUMED', consume_count = consume_count + 1, consumed_at = ? WHERE approval_id = ? AND operation = ? AND consumed = 0";
+// The select returns only LIVE approvals (unconsumed AND not invalidated), so a
+// FAIL-revoked approval can never be replayed even if a later PASS restores the
+// candidate's APPROVED_FOR_PROMOTION status.
+var APPROVAL_LEDGER_SELECT = "SELECT approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state, consumed, consume_count, invalidated FROM personal_ai_approval_ledger WHERE operation = ? AND candidate_id = ? AND candidate_version = ? AND content_hash = ? AND consumed = 0 AND invalidated = 0 ORDER BY expires_at DESC";
+var APPROVAL_LEDGER_CONSUME = "UPDATE personal_ai_approval_ledger SET consumed = 1, state = 'CONSUMED', consume_count = consume_count + 1, consumed_at = ? WHERE approval_id = ? AND operation = ? AND consumed = 0 AND invalidated = 0";
+// Atomic stale-approval revocation. Only UNCONSUMED, not-yet-invalidated
+// approvals bound to the operation+candidate are transitioned; a consumed
+// approval (evidence of a completed/pending write) is never rewritten.
+var APPROVAL_LEDGER_INVALIDATE = "UPDATE personal_ai_approval_ledger SET invalidated = 1, state = 'INVALIDATED', invalidated_at = ? WHERE operation = ? AND candidate_id = ? AND consumed = 0 AND invalidated = 0";
+var KNOWLEDGE_PROMOTION_APPROVAL_INVALIDATED = "INVALIDATED";
 function knowledgePromotionOutcome(resultStatus, extra) {
   const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, status: resultStatus, ...(extra || {}) };
   return { isError: false, text: JSON.stringify(body), structuredContent: body };
@@ -3083,6 +3096,10 @@ function validateCandidateGate(candidate, supplied, approval, nowMs) {
   if (String(approval.review_result) !== KNOWLEDGE_CANDIDATE_REVIEW_PASS) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   if (!String(approval.approval_id || "").trim()) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   if (!String(approval.approved_by || "").trim()) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  // A FAIL-revoked (stale) approval is permanently dead: even if the candidate
+  // is later re-PASSed with the same version/hash it can never authorise a write.
+  if (approval.invalidated === true || Number(approval.invalidated) === 1) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (String(approval.state || "") === KNOWLEDGE_PROMOTION_APPROVAL_INVALIDATED) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   if (approval.consumed === true || Number(approval.consumed) === 1) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   const now = Number.isFinite(nowMs) ? Number(nowMs) : Date.now();
   const expires = Date.parse(String(approval.expires_at));
@@ -3136,20 +3153,80 @@ async function stageKnowledgeCandidate(env, args) {
 async function recordKnowledgeCandidateReview(env, args) {
   const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
+  const db = env.ASSET_DB;
   const candidateId = String(input.candidate_id ?? "").trim();
   const reviewResult = String(input.review_result ?? "").trim().toUpperCase();
   if (![KNOWLEDGE_CANDIDATE_REVIEW_PASS, KNOWLEDGE_CANDIDATE_REVIEW_FAIL].includes(reviewResult)) {
     return { isError: true, text: "INVALID_REVIEW_RESULT" };
   }
-  const nextStatus = reviewResult === KNOWLEDGE_CANDIDATE_REVIEW_PASS
-    ? KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION
-    : KNOWLEDGE_CANDIDATE_PENDING_REVIEW;
+  // NOTE: approval/approver/receipt fields supplied by the caller are ignored.
+  // Recording a review never mints an approval; it can only REVOKE stale ones.
+  let candidate;
   try {
-    await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_REVIEW_UPDATE).bind(nextStatus, reviewResult, candidateId).run();
+    candidate = await db.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind(candidateId).first();
   } catch {
     return { isError: true, text: "ASSET_WRITE_FAILED" };
   }
-  const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, candidate_id: candidateId, status: nextStatus, review_state: reviewResult };
+  if (!candidate) return { isError: true, text: "CANDIDATE_NOT_FOUND" };
+  const currentStatus = String(candidate.status);
+  // Only pre-promotion states are reviewable. PROMOTED / CANONICAL_READBACK_VERIFIED
+  // are terminal: review must never regress them back to APPROVED_FOR_PROMOTION.
+  if (![KNOWLEDGE_CANDIDATE_DRAFT, KNOWLEDGE_CANDIDATE_PENDING_REVIEW, KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION].includes(currentStatus)) {
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
+      reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE,
+      candidate_id: candidateId,
+      review_recorded: false
+    });
+  }
+  const nextStatus = reviewResult === KNOWLEDGE_CANDIDATE_REVIEW_PASS
+    ? KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION
+    : KNOWLEDGE_CANDIDATE_PENDING_REVIEW;
+  const nowIso = (new Date()).toISOString();
+  const reviewWrite = db.prepare(KNOWLEDGE_CANDIDATE_REVIEW_RECORD).bind(nextStatus, reviewResult, reviewResult, nowIso, candidateId);
+  // A review FAIL must atomically revoke every still-live KNOWLEDGE_PROMOTION
+  // approval bound to this candidate. A later PASS therefore requires a NEW
+  // trusted Human Gate approval; the revoked one can never be replayed.
+  const invalidateWrite = reviewResult === KNOWLEDGE_CANDIDATE_REVIEW_FAIL
+    ? db.prepare(APPROVAL_LEDGER_INVALIDATE).bind(nowIso, KNOWLEDGE_PROMOTION_OPERATION, candidateId)
+    : null;
+  let reviewChanges = 0;
+  let invalidatedCount = 0;
+  if (typeof db.batch === "function") {
+    try {
+      const results = await db.batch(invalidateWrite ? [reviewWrite, invalidateWrite] : [reviewWrite]);
+      reviewChanges = results && results[0] && results[0].meta ? Number(results[0].meta.changes) || 0 : 0;
+      if (invalidateWrite) invalidatedCount = results && results[1] && results[1].meta ? Number(results[1].meta.changes) || 0 : 0;
+    } catch {
+      return { isError: true, text: "ASSET_WRITE_FAILED" };
+    }
+  } else {
+    // No atomic batch available. A FAIL cannot guarantee both the status change
+    // and the stale-approval revocation, so it fails closed rather than leave a
+    // live approval that a later PASS could resurrect.
+    if (invalidateWrite) return { isError: true, text: "ASSET_WRITE_FAILED" };
+    try {
+      const res = await reviewWrite.run();
+      reviewChanges = res && res.meta ? Number(res.meta.changes) || 0 : 1;
+    } catch {
+      return { isError: true, text: "ASSET_WRITE_FAILED" };
+    }
+  }
+  if (reviewChanges < 1) {
+    // The guarded UPDATE found no reviewable candidate (e.g. it was promoted
+    // concurrently). No status regress; report the illegal transition.
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
+      reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE,
+      candidate_id: candidateId,
+      review_recorded: false
+    });
+  }
+  const body = {
+    contract: KNOWLEDGE_CANDIDATE_CONTRACT,
+    candidate_id: candidateId,
+    status: nextStatus,
+    review_state: reviewResult,
+    approvals_invalidated: invalidatedCount
+  };
   return { isError: false, text: JSON.stringify(body), structuredContent: body };
 }
 async function createKnowledgeCandidate(env, args) {

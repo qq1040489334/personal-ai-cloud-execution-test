@@ -29071,6 +29071,7 @@ LEDGER_OPERATION_WRITERS = {
 
 LEDGER_ENTRY_REGISTERED = "REGISTERED"
 LEDGER_ENTRY_CONSUMED = "CONSUMED"
+LEDGER_ENTRY_INVALIDATED = "INVALIDATED"
 
 LEDGER_CONSUME_ACCEPTED = "ACCEPTED"
 LEDGER_CONSUME_REPLAY_REJECTED = "REPLAY_REJECTED"
@@ -29253,6 +29254,7 @@ def register_production_approval(
         "state": LEDGER_ENTRY_REGISTERED,
         "consumed": False,
         "consume_count": 0,
+        "invalidated": False,
         "metadata": dict(metadata),
     }
     ledger["approvals"][approval_id] = entry
@@ -29278,6 +29280,12 @@ def consume_production_approval(ledger: dict, approval_id: str) -> dict:
     if not isinstance(entry, dict):
         return result
     result["operation"] = entry.get("operation")
+    if entry.get("invalidated") is True:
+        result["result"] = LEDGER_CONSUME_REPLAY_REJECTED
+        result["reason"] = LEDGER_REJECT_ALREADY_CONSUMED
+        result["consume_count"] = entry.get("consume_count", 0)
+        result["canonical_write_count"] = ledger.get("canonical_write_count", 0)
+        return result
     if entry.get("consumed") is True:
         result["result"] = LEDGER_CONSUME_REPLAY_REJECTED
         result["reason"] = LEDGER_REJECT_ALREADY_CONSUMED
@@ -30569,9 +30577,19 @@ def submit_knowledge_candidate_for_review(store: dict, candidate_id: str) -> dic
 
 
 def record_knowledge_candidate_review(
-    store: dict, candidate_id: str, review_result: str
+    store: dict,
+    candidate_id: str,
+    review_result: str,
+    *,
+    ledger: object = None,
 ) -> dict:
-    """Record a review result. PASS advances to APPROVED_FOR_PROMOTION."""
+    """Record a review result. PASS advances to APPROVED_FOR_PROMOTION.
+
+    Only pre-promotion candidates are reviewable; PROMOTED /
+    CANONICAL_READBACK_VERIFIED are terminal and are never regressed. A FAIL
+    revokes every still-live candidate-bound KNOWLEDGE_PROMOTION approval in
+    ``ledger`` (when supplied) so a later PASS needs a NEW Human Gate approval.
+    """
     candidate = (
         store.get("candidates", {}).get(candidate_id)
         if isinstance(store, dict)
@@ -30588,15 +30606,24 @@ def record_knowledge_candidate_review(
     if candidate.get("status") not in (
         KNOWLEDGE_CANDIDATE_DRAFT,
         KNOWLEDGE_CANDIDATE_PENDING_REVIEW,
+        KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION,
     ):
         return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE}
+    revoked = {"invalidated": 0, "approval_ids": []}
+    if result == KNOWLEDGE_CANDIDATE_REVIEW_FAIL:
+        revoked = invalidate_knowledge_promotion_approvals(ledger, candidate_id)
     candidate["review_state"] = result
     candidate["status"] = (
         KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION
         if result == KNOWLEDGE_CANDIDATE_REVIEW_PASS
         else KNOWLEDGE_CANDIDATE_PENDING_REVIEW
     )
-    return {"ok": True, "candidate": candidate}
+    return {
+        "ok": True,
+        "candidate": candidate,
+        "approvals_invalidated": revoked["invalidated"],
+        "invalidated_approval_ids": revoked["approval_ids"],
+    }
 
 
 def _lookup_knowledge_promotion_approval(ledger: object, receipt: object) -> object:
@@ -30650,6 +30677,38 @@ def register_knowledge_promotion_approval(
         approved_by=str(approved_by),
         expires_at=str(expires_at),
     )
+
+
+def invalidate_knowledge_promotion_approvals(ledger: dict, candidate_id: str) -> dict:
+    """Atomically revoke every still-live KNOWLEDGE_PROMOTION approval.
+
+    Only UNCONSUMED, not-yet-invalidated approvals bound to ``candidate_id`` are
+    revoked. The rows are marked (never deleted) so the revocation is durable and
+    a later PASS cannot resurrect a pre-FAIL approval. Returns the number revoked.
+    """
+    revoked = 0
+    if not isinstance(ledger, dict):
+        return {"invalidated": 0, "approval_ids": []}
+    approvals = ledger.get("approvals")
+    if not isinstance(approvals, dict):
+        return {"invalidated": 0, "approval_ids": []}
+    revoked_ids = []
+    for approval_id, entry in approvals.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("operation") != KNOWLEDGE_PROMOTION_OPERATION:
+            continue
+        metadata = entry.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if str(metadata.get("candidate_id")) != str(candidate_id):
+            continue
+        if entry.get("consumed") is True or entry.get("invalidated") is True:
+            continue
+        entry["invalidated"] = True
+        entry["state"] = LEDGER_ENTRY_INVALIDATED
+        revoked += 1
+        revoked_ids.append(approval_id)
+    return {"invalidated": revoked, "approval_ids": revoked_ids}
 
 
 def validate_candidate_gate(
@@ -30722,6 +30781,10 @@ def validate_candidate_gate(
     if not str(bound.get("approved_by") or "").strip():
         return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
     if not str(bound.get("approval_receipt") or "").strip():
+        return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
+    if approval.get("invalidated") is True or str(approval.get("state") or "") == (
+        LEDGER_ENTRY_INVALIDATED
+    ):
         return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
     if approval.get("consumed") is True:
         return outcome(False, KNOWLEDGE_PROMOTION_REJECT_APPROVAL)
@@ -30995,6 +31058,25 @@ def sqlite_submit_knowledge_candidate_for_review(conn, candidate_id: str) -> dic
     return {"ok": True, "status": KNOWLEDGE_CANDIDATE_PENDING_REVIEW}
 
 
+def sqlite_invalidate_unconsumed_promotion_approvals(
+    conn, candidate_id: str, *, operation: str = KNOWLEDGE_PROMOTION_OPERATION
+) -> int:
+    """Revoke every still-live candidate-bound promotion approval (no commit).
+
+    Only UNCONSUMED, not-yet-invalidated rows are transitioned. The row is marked
+    (never deleted) so the revocation is durable. The caller controls the
+    transaction so the candidate status change and this revocation commit
+    atomically.
+    """
+    cursor = conn.execute(
+        "UPDATE personal_ai_approval_ledger SET invalidated = 1, "
+        "state = 'INVALIDATED', invalidated_at = ? "
+        "WHERE operation = ? AND candidate_id = ? AND consumed = 0 AND invalidated = 0",
+        (_utc_now(), str(operation), str(candidate_id)),
+    )
+    return int(cursor.rowcount) if cursor.rowcount is not None else 0
+
+
 def sqlite_record_knowledge_candidate_review(
     conn, candidate_id: str, review_result: str
 ) -> dict:
@@ -31007,20 +31089,50 @@ def sqlite_record_knowledge_candidate_review(
     ).fetchone()
     if row is None:
         return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING}
-    if row["status"] not in (KNOWLEDGE_CANDIDATE_DRAFT, KNOWLEDGE_CANDIDATE_PENDING_REVIEW):
+    # Only pre-promotion candidates are reviewable; PROMOTED /
+    # CANONICAL_READBACK_VERIFIED are terminal and are never regressed.
+    if row["status"] not in (
+        KNOWLEDGE_CANDIDATE_DRAFT,
+        KNOWLEDGE_CANDIDATE_PENDING_REVIEW,
+        KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION,
+    ):
         return {"ok": False, "reason": KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE}
     next_status = (
         KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION
         if result == KNOWLEDGE_CANDIDATE_REVIEW_PASS
         else KNOWLEDGE_CANDIDATE_PENDING_REVIEW
     )
-    conn.execute(
-        "UPDATE knowledge_candidates SET status = ?, review_state = ?, review_result = ? "
-        "WHERE candidate_id = ?",
-        (next_status, result, result, str(candidate_id)),
-    )
-    conn.commit()
-    return {"ok": True, "status": next_status, "review_state": result}
+    invalidated = 0
+    try:
+        conn.execute(
+            "UPDATE knowledge_candidates SET status = ?, review_state = ?, "
+            "review_result = ?, reviewed_at = ? "
+            "WHERE candidate_id = ? AND status IN (?, ?, ?)",
+            (
+                next_status,
+                result,
+                result,
+                _utc_now(),
+                str(candidate_id),
+                KNOWLEDGE_CANDIDATE_DRAFT,
+                KNOWLEDGE_CANDIDATE_PENDING_REVIEW,
+                KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION,
+            ),
+        )
+        if result == KNOWLEDGE_CANDIDATE_REVIEW_FAIL:
+            invalidated = sqlite_invalidate_unconsumed_promotion_approvals(
+                conn, str(candidate_id)
+            )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001 - surfaced to the caller
+        conn.rollback()
+        return {"ok": False, "reason": "record_failed", "error": str(exc)}
+    return {
+        "ok": True,
+        "status": next_status,
+        "review_state": result,
+        "approvals_invalidated": invalidated,
+    }
 
 
 def sqlite_register_knowledge_promotion_approval(
@@ -31039,8 +31151,9 @@ def sqlite_register_knowledge_promotion_approval(
         conn.execute(
             "INSERT INTO personal_ai_approval_ledger (approval_id, operation, "
             "asset_type, candidate_id, candidate_version, content_hash, review_result, "
-            "approved_by, expires_at, state, consumed, consume_count, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'REGISTERED', 0, 0, ?)",
+            "approved_by, expires_at, state, consumed, consume_count, invalidated, "
+            "created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'REGISTERED', 0, 0, 0, ?)",
             (
                 str(approval_id),
                 KNOWLEDGE_PROMOTION_OPERATION,
@@ -31072,7 +31185,7 @@ def sqlite_consume_promotion_approval(
     cursor = conn.execute(
         "UPDATE personal_ai_approval_ledger SET consumed = 1, state = 'CONSUMED', "
         "consume_count = consume_count + 1, consumed_at = ? "
-        "WHERE approval_id = ? AND operation = ? AND consumed = 0",
+        "WHERE approval_id = ? AND operation = ? AND consumed = 0 AND invalidated = 0",
         (_utc_now(), str(approval_id), str(operation)),
     )
     conn.commit()

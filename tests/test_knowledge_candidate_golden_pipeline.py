@@ -288,8 +288,111 @@ def test_5_repeat_promotion_creates_no_duplicate_golden() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Ledger backward compatibility (additive KNOWLEDGE_PROMOTION only)
+# 6. Stale approval: PASS -> approval -> FAIL -> PASS cannot replay old approval
 # ---------------------------------------------------------------------------
+
+
+def test_6_fail_invalidates_stale_approval_and_requires_new_approval() -> None:
+    content = {"type": "note", "text": "stale"}
+    store = hello_module.new_knowledge_candidate_store()
+    staged = hello_module.stage_knowledge_candidate(
+        store, "cand-stale-py", content, asset_id="knowledge:cand-stale-py", title="stale"
+    )
+    candidate = staged["candidate"]
+    hello_module.submit_knowledge_candidate_for_review(store, "cand-stale-py")
+    hello_module.record_knowledge_candidate_review(store, "cand-stale-py", "PASS")
+    ledger = hello_module.knowledge_candidate_promotion_ledger()
+    hello_module.register_knowledge_promotion_approval(
+        ledger,
+        "receipt:stale-old",
+        candidate_id="cand-stale-py",
+        candidate_version=candidate["version"],
+        content_hash=candidate["content_hash"],
+        review_result="PASS",
+        approved_by="human-operator",
+        expires_at=future_iso(),
+    )
+    assert ledger["approvals"]["receipt:stale-old"]["invalidated"] is False
+
+    fail = hello_module.record_knowledge_candidate_review(
+        store, "cand-stale-py", "FAIL", ledger=ledger
+    )
+    assert fail["ok"] is True
+    assert fail["approvals_invalidated"] == 1
+    assert ledger["approvals"]["receipt:stale-old"]["invalidated"] is True
+
+    repass = hello_module.record_knowledge_candidate_review(
+        store, "cand-stale-py", "PASS", ledger=ledger
+    )
+    assert repass["ok"] is True
+    golden: dict = {}
+    stale = hello_module.promote_knowledge_candidate(
+        store,
+        "cand-stale-py",
+        candidate_version=candidate["version"],
+        content_hash=candidate["content_hash"],
+        review_result="PASS",
+        approval_receipt="receipt:stale-old",
+        ledger=ledger,
+        golden_store=golden,
+    )
+    assert stale["status"] == hello_module.KNOWLEDGE_PROMOTION_REJECTED
+    assert stale["reason"] == hello_module.KNOWLEDGE_PROMOTION_REJECT_APPROVAL
+    assert stale["canonical_write_attempts"] == 0
+    assert stale["write_calls"] == 0
+    assert golden == {}
+
+    # A fresh Human Gate approval for the same candidate/version/hash works.
+    hello_module.register_knowledge_promotion_approval(
+        ledger,
+        "receipt:stale-new",
+        candidate_id="cand-stale-py",
+        candidate_version=candidate["version"],
+        content_hash=candidate["content_hash"],
+        review_result="PASS",
+        approved_by="human-operator",
+        expires_at=future_iso(),
+    )
+    fresh = hello_module.promote_knowledge_candidate(
+        store,
+        "cand-stale-py",
+        candidate_version=candidate["version"],
+        content_hash=candidate["content_hash"],
+        review_result="PASS",
+        approval_receipt="receipt:stale-new",
+        ledger=ledger,
+        golden_store=golden,
+    )
+    assert fresh["status"] == hello_module.KNOWLEDGE_PROMOTION_WRITTEN
+    assert fresh["write_calls"] == 1
+    assert len(golden) == 1
+
+
+def test_6b_review_cannot_regress_terminal_candidate() -> None:
+    store, ledger, candidate, receipt, _ = _approved_candidate(
+        candidate_id="cand-terminal-py"
+    )
+    golden: dict = {}
+    promoted = hello_module.promote_knowledge_candidate(
+        store,
+        "cand-terminal-py",
+        candidate_version=candidate["version"],
+        content_hash=candidate["content_hash"],
+        review_result="PASS",
+        approval_receipt=receipt,
+        ledger=ledger,
+        golden_store=golden,
+    )
+    assert promoted["status"] == hello_module.KNOWLEDGE_PROMOTION_WRITTEN
+    regress = hello_module.record_knowledge_candidate_review(
+        store, "cand-terminal-py", "FAIL", ledger=ledger
+    )
+    assert regress["ok"] is False
+    assert regress["reason"] == hello_module.KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE
+    assert candidate["status"] == hello_module.KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED
+
+
+
 
 
 def test_ledger_additive_and_backward_compatible() -> None:
@@ -470,6 +573,13 @@ function runStatement(sql, args) {
     candidateRows.set(args[0], { candidate_id: args[0], asset_id: args[1], title: args[2], status: args[3], content: args[4], content_hash: args[5], version: args[6], provenance: args[7], created_at: args[8], review_state: args[9], review_result: null });
     return { success: true, meta: { changes: 1 } };
   }
+  if (sql.indexOf("UPDATE knowledge_candidates SET status = ?, review_state = ?, review_result = ?") === 0) {
+    const row = candidateRows.get(args[4]);
+    if (!row) return { success: true, meta: { changes: 0 } };
+    if (!["DRAFT", "PENDING_REVIEW", "APPROVED_FOR_PROMOTION"].includes(String(row.status))) return { success: true, meta: { changes: 0 } };
+    row.status = args[0]; row.review_state = args[1]; row.review_result = args[2]; row.reviewed_at = args[3];
+    return { success: true, meta: { changes: 1 } };
+  }
   if (sql.indexOf("UPDATE knowledge_candidates SET status = ?, review_state = ?") === 0) {
     const row = candidateRows.get(args[2]);
     if (!row) return { success: true, meta: { changes: 0 } };
@@ -485,13 +595,23 @@ function runStatement(sql, args) {
   if (sql.indexOf("INSERT INTO personal_ai_approval_ledger") === 0) {
     const [approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, created_at] = args;
     if (approvalRows.has(approval_id)) throw new Error("UNIQUE constraint failed: personal_ai_approval_ledger");
-    approvalRows.set(approval_id, { approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state: "REGISTERED", consumed: 0, consume_count: 0, created_at });
+    approvalRows.set(approval_id, { approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state: "REGISTERED", consumed: 0, consume_count: 0, invalidated: 0, invalidated_at: null, created_at });
     return { success: true, meta: { changes: 1 } };
+  }
+  if (sql.indexOf("UPDATE personal_ai_approval_ledger SET invalidated = 1") === 0) {
+    const invalidated_at = args[0], operation = args[1], candidate_id = args[2];
+    let changes = 0;
+    for (const row of approvalRows.values()) {
+      if (row.operation === operation && row.candidate_id === candidate_id && Number(row.consumed) === 0 && Number(row.invalidated) === 0) {
+        row.invalidated = 1; row.state = "INVALIDATED"; row.invalidated_at = invalidated_at; changes++;
+      }
+    }
+    return { success: true, meta: { changes } };
   }
   if (sql.indexOf("UPDATE personal_ai_approval_ledger SET consumed = 1") === 0) {
     const consumed_at = args[0], approval_id = args[1], operation = args[2];
     const row = approvalRows.get(approval_id);
-    if (!row || row.operation !== operation || Number(row.consumed) === 1) return { success: true, meta: { changes: 0 } };
+    if (!row || row.operation !== operation || Number(row.consumed) === 1 || Number(row.invalidated) === 1) return { success: true, meta: { changes: 0 } };
     row.consumed = 1; row.state = "CONSUMED"; row.consume_count = Number(row.consume_count) + 1; row.consumed_at = consumed_at;
     return { success: true, meta: { changes: 1 } };
   }
@@ -504,7 +624,7 @@ function queryFirst(sql, args) {
   if (sql.indexOf("SELECT approval_id, operation, asset_type") === 0) {
     let best = null;
     for (const row of approvalRows.values()) {
-      if (row.operation === args[0] && row.candidate_id === args[1] && Number(row.candidate_version) === Number(args[2]) && row.content_hash === args[3]) {
+      if (row.operation === args[0] && row.candidate_id === args[1] && Number(row.candidate_version) === Number(args[2]) && row.content_hash === args[3] && Number(row.consumed) === 0 && Number(row.invalidated) === 0) {
         if (!best || String(row.expires_at) > String(best.expires_at)) best = row;
       }
     }
@@ -594,6 +714,25 @@ def _approve_worker(candidate_id: str, expires="2999-01-01T00:00:00.000Z") -> st
         + json.dumps(expires)
         + ", new Date().toISOString()).run();\n"
         + "const approval = await env.ASSET_DB.prepare(APPROVAL_LEDGER_SELECT).bind('KNOWLEDGE_PROMOTION', cand.candidate_id, cand.version, cand.content_hash).first();\n"
+    )
+
+
+def _worker_approval_insert(
+    candidate_id: str, receipt: str, expires="2999-01-01T00:00:00.000Z", *, var=None
+) -> str:
+    # Human Gate registration into the trusted ledger (out-of-band in prod). Uses
+    # a caller-supplied variable so it can be emitted more than once in a script
+    # (e.g. an old, revoked approval followed by a fresh one).
+    var = var or ("cand_" + re.sub(r"[^0-9a-zA-Z_]", "_", candidate_id))
+    return (
+        f"const {var} = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
+        + json.dumps(candidate_id)
+        + ").first();\n"
+        + "await env.ASSET_DB.prepare('INSERT INTO personal_ai_approval_ledger (approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind("
+        + json.dumps(receipt)
+        + f", 'KNOWLEDGE_PROMOTION', 'KNOWLEDGE', {var}.candidate_id, {var}.version, {var}.content_hash, 'PASS', 'human-operator', "
+        + json.dumps(expires)
+        + ", new Date().toISOString()).run();\n"
     )
 
 
@@ -905,6 +1044,97 @@ def test_worker_approval_is_candidate_bound_and_single_use() -> None:
     assert report["approvals"][0]["operation"] == "KNOWLEDGE_PROMOTION"
 
 
+def test_worker_review_fail_revokes_stale_approval() -> None:
+    """PASS -> approval -> FAIL -> PASS: the pre-FAIL approval is permanently dead.
+
+    Regression for the stale-approval privilege-escalation: before the fix the
+    review FAIL only updated ``knowledge_candidates`` and left the old
+    KNOWLEDGE_PROMOTION approval live, so a later PASS could replay it.
+    """
+    script = (
+        "\n"
+        + _worker_env_setup("cand-stale", {"text": "stale"}, review=True)
+        + _approve_worker("cand-stale")
+        # The approval is live before the FAIL.
+        + "const before = await env.ASSET_DB.prepare(APPROVAL_LEDGER_SELECT).bind('KNOWLEDGE_PROMOTION', 'cand-stale', 1, cand.content_hash).first();\n"
+        + "const fail = await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-stale', review_result: 'FAIL' });\n"
+        # After the FAIL the stale approval is no longer selectable / consumable.
+        + "const afterFail = await env.ASSET_DB.prepare(APPROVAL_LEDGER_SELECT).bind('KNOWLEDGE_PROMOTION', 'cand-stale', 1, cand.content_hash).first();\n"
+        + "const rePass = await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-stale', review_result: 'PASS' });\n"
+        + "const staleAttempt = await promoteKnowledgeCandidate(env, { candidate_id: 'cand-stale', candidate_version: 1, content_hash: cand.content_hash, review_result: 'PASS' });\n"
+        + "console.log(JSON.stringify({ before: before && before.approval_id, fail: fail.structuredContent, afterFail, rePass: rePass.structuredContent, staleAttempt: staleAttempt.structuredContent, assets: Array.from(assetRows.values()), approvals: Array.from(approvalRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    assert report["before"] == "receipt:cand-stale"
+    assert report["fail"]["status"] == "PENDING_REVIEW"
+    assert report["fail"]["approvals_invalidated"] == 1
+    assert report["afterFail"] is None
+    assert report["rePass"]["status"] == "APPROVED_FOR_PROMOTION"
+    # The re-PASS must not resurrect the revoked approval: promotion is rejected
+    # before any Canonical write.
+    assert report["staleAttempt"]["status"] == "REJECTED"
+    assert report["staleAttempt"]["reason"] == "missing_or_expired_approval"
+    assert report["staleAttempt"]["write_calls"] == 0
+    assert report["assets"] == []
+    # The revoked row is retained as durable evidence (marked, never deleted).
+    assert len(report["approvals"]) == 1
+    assert report["approvals"][0]["invalidated"] == 1
+    assert report["approvals"][0]["state"] == "INVALIDATED"
+
+
+def test_worker_repromotion_requires_a_fresh_approval_after_fail() -> None:
+    """After FAIL, only a NEW trusted Human Gate approval can authorise promotion."""
+    script = (
+        "\n"
+        + _worker_env_setup("cand-fresh", {"text": "fresh"}, review=True)
+        + _worker_approval_insert(
+            "cand-fresh", "receipt:cand-fresh:old", var="candFreshOld"
+        )
+        + "await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-fresh', review_result: 'FAIL' });\n"
+        + "await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-fresh', review_result: 'PASS' });\n"
+        + "const staleAttempt = await promoteKnowledgeCandidate(env, { candidate_id: 'cand-fresh', candidate_version: 1, content_hash: candFreshOld.content_hash, review_result: 'PASS' });\n"
+        # A fresh, independent Human Gate approval is issued for the re-PASSed
+        # candidate (same version/hash) and now authorises the write.
+        + _worker_approval_insert(
+            "cand-fresh", "receipt:cand-fresh:new", var="candFreshNew"
+        )
+        + "const fresh = await promoteKnowledgeCandidate(env, { candidate_id: 'cand-fresh', candidate_version: 1, content_hash: candFreshNew.content_hash, review_result: 'PASS' });\n"
+        + "console.log(JSON.stringify({ staleAttempt: staleAttempt.structuredContent, fresh: fresh.structuredContent, assets: Array.from(assetRows.values()), approvals: Array.from(approvalRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    assert report["staleAttempt"]["status"] == "REJECTED"
+    assert report["staleAttempt"]["write_calls"] == 0
+    assert report["fresh"]["status"] == "WRITTEN"
+    assert report["fresh"]["read_back_verified"] is True
+    # Exactly one Golden asset: the stale attempt wrote nothing, the fresh one once.
+    assert len(report["assets"]) == 1
+    by_id = {row["approval_id"]: row for row in report["approvals"]}
+    assert by_id["receipt:cand-fresh:old"]["invalidated"] == 1
+    assert by_id["receipt:cand-fresh:new"]["consumed"] == 1
+    assert by_id["receipt:cand-fresh:new"]["invalidated"] == 0
+
+
+def test_worker_review_rejects_regression_from_terminal_candidate() -> None:
+    """A PROMOTED / CANONICAL_READBACK_VERIFIED candidate cannot be reviewed back."""
+    script = (
+        "\n"
+        + _worker_env_setup("cand-term", {"text": "term"}, review=True)
+        + _approve_worker("cand-term")
+        + "const promote = await promoteKnowledgeCandidate(env, { candidate_id: 'cand-term', candidate_version: 1, content_hash: cand.content_hash, review_result: 'PASS' });\n"
+        + "const regress = await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-term', review_result: 'FAIL' });\n"
+        + "const after = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind('cand-term').first();\n"
+        + "console.log(JSON.stringify({ promote: promote.structuredContent, regress: regress.structuredContent, after, assets: Array.from(assetRows.values()) }));\n"
+    )
+    report = run_gated_probe(script)
+    assert report["promote"]["status"] == "WRITTEN"
+    assert report["after"]["status"] == "CANONICAL_READBACK_VERIFIED"
+    assert report["regress"]["status"] == "REJECTED"
+    assert report["regress"]["reason"] == "candidate_state"
+    assert report["regress"]["review_recorded"] is False
+    # The terminal status is untouched by the rejected review.
+    assert report["after"]["status"] == "CANONICAL_READBACK_VERIFIED"
+
+
 def test_worker_readback_failure_is_never_reported_verified() -> None:
     script = (
         "\n"
@@ -1106,3 +1336,90 @@ def test_isolated_sqlite_atomic_approval_consume_is_single_use(tmp_path) -> None
         )
     admin2.rollback()
     admin2.close()
+
+
+def test_isolated_sqlite_fail_revokes_stale_approval(tmp_path) -> None:
+    """Durable (SQLite) model of the stale-approval fix.
+
+    PASS -> register approval -> FAIL (atomic revoke) -> PASS -> the old
+    approval is unconsumable and a fresh approval is required. The revocation is
+    a durable mark (row retained), and candidate status + revocation commit in
+    one transaction.
+    """
+    db_path = tmp_path / "isolated_stale.db"
+    conn = hello_module.knowledge_candidate_sqlite_connect(db_path)
+    staged = hello_module.sqlite_stage_knowledge_candidate(
+        conn, "cand-stale-iso", {"text": "stale"}, asset_id="knowledge:cand-stale-iso", title="s"
+    )
+    assert staged["staged"] is True
+    assert hello_module.sqlite_submit_knowledge_candidate_for_review(
+        conn, "cand-stale-iso"
+    )["ok"] is True
+    assert hello_module.sqlite_record_knowledge_candidate_review(
+        conn, "cand-stale-iso", "PASS"
+    )["ok"] is True
+    assert hello_module.sqlite_register_knowledge_promotion_approval(
+        conn,
+        "ap:stale-old",
+        candidate_id="cand-stale-iso",
+        candidate_version=1,
+        content_hash=staged["candidate"]["content_hash"],
+        review_result="PASS",
+        approved_by="human-operator",
+        expires_at="2999-01-01T00:00:00+00:00",
+    )["registered"] is True
+
+    fail = hello_module.sqlite_record_knowledge_candidate_review(
+        conn, "cand-stale-iso", "FAIL"
+    )
+    assert fail["ok"] is True
+    assert fail["status"] == hello_module.KNOWLEDGE_CANDIDATE_PENDING_REVIEW
+    assert fail["approvals_invalidated"] == 1
+    # The stale approval is revoked and can never be consumed.
+    row = conn.execute(
+        "SELECT consumed, invalidated, state FROM personal_ai_approval_ledger "
+        "WHERE approval_id = 'ap:stale-old'"
+    ).fetchone()
+    assert row["invalidated"] == 1
+    assert row["consumed"] == 0
+    assert row["state"] == "INVALIDATED"
+    assert hello_module.sqlite_consume_promotion_approval(conn, "ap:stale-old")[
+        "accepted"
+    ] is False
+
+    # Re-PASS: the old approval must not be reusable; a fresh one is required.
+    assert hello_module.sqlite_record_knowledge_candidate_review(
+        conn, "cand-stale-iso", "PASS"
+    )["ok"] is True
+    assert hello_module.sqlite_consume_promotion_approval(conn, "ap:stale-old")[
+        "accepted"
+    ] is False
+    assert hello_module.sqlite_register_knowledge_promotion_approval(
+        conn,
+        "ap:stale-new",
+        candidate_id="cand-stale-iso",
+        candidate_version=1,
+        content_hash=staged["candidate"]["content_hash"],
+        review_result="PASS",
+        approved_by="human-operator",
+        expires_at="2999-01-01T00:00:00+00:00",
+    )["registered"] is True
+    assert hello_module.sqlite_consume_promotion_approval(conn, "ap:stale-new")[
+        "accepted"
+    ] is True
+
+    # A terminal candidate cannot be reviewed back.
+    conn.execute(
+        "UPDATE knowledge_candidates SET status = ? WHERE candidate_id = ?",
+        (
+            hello_module.KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED,
+            "cand-stale-iso",
+        ),
+    )
+    conn.commit()
+    terminal = hello_module.sqlite_record_knowledge_candidate_review(
+        conn, "cand-stale-iso", "FAIL"
+    )
+    assert terminal["ok"] is False
+    assert terminal["reason"] == hello_module.KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE
+    conn.close()

@@ -1,18 +1,21 @@
 # KNOWLEDGE_GATE_PRODUCTION_RELEASE_PLAN_V1
 
-- Companion task: `cf-00bcf790b680` (`KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_V1`)
+- Companion task: `cf-e92e0c936a1a` (stale-approval fix, continuation of
+  `cf-00bcf790b680` / `KNOWLEDGE_GATE_RELEASE_CANDIDATE_FINALIZE_V1`)
 - Repository: `qq1040489334/personal-ai-cloud-execution-test`
 - Original base commit: `fb01f893f0357c4c6a1289a2ca098c139203650f`
+- Stale-approval fix base commit: `e3ead9540b48f58b02fbb75af86fa763ca041923`
 - Document status: **STAGED — NOT EXECUTABLE YET** (`PARTIAL`; real D1 UNVERIFIED)
 - Intended use: direct input to a **separate**, explicitly authorized production
   execution task. It requires no implicit context from the finalize run.
 
 > **Read this first.** The release candidate now implements the gate (ledger
-> reuse, callable candidate persistence, additive migration) and is green in
-> an in-repo/isolated environment (`1560 passed, 1 skipped`). It is **not** a
-> production PASS: real Cloudflare D1 concurrency/migration and production
-> deploy/Canonical read-back are `UNVERIFIED`. Do not execute any step below
-> until §1 is satisfied and independently verified.
+> reuse, callable candidate persistence, additive migration, and atomic
+> FAIL-time revocation of stale approvals) and is green in an in-repo/isolated
+> environment (`1566 passed, 1 skipped`). It is **not** a production PASS: real
+> Cloudflare D1 concurrency/migration and production deploy/Canonical read-back
+> are `UNVERIFIED`. Do not execute any step below until §1 is satisfied and
+> independently verified.
 
 ---
 
@@ -32,6 +35,14 @@ The single public Knowledge MCP tool is `write_knowledge_candidate` with
 `candidate_operation` in {create, read, submit_review, review, promote}. The
 `tools/list` surface stays at 11 tools.
 
+Review semantics enforced in code: a review may only act on a pre-promotion
+candidate (`DRAFT` / `PENDING_REVIEW` / `APPROVED_FOR_PROMOTION`); `PROMOTED` /
+`CANONICAL_READBACK_VERIFIED` are terminal and can never be reviewed back. A
+review `FAIL` atomically revokes every still-live candidate-bound
+`KNOWLEDGE_PROMOTION` approval in the same D1 batch as the status change, so a
+later `PASS` requires a NEW Human-Gate-bound approval and a revoked approval can
+never be replayed.
+
 ---
 
 ## 1. Preconditions (all must be true and evidenced before ANY production step)
@@ -41,10 +52,10 @@ The single public Knowledge MCP tool is `write_knowledge_candidate` with
 | P1 | P0-A: `KNOWLEDGE_PROMOTION` uses the shared `personal_ai_approval_ledger`; no `knowledge_promotion_approvals`; worker cannot mint approvals | code review + regression tests | DONE (in-repo) |
 | P2 | P0-B: `create -> DRAFT persisted -> submit/review -> Human Gate -> promote`; cross-session read proven | MCP + isolated-DB tests | DONE (isolated SQLite) |
 | P3 | P0-C: `0003_knowledge_candidate_golden_pipeline.sql` committed; freeze tests converted to additive safety; idempotent on isolated DB | isolated-DB logs | DONE (isolated SQLite); real Cloudflare D1 `UNVERIFIED` |
-| P4 | Full repository suite green on the exact RC commit | `python -m pytest -q` | DONE (1560 passed, 1 skipped) |
+| P4 | Full repository suite green on the exact RC commit | `python -m pytest -q` | DONE (1566 passed, 1 skipped) |
 | P5 | Worker build/deploy dry-run green | wrangler dry-run | **UNVERIFIED** (no wrangler toolchain) |
 | P6 | MCP tool registration/dispatch verified | `tools/list` + dispatch tests | DONE (11 tools; sub-ops tested) |
-| P7 | No unresolved P0 security defect | security review | DONE in code; real-D1 concurrency `UNVERIFIED` |
+| P7 | No unresolved P0 security defect (incl. stale-approval revocation) | security review | DONE in code; real-D1 concurrency `UNVERIFIED` |
 | P8 | RC commit SHA frozen and recorded | `git rev-parse HEAD` | DONE (see finalize report §2) |
 
 If any precondition fails: do not proceed; report `BLOCKED` (or `PARTIAL` when
@@ -103,6 +114,9 @@ STOP (fail-closed).
   approval -> `REJECTED`.
 - Wrong hash / wrong version / expired / replayed / cross-candidate approval
   -> `REJECTED`.
+- Review on a `PROMOTED` / `CANONICAL_READBACK_VERIFIED` candidate -> `REJECTED`.
+- PASS -> approval -> FAIL -> PASS with the pre-FAIL approval -> `REJECTED` with
+  zero writes; only a fresh Human-Gate-bound approval succeeds.
 - Concurrency: two consumes of one approval -> at most one succeeds; two
   promotions -> no duplicate Golden.
 
@@ -120,8 +134,10 @@ Any failure -> STOP; promotion stays disabled; Rollback §4.
 ### Step 5 — Verify Candidate storage / approval ledger
 1. Create a DRAFT candidate (authorized agent); read it back by `candidate_id`
    from an independent session/worker.
-2. Submit for review; verify PASS/FAIL state control; verify content/version
-   change invalidates prior approvals.
+2. Submit for review; verify PASS/FAIL state control; verify a review `FAIL`
+   atomically revokes every unconsumed candidate-bound `KNOWLEDGE_PROMOTION`
+   approval (`state='INVALIDATED'`), that the revoked row is retained, and that a
+   subsequent `PASS` cannot replay it (new approval required).
 3. Verify the approval is in the trusted ledger, bound to
    candidate/version/hash/review/approver/expiry/operation.
 
@@ -171,7 +187,8 @@ target.
    historical data. If forcibly dropped, the gate finds no candidate/approval
    and rejects; it never re-enables the bypass.
 5. **Ledger.** Do not delete consumed approval evidence; never reuse a consumed
-   approval.
+   approval. Invalidated (FAIL-revoked) approvals are retained as durable
+   evidence and must never be un-invalidated or reused.
 6. **Post-rollback verification:** re-run Step 3 rejection probes and the Step 0
    corpus diff.
 
