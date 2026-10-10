@@ -23,10 +23,10 @@ Scope proven here (local SQLite only):
   consumed or expired approval.
 
 Real Cloudflare D1 is NOT exercised and remains ``REAL_D1_UNVERIFIED``. The
-Site<->Worker integration is ``BLOCKED``: this repository ships no Site side
-mint adapter (``write_knowledge_candidate`` / WebAuthn) for the
-``KNOWLEDGE_PROMOTION`` operation, so a Site-minted row cannot be independently
-demonstrated here.
+Deployed Site<->Worker integration remains ``BLOCKED`` until its source and
+existing verifier are reconciled. Issue #7 adds a candidate Site mint adapter;
+``site/tests/knowledge-approval-bridge.mjs`` exercises that real adapter and the
+real Worker with a synthetic signer, without claiming deployed WebAuthn proof.
 """
 
 from __future__ import annotations
@@ -376,12 +376,12 @@ def test_worker_real_sql_single_use_cas_and_replay(tmp_path) -> None:
     now = int(time.time())
     wins = 0
     for conn in (a, b):
-        cur = conn.execute(constants["consume"], (now, "ap:kp:1", "KNOWLEDGE_PROMOTION"))
+        cur = conn.execute(constants["consume"], (now, "ap:kp:1", "KNOWLEDGE_PROMOTION", *candidate, now))
         conn.commit()
         wins += cur.rowcount
     assert wins == 1
     # Replay after consume is rejected by the same real SQL.
-    replay = seed.execute(constants["consume"], (now, "ap:kp:1", "KNOWLEDGE_PROMOTION"))
+    replay = seed.execute(constants["consume"], (now, "ap:kp:1", "KNOWLEDGE_PROMOTION", *candidate, now))
     seed.commit()
     assert replay.rowcount == 0
 

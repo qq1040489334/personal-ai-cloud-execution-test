@@ -3091,7 +3091,7 @@ var KNOWLEDGE_CANDIDATE_STATUS_UPDATE = "UPDATE knowledge_candidates SET status 
 // are a mirror updated in the same statement; the gate reads/writes the legacy
 // field so a Site-minted approval and a Worker consume can never diverge.
 var APPROVAL_LEDGER_SELECT = "SELECT approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state, consumed, consume_count, invalidated, consumed_at FROM personal_ai_approval_ledger WHERE operation = ? AND candidate_id = ? AND candidate_version = ? AND content_hash = ? AND consumed_at IS NULL AND invalidated = 0 ORDER BY expires_at DESC";
-var APPROVAL_LEDGER_CONSUME = "UPDATE personal_ai_approval_ledger SET consumed = 1, state = 'CONSUMED', consume_count = consume_count + 1, consumed_at = ? WHERE approval_id = ? AND operation = ? AND consumed_at IS NULL AND invalidated = 0";
+var APPROVAL_LEDGER_CONSUME = "UPDATE personal_ai_approval_ledger SET consumed = 1, state = 'CONSUMED', consume_count = consume_count + 1, consumed_at = ? WHERE approval_id = ? AND operation = ? AND consumed_at IS NULL AND invalidated = 0 AND candidate_id = ? AND candidate_version = ? AND content_hash = ? AND review_result = 'PASS' AND state = 'REGISTERED' AND CASE WHEN typeof(expires_at) IN ('integer', 'real') THEN expires_at ELSE unixepoch(expires_at) END > ?";
 // Atomic stale-approval revocation. Only UNCONSUMED, not-yet-invalidated
 // approvals bound to the operation+candidate are transitioned; a consumed
 // approval (evidence of a completed/pending write) is never rewritten.
@@ -3445,7 +3445,8 @@ async function promoteKnowledgeCandidate(env, args) {
   } catch {
     approval = null;
   }
-  const gate = validateCandidateGate(candidate, supplied, approval, Date.parse(String(input.now ?? "")) || Date.now());
+  // Expiry uses server time exclusively; a caller cannot backdate the gate.
+  const gate = validateCandidateGate(candidate, supplied, approval, Date.now());
   if (!gate.ok) {
     // Fail closed BEFORE any Golden/Canonical write attempt.
     return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: gate.reason, write_calls: 0, candidate_id: candidateId });
@@ -3475,7 +3476,8 @@ async function promoteKnowledgeCandidate(env, args) {
   // receives meta.changes === 1.
   let consumed = 0;
   try {
-    const consumedResult = await db.prepare(APPROVAL_LEDGER_CONSUME).bind(Math.floor(Date.now() / 1000), String(approval.approval_id), KNOWLEDGE_PROMOTION_OPERATION).run();
+    const consumeNow = Math.floor(Date.now() / 1000);
+    const consumedResult = await db.prepare(APPROVAL_LEDGER_CONSUME).bind(consumeNow, String(approval.approval_id), KNOWLEDGE_PROMOTION_OPERATION, candidateId, Number(candidate.version), String(candidate.content_hash), consumeNow).run();
     consumed = consumedResult && consumedResult.meta ? Number(consumedResult.meta.changes) || 0 : 0;
   } catch {
     consumed = 0;

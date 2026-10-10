@@ -1,0 +1,148 @@
+{
+  "observed_date": "2026-10-10",
+  "issue": 7,
+  "repo_baseline": "b55245d53533dc8da68a50de13c5da14803ad4e6",
+  "site_gate": {
+    "contract": "KNOWLEDGE_APPROVAL_GATE_ADAPTER_V1",
+    "operation": "write_knowledge_candidate",
+    "operation_mapped": true,
+    "approval_entry": "/knowledge",
+    "approval_required": true,
+    "approval_ttl_ms": 300000,
+    "one_use_consume": "CONDITIONAL_UPDATE_RETURNING",
+    "preparation_enabled": true,
+    "execution_enabled": false,
+    "canonical_write_performed": false,
+    "approval_registered": false,
+    "approval_consumed": false,
+    "new_database_created": false,
+    "missing": [],
+    "status": "BLOCKED",
+    "reason": "KNOWLEDGE_APPROVAL_OPERATION_SCHEMA_REQUIRED",
+    "ledger": {
+      "status": "VERIFIED",
+      "table": "personal_ai_approval_ledger",
+      "primary_key": "approval_id",
+      "atomic_consume": "CONDITIONAL_UPDATE_RETURNING",
+      "knowledge_operation_supported": false
+    },
+    "ledger_knowledge_operation_supported": false,
+    "writer_visible": true,
+    "writer_path": "EXISTING_NATIVE_WRITER_SITE_APPROVAL_ADAPTER",
+    "writer_approval_enforcement": "SITE_ONLY_LEGACY_WRITER_HAS_NO_RECEIPT_ARGUMENT",
+    "execution_reason": "KNOWLEDGE_CANONICAL_WRITE_NOT_AUTHORIZED"
+  },
+  "worker_readonly": {
+    "status": "VERIFIED",
+    "environment": "production",
+    "traffic_percent": 100,
+    "identity_sha256": "e9380edbabd782197a154496ba9e0b92101eeac0919de0b9e9706420c293a7ed"
+  },
+  "site_provenance": {
+    "version_number": 31,
+    "identity_sha256": "c291c21d17e429fad51b33609293761a0d3ba022d65d6f830421166f1e19dc28",
+    "archive_sha256": "87276f2ac56579986382ae033ad1acd2e0b3a8df133d6b953ac3dfe0223558b2",
+    "source_bytes_accessible": false,
+    "repo_equals_deployed": false
+  },
+  "knowledge_manifest": [
+    {
+      "asset_id": "candidate-writer-validation-20261009-v1",
+      "version": "1.0",
+      "content_hash": "0effe682ef88390907f6b5a0b84b678f81d510ca4ab734352c528df5e2e6d6a4"
+    },
+    {
+      "asset_id": "knowledge-agent-local-execution-interface",
+      "version": "1.0",
+      "content_hash": "f03a0ddbb3f1015d505173e65aba6776083554d6cb95e005b06c42f96165711c"
+    },
+    {
+      "asset_id": "knowledge-agent-permission-action-governance",
+      "version": "1.0",
+      "content_hash": "300cd030d85a561f82c48147a8e8d80412bed094dde16a7ef206834b7b1191d7"
+    },
+    {
+      "asset_id": "knowledge-agent-structured-data-low-code-pattern",
+      "version": "2.0",
+      "content_hash": "65c3e513cab4bec644357f87363e33a119e39bc2f50633be05fe5d4ce33606eb"
+    },
+    {
+      "asset_id": "knowledge-ai-era-computational-thinking-review",
+      "version": "1.0",
+      "content_hash": "bd84231cc073e46b693df3579c435ed4f1772765015c889df173a356d12ff182"
+    },
+    {
+      "asset_id": "knowledge-ai-intent-clarification-pattern",
+      "version": "2.0",
+      "content_hash": "25b00717d2b26bc0ba0236d4346894894b3b3012a91dcbcffcfbf0465a26e1cd"
+    },
+    {
+      "asset_id": "knowledge-ai-kernel-hardware-abstraction",
+      "version": "1.0",
+      "content_hash": "312bbc504eb2ba037ce0daa982e78049f25461a4b7e475aabfa8d873dd3379c7"
+    },
+    {
+      "asset_id": "knowledge-architecture-local-execution-shared-intelligence",
+      "version": "1.0",
+      "content_hash": "11be28739a7d4a24dc80af494fb38e7e94f9be01d35d7a04c3d7fce9ad002e64"
+    },
+    {
+      "asset_id": "knowledge-architecture-scoped-knowledge-layers",
+      "version": "1.0",
+      "content_hash": "34f5c9fb08b4006fee5d63c676c9bd611452e0bb17045bef95343102dd315bc0"
+    },
+    {
+      "asset_id": "knowledge-evidence-vs-expected-value",
+      "version": "1.0",
+      "content_hash": "0e7f355c4132cbc537e8980b41bb64f483cbeb36a29307369790505a2bd8dbe1"
+    },
+    {
+      "asset_id": "knowledge-internal-controllable-variables",
+      "version": "2.0",
+      "content_hash": "a5b5fc185b7a802ff0292498a67ca4fa1bba4deab7a1c21e530d8e0a36c4b9a9"
+    },
+    {
+      "asset_id": "knowledge-llm-representation-ablation-alignment",
+      "version": "2.0",
+      "content_hash": "06a88507f58b70deba11d291fe51d35117391588351e2e022a9d3efacab91fb4"
+    },
+    {
+      "asset_id": "knowledge-mobile-entry-multi-agent-remote-collaboration",
+      "version": "2.0",
+      "content_hash": "a3762b4a7268a8251611dd3eff8947ef81f07924e83abbac92d691a6961397ed"
+    },
+    {
+      "asset_id": "knowledge-model-executor-cost-routing",
+      "version": "3.0",
+      "content_hash": "7a4a5afcb5a3e53ca4225275a1b19a692338296a5d3b6a4ccd3a323a9ab83a74"
+    },
+    {
+      "asset_id": "knowledge-obsidian-agent-interface-capabilities",
+      "version": "2.0",
+      "content_hash": "37b42e3886bd9a4d344c19f239f7caddfdf325caf3ea3b559e1a5a6aec807874"
+    },
+    {
+      "asset_id": "knowledge-openless-voice-structured-text",
+      "version": "2.0",
+      "content_hash": "99705334eff8b420c3f6394a6c8a8fa0c451319922fc7b2629829bfdd630672a"
+    },
+    {
+      "asset_id": "knowledge-operit-mobile-agent-runtime",
+      "version": "2.0",
+      "content_hash": "32e04ecc19e8e4f7fd6ee3c6f09fdef0173b4ea6d8eb41b09648cedb5d73757a"
+    },
+    {
+      "asset_id": "knowledge-workflow-auditable-task-contract",
+      "version": "1.0",
+      "content_hash": "8d3360d886b4970e675f070f16169fa6aeb8550a17da59d37300967503ff2078"
+    },
+    {
+      "asset_id": "knowledge:golden:cloudflare-deploy:e58ac1e1",
+      "version": "1.0",
+      "content_hash": "595eec3fc4b2dedd77521a1b76df33a6b604c9d668ea2a140586a28fb433f7a7"
+    }
+  ],
+  "manifest_readback_unchanged": true,
+  "production_mutations": 0,
+  "privacy": "Raw production identifiers, private Site source commit and secret-binding names are retained only in the private owner receipt, excluded from this public PR."
+}

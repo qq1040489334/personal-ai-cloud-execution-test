@@ -27,6 +27,26 @@
 --   * exactly one approval ledger / one mint authority (the Site) is preserved.
 
 -- 1. Ensure the trusted operation registry exists and contains ALL operations
+-- Executable guard: even a direct Wrangler migrations apply halts on schema
+-- drift BEFORE any DDL. json() deliberately raises on the fail-closed branch.
+-- The maintained D1 batch runner skips a verified UNION; direct reapplication
+-- without migration history deliberately halts instead of losing candidate data.
+SELECT CASE WHEN
+  (SELECT replace(replace(replace(replace(replace(sql, ' ', ''), char(10), ''), char(13), ''), char(9), ''), '"', '')
+   FROM sqlite_master WHERE type = 'table' AND name = 'personal_ai_approval_ledger') =
+  'CREATETABLEpersonal_ai_approval_ledger(approval_idTEXTPRIMARYKEY,requesting_user_hashTEXTNOTNULLCHECK(length(requesting_user_hash)=64),operationTEXTCHECK(operationIN(''deploy_worker_version'',''write_decision_record'')),exact_targetTEXT,payload_sha256TEXT,created_atINTEGER,expires_atINTEGER,consumed_atINTEGER)STRICT'
+  AND NOT EXISTS (SELECT 1 FROM sqlite_master WHERE name IN
+    ('personal_ai_approval_ledger__v2', 'personal_ai_approval_ledger__legacy_backup'))
+  AND NOT EXISTS (SELECT 1 FROM pragma_foreign_key_list('personal_ai_approval_ledger'))
+  AND NOT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'personal_ai_approval_ledger')
+  AND NOT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index'
+    AND tbl_name = 'personal_ai_approval_ledger' AND sql IS NOT NULL)
+  AND NOT EXISTS (SELECT 1 FROM sqlite_master AS m, pragma_foreign_key_list(m.name) AS f
+    WHERE m.type = 'table' AND f."table" = 'personal_ai_approval_ledger')
+THEN 1 ELSE json('HALT_LEDGER_SCHEMA_DRIFT_OR_UNRECONCILED_BACKUP') END;
+
+-- The ledger operation was nullable in the production legacy schema. Preserve
+-- that constraint for legacy receipts; Site mint always supplies an operation.
 --    (legacy + repo) before the FK-bound rebuild, so no existing row is orphaned.
 CREATE TABLE IF NOT EXISTS approval_ledger_operations (
   operation        TEXT PRIMARY KEY,
@@ -44,11 +64,20 @@ INSERT OR IGNORE INTO approval_ledger_operations
   ('knowledge_write',       'KNOWLEDGE', 'writeKnowledgeCandidate', 1, 1),
   ('KNOWLEDGE_PROMOTION',   'KNOWLEDGE', 'writeKnowledgeCandidate', 1, 1);
 
+-- Fail within the same migration transaction if a pre-existing registry has
+-- changed ownership, flags, unknown operations or a conflicting mapping.
+SELECT CASE WHEN (SELECT count(*) FROM approval_ledger_operations) = 5
+  AND (SELECT count(*) FROM approval_ledger_operations WHERE single_use = 1 AND replay_guard = 1
+    AND ((operation = 'deploy_worker_version' AND asset_type = 'DEPLOY' AND canonical_writer = 'deployWorkerVersion')
+      OR (operation IN ('write_decision_record','decision_write') AND asset_type = 'DECISION' AND canonical_writer = 'writeDecisionRecord')
+      OR (operation IN ('knowledge_write','KNOWLEDGE_PROMOTION') AND asset_type = 'KNOWLEDGE' AND canonical_writer = 'writeKnowledgeCandidate'))) = 5
+THEN 1 ELSE json('HALT_APPROVAL_REGISTRY_DRIFT') END;
+
 -- 2. Union table: legacy columns verbatim + nullable Worker columns.
 CREATE TABLE personal_ai_approval_ledger__v2 (
   approval_id          TEXT PRIMARY KEY,
   requesting_user_hash TEXT NOT NULL CHECK (length(requesting_user_hash) = 64),
-  operation            TEXT NOT NULL CHECK (operation IN (
+  operation            TEXT CHECK (operation IN (
       'deploy_worker_version','write_decision_record',
       'decision_write','knowledge_write','KNOWLEDGE_PROMOTION')),
   exact_target         TEXT,

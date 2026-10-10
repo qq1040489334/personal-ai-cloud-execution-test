@@ -27,7 +27,7 @@ _ORIGINAL_RUN = subprocess.run
 
 def _spill_node_eval(argv):
     args = list(argv)
-    if not args or os.path.basename(str(args[0])) not in {"node", "node.exe"}:
+    if not args or os.path.basename(str(args[0])).casefold() not in {"node", "node.exe"}:
         return None
     if "-e" not in args:
         return None
