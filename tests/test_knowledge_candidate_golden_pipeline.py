@@ -508,6 +508,7 @@ def test_no_new_migration_artifact_added_and_plan_documented() -> None:
     assert names == {
         "0001_asset_provenance_v0_2.sql",
         "0002_dispatch_idempotency.sql",
+        "0002z_knowledge_approval_ledger_compat.sql",
         "0003_knowledge_candidate_golden_pipeline.sql",
     }
     sql = (

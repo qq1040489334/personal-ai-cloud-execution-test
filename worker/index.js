@@ -3086,12 +3086,16 @@ var KNOWLEDGE_CANDIDATE_STATUS_UPDATE = "UPDATE knowledge_candidates SET status 
 // The select returns only LIVE approvals (unconsumed AND not invalidated), so a
 // FAIL-revoked approval can never be replayed even if a later PASS restores the
 // candidate's APPROVED_FOR_PROMOTION status.
-var APPROVAL_LEDGER_SELECT = "SELECT approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state, consumed, consume_count, invalidated FROM personal_ai_approval_ledger WHERE operation = ? AND candidate_id = ? AND candidate_version = ? AND content_hash = ? AND consumed = 0 AND invalidated = 0 ORDER BY expires_at DESC";
-var APPROVAL_LEDGER_CONSUME = "UPDATE personal_ai_approval_ledger SET consumed = 1, state = 'CONSUMED', consume_count = consume_count + 1, consumed_at = ? WHERE approval_id = ? AND operation = ? AND consumed = 0 AND invalidated = 0";
+// The single-use authority is the LEGACY `consumed_at` column (INTEGER epoch),
+// shared with the Site WebAuthn CAS. The Worker-only `consumed`/`state` columns
+// are a mirror updated in the same statement; the gate reads/writes the legacy
+// field so a Site-minted approval and a Worker consume can never diverge.
+var APPROVAL_LEDGER_SELECT = "SELECT approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state, consumed, consume_count, invalidated, consumed_at FROM personal_ai_approval_ledger WHERE operation = ? AND candidate_id = ? AND candidate_version = ? AND content_hash = ? AND consumed_at IS NULL AND invalidated = 0 ORDER BY expires_at DESC";
+var APPROVAL_LEDGER_CONSUME = "UPDATE personal_ai_approval_ledger SET consumed = 1, state = 'CONSUMED', consume_count = consume_count + 1, consumed_at = ? WHERE approval_id = ? AND operation = ? AND consumed_at IS NULL AND invalidated = 0";
 // Atomic stale-approval revocation. Only UNCONSUMED, not-yet-invalidated
 // approvals bound to the operation+candidate are transitioned; a consumed
 // approval (evidence of a completed/pending write) is never rewritten.
-var APPROVAL_LEDGER_INVALIDATE = "UPDATE personal_ai_approval_ledger SET invalidated = 1, state = 'INVALIDATED', invalidated_at = ? WHERE operation = ? AND candidate_id = ? AND consumed = 0 AND invalidated = 0";
+var APPROVAL_LEDGER_INVALIDATE = "UPDATE personal_ai_approval_ledger SET invalidated = 1, state = 'INVALIDATED', invalidated_at = ? WHERE operation = ? AND candidate_id = ? AND consumed_at IS NULL AND invalidated = 0";
 var KNOWLEDGE_PROMOTION_APPROVAL_INVALIDATED = "INVALIDATED";
 function knowledgePromotionOutcome(resultStatus, extra) {
   const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, status: resultStatus, ...(extra || {}) };
@@ -3125,8 +3129,18 @@ function validateCandidateGate(candidate, supplied, approval, nowMs) {
   if (approval.invalidated === true || Number(approval.invalidated) === 1) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   if (String(approval.state || "") === KNOWLEDGE_PROMOTION_APPROVAL_INVALIDATED) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   if (approval.consumed === true || Number(approval.consumed) === 1) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  // The legacy `consumed_at` (INTEGER epoch, shared with the Site WebAuthn CAS)
+  // is the single-use authority. A non-null value means another consumer has
+  // already spent this approval, so it is rejected even if the mirror lags.
+  if (approval.consumed_at !== null && approval.consumed_at !== void 0 && String(approval.consumed_at).trim() !== "") return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   const now = Number.isFinite(nowMs) ? Number(nowMs) : Date.now();
-  const expires = Date.parse(String(approval.expires_at));
+  // `expires_at` is INTEGER epoch seconds in the production/union ledger and an
+  // ISO string in the repo-only schema; accept both, fail closed on neither.
+  const expiresRaw = approval.expires_at;
+  const expiresNumeric = Number(expiresRaw);
+  const expires = String(expiresRaw ?? "").trim() !== "" && Number.isFinite(expiresNumeric)
+    ? expiresNumeric * 1000
+    : Date.parse(String(expiresRaw));
   if (!Number.isFinite(expires) || expires <= now) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
   return { ok: true, reason: null };
 }
@@ -3456,11 +3470,12 @@ async function promoteKnowledgeCandidate(env, args) {
     return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE, write_calls: 0, candidate_id: candidateId });
   }
   // Atomic single-use consume against the shared trusted ledger. The conditional
-  // UPDATE (consumed = 0) is a compare-and-swap: under concurrent promotion of
-  // the same candidate, at most one consumer receives meta.changes === 1.
+  // UPDATE (consumed_at IS NULL, legacy integer epoch) is a compare-and-swap:
+  // under concurrent promotion of the same candidate, at most one consumer
+  // receives meta.changes === 1.
   let consumed = 0;
   try {
-    const consumedResult = await db.prepare(APPROVAL_LEDGER_CONSUME).bind((new Date()).toISOString(), String(approval.approval_id), KNOWLEDGE_PROMOTION_OPERATION).run();
+    const consumedResult = await db.prepare(APPROVAL_LEDGER_CONSUME).bind(Math.floor(Date.now() / 1000), String(approval.approval_id), KNOWLEDGE_PROMOTION_OPERATION).run();
     consumed = consumedResult && consumedResult.meta ? Number(consumedResult.meta.changes) || 0 : 0;
   } catch {
     consumed = 0;
