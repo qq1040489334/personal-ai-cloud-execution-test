@@ -23,10 +23,10 @@ Scope proven here (local SQLite only):
   consumed or expired approval.
 
 Real Cloudflare D1 is NOT exercised and remains ``REAL_D1_UNVERIFIED``. The
-Site<->Worker integration is ``BLOCKED``: this repository ships no Site side
-mint adapter (``write_knowledge_candidate`` / WebAuthn) for the
-``KNOWLEDGE_PROMOTION`` operation, so a Site-minted row cannot be independently
-demonstrated here.
+Deployed Site<->Worker integration remains ``BLOCKED`` until its source and
+existing verifier are reconciled. Issue #7 adds a candidate Site mint adapter;
+``site/tests/knowledge-approval-bridge.mjs`` exercises that real adapter and the
+real Worker with a synthetic signer, without claiming deployed WebAuthn proof.
 """
 
 from __future__ import annotations
@@ -366,9 +366,17 @@ def test_worker_real_sql_single_use_cas_and_replay(tmp_path) -> None:
     seed = _connect(path)
     _seed_legacy(seed)
     _guarded_rebuild(seed)
+    _apply_migration(seed, GOLDEN_SQL)
     candidate = ("cand-v03", 1, "9" * 64)
     _seed_bound_union_approval(seed, "ap:kp:1", *candidate, int(time.time()) + 600)
-    live = seed.execute(constants["select"], ("KNOWLEDGE_PROMOTION", *candidate)).fetchall()
+    target = json.dumps({"operation": "KNOWLEDGE_PROMOTION", "candidate_id": candidate[0],
+                         "candidate_version": 1, "content_hash": candidate[2], "asset_id": "knowledge:test",
+                         "review_result": "PASS", "reviewed_at": "review-1"}, separators=(",", ":"))
+    payload_hash = hashlib.sha256(target.encode()).hexdigest()
+    seed.execute("UPDATE personal_ai_approval_ledger SET exact_target=?,payload_sha256=? WHERE approval_id='ap:kp:1'", (target, payload_hash))
+    seed.execute("INSERT INTO knowledge_candidates(candidate_id,asset_id,status,content,content_hash,version,created_at,review_state,review_result,reviewed_at) VALUES(?, 'knowledge:test','PROMOTION_RESERVED','test',?,1,'now','PASS','PASS','review-1')", (candidate[0],candidate[2]))
+    seed.commit()
+    live = seed.execute(constants["select"], ("KNOWLEDGE_PROMOTION", *candidate, target, payload_hash)).fetchall()
     assert len(live) == 1
 
     a = _connect(path)
@@ -376,12 +384,12 @@ def test_worker_real_sql_single_use_cas_and_replay(tmp_path) -> None:
     now = int(time.time())
     wins = 0
     for conn in (a, b):
-        cur = conn.execute(constants["consume"], (now, "ap:kp:1", "KNOWLEDGE_PROMOTION"))
+        cur = conn.execute(constants["consume"], (now, "ap:kp:1", "KNOWLEDGE_PROMOTION", *candidate, now, target, payload_hash, "knowledge:test", "review-1"))
         conn.commit()
         wins += cur.rowcount
     assert wins == 1
     # Replay after consume is rejected by the same real SQL.
-    replay = seed.execute(constants["consume"], (now, "ap:kp:1", "KNOWLEDGE_PROMOTION"))
+    replay = seed.execute(constants["consume"], (now, "ap:kp:1", "KNOWLEDGE_PROMOTION", *candidate, now, target, payload_hash, "knowledge:test", "review-1"))
     seed.commit()
     assert replay.rowcount == 0
 
@@ -403,7 +411,7 @@ def test_worker_real_sql_stale_invalidation_blocks_replay() -> None:
     _guarded_rebuild(conn)
     _seed_bound_union_approval(conn, "ap:stale", "cand-s", 1, "8" * 64, int(time.time()) + 600)
     assert len(conn.execute(
-        constants["select"], ("KNOWLEDGE_PROMOTION", "cand-s", 1, "8" * 64)).fetchall()) == 1
+        constants["select"], ("KNOWLEDGE_PROMOTION", "cand-s", 1, "8" * 64, "cand-s", "8" * 64)).fetchall()) == 1
 
     changed = conn.execute(
         constants["invalidate"],
@@ -412,7 +420,7 @@ def test_worker_real_sql_stale_invalidation_blocks_replay() -> None:
     conn.commit()
     assert changed.rowcount == 1
     assert len(conn.execute(
-        constants["select"], ("KNOWLEDGE_PROMOTION", "cand-s", 1, "8" * 64)).fetchall()) == 0
+        constants["select"], ("KNOWLEDGE_PROMOTION", "cand-s", 1, "8" * 64, "cand-s", "8" * 64)).fetchall()) == 0
     row = conn.execute(
         "SELECT invalidated, consumed, state FROM personal_ai_approval_ledger "
         "WHERE approval_id='ap:stale'"
