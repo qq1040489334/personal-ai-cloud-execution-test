@@ -1,0 +1,182 @@
+{
+  "schema": "CLOUD_TAKEOVER_INPUTS_V1",
+  "task_id": "cf-5acdfcb3a2ce",
+  "project_id": "cloud-assets-activation",
+  "task_name": "CLOUD_TAKEOVER_PR8_SITE_V32_RECONCILIATION_V1",
+  "generated_at_utc": "2026-10-10T12:47:02Z",
+  "generated_by": "Personal AI Cloud Agent (opencode runner, GitHub Actions workflow cloud-agent-dispatch)",
+  "offline_dependency": {
+    "requires_windows_computer_online": false,
+    "note": "All captured evidence was gathered from the cloud runner, the public GitHub git/API surface and the public Site endpoint. No local Windows path, Library download or desktop agent was required."
+  },
+  "execution_environment": {
+    "runner": "GitHub Actions hosted Linux runner (run 38052724396)",
+    "workflow": "cloud-agent-dispatch",
+    "event": "repository_dispatch",
+    "os": "Ubuntu 24.04.5 LTS, kernel 6.17.0-1022-azure, x86_64",
+    "python": "3.11.17",
+    "pytest": "9.1.1",
+    "node_default": "20.20.2",
+    "node_used_for_tests": "24.21.0 (/opt/hostedtoolcache/node/24.21.0/x64/bin/node)",
+    "node_used_reason": "The repository's isolated D1 transport tests import node:sqlite, which is unavailable on the runner's default Node 20.20.2. Node 24.21.0 is the exact Node major recorded in PR #8 Linux CI (Node 24.21.0) and was already present in the runner tool cache; no new infrastructure was installed.",
+    "checkout_commit": "b55245d53533dc8da68a50de13c5da14803ad4e6",
+    "checkout_ref": "refs/heads/main",
+    "github_sha": "b55245d53533dc8da68a50de13c5da14803ad4e6"
+  },
+  "repository": {
+    "url": "https://github.com/qq1040489334/personal-ai-cloud-execution-test",
+    "visibility": "public",
+    "base_branch": "main",
+    "base_sha": "b55245d53533dc8da68a50de13c5da14803ad4e6",
+    "pr_number": 8,
+    "pr_url": "https://github.com/qq1040489334/personal-ai-cloud-execution-test/pull/8",
+    "pr_state": "open",
+    "pr_draft": true,
+    "pr_mergeable_state": "clean",
+    "pr_commits": 3,
+    "pr_changed_files": 19,
+    "pr_head_ref": "codex/issue-7-knowledge-approval-bridge",
+    "pr_head_sha": "2b0e4366ac0bc92b3c0e16218fdd8660f1b2caae",
+    "pr_head_sha_confirmed_by": ["git ls-remote origin (refs/pull/8/head)", "GitHub REST API /repos/.../pulls/8"],
+    "fix_commit_sha": "873c5336b9e56dcc7d6582ab52ecb4399e9a3db4",
+    "fix_commit_title": "Fix signed review binding and transactional Knowledge schema guards",
+    "pre_fix_commit_sha": "bd3d6ca6febf5722363d3e3e64d781abcb318fd1",
+    "pre_fix_commit_title": "fix: bind Knowledge approvals and guard legacy ledger migrations",
+    "pr_merge_ref_sha": "ec95944e6478fbdfbe2d568da27da4f65758653e",
+    "head_after_pr": "no newer commits on the PR branch since 2b0e4366ac0bc92b3c0e16218fdd8660f1b2caae; main is still b55245d53533dc8da68a50de13c5da14803ad4e6",
+    "last_updated_utc": "2026-10-10T03:01:04Z",
+    "local_fetch_evidence": "git ls-remote origin succeeded 2026-10-10; refs/pull/8/head == 2b0e436..., refs/heads/main == b55245d..."
+  },
+  "inputs": [
+    {
+      "id": "github_pr8_source_bytes",
+      "kind": "SOURCE_PATCH_BYTES",
+      "status": "OBTAINED_AND_HASH_VERIFIED",
+      "value": "origin/codex/issue-7-knowledge-approval-bridge @ 2b0e4366ac0bc92b3c0e16218fdd8660f1b2caae (contains all four P2 fixes at 873c533)",
+      "how_obtained": "git fetch/ls-remote from the public GitHub remote; real git objects, not a summary or re-typed text",
+      "integrity_check": "Every production/test source file hash in the committed reports/pr8_p2_verification.json source_hashes block was recomputed from the fetched git objects and matched exactly (see cloud_takeover_test_results.json.source_hash_verification)."
+    },
+    {
+      "id": "pr8_p2_verification_json",
+      "kind": "COMMITTED_EVIDENCE_REPORT",
+      "status": "OBTAINED",
+      "value": "reports/pr8_p2_verification.json @ 2b0e436",
+      "sha256": "f500d1484c9babbe610a2e6bb152c7d40986d061746f8f3e95d58615825c21d6",
+      "note": "Historical, self-reported evidence. Its claims were independently re-derived where the bytes are reachable; see test results file."
+    },
+    {
+      "id": "github_pr8_metadata",
+      "kind": "PR_METADATA_AND_COMMENTS",
+      "status": "OBTAINED",
+      "value": "3 issue comments (1 REQUEST CHANGES with four P2 findings, 1 fix instruction, 1 bot notice), 0 review comments; PR body; all read via the unauthenticated public GitHub REST API",
+      "note": "Read-only. No comment, review, label or reaction was posted. No token was used."
+    },
+    {
+      "id": "pr8_ci_runs",
+      "kind": "CI_EVIDENCE",
+      "status": "OBTAINED",
+      "value": {
+        "code_head_run": {"run_id": 38018275254, "job_id": 114113357869, "head_sha": "873c5336b9e56dcc7d6582ab52ecb4399e9a3db4", "conclusion": "success"},
+        "final_doc_head_run": {"run_id": 38018890035, "job_id": 114115263784, "head_sha": "2b0e4366ac0bc92b3c0e16218fdd8660f1b2caae", "conclusion": "success"}
+      },
+      "how_obtained": "public GitHub API actions/runs and actions/runs/{id}/jobs",
+      "note": "Historical CI on the PR head only. Not treated as this takeover's test result."
+    },
+    {
+      "id": "site_v32_deployment",
+      "kind": "DEPLOYED_ARTIFACT_METADATA",
+      "status": "REPORT_ONLY_SOURCE_NOT_ACCESSIBLE",
+      "value": {
+        "site_project_id": "appgprj_6abe497585848191908c3278c333ccbc",
+        "site_source_repo_commit": "b9a982574519ed38b8dea861b91554d268ec3ca0",
+        "site_build_sha256": "2176e6d424b6e8df61a09b8ccf04efbee0efd61c24c23fa1f4b11761d20b8fed",
+        "site_url": "https://personal-ai-deploy-write-probe.tangyuandousha1010.chatgpt.site",
+        "owner_validation_entry": "/knowledge-validation",
+        "production_knowledge_execution": false
+      },
+      "read_only_probe": {
+        "method": "unauthenticated HTTPS GET of the site root",
+        "observed": "HTTP 401 (Cloudflare Access / owner-auth protected)",
+        "interpretation": "The deployed site is not anonymously readable. No challenge, mint, passkey, QR or database write was triggered. No credential or token was created or used.",
+        "probed_at_utc": "2026-10-10T12:45:00Z"
+      },
+      "why_not_obtained": "The Site source repository (commit b9a9825...) is a separate private repository. It is not present in this GitHub repository, there is no configured remote for it, and no access token exists in this environment. The task forbids generating new Site access tokens or changing authorization. Therefore the Site v32 source bytes are NOT available for byte-level review here.",
+      "assumption_guard": "Deployed Site source is NOT assumed equal to this GitHub repository, per the task contract."
+    },
+    {
+      "id": "cloud_library_deliverables",
+      "kind": "LIBRARY_ZIP_DELIVERABLES",
+      "status": "INACCESSIBLE_NO_LIBRARY_TOOL",
+      "value": [
+        {"library_id": "libfile_1b89d2b617fc8191a5b5670e939c6840", "name": "Personal_AI_PR8_Site_v31_Local_Adaptation_Delivery_2026-10-10.zip"},
+        {"library_id": "libfile_6d9ab0525a8c8191a520058adef9cb0e", "name": "Personal_AI_PR8_Real_D1_Validation_2026-10-10.zip", "version": 2},
+        {"library_id": "libfile_0508b824bb0c81918a938e7101fe0b54", "name": "Personal_AI_Site_v32_Owner_Test_Preparation_2026-10-10.zip"}
+      ],
+      "why_not_obtained": "There is no official Library / consumer-local materialization tool available in this cloud execution environment (no MCP Library tool, no Library credential or download endpoint). A Library ID is an object identifier, not a download URL. The Windows original paths are not cloud paths. Per the task contract, an unavailable/scope-restricted Library path must be abandoned rather than replaced with a guessed storage location.",
+      "action_taken": "None. No guessed URL was constructed, no scope was bypassed, and the previous scope_violation path was not re-attempted."
+    },
+    {
+      "id": "unpushed_local_windows_changes",
+      "kind": "UNPUSHED_LOCAL_PATCHES",
+      "status": "NOT_OBTAINED",
+      "claimed_items": [
+        "_cf_KV internal-table foreign_key_check compatibility correction",
+        "concurrent-success-but-false-failure authoritative read-back / review-generation correction",
+        "Worker MCP schema candidate_version/content_hash declaration",
+        "Site v32 adaptation and owner test entry (only reachable via deployed Site / Library zip)"
+      ],
+      "evidence_of_absence_in_reachable_pr8_bytes": {
+        "_cf_KV / foreign_key_check": "grep over 873c533 found no _cf_KV handling and no foreign_key_check in production code (only inside an isolated test assertion).",
+        "MCP schema candidate_version/content_hash": "worker/index.js @ 873c533 write_knowledge_candidate inputSchema declares neither candidate_version nor content_hash properties (required is empty).",
+        "site_v32_adaptation": "Site v32 deployed build 2176e6d4... has no matching source in this repo; PR #8 site/worker bytes are the v31-era bridge only."
+      },
+      "rule_followed": "These bytes were NOT reconstructed from the task description and were NOT re-typed and presented as the original work. They remain missing inputs."
+    },
+    {
+      "id": "real_d1_validation_history",
+      "kind": "HISTORICAL_REPORT_ONLY",
+      "status": "REPORT_ONLY_NOT_REEXECUTED",
+      "resources_named": {
+        "temp_d1": "da76ac9b-862e-499e-a4a6-9e6f27d2d5c4",
+        "production_d1_excluded": "45d6f18a-3a34-4ccd-8337-c00a775cd7a2",
+        "account": "78a22a0699aa94a39d8f7bfdbac18249"
+      },
+      "historical_claims": {
+        "real_d1_main_regression": "30/31 pass; the single failure was a physical-schema comparison blocked by an empty sqlite_sequence that SQL export/re-import could not delete",
+        "official_time_travel_point_verification": "3 targeted items passed after a corrected restore flow; the original failure was retained and not rewritten",
+        "native_binding_batch": "14 initial groups 13 pass / 1 fail; after a concurrency fix 3 targeted items passed; no full 14-group rerun after the fix"
+      },
+      "action_taken": "None. No D1 write/delete/migration, no remote preview proxy, no production-as-test. The 30-minute proxy from a prior round is already ended."
+    },
+    {
+      "id": "human_gate_status",
+      "kind": "HUMAN_GATE",
+      "status": "REPORT_ONLY_NOT_COMPLETED",
+      "value": {
+        "mobile_cross_device_qr": "no QR shown; after exiting it reported failure",
+        "existing_passkey": "previously configured on the computer",
+        "readonly_screenshot": "READY",
+        "real_passkey": false
+      },
+      "rule_followed": "No server-side signature failure was inferred from the client symptom. No attempt was made to perform or bypass human verification, and no passkey was registered."
+    }
+  ],
+  "access_denied_or_blocked": [
+    {"path": "cloud Library materialization of the 3 libfile_* deliverables", "status": "BLOCKED", "reason": "no Library tool / credential in this environment"},
+    {"path": "Site source repository @ b9a9825...", "status": "BLOCKED", "reason": "separate repo, no remote/token; generating one is forbidden"},
+    {"path": "authenticated reads of the deployed Site (owner-only /knowledge-validation)", "status": "BLOCKED", "reason": "HTTP 401 without owner auth; authenticating would require unavailable credentials and is out of scope"},
+    {"path": "GitHub private endpoints (gh CLI with token) for comments/checks", "status": "BLOCKED", "reason": "no GH_TOKEN; public unauth REST API was used instead and was sufficient for PR metadata + CI conclusions"},
+    {"path": "real / non-production D1 execution", "status": "BLOCKED", "reason": "no pre-authorized non-production D1 identity with a safe restore/query transport; production D1 explicitly excluded"}
+  ],
+  "prohibited_actions_confirmed_not_performed": [
+    "no production or test cloud D1 write/delete/migration",
+    "no Site or Worker deployment/publish",
+    "no PR #8 force-push or overwrite; no push to codex/issue-7-knowledge-approval-bridge",
+    "no merge of any PR/branch",
+    "no new branch on origin, no new second state database",
+    "no secrets / tokens / credentials / permissions / bindings changed",
+    "no passkey registered and no human-gate bypass",
+    "no paid OpenAI/token API call; no new infrastructure or cloud resource",
+    "no external comments, reviews or third-party contact"
+  ]
+}

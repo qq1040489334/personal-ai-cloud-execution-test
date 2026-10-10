@@ -1,0 +1,171 @@
+{
+  "schema": "CLOUD_TAKEOVER_TEST_RESULTS_V1",
+  "task_id": "cf-5acdfcb3a2ce",
+  "project_id": "cloud-assets-activation",
+  "generated_at_utc": "2026-10-10T12:47:02Z",
+  "environment": {
+    "os": "Ubuntu 24.04.5 LTS (GitHub Actions hosted runner, run 38052724396)",
+    "python": "3.11.17",
+    "pytest": "9.1.1",
+    "node_default": "20.20.2",
+    "node_used_for_node_sqlite_tests": "24.21.0",
+    "node_24_path": "/opt/hostedtoolcache/node/24.21.0/x64/bin",
+    "checkout_commit_main": "b55245d53533dc8da68a50de13c5da14803ad4e6",
+    "pr_head_sha": "2b0e4366ac0bc92b3c0e16218fdd8660f1b2caae",
+    "fix_commit_sha": "873c5336b9e56dcc7d6582ab52ecb4399e9a3db4",
+    "pre_fix_commit_sha": "bd3d6ca6febf5722363d3e3e64d781abcb318fd1",
+    "isolation": "All runs are local/isolated. PR-branch code was checked out into throwaway git worktrees OUTSIDE the task repository (/home/runner/work/pr8-verify and /home/runner/work/pr8-baseline). No real D1, no published Site/Worker, no network write."
+  },
+  "results": [
+    {
+      "id": "main_full_pytest",
+      "target": "repository main @ b55245d (task checkout)",
+      "command": "python -m pytest -q",
+      "cwd": "/home/runner/work/personal-ai-cloud-execution-test/personal-ai-cloud-execution-test",
+      "status": "PASS",
+      "passed": 1587,
+      "failed": 0,
+      "skipped": 1,
+      "errors": 0,
+      "summary_line": "1587 passed, 1 skipped in 50.61s",
+      "significance": "Independently reproduced the current base-branch baseline in the cloud. This is the pre-PR baseline, NOT the PR patch result."
+    },
+    {
+      "id": "pr8_full_pytest",
+      "target": "PR #8 fix commit @ 873c533 (worktree)",
+      "command": "python -m pytest -q  (PATH=/opt/hostedtoolcache/node/24.21.0/x64/bin:$PATH)",
+      "cwd": "/home/runner/work/pr8-verify",
+      "status": "PASS",
+      "passed": 1589,
+      "failed": 0,
+      "skipped": 1,
+      "errors": 0,
+      "summary_line": "1589 passed, 1 skipped in 56.80s",
+      "significance": "Independently reproduced the complete PR patch suite +2 tests over the base, exactly matching the historical claim of 1589 passed / 1 skipped. The +2 are the new pytest wrappers (test_pr8_p2_regressions.py, test_site_knowledge_approval_bridge.py).",
+      "note": "An earlier identical run inside /tmp/opencode/pr8 produced 1 failure (test_hello.py::test_delivery_ledger_default_path_is_canonical_not_tmp) purely because the worktree path was under /tmp; re-running from a non-/tmp path passed. That failure was a harness artifact, not a code defect."
+    },
+    {
+      "id": "pr8_p2_regressions_node_repaired",
+      "target": "PR #8 fix commit @ 873c533",
+      "command": "node --test --test-reporter=tap site/tests/pr8-p2-regressions.mjs",
+      "cwd": "/home/runner/work/pr8-verify",
+      "status": "PASS",
+      "node": "24.21.0",
+      "tests": 127,
+      "passed": 127,
+      "failed": 0,
+      "significance": "The four P2 defect scenarios (plus variants) pass on the fixed bytes: 127/127."
+    },
+    {
+      "id": "pr8_p2_regressions_node_baseline",
+      "target": "pre-fix commit @ bd3d6ca with the new test file copied in (baseline)",
+      "command": "node --test --test-reporter=tap site/tests/pr8-p2-regressions.mjs",
+      "cwd": "/home/runner/work/pr8-baseline",
+      "status": "EXPECTED_FAILURES_CONFIRMED",
+      "node": "24.21.0",
+      "tests": 127,
+      "passed": 6,
+      "failed": 121,
+      "significance": "Failure-first proof: the same new tests fail on the pre-fix bytes (6 pass / 121 fail) and pass on the fixed bytes (127/0). This confirms the tests genuinely detect the four P2 defects and are not vacuous string assertions.",
+      "source_of_baseline_file": "site/tests/pr8-p2-regressions.mjs copied from 873c533 because the file does not exist at bd3d6ca"
+    },
+    {
+      "id": "pr8_bridge_node",
+      "target": "PR #8 fix commit @ 873c533",
+      "command": "node --test --test-reporter=tap site/tests/knowledge-approval-bridge.mjs",
+      "cwd": "/home/runner/work/pr8-verify",
+      "status": "PASS",
+      "node": "24.21.0",
+      "tests": 26,
+      "passed": 26,
+      "failed": 0
+    },
+    {
+      "id": "pr8_site_security_node",
+      "target": "PR #8 fix commit @ 873c533",
+      "command": "node --test --test-reporter=tap site/tests/security.mjs",
+      "cwd": "/home/runner/work/pr8-verify",
+      "status": "PASS",
+      "node": "24.21.0",
+      "tests": 12,
+      "passed": 12,
+      "failed": 0,
+      "note": "The historical 'Site readonly/security: 17 passed' figure is the combined security.mjs (12) + readonly-diagnosis.mjs (5), not security.mjs alone."
+    },
+    {
+      "id": "pr8_site_readonly_diagnosis_node",
+      "target": "PR #8 fix commit @ 873c533",
+      "command": "node --test --test-reporter=tap site/tests/readonly-diagnosis.mjs",
+      "cwd": "/home/runner/work/pr8-verify",
+      "status": "PASS",
+      "node": "24.21.0",
+      "tests": 5,
+      "passed": 5,
+      "failed": 0
+    },
+    {
+      "id": "pr8_targeted_pytest",
+      "target": "PR #8 fix commit @ 873c533",
+      "command": "python -m pytest -q tests/test_pr8_p2_regressions.py",
+      "cwd": "/home/runner/work/pr8-verify",
+      "status": "PASS",
+      "passed": 1,
+      "failed": 0,
+      "summary_line": "1 passed in 0.46s"
+    }
+  ],
+  "aggregate": {
+    "main_baseline": "1587 passed / 1 skipped / 0 failed",
+    "pr8_patch_full_suite": "1589 passed / 1 skipped / 0 failed",
+    "pr8_node_isolated_sets": {
+      "p2_regressions": "127/127",
+      "bridge": "26/26",
+      "security": "12/12",
+      "readonly_diagnosis": "5/5"
+    },
+    "pr8_node_baseline_p2": "6 passed / 121 failed (failure-first proof)",
+    "note": "The Node test sets overlap; do not sum them. The authoritative integration/security P2 set is pr8-p2-regressions.mjs."
+  },
+  "immutable_0003_preserved": {
+    "path": "worker/migrations/0003_knowledge_candidate_golden_pipeline.sql",
+    "expected_sha256": "9a51d3a53ad5ac3e78e07fc9720ad5492443f5a1f6ac677018570fdfc337927a",
+    "sha256_main": "9a51d3a53ad5ac3e78e07fc9720ad5492443f5a1f6ac677018570fdfc337927a",
+    "sha256_pr8_873c533": "9a51d3a53ad5ac3e78e07fc9720ad5492443f5a1f6ac677018570fdfc337927a",
+    "sha256_pr8_2b0e436": "9a51d3a53ad5ac3e78e07fc9720ad5492443f5a1f6ac677018570fdfc337927a",
+    "git_blob": "0398d1787aeb2ddc400a638e79ae8188be548f67",
+    "matches_recorded_git_blob": true,
+    "unchanged": true
+  },
+  "source_hash_verification": {
+    "description": "Recomputed SHA-256 of the fetched PR-branch git objects and compared to reports/pr8_p2_verification.json.source_hashes. All matched.",
+    "matched": {
+      "worker/index.js": "a3a463ff423034304320c10dbb5059d6f2e78464af6a1a42eea937632e5fa134",
+      "site/worker/index.js": "df2eaabf1bad185435319d0b5412ac2a7616e0a8252dd3bd6da5f6c83682bb3a",
+      "site/worker/knowledge-approval.js": "ac9551cf71ad1f511a9ec1a47d3ab45ac1565c0e4750824460bef00d010f48e6",
+      "worker/knowledge-ledger-migrations.js": "810c5c0d27568689d2cd580fb53c2f47ddf2aa86356b95d154868e98f6abe9a0",
+      "worker/migrations/0002z_knowledge_approval_ledger_compat.sql": "e9221650ae7f0befd69ad17ca9685a305f9b7099c8b1bf4927c703fd091034ed",
+      "worker/migrations/0003_knowledge_candidate_golden_pipeline.sql": "9a51d3a53ad5ac3e78e07fc9720ad5492443f5a1f6ac677018570fdfc337927a",
+      "tests/conftest.py": "63fc3f7175892d7c2c47aa6c4fa8b7d04b80aa3a6fadc0cebc3f4175f7c12592"
+    },
+    "mismatches": [],
+    "conclusion": "The exact PR #8 fix bytes were obtained from git and match the committed evidence byte-for-byte. No patch was fabricated."
+  },
+  "acceptance_status": {
+    "cloud_execution_independent_of_windows": "PASS",
+    "pr8_source_separation_obtained_vs_report_only_vs_inaccessible": "PASS",
+    "executable_local_baseline_and_patch_verification": "PASS (main baseline + PR patch + failure-first P2 proof)",
+    "source_diff_inventory_and_handover": "PASS (see CLOUD_TAKEOVER_PR8_SITE_V32_RECONCILIATION_V1.md and cloud_takeover_inputs.json)",
+    "no_production_test_writes_deploys_or_bypass": "PASS (no writes/deploys/permission changes)",
+    "site_v32_source_byte_review": "BLOCKED (separate private repo; no token; token creation forbidden)",
+    "unpushed_local_patch_application": "BLOCKED (bytes not obtainable: no Library tool; absent from PR branch)",
+    "real_d1_reexecution": "BLOCKED (no authorized non-production D1 identity; production excluded)",
+    "authenticated_site_owner_entry_check": "BLOCKED (HTTP 401; owner auth unavailable in scope)",
+    "historical_windows_full_suite": "PARTIAL_UNRESOLVED (historical TIMED_OUT at 240s with no pytest summary; not counted as pass or fail here)"
+  },
+  "blocked_items": [
+    {"item": "Site v32 source byte review", "status": "BLOCKED", "reason": "separate private Site repo @ b9a9825; no access"},
+    {"item": "Apply the disclosed unpushed local patches", "status": "BLOCKED", "reason": "exact bytes not obtainable in this environment"},
+    {"item": "Real / non-production D1 validation rerun", "status": "BLOCKED", "reason": "no pre-authorized non-production D1 transport; production D1 excluded"},
+    {"item": "Deployed WebAuthn / human-gate end-to-end", "status": "BLOCKED", "reason": "human gate not completed; owner Site entry returns HTTP 401"}
+  ]
+}
