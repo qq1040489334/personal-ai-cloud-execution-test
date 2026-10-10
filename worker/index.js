@@ -3059,20 +3059,22 @@ var KNOWLEDGE_PROMOTION_REJECT_RESERVED = "promotion_reserved";
 // `approved_by` / `approval_receipt` / `promotion_decision` can never authorise
 // a write. Approvals enter the ledger only through the trusted Human Gate
 // process, which writes to D1 out of band.
-var KNOWLEDGE_CANDIDATE_SELECT = "SELECT candidate_id, asset_id, title, status, content, content_hash, version, provenance, created_at, review_state, review_result FROM knowledge_candidates WHERE candidate_id = ?";
+var KNOWLEDGE_CANDIDATE_SELECT = "SELECT candidate_id, asset_id, title, status, content, content_hash, version, provenance, created_at, review_state, review_result, reviewed_at FROM knowledge_candidates WHERE candidate_id = ?";
 var KNOWLEDGE_CANDIDATE_INSERT = "INSERT INTO knowledge_candidates (candidate_id, asset_id, title, status, content, content_hash, version, provenance, created_at, review_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 var KNOWLEDGE_CANDIDATE_REVIEW_UPDATE = "UPDATE knowledge_candidates SET status = ?, review_state = ? WHERE candidate_id = ?";
 // Recording a review may only act on a pre-promotion candidate. The guarded
 // UPDATE makes the legal lifecycle transition atomic: a PROMOTED /
 // CANONICAL_READBACK_VERIFIED candidate can never be regressed back to
 // APPROVED_FOR_PROMOTION through the review tool (changes === 0 -> rejected).
-var KNOWLEDGE_CANDIDATE_REVIEW_RECORD = "UPDATE knowledge_candidates SET status = ?, review_state = ?, review_result = ?, reviewed_at = ? WHERE candidate_id = ? AND status IN ('DRAFT', 'PENDING_REVIEW', 'APPROVED_FOR_PROMOTION')";
+// Monotonic persisted review timestamps distinguish even same-millisecond
+// re-PASSes (and clock rollback) at the atomic UPDATE boundary.
+var KNOWLEDGE_CANDIDATE_REVIEW_RECORD = "UPDATE knowledge_candidates SET status = ?, review_state = ?, review_result = ?, reviewed_at = CASE WHEN julianday(reviewed_at) >= julianday(?) THEN strftime('%Y-%m-%dT%H:%M:%fZ', julianday(reviewed_at) + 1.0 / 86400000) ELSE ? END WHERE candidate_id = ? AND status IN ('DRAFT', 'PENDING_REVIEW', 'APPROVED_FOR_PROMOTION')";
 // The single atomic promotion claim. Only a candidate that is still in the
 // reviewed-PASS pre-promotion state can be claimed; a concurrent review FAIL
 // (which moves the candidate to PENDING_REVIEW) or a competing promotion makes
 // this compare-and-swap return changes === 0, so the loser fails closed BEFORE
 // consuming an approval or calling the Canonical writer.
-var KNOWLEDGE_CANDIDATE_RESERVE = "UPDATE knowledge_candidates SET status = ? WHERE candidate_id = ? AND status = ? AND review_state = ?";
+var KNOWLEDGE_CANDIDATE_RESERVE = "UPDATE knowledge_candidates SET status = ? WHERE candidate_id = ? AND status = ? AND review_state = ? AND review_result = 'PASS' AND version = ? AND content_hash = ? AND asset_id = ? AND reviewed_at = ? AND EXISTS (SELECT 1 FROM personal_ai_approval_ledger WHERE approval_id = ? AND operation = 'KNOWLEDGE_PROMOTION' AND candidate_id = knowledge_candidates.candidate_id AND candidate_version = knowledge_candidates.version AND content_hash = knowledge_candidates.content_hash AND review_result = 'PASS' AND exact_target = ? AND payload_sha256 = ? AND state = 'REGISTERED' AND consumed_at IS NULL AND invalidated = 0 AND CASE WHEN typeof(expires_at) IN ('integer', 'real') THEN expires_at ELSE unixepoch(expires_at) END > ?)";
 // Guarded lifecycle transitions. The promotion only ever advances a candidate it
 // still owns (PROMOTION_RESERVED -> PROMOTED -> CANONICAL_READBACK_VERIFIED) and
 // can release a failed claim (PROMOTION_RESERVED -> APPROVED_FOR_PROMOTION).
@@ -3090,8 +3092,8 @@ var KNOWLEDGE_CANDIDATE_STATUS_UPDATE = "UPDATE knowledge_candidates SET status 
 // shared with the Site WebAuthn CAS. The Worker-only `consumed`/`state` columns
 // are a mirror updated in the same statement; the gate reads/writes the legacy
 // field so a Site-minted approval and a Worker consume can never diverge.
-var APPROVAL_LEDGER_SELECT = "SELECT approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state, consumed, consume_count, invalidated, consumed_at FROM personal_ai_approval_ledger WHERE operation = ? AND candidate_id = ? AND candidate_version = ? AND content_hash = ? AND consumed_at IS NULL AND invalidated = 0 ORDER BY expires_at DESC";
-var APPROVAL_LEDGER_CONSUME = "UPDATE personal_ai_approval_ledger SET consumed = 1, state = 'CONSUMED', consume_count = consume_count + 1, consumed_at = ? WHERE approval_id = ? AND operation = ? AND consumed_at IS NULL AND invalidated = 0 AND candidate_id = ? AND candidate_version = ? AND content_hash = ? AND review_result = 'PASS' AND state = 'REGISTERED' AND CASE WHEN typeof(expires_at) IN ('integer', 'real') THEN expires_at ELSE unixepoch(expires_at) END > ?";
+var APPROVAL_LEDGER_SELECT = "SELECT approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state, consumed, consume_count, invalidated, consumed_at, exact_target, payload_sha256 FROM personal_ai_approval_ledger WHERE operation = ? AND candidate_id = ? AND candidate_version = ? AND content_hash = ? AND exact_target = ? AND payload_sha256 = ? AND consumed_at IS NULL AND invalidated = 0 ORDER BY expires_at DESC";
+var APPROVAL_LEDGER_CONSUME = "UPDATE personal_ai_approval_ledger SET consumed = 1, state = 'CONSUMED', consume_count = consume_count + 1, consumed_at = ? WHERE approval_id = ? AND operation = ? AND consumed_at IS NULL AND invalidated = 0 AND candidate_id = ? AND candidate_version = ? AND content_hash = ? AND review_result = 'PASS' AND state = 'REGISTERED' AND CASE WHEN typeof(expires_at) IN ('integer', 'real') THEN expires_at ELSE unixepoch(expires_at) END > ? AND exact_target = ? AND payload_sha256 = ? AND EXISTS (SELECT 1 FROM knowledge_candidates c WHERE c.candidate_id = personal_ai_approval_ledger.candidate_id AND c.version = personal_ai_approval_ledger.candidate_version AND c.content_hash = personal_ai_approval_ledger.content_hash AND c.status = 'PROMOTION_RESERVED' AND c.review_state = 'PASS' AND c.review_result = 'PASS' AND c.asset_id = ? AND c.reviewed_at = ?)";
 // Atomic stale-approval revocation. Only UNCONSUMED, not-yet-invalidated
 // approvals bound to the operation+candidate are transitioned; a consumed
 // approval (evidence of a completed/pending write) is never rewritten.
@@ -3220,7 +3222,7 @@ async function recordKnowledgeCandidateReview(env, args) {
     ? KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION
     : KNOWLEDGE_CANDIDATE_PENDING_REVIEW;
   const nowIso = (new Date()).toISOString();
-  const reviewWrite = db.prepare(KNOWLEDGE_CANDIDATE_REVIEW_RECORD).bind(nextStatus, reviewResult, reviewResult, nowIso, candidateId);
+  const reviewWrite = db.prepare(KNOWLEDGE_CANDIDATE_REVIEW_RECORD).bind(nextStatus, reviewResult, reviewResult, nowIso, nowIso, candidateId);
   // A review FAIL must atomically revoke every still-live KNOWLEDGE_PROMOTION
   // approval bound to this candidate. A later PASS therefore requires a NEW
   // trusted Human Gate approval; the revoked one can never be replayed.
@@ -3439,17 +3441,29 @@ async function promoteKnowledgeCandidate(env, args) {
       recovery_hint: "a prior promotion claim is unresolved; obtain a fresh Human Gate approval after the claim is cleared"
     });
   }
+  // Reconstruct the Site's complete signed target. Select only this generation
+  // so an older live receipt cannot shadow a fresh approval with equal expiry.
+  const exactTarget = JSON.stringify({ operation: KNOWLEDGE_PROMOTION_OPERATION,
+    candidate_id: candidate.candidate_id, candidate_version: Number(candidate.version),
+    content_hash: candidate.content_hash, asset_id: candidate.asset_id,
+    review_result: "PASS", reviewed_at: candidate.reviewed_at });
+  const payloadHash = await sha256Hex(exactTarget);
   let approval = null;
   try {
-    approval = await db.prepare(APPROVAL_LEDGER_SELECT).bind(KNOWLEDGE_PROMOTION_OPERATION, candidateId, Number(candidate.version), String(candidate.content_hash)).first();
+    approval = await db.prepare(APPROVAL_LEDGER_SELECT).bind(KNOWLEDGE_PROMOTION_OPERATION, candidateId, Number(candidate.version), String(candidate.content_hash), exactTarget, payloadHash).first();
   } catch {
     approval = null;
   }
   // Expiry uses server time exclusively; a caller cannot backdate the gate.
+  // SQL reservation/consume below pin these bytes and the persisted target.
   const gate = validateCandidateGate(candidate, supplied, approval, Date.now());
   if (!gate.ok) {
     // Fail closed BEFORE any Golden/Canonical write attempt.
     return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: gate.reason, write_calls: 0, candidate_id: candidateId });
+  }
+  if (!candidate.reviewed_at || candidate.review_result !== "PASS" ||
+      approval?.exact_target !== exactTarget || approval?.payload_sha256 !== payloadHash) {
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_APPROVAL, write_calls: 0, candidate_id: candidateId });
   }
   // Atomic promotion claim: compete with a concurrent review FAIL on the same
   // candidate status. Only a reviewed-PASS candidate still in
@@ -3460,7 +3474,7 @@ async function promoteKnowledgeCandidate(env, args) {
   // by a Canonical write and a FAIL can never be recorded after the claim.
   let reserved = 0;
   try {
-    const reserveResult = await db.prepare(KNOWLEDGE_CANDIDATE_RESERVE).bind(KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED, candidateId, KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION, KNOWLEDGE_CANDIDATE_REVIEW_PASS).run();
+    const reserveResult = await db.prepare(KNOWLEDGE_CANDIDATE_RESERVE).bind(KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED, candidateId, KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION, KNOWLEDGE_CANDIDATE_REVIEW_PASS, Number(candidate.version), String(candidate.content_hash), candidate.asset_id, candidate.reviewed_at, approval.approval_id, exactTarget, payloadHash, Math.floor(Date.now() / 1000)).run();
     reserved = reserveResult && reserveResult.meta ? Number(reserveResult.meta.changes) || 0 : 0;
   } catch {
     reserved = 0;
@@ -3477,7 +3491,7 @@ async function promoteKnowledgeCandidate(env, args) {
   let consumed = 0;
   try {
     const consumeNow = Math.floor(Date.now() / 1000);
-    const consumedResult = await db.prepare(APPROVAL_LEDGER_CONSUME).bind(consumeNow, String(approval.approval_id), KNOWLEDGE_PROMOTION_OPERATION, candidateId, Number(candidate.version), String(candidate.content_hash), consumeNow).run();
+    const consumedResult = await db.prepare(APPROVAL_LEDGER_CONSUME).bind(consumeNow, String(approval.approval_id), KNOWLEDGE_PROMOTION_OPERATION, candidateId, Number(candidate.version), String(candidate.content_hash), consumeNow, exactTarget, payloadHash, candidate.asset_id, candidate.reviewed_at).run();
     consumed = consumedResult && consumedResult.meta ? Number(consumedResult.meta.changes) || 0 : 0;
   } catch {
     consumed = 0;

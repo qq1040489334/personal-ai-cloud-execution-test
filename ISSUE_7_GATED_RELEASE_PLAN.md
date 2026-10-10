@@ -1,5 +1,25 @@
 # ISSUE_7_GATED_RELEASE_PLAN
 
+## PR #8 P2 repair verification (2026-10-10)
+
+Review baseline: `bd3d6ca6febf5722363d3e3e64d781abcb318fd1`. The remote head and latest comments were re-read before editing and before submission. Work used a separate Windows checkout; existing user checkouts were untouched.
+
+- P2-1: Worker loads and validates the complete Site exact_target and SHA-256, filters by that generation, and atomically pins operation/id/version/hash/asset/PASS/reviewed_at at reservation and consumption. Persisted review timestamps advance monotonically even with a frozen/rolled-back clock. A stale receipt cannot shadow a fresh same-expiry receipt.
+- P2-2: reviewed table/index SQL and index_list/index_xinfo verify table ownership, uniqueness, origin, partial predicates, ordered columns, expressions, collation and direction; additional enforcing indexes halt.
+- P2-3: the original schema/registry/history snapshot guards, complete postconditions and successful history inserts run in one D1 batch. Preconditions are pinned before classification; postconditions execute before success records. Failures roll back DDL/data/history. ALREADY_APPLIED also runs a read-only guarded batch. No post-commit history deletion occurs.
+- P2-4: complete reviewed 13-column candidate DDL and both indexes are checked before apply/adoption and on every idempotent return. Literal whitespace/case, types, defaults, nullability, PK and added constraints are significant. Immutable 0003 remains `9a51d3a53ad5ac3e78e07fc9720ad5492443f5a1f6ac677018570fdfc337927a`.
+
+Fresh executable evidence on Windows/Python 3.11.9/Node 26.7.0 (not Linux/Node 24): `site/tests/pr8-p2-regressions.mjs`: **127 passed, 0 failed**. On original committed Worker/runner bytes the same suite produces **6 passed, 121 failed**; the four original unsafe scenarios each fail their safe expectation. This suite is wrapped by `tests/test_pr8_p2_regressions.py` for complete CI. It asserts actual persisted rows, zero writer attempts and unconsumed receipts, and schema/data/history equality across drift failures. Synthetic Ed25519 verifier and isolated Node SQLite only.
+
+Fresh original bridge: **26 passed**. Fresh Site security/readonly: **17 passed**. Related Python tests: **54 passed** (includes the bridge and P2 wrappers; do not add these counts to the 127+26+17 scenario totals).
+
+Linux/Python 3.11/Node 24 full CI: PENDING for this revised commit, not inferred from old 1588/1. Windows complete diagnostic: PENDING; an earlier connection interruption produced no valid complete result. Official portable Node 24 download was attempted but the nodejs.org transport returned EOF; no installation or persistent environment change occurred. Exact Node 24 verification will be recorded from the existing Linux CI.
+
+Parent-supplied read-only observation at **2026-10-10 02:30:26 UTC**: deployed Site v0.3.6 reports Knowledge execution disabled, BLOCKED/KNOWLEDGE_APPROVAL_OPERATION_SCHEMA_REQUIRED, SITE_ONLY_LEGACY_WRITER_HAS_NO_RECEIPT_ARGUMENT, approval_live_verified=false, GOLDEN_RECEIPT_INVALID_OR_EXPIRED. This was supplied by the delegating thread, not freshly queried by this repair checkout. No deployed source/verifier completion receipt or preauthorized real nonproduction D1 identity/restore/query transport is available.
+
+Current acceptance: **CODE_PARTIAL (local regressions pass; revised full Linux CI pending); SITE_WORKER_BLOCKED; REAL_D1_UNVERIFIED; RELEASE_NOT_PERFORMED. Production is not ready.** PR remains draft and Issue #7 open. No merge/deploy, production migration/mint/consume/Canonical write, keys/bindings/permissions change, second approval authority, or paid API/resource was used. Separate explicit authorization and the missing integration/isolated-D1 prerequisites are required for those future stages.
+
+
 **RELEASE_NOT_PERFORMED. No production action is authorized by this plan.**
 
 Baseline: `b55245d53533dc8da68a50de13c5da14803ad4e6`. A PR is a code candidate, not a deployment or successful Human Gate.
@@ -8,10 +28,10 @@ Baseline: `b55245d53533dc8da68a50de13c5da14803ad4e6`. A PR is a code candidate, 
 
 | Path | SHA-256 |
 |---|---|
-| `worker/index.js` | `bf8e4319a2ec5979644b66cd3879eb52a2912e23aaef4c84629698220a850a9d` |
+| `worker/index.js` | `a3a463ff423034304320c10dbb5059d6f2e78464af6a1a42eea937632e5fa134` |
 | `site/worker/index.js` | `df2eaabf1bad185435319d0b5412ac2a7616e0a8252dd3bd6da5f6c83682bb3a` |
 | `site/worker/knowledge-approval.js` | `ac9551cf71ad1f511a9ec1a47d3ab45ac1565c0e4750824460bef00d010f48e6` |
-| `worker/knowledge-ledger-migrations.js` | `23e2c1c8988a3e34208c4585a28ab17bb8434ed2117159995e0700cdcde3374e` |
+| `worker/knowledge-ledger-migrations.js` | `810c5c0d27568689d2cd580fb53c2f47ddf2aa86356b95d154868e98f6abe9a0` |
 | `worker/migrations/0002z_knowledge_approval_ledger_compat.sql` | `e9221650ae7f0befd69ad17ca9685a305f9b7099c8b1bf4927c703fd091034ed` |
 | `worker/migrations/0003_knowledge_candidate_golden_pipeline.sql` | `9a51d3a53ad5ac3e78e07fc9720ad5492443f5a1f6ac677018570fdfc337927a` |
 
