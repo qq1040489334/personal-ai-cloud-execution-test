@@ -1,0 +1,137 @@
+{
+  "report": "review_metadata_bounds_report",
+  "task_id": "cf-3b1edc97a277",
+  "contract": "FIX_KV_METADATA_BOUNDS_FOR_REVIEW_REGISTRATION",
+  "risk_level": "LOW",
+  "repair_kind": "CONTRACT/OFFLINE_SOURCE_DEFECT_REPAIR",
+  "offline_status": "PASS",
+  "baseline_head": "a0d3bfc5e079b5886820428d417781cdb103eead",
+  "candidate_commit": "TO_BE_SET",
+  "goal": "Repair the KV metadata overflow defect when a task review is registered, with offline red/green regression. No production deploy, no real review registration, no D1 operation.",
+  "files_changed": [
+    "worker/index.js",
+    "tests/test_autonomous_advancement.py",
+    "reports/review_metadata_bounds_report.json"
+  ],
+  "defect": {
+    "summary": "saveTask copied the whole registry entry, including review_note and review_event.note, into the Cloudflare KV metadata object. A single real review note was therefore duplicated into metadata twice.",
+    "location": "worker/index.js saveTask (pre-fix: `const { task_id, dispatch_contract, dispatch_events, ...meta } = entry; put(..., { metadata: meta })`)",
+    "kv_metadata_limit_bytes": 1024,
+    "reported_trigger": "A 611-byte note, duplicated into review_note + review_event.note, already exceeded the 1024-byte serialized UTF-8 metadata limit.",
+    "measured_pre_fix_metadata_bytes": [2773, 2782, 2829, 2838, 3062, 3118, 4229, 4285, 12215, 12271]
+  },
+  "fix": {
+    "approach": "Keep the complete original review content (review_note, review_event, review_dispatch, dispatch_contract, dispatch_events and unknown fields) in the JSON value read back by readTask. Write only a bounded projection into KV metadata.",
+    "metadata_projection_fields": [
+      "status",
+      "normalized_status",
+      "execution_status",
+      "workflow_conclusion",
+      "workflow_verified",
+      "terminal",
+      "result_available",
+      "synced",
+      "reviewed",
+      "verdict",
+      "review_verdict",
+      "review_state",
+      "reviewed_at",
+      "project_id",
+      "root_task_id",
+      "parent_task_id",
+      "dispatch_state",
+      "dispatch_attempt",
+      "dispatch_accepted_at",
+      "dispatch_confirm_deadline",
+      "title",
+      "created_at",
+      "updated_at",
+      "completed_at"
+    ],
+    "bounded_presence_flags": ["review_note_present", "review_event_present"],
+    "excluded_from_metadata": [
+      "review_note",
+      "review_event",
+      "review_dispatch",
+      "dispatch_contract",
+      "dispatch_events",
+      "unknown/oversized fields (e.g. blobs)"
+    ],
+    "bounding_policy": {
+      "max_serialized_utf8_bytes": 1024,
+      "string_limit_bytes": 256,
+      "degradation_order": [
+        "shrink string fields via 128/64/32/16/8/0 byte limits",
+        "mark metadata_bounded = true (bounded, non-leaking)",
+        "last-resort core-field projection with metadata_bounded = true"
+      ],
+      "non_leaking": "Objects/arrays and unknown fields are never copied to metadata; the note payload is represented by booleans only."
+    },
+    "other_write_paths": "recordTask now also routes its initial metadata through buildTaskMetadata so every write to TASK_REGISTRY is bounded."
+  },
+  "consumer_enumeration": {
+    "listing": "listTasks -> listPendingResults consumes status/normalized_status/execution_status/terminal/result_available/workflow_conclusion/workflow_verified/reviewed/review_verdict/title/created_at/updated_at/completed_at; all preserved.",
+    "lineage": "project_id/root_task_id/parent_task_id feed resolveLineage/lineageInScope; all preserved.",
+    "liveness": "dispatch_state/dispatch_attempt/dispatch_accepted_at/dispatch_confirm_deadline feed classifyTaskDispatchLiveness/planTaskDispatchRetry; all preserved.",
+    "review_consumer": "reviewed/review_verdict/reviewed_at plus bounded presence flags are preserved; the full review_note/review_event remains available to consumers via readTask (value).",
+    "no_second_state_store": true,
+    "full_note_not_truncated_in_value": true
+  },
+  "red_evidence": {
+    "command": "python -m pytest tests/test_autonomous_advancement.py -k \"long_review_note or abnormal_large\" -q",
+    "result": "9 failed, 32 deselected in 0.52s",
+    "log_md5": "72d53b6da854fdd18e3609f8af67a5b4",
+    "observed": "The KV mock recorded serialized metadata of 2773-12271 UTF-8 bytes, far above the 1024-byte bound, and review_note/review_event were present in metadata."
+  },
+  "green_evidence": {
+    "command": "python -m pytest tests/test_autonomous_advancement.py -k \"long_review_note or abnormal_large\" -q",
+    "result": "9 passed, 32 deselected in 0.51s",
+    "log_md5": "0c967590ee967380e2e7cd7b42f6b2fb",
+    "metadata_measurements": {
+      "long_english_note_utf8_bytes": 1015,
+      "long_chinese_note_utf8_bytes": 1743,
+      "serialized_metadata_bytes": 620,
+      "violations": []
+    }
+  },
+  "regression_coverage": {
+    "long_english_note_within_1024_bytes": true,
+    "long_chinese_multibyte_note_within_1024_bytes": true,
+    "full_note_round_trips_in_value": true,
+    "review_event_note_round_trips_in_value": true,
+    "metadata_excludes_review_note_and_review_event": true,
+    "listing_lineage_liveness_fields_preserved": true,
+    "verdicts_pass_fail_blocked_bounded": true,
+    "idempotent_replay_bounded_and_no_extra_review_write": true,
+    "no_approved_next_task_dispatch_calls_zero": true,
+    "approved_child_dispatch_still_exactly_once": true,
+    "abnormal_large_unknown_field_dropped_and_not_leaked": true,
+    "legacy_assertions_weakened_or_removed": false
+  },
+  "focused_suite": {
+    "command": "python -m pytest tests/test_autonomous_advancement.py tests/test_dispatch_retry_executor.py tests/test_supervisor_lineage_filter.py tests/test_status_contract_v0_2.py tests/test_submit_task_mode_passthrough.py tests/test_mark_reviewed_gate.py -q",
+    "result": "135 passed in 2.28s"
+  },
+  "full_suite": {
+    "command": "python -m pytest -q",
+    "result": "1688 passed, 1 skipped in 66.25s",
+    "log_md5": "ec50d962f70945e950d1ef4aa11890dd"
+  },
+  "online_evidence_boundary": {
+    "observed_case": "cf-57ec1d9c51fa",
+    "observation": "Both a long note and a 79-byte short note returned Internal error, and the review fields remained null.",
+    "interpretation": "This task repairs a reproducible source-level metadata bounds defect. It does NOT confirm the online root cause and does NOT prove the online error has been fixed.",
+    "online_fix": "NOT_PERFORMED"
+  },
+  "not_executed": [
+    "real Cloudflare D1 (ASSET_DB) read or write",
+    "remote KV (TASK_REGISTRY) write",
+    "production Worker deployment (wrangler deploy / Canonical write)",
+    "real mark_reviewed against production",
+    "real next-task dispatch to production GitHub",
+    "mobile/phone acceptance",
+    "browser authorization bypass or permission widening (none attempted)",
+    "workflow / binding / schema / secret / permission changes"
+  ],
+  "workflow_untouched": true
+}

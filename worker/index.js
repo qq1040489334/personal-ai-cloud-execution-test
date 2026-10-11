@@ -1768,6 +1768,111 @@ function lineageInScope(record, scope, index) {
   if (projectId) return resolved.kind === LINEAGE_KIND_PROJECT && resolved.key === String(projectId);
   return resolved.kind === LINEAGE_KIND_ROOT && resolved.key === String(rootTaskId);
 }
+var TASK_METADATA_MAX_BYTES = 1024;
+var TASK_METADATA_STRING_LIMIT = 256;
+var TASK_METADATA_CORE_FIELDS = [
+  "status",
+  "normalized_status",
+  "execution_status",
+  "terminal",
+  "result_available",
+  "reviewed",
+  "review_verdict",
+  "created_at",
+  "updated_at",
+  "dispatch_state",
+  "dispatch_attempt"
+];
+var TASK_METADATA_FIELDS = [
+  // execution state consumed by listing / pending-review reconciliation
+  "status",
+  "normalized_status",
+  "execution_status",
+  "workflow_conclusion",
+  "workflow_verified",
+  "terminal",
+  "result_available",
+  "synced",
+  // review consumer (verdict + timestamps only; never the note payload)
+  "reviewed",
+  "verdict",
+  "review_verdict",
+  "review_state",
+  "reviewed_at",
+  // lineage consumed by the supervisor scope filter
+  "project_id",
+  "root_task_id",
+  "parent_task_id",
+  // liveness / dispatch lease consumed by the retry planner
+  "dispatch_state",
+  "dispatch_attempt",
+  "dispatch_accepted_at",
+  "dispatch_confirm_deadline",
+  // bounded display / audit timestamps
+  "title",
+  "created_at",
+  "updated_at",
+  "completed_at"
+];
+function truncateUtf8Bytes(text, maxBytes) {
+  if (typeof text !== "string") return text;
+  const bytes = new TextEncoder().encode(text);
+  if (maxBytes < 0 || bytes.length <= maxBytes) return text;
+  let end = maxBytes;
+  while (end > 0 && (bytes[end] & 192) === 128) end -= 1;
+  return new TextDecoder().decode(bytes.subarray(0, end));
+}
+function metadataUtf8Bytes(metadata) {
+  return utf8ByteLength(JSON.stringify(metadata));
+}
+function boundTaskMetadata(metadata, maxBytes) {
+  if (metadataUtf8Bytes(metadata) <= maxBytes) return metadata;
+  const limits = [128, 64, 32, 16, 8, 0];
+  for (const limit of limits) {
+    const next = {};
+    for (const key of Object.keys(metadata)) {
+      const value = metadata[key];
+      next[key] = typeof value === "string" ? truncateUtf8Bytes(value, limit) : value;
+    }
+    if (metadataUtf8Bytes(next) <= maxBytes) {
+      next.metadata_bounded = true;
+      return next;
+    }
+  }
+  const minimal = { metadata_bounded: true };
+  for (const key of TASK_METADATA_CORE_FIELDS) {
+    if (!(key in metadata)) continue;
+    const value = metadata[key];
+    minimal[key] = typeof value === "string" ? truncateUtf8Bytes(value, 32) : value;
+  }
+  return minimal;
+}
+function buildTaskMetadata(entry) {
+  const source = entry && typeof entry === "object" && !Array.isArray(entry) ? entry : {};
+  const reviewEvent = source.review_event;
+  const eventNote = reviewEvent && typeof reviewEvent === "object" ? reviewEvent.note : void 0;
+  const note = source.review_note;
+  const metadata = {
+    // Bounded, non-leaking presence flags: the full note/event stay in the JSON
+    // value only, so the 1024-byte KV metadata bound can never be breached by a
+    // long or multi-byte note.
+    review_note_present: typeof note === "string" && note.length > 0 || typeof eventNote === "string" && eventNote.length > 0,
+    review_event_present: Boolean(reviewEvent && typeof reviewEvent === "object")
+  };
+  for (const field of TASK_METADATA_FIELDS) {
+    if (!(field in source)) continue;
+    const value = source[field];
+    if (value === null || typeof value === "number" || typeof value === "boolean") {
+      metadata[field] = value;
+    } else if (typeof value === "string") {
+      metadata[field] = truncateUtf8Bytes(value, TASK_METADATA_STRING_LIMIT);
+    }
+    // Objects/arrays (review_event, review_dispatch, dispatch_contract,
+    // dispatch_events, unknown blobs) are intentionally excluded; the full
+    // record is already persisted in the JSON value and read via readTask.
+  }
+  return boundTaskMetadata(metadata, TASK_METADATA_MAX_BYTES);
+}
 async function recordTask(env, contract, options) {
   if (!env.TASK_REGISTRY) return;
   const opts = options && typeof options === "object" ? options : {};
@@ -1793,7 +1898,7 @@ async function recordTask(env, contract, options) {
   if (contract.root_task_id) meta.root_task_id = String(contract.root_task_id);
   if (contract.parent_task_id) meta.parent_task_id = String(contract.parent_task_id);
   await env.TASK_REGISTRY.put(regKey(contract.task_id), JSON.stringify({ task_id: contract.task_id, ...meta, dispatch_contract: contract }), {
-    metadata: meta
+    metadata: buildTaskMetadata(meta)
   });
 }
 async function listTasks(env) {
@@ -1803,8 +1908,10 @@ async function listTasks(env) {
 }
 async function saveTask(env, entry) {
   if (!env.TASK_REGISTRY) return;
-  const { task_id, dispatch_contract, dispatch_events, ...meta } = entry;
-  await env.TASK_REGISTRY.put(regKey(task_id), JSON.stringify(entry), { metadata: meta });
+  const { task_id, ...rest } = entry;
+  await env.TASK_REGISTRY.put(regKey(task_id), JSON.stringify(entry), {
+    metadata: buildTaskMetadata(rest)
+  });
 }
 async function updateDispatchLease(env, taskId, patch) {
   if (!env.TASK_REGISTRY) return null;

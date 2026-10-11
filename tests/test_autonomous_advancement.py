@@ -613,3 +613,325 @@ def test_dispatch_marker_migration_is_additive_and_non_destructive() -> None:
     upper = sql.upper()
     for destructive in ("DROP TABLE", "DROP COLUMN", "DELETE FROM", "TRUNCATE"):
         assert destructive not in upper
+
+
+# -- Worker source: bounded KV metadata for long review notes ----------------
+#
+# Cloudflare KV caps the serialized ``metadata`` object at 1024 UTF-8 bytes.
+# ``saveTask`` used to spill the whole registry entry (including ``review_note``
+# and ``review_event.note``) into that metadata, so a single real long note was
+# duplicated and blew the limit. These probes exercise the *production* source
+# with a KV mock that measures the exact serialized metadata and records a
+# violation whenever the 1024-byte bound is exceeded.
+
+LONG_ENGLISH_NOTE = "review " + (
+    "the reviewer confirmed the full evidence chain and signed off. " * 16
+)
+LONG_CHINESE_NOTE = "审查备注：" + (
+    "这是一段用于验证元数据边界的完整中文长备注内容。" * 24
+)
+
+MAX_METADATA_BYTES = 1024
+
+
+def utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def metadata_task(task_id: str = PARENT_TASK_ID, **overrides) -> dict:
+    base = {
+        "task_id": task_id,
+        "status": "PASS",
+        "normalized_status": "PASS",
+        "execution_status": "PASS",
+        "terminal": True,
+        "result_available": True,
+        "workflow_verified": True,
+        "workflow_conclusion": "success",
+        "reviewed": False,
+        "review_verdict": None,
+        "title": "long-note metadata bounds probe",
+        "project_id": "cloud-assets-activation",
+        "root_task_id": task_id,
+        "dispatch_state": "CONFIRMED",
+        "dispatch_attempt": 1,
+        "dispatch_accepted_at": "2026-09-27T00:00:00.000Z",
+        "created_at": "2026-09-27T00:00:00.000Z",
+        "updated_at": "2026-09-27T00:00:00.000Z",
+    }
+    base.update(overrides)
+    return base
+
+
+WORKER_METADATA_HARNESS = r"""
+const markerRows = new Map();
+function makeD1() {
+  return {
+    prepare: function(sql) {
+      return {
+        bind: function(...args) {
+          return {
+            run: async function() {
+              if (sql.indexOf("INSERT OR IGNORE INTO task_dispatch_markers") === 0) {
+                const key = args[0];
+                if (markerRows.has(key)) return { success: true, meta: { changes: 0 } };
+                markerRows.set(key, {
+                  dispatch_key: args[0], parent_task_id: args[1], review_verdict: args[2],
+                  review_timestamp: args[3], review_note: args[4], child_task_id: args[5],
+                  dispatch_state: args[6], dispatch_status: null, github_http_status: null,
+                  github_request_id: null, dispatched_at: null, created_at: args[7], updated_at: args[8]
+                });
+                return { success: true, meta: { changes: 1 } };
+              }
+              if (sql.indexOf("UPDATE task_dispatch_markers") === 0) {
+                const row = markerRows.get(args[6]);
+                if (row) {
+                  row.dispatch_state = args[0]; row.dispatch_status = args[1];
+                  row.github_http_status = args[2]; row.github_request_id = args[3];
+                  row.dispatched_at = args[4]; row.updated_at = args[5];
+                  return { success: true, meta: { changes: 1 } };
+                }
+                return { success: true, meta: { changes: 0 } };
+              }
+              return { success: true, meta: { changes: 0 } };
+            },
+            first: async function() {
+              if (sql.indexOf("FROM task_dispatch_markers") !== -1) {
+                return markerRows.get(args[0]) || null;
+              }
+              return null;
+            },
+            all: async function() { return { results: [] }; }
+          };
+        }
+      };
+    }
+  };
+}
+const kv = new Map();
+const metaStore = new Map();
+const putLog = [];
+const violations = [];
+const MAX_METADATA_BYTES = 1024;
+function utf8Len(text) { return new TextEncoder().encode(text).length; }
+function projectMetadata(record) {
+  const meta = {};
+  for (const key of Object.keys(record)) {
+    if (key === "task_id" || key === "dispatch_contract" || key === "dispatch_events") continue;
+    meta[key] = record[key];
+  }
+  return meta;
+}
+function seedTask(task) {
+  kv.set("task:" + task.task_id, JSON.stringify(task));
+  metaStore.set("task:" + task.task_id, projectMetadata(task));
+}
+const env = {
+  GITHUB_REPO: "owner/repo",
+  GITHUB_TOKEN: "test-token",
+  ASSET_DB: makeD1(),
+  TASK_REGISTRY: {
+    get: async function(key, type) {
+      const raw = kv.has(key) ? kv.get(key) : null;
+      if (raw == null) return null;
+      return type === "json" ? JSON.parse(raw) : raw;
+    },
+    put: async function(key, value, opts) {
+      const metadata = opts && opts.metadata ? opts.metadata : {};
+      const bytes = utf8Len(JSON.stringify(metadata));
+      if (bytes > MAX_METADATA_BYTES) violations.push({ key: key, bytes: bytes });
+      putLog.push({ key: key, value: JSON.parse(value), metadata: metadata, metadata_bytes: bytes });
+      kv.set(key, value);
+      metaStore.set(key, metadata);
+    },
+    list: async function() {
+      return { keys: Array.from(kv.keys()).map(function(name) {
+        return { name: name, metadata: metaStore.get(name) || {} };
+      }) };
+    }
+  }
+};
+const dispatchCalls = [];
+globalThis.fetch = async function(url, options) {
+  const u = String(url);
+  if (u.indexOf("/actions/artifacts") !== -1) {
+    return {
+      ok: true, status: 200,
+      headers: { get: function() { return null; } },
+      json: async function() { return { artifacts: [] }; },
+      text: async function() { return ""; }
+    };
+  }
+  let parsed = null;
+  try { parsed = options && options.body ? JSON.parse(options.body) : null; } catch (e) { parsed = null; }
+  dispatchCalls.push({ url: u, body: parsed });
+  return {
+    ok: true, status: 204,
+    headers: { get: function() { return "req-1"; } },
+    text: async function() { return ""; }
+  };
+};
+const TASK_ID = __TASK_ID__;
+seedTask(__TASK_JSON__);
+const args = __ARGS_JS__;
+const results = [];
+for (let i = 0; i < __TIMES__; i++) results.push(await toolMarkReviewed(env, args));
+const putsAfterReviews = putLog.length;
+const stored = JSON.parse(kv.get("task:" + TASK_ID));
+const listing = JSON.parse((await toolListPendingResults(env, {})).text);
+console.log(JSON.stringify({
+  results: results,
+  dispatchCalls: dispatchCalls,
+  violations: violations,
+  putLog: putLog,
+  putsAfterReviews: putsAfterReviews,
+  metadata: metaStore.get("task:" + TASK_ID),
+  stored: stored,
+  listing: listing
+}));
+"""
+
+
+def run_worker_metadata_probe(
+    *,
+    note: str,
+    verdict: str = "PASS",
+    approved=OMIT,
+    times: int = 1,
+    task: dict | None = None,
+) -> dict:
+    task = task if task is not None else metadata_task()
+    if approved is OMIT:
+        args_js = '{ task_id: TASK_ID, verdict: %s, note: %s }' % (
+            json.dumps(verdict),
+            json.dumps(note),
+        )
+    else:
+        args_js = (
+            '{ task_id: TASK_ID, verdict: %s, note: %s, approved_next_task: %s }'
+            % (json.dumps(verdict), json.dumps(note), json.dumps(approved))
+        )
+    script = WORKER_METADATA_HARNESS
+    script = script.replace("__TASK_ID__", json.dumps(task["task_id"]))
+    script = script.replace("__TASK_JSON__", json.dumps(task))
+    script = script.replace("__ARGS_JS__", args_js)
+    script = script.replace("__TIMES__", str(times))
+    return run_worker_probe(script)
+
+
+@pytest.mark.parametrize("note", [LONG_ENGLISH_NOTE, LONG_CHINESE_NOTE])
+def test_worker_long_review_note_metadata_stays_within_kv_limit(note: str) -> None:
+    # A real long note is many hundreds of bytes; the historic defect duplicated
+    # it into metadata and immediately exceeded the 1024-byte KV bound.
+    assert utf8_len(note) > 611
+
+    report = run_worker_metadata_probe(note=note, times=1)
+
+    assert report["violations"] == [], report["violations"]
+    assert report["putLog"], "review must persist the registry record"
+    for put in report["putLog"]:
+        assert put["metadata_bytes"] <= MAX_METADATA_BYTES
+        # The unbounded review payload stays in the JSON value, not metadata.
+        assert "review_note" not in put["metadata"]
+        assert "review_event" not in put["metadata"]
+
+    # Full original content is preserved in the value and reads back identically.
+    stored = report["stored"]
+    assert stored["review_note"] == note
+    assert stored["review_event"]["note"] == note
+
+    # Listing/lineage/liveness/review fields the consumers rely on survive.
+    metadata = report["metadata"]
+    assert metadata["reviewed"] is True
+    assert metadata["review_verdict"] == "PASS"
+    assert metadata["review_note_present"] is True
+    assert metadata["review_event_present"] is True
+    assert metadata["status"] == "PASS"
+    assert metadata["normalized_status"] == "PASS"
+    assert metadata["execution_status"] == "PASS"
+    assert metadata["terminal"] is True
+    assert metadata["result_available"] is True
+    assert metadata["project_id"] == "cloud-assets-activation"
+    assert metadata["root_task_id"] == PARENT_TASK_ID
+    assert metadata["dispatch_state"] == "CONFIRMED"
+    assert metadata["dispatch_attempt"] == 1
+    assert metadata["created_at"] and metadata["updated_at"]
+
+    # Listing still enumerates the task (now reviewed, so not pending-review).
+    assert report["listing"]["counts"]["total"] == 1
+
+
+@pytest.mark.parametrize("verdict", ["PASS", "FAIL", "BLOCKED"])
+def test_worker_long_review_note_bounds_all_verdicts(verdict: str) -> None:
+    report = run_worker_metadata_probe(note=LONG_ENGLISH_NOTE, verdict=verdict, times=1)
+
+    assert report["violations"] == []
+    assert report["metadata"]["review_verdict"] == verdict
+    assert report["stored"]["review_event"]["verdict"] == verdict
+    assert report["stored"]["review_note"] == LONG_ENGLISH_NOTE
+    for put in report["putLog"]:
+        assert put["metadata_bytes"] <= MAX_METADATA_BYTES
+
+
+def test_worker_long_review_note_replay_is_idempotent_and_bounded() -> None:
+    report = run_worker_metadata_probe(note=LONG_CHINESE_NOTE, times=2)
+
+    first = structured(report["results"][0])
+    second = structured(report["results"][1])
+    assert first["idempotent"] is False
+    assert second["idempotent"] is True
+    assert first["review_verdict"] == "PASS"
+    assert second["review_verdict"] == "PASS"
+    assert report["violations"] == []
+    # A replay without an approved child never rewrites the registry record.
+    assert report["putsAfterReviews"] == 1
+    for put in report["putLog"]:
+        assert put["metadata_bytes"] <= MAX_METADATA_BYTES
+
+
+def test_worker_long_review_note_without_approved_next_task_dispatches_nothing() -> None:
+    report = run_worker_metadata_probe(note=LONG_ENGLISH_NOTE, times=1)
+
+    assert report["dispatchCalls"] == []
+    result = structured(report["results"][0])
+    assert result["child_dispatch"]["dispatched"] is False
+    assert result["child_dispatch"]["reason"] == "NO_APPROVED_NEXT_TASK"
+    assert report["violations"] == []
+
+
+def test_worker_long_review_note_with_approved_child_preserves_dispatch() -> None:
+    report = run_worker_metadata_probe(
+        note=LONG_ENGLISH_NOTE, approved=approved_child(), times=1
+    )
+
+    assert len(report["dispatchCalls"]) == 1
+    result = structured(report["results"][0])
+    assert result["child_dispatch"]["dispatched"] is True
+    child_task_id = result["child_dispatch"]["child_task_id"]
+    assert child_task_id
+    assert report["violations"] == []
+    stored = report["stored"]
+    assert stored["review_note"] == LONG_ENGLISH_NOTE
+    assert stored["review_dispatch"]["child_task_id"] == child_task_id
+    for put in report["putLog"]:
+        assert put["metadata_bytes"] <= MAX_METADATA_BYTES
+
+
+def test_worker_abnormal_large_fields_are_bounded_and_not_leaked() -> None:
+    huge_title = "标题" * 500
+    secret_blob = "token=super-secret-value " * 200
+    task = metadata_task(title=huge_title, secret_blob=secret_blob)
+
+    report = run_worker_metadata_probe(note=LONG_CHINESE_NOTE, task=task, times=1)
+
+    assert report["violations"] == []
+    metadata = report["metadata"]
+    # Unknown oversized fields are not copied into metadata at all.
+    assert "secret_blob" not in metadata
+    assert "super-secret-value" not in json.dumps(metadata, ensure_ascii=False)
+    # A pathological title is capped, never emitted whole.
+    assert utf8_len(metadata["title"]) <= MAX_METADATA_BYTES
+    assert metadata["title"] != huge_title
+    # The full original content still round-trips through the value.
+    assert report["stored"]["secret_blob"] == secret_blob
+    assert report["stored"]["title"] == huge_title
