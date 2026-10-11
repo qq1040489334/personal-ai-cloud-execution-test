@@ -6,7 +6,7 @@
   "repair_kind": "CONTRACT/OFFLINE_SOURCE_DEFECT_REPAIR",
   "offline_status": "PASS",
   "baseline_head": "a0d3bfc5e079b5886820428d417781cdb103eead",
-  "candidate_commit": "TO_BE_SET",
+  "candidate_commit": "9f4d81d8afbb16f2e7cfe1cd732177dbdc849d83",
   "goal": "Repair the KV metadata overflow defect when a task review is registered, with offline red/green regression. No production deploy, no real review registration, no D1 operation.",
   "files_changed": [
     "worker/index.js",
