@@ -133,5 +133,101 @@
     "browser authorization bypass or permission widening (none attempted)",
     "workflow / binding / schema / secret / permission changes"
   ],
-  "workflow_untouched": true
+  "workflow_untouched": true,
+  "updated_by_task": "cf-8566e7edf408",
+  "latest_round": "round_2",
+  "round_2": {
+    "task_id": "cf-8566e7edf408",
+    "parent_task_id": "cf-3b1edc97a277",
+    "root_task_id": "cf-3b1edc97a277",
+    "risk_level": "LOW",
+    "baseline_head": "f86589564c858e8bfe5e894f25cf9a038a79715a",
+    "candidate_commit": "__CANDIDATE_COMMIT__",
+    "scope": "Same approved 3-file BUGFIX continuation of the review-registration metadata repair.",
+    "prior_round_verification": "Round 1 workflow reported the full suite passing (1688 passed, 1 skipped) and reported the metadata bound as satisfied, yet independent acceptance remained CHANGES_REQUIRED: two defects were still reproducible from the same source. This round repairs only those source-reproducible defects; it does not re-litigate round 1's recorded evidence.",
+    "defects": {
+      "R1": {
+        "summary": "boundTaskMetadata measured the candidate serialized bytes BEFORE appending the metadata_bounded marker, so an accepted candidate of exactly 1024 bytes became 1025 bytes once the marker was added.",
+        "counterexample": "buildTaskMetadata({status:'PASS',normalized_status:'PASS',execution_status:'PASS',workflow_conclusion:'success',workflow_verified:true,terminal:true,result_available:true,reviewed:true,review_verdict:'PASS',reviewed_at:'2026-10-11T23:00:00Z',project_id:'p'*96,root_task_id:'r'*96,parent_task_id:'a'*96,title:'t'*152,dispatch_state:'CONFIRMED',dispatch_attempt:1,dispatch_accepted_at:'2026-10-11T22:00:00Z',dispatch_confirm_deadline:'2026-10-11T23:00:00Z',created_at:'2026-10-11T22:00:00Z',updated_at:'2026-10-11T23:00:00Z'})",
+        "measured_pre_fix_final_bytes": 1025,
+        "measured_post_fix_final_bytes": 902
+      },
+      "R2": {
+        "summary": "buildTaskMetadata truncated the shared 256-byte string limit onto identity fields (project_id/root_task_id/parent_task_id), so a contract-legal longer identity was silently narrowed and listPendingResults excluded the task before reading the complete JSON value.",
+        "counterexample": "buildTaskMetadata({status:'PASS',normalized_status:'PASS',execution_status:'PASS',terminal:true,result_available:true,workflow_verified:true,reviewed:false,project_id:'p'*257,title:'test'})",
+        "measured_pre_fix_project_id_length": 256,
+        "measured_post_fix_project_id_length": 257,
+        "measured_pre_fix_lineage_in_scope": false,
+        "measured_post_fix_lineage_in_scope": true
+      }
+    },
+    "fix": {
+      "R1": "boundTaskMetadata now sets metadata_bounded and lineage_in_metadata_complete on each candidate BEFORE measuring, and the last-resort core projection is also measured against the bound. The final serialized metadata (markers included) is guaranteed <= 1024 bytes.",
+      "R2": "Identity fields are no longer capped by the 256-byte display limit. buildTaskMetadata records lineage_in_metadata_complete=false whenever bounding alters any identity field, and listPendingResults reads the complete JSON value back via the existing readTask(env, task_id) before applying the lineage filter, using the recovered identity for both scope matching and parent-chain resolution. No second state store is introduced; the complete record already lives in the value.",
+      "unresolved_identity_handling": "If a task's identity is marked incomplete and the value read-back fails, the task is retained (not silently dropped) and counted in report.lineage_unresolved, so an unknown identity is never treated as a confirmed mismatch."
+    },
+    "red_evidence": {
+      "command": "git show f865895:worker/index.js > worker/index.js && python -m pytest tests/test_autonomous_advancement.py -k \"r1_ or r2_\" -q",
+      "result": "8 failed, 1 passed, 41 deselected",
+      "log_md5": "073c40260c97d034aeb6699cc9bbb29c",
+      "note": "The single passing case is the guard test confirming ordinary short identities still use the plain listing path; the 8 R1/R2 counterexample tests fail on the original source."
+    },
+    "green_evidence": {
+      "command": "python -m pytest tests/test_autonomous_advancement.py -k \"r1_ or r2_\" -q",
+      "result": "9 passed, 41 deselected",
+      "log_md5": "ad3755a3a0a524e73fbcebbee927c201"
+    },
+    "new_tests": [
+      "test_r1_build_task_metadata_counterexample_is_within_final_utf8_bound",
+      "test_r1_boundary_1023_1024_1025_multibyte_and_marker_overhead",
+      "test_r2_identity_is_not_truncated_and_scope_matches_exactly",
+      "test_r2_identity_semantics_are_exact_for_root_and_parent",
+      "test_r2_long_project_identity_is_not_dropped_from_scoped_listing",
+      "test_r2_shared_prefix_identities_never_cross_associate",
+      "test_r2_long_root_identity_and_parent_chain_resolve_correctly",
+      "test_r2_normal_short_identity_still_uses_the_plain_listing_path",
+      "test_r2_long_title_squeezing_identity_is_recovered_from_value"
+    ],
+    "regression_coverage": {
+      "final_metadata_with_all_markers_within_1024_utf8_bytes": true,
+      "boundary_1023_1024_1025": true,
+      "multi_byte_truncation_on_code_point_boundary_no_replacement_char": true,
+      "identity_fields_not_truncated": true,
+      "long_project_root_parent_and_shared_prefix_scope_exact": true,
+      "long_title_squeezing_identity_recovered_from_value": true,
+      "normal_short_identities_use_plain_listing_path": true,
+      "full_note_value_and_review_idempotence_preserved": true,
+      "listing_liveness_and_zero_dispatch_without_approved_next_task_preserved": true,
+      "legacy_assertions_weakened_or_removed": false
+    },
+    "test_suites": {
+      "autonomous_advancement_file": "50 passed in 1.25s",
+      "focused_suite": "173 passed in 3.12s",
+      "full_suite": {
+        "command": "python -m pytest -q",
+        "result": "1697 passed, 1 skipped in 60.70s",
+        "log_md5": "2e22ba2dea42fa97df8780314692c022"
+      }
+    },
+    "online_evidence_boundary": {
+      "observation": "A 79-byte note also fails online and the review fields remain null.",
+      "interpretation": "This round repairs only reproducible source-level defects. The online root cause and the online fix effect remain unverified.",
+      "online_fix": "NOT_PERFORMED"
+    },
+    "files_changed": [
+      "worker/index.js",
+      "tests/test_autonomous_advancement.py",
+      "reports/review_metadata_bounds_report.json"
+    ],
+    "not_executed": [
+      "production Worker deployment (wrangler deploy / Canonical write)",
+      "remote KV (TASK_REGISTRY) write",
+      "real Cloudflare D1 (ASSET_DB) read or write",
+      "real mark_reviewed against production",
+      "real next-task dispatch to production GitHub",
+      "mobile/phone acceptance",
+      "workflow / binding / schema / secret / permission changes"
+    ],
+    "workflow_untouched": true
+  }
 }

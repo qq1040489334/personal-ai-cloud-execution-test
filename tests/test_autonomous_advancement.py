@@ -935,3 +935,346 @@ def test_worker_abnormal_large_fields_are_bounded_and_not_leaked() -> None:
     # The full original content still round-trips through the value.
     assert report["stored"]["secret_blob"] == secret_blob
     assert report["stored"]["title"] == huge_title
+
+
+# -- Review-round R1/R2 regressions (independent verification defects) -------
+#
+# Round 2 of the same approved registration defect. Two independently reproduced
+# source-level defects remained after the first repair:
+#
+# R1: ``boundTaskMetadata`` measured the candidate *before* adding the
+#     ``metadata_bounded`` marker, so an accepted candidate of exactly 1024
+#     serialized bytes grew to 1025 once the marker was appended.
+# R2: identity fields (``project_id`` / ``root_task_id`` / ``parent_task_id``)
+#     were truncated to 256 bytes by the shared string limit, so a contract-legal
+#     longer identity was silently narrowed and ``listPendingResults`` excluded
+#     the task before it ever read the complete JSON value.
+#
+# The production Worker source is exercised directly under Node, enforcing the
+# final serialized UTF-8 length (markers included) and the exact lineage
+# semantics against the complete value.
+
+R1_PLAIN_COUNTEREXAMPLE = {
+    "status": "PASS",
+    "normalized_status": "PASS",
+    "execution_status": "PASS",
+    "workflow_conclusion": "success",
+    "workflow_verified": True,
+    "terminal": True,
+    "result_available": True,
+    "reviewed": True,
+    "review_verdict": "PASS",
+    "reviewed_at": "2026-10-11T23:00:00Z",
+    "project_id": "p" * 96,
+    "root_task_id": "r" * 96,
+    "parent_task_id": "a" * 96,
+    "title": "t" * 152,
+    "dispatch_state": "CONFIRMED",
+    "dispatch_attempt": 1,
+    "dispatch_accepted_at": "2026-10-11T22:00:00Z",
+    "dispatch_confirm_deadline": "2026-10-11T23:00:00Z",
+    "created_at": "2026-10-11T22:00:00Z",
+    "updated_at": "2026-10-11T23:00:00Z",
+}
+
+R2_COUNTEREXAMPLE = {
+    "status": "PASS",
+    "normalized_status": "PASS",
+    "execution_status": "PASS",
+    "terminal": True,
+    "result_available": True,
+    "workflow_verified": True,
+    "reviewed": False,
+    "project_id": "p" * 257,
+    "title": "test",
+}
+
+WORKER_FUNCTION_HARNESS = r"""
+const PROBE_ENTRY = __ENTRY__;
+const PROBE_TASK_ID = __TASK_ID__;
+const PROBE_SCOPE = __SCOPE__;
+const PROBE_METADATA = buildTaskMetadata(PROBE_ENTRY);
+const PROBE_RECORD = Object.assign({ task_id: PROBE_TASK_ID }, PROBE_METADATA);
+const PROBE_IN_SCOPE = lineageInScope(PROBE_RECORD, PROBE_SCOPE, new Map());
+const PROBE_MARKERS = {};
+for (const key of Object.keys(PROBE_METADATA)) {
+  if (key === "metadata_bounded" || key === "lineage_in_metadata_complete") PROBE_MARKERS[key] = PROBE_METADATA[key];
+}
+console.log(JSON.stringify({
+  metadata: PROBE_METADATA,
+  bytes: new TextEncoder().encode(JSON.stringify(PROBE_METADATA)).length,
+  markers: PROBE_MARKERS,
+  inScope: PROBE_IN_SCOPE
+}));
+"""
+
+
+def run_worker_function_probe(entry: dict, *, scope: dict | None, task_id: str = "cf-probe") -> dict:
+    script = WORKER_FUNCTION_HARNESS
+    script = script.replace("__ENTRY__", json.dumps(entry))
+    script = script.replace("__TASK_ID__", json.dumps(task_id))
+    script = script.replace("__SCOPE__", json.dumps(scope))
+    return run_worker_probe(script)
+
+
+WORKER_BOUNDS_HARNESS = r"""
+const RAW = __RAW__;
+function rawSize(obj) { return new TextEncoder().encode(JSON.stringify(obj)).length; }
+function makeExact(target) {
+  let pad = 0;
+  while (rawSize({ status: "PASS", title: "x".repeat(pad) }) < target) pad += 1;
+  const obj = { status: "PASS", title: "x".repeat(pad) };
+  return { obj: obj, raw: rawSize(obj) };
+}
+const boundaries = [1023, 1024, 1025].map(function(target) {
+  const made = makeExact(target);
+  const bounded = boundTaskMetadata(made.obj, 1024);
+  return {
+    target: target,
+    raw: made.raw,
+    final_bytes: rawSize(bounded),
+    metadata_bounded: bounded.metadata_bounded === true,
+    has_marker: "metadata_bounded" in bounded
+  };
+});
+const projection = buildTaskMetadata(RAW);
+const multibyte = buildTaskMetadata({ status: "PASS", title: "汉".repeat(400), project_id: "项目".repeat(200) });
+console.log(JSON.stringify({
+  boundaries: boundaries,
+  projection_bytes: rawSize(projection),
+  projection_bounded: projection.metadata_bounded === true,
+  multibyte_bytes: rawSize(multibyte),
+  multibyte_title: multibyte.title,
+  multibyte_project: multibyte.project_id,
+  multibyte_has_replacement: JSON.stringify(multibyte).indexOf("\ufffd") !== -1
+}));
+"""
+
+
+def run_worker_bounds_probe(raw_entry: dict) -> dict:
+    script = WORKER_BOUNDS_HARNESS.replace("__RAW__", json.dumps(raw_entry))
+    return run_worker_probe(script)
+
+
+def test_r1_build_task_metadata_counterexample_is_within_final_utf8_bound() -> None:
+    report = run_worker_function_probe(R1_PLAIN_COUNTEREXAMPLE, scope=None)
+
+    # The historic defect measured before appending the marker -> 1025 bytes.
+    assert report["bytes"] <= MAX_METADATA_BYTES, report["bytes"]
+    assert "metadata_bounded" in report["metadata"]
+
+
+def test_r1_boundary_1023_1024_1025_multibyte_and_marker_overhead() -> None:
+    report = run_worker_bounds_probe(R1_PLAIN_COUNTEREXAMPLE)
+
+    by_target = {item["target"]: item for item in report["boundaries"]}
+    # Exactly at the bound the object is returned untouched.
+    assert by_target[1023]["final_bytes"] == 1023
+    assert by_target[1023]["has_marker"] is False
+    assert by_target[1024]["final_bytes"] == 1024
+    assert by_target[1024]["has_marker"] is False
+    # One byte over: the marker must be counted, so the final object shrinks.
+    assert by_target[1025]["has_marker"] is True
+    assert by_target[1025]["final_bytes"] <= MAX_METADATA_BYTES
+
+    for item in report["boundaries"]:
+        assert item["final_bytes"] <= MAX_METADATA_BYTES
+
+    # The exact plain counterexample stays bounded once projected.
+    assert report["projection_bytes"] <= MAX_METADATA_BYTES
+    assert report["projection_bounded"] is True
+
+    # Multi-byte fields are truncated on a code-point boundary, never split.
+    assert report["multibyte_bytes"] <= MAX_METADATA_BYTES
+    assert report["multibyte_has_replacement"] is False
+    assert "\ufffd" not in json.dumps(report["multibyte_title"])
+
+
+def test_r2_identity_is_not_truncated_and_scope_matches_exactly() -> None:
+    entry = R2_COUNTEREXAMPLE
+    report = run_worker_function_probe(entry, scope={"project_id": entry["project_id"]})
+
+    # Historic defect truncated project_id to 256 and failed the scope match.
+    assert len(report["metadata"]["project_id"]) == 257
+    assert report["metadata"]["project_id"] == entry["project_id"]
+    assert report["inScope"] is True
+
+
+def test_r2_identity_semantics_are_exact_for_root_and_parent() -> None:
+    root = "r" * 257
+    report = run_worker_function_probe(
+        {"status": "PASS", "root_task_id": root, "reviewed": False},
+        scope={"root_task_id": root},
+    )
+    assert len(report["metadata"]["root_task_id"]) == 257
+    assert report["inScope"] is True
+
+    # A shared prefix must never cross-associate two identities.
+    near = root[:-1] + "X"
+    wrong = run_worker_function_probe(
+        {"status": "PASS", "root_task_id": root, "reviewed": False},
+        scope={"root_task_id": near},
+    )
+    assert wrong["inScope"] is False
+
+
+WORKER_LINEAGE_READBACK_HARNESS = r"""
+const valueStore = new Map();
+const metaStore = new Map();
+function seedTask(task) {
+  const copy = JSON.parse(JSON.stringify(task));
+  const task_id = copy.task_id;
+  const rest = Object.assign({}, copy);
+  delete rest.task_id;
+  valueStore.set("task:" + task_id, JSON.stringify(copy));
+  metaStore.set("task:" + task_id, buildTaskMetadata(rest));
+}
+const env = {
+  GITHUB_REPO: "owner/repo",
+  GITHUB_TOKEN: "test-token",
+  TASK_REGISTRY: {
+    get: async function(key, type) {
+      const raw = valueStore.has(key) ? valueStore.get(key) : null;
+      if (raw == null) return null;
+      return type === "json" ? JSON.parse(raw) : raw;
+    },
+    put: async function(key, value, opts) {
+      valueStore.set(key, value);
+      const parsed = JSON.parse(value);
+      const rest = Object.assign({}, parsed);
+      delete rest.task_id;
+      metaStore.set(key, opts && opts.metadata ? opts.metadata : buildTaskMetadata(rest));
+    },
+    list: async function() {
+      return { keys: Array.from(valueStore.keys()).map(function(name) {
+        return { name: name, metadata: metaStore.get(name) || {} };
+      }) };
+    }
+  }
+};
+globalThis.fetch = async function(url) {
+  if (String(url).indexOf("/actions/artifacts") !== -1) {
+    return {
+      ok: true, status: 200,
+      headers: { get: function() { return null; } },
+      json: async function() { return { artifacts: [] }; },
+      text: async function() { return ""; }
+    };
+  }
+  throw new Error("unexpected non-artifact fetch during listing");
+};
+const TASKS = __TASKS__;
+for (const task of TASKS) seedTask(task);
+const scope = __SCOPE__;
+const scoped = JSON.parse((await toolListPendingResults(env, { scope: scope })).text);
+const metas = {};
+for (const entry of metaStore.entries()) {
+  metas[entry[0]] = {
+    lineage_in_metadata_complete: entry[1].lineage_in_metadata_complete,
+    metadata_bounded: entry[1].metadata_bounded,
+    project_id: entry[1].project_id,
+    root_task_id: entry[1].root_task_id,
+    parent_task_id: entry[1].parent_task_id
+  };
+}
+console.log(JSON.stringify({ scoped: scoped, metadata: metas }));
+"""
+
+
+def run_worker_lineage_readback_probe(tasks: list[dict], scope: dict) -> dict:
+    script = WORKER_LINEAGE_READBACK_HARNESS
+    script = script.replace("__TASKS__", json.dumps(tasks))
+    script = script.replace("__SCOPE__", json.dumps(scope))
+    return run_worker_probe(script)
+
+
+def lineage_task(task_id: str, **overrides) -> dict:
+    base = {
+        "task_id": task_id,
+        "status": "PASS",
+        "normalized_status": "PASS",
+        "execution_status": "PASS",
+        "terminal": True,
+        "result_available": True,
+        "workflow_verified": True,
+        "reviewed": False,
+        "review_verdict": None,
+        "title": "lineage read-back",
+        "created_at": "2026-10-11T22:00:00.000Z",
+        "updated_at": "2026-10-11T23:00:00.000Z",
+    }
+    base.update(overrides)
+    return base
+
+
+def pending_task_ids(report: dict) -> list[str]:
+    return [item["task_id"] for item in report["scoped"]["pending"]]
+
+
+def test_r2_long_project_identity_is_not_dropped_from_scoped_listing() -> None:
+    long_project = "p" * 400
+    task = lineage_task(
+        "cf-long-project",
+        project_id=long_project,
+        root_task_id="r" * 400,
+        parent_task_id="a" * 400,
+        title="t" * 600,
+    )
+    report = run_worker_lineage_readback_probe([task], {"project_id": long_project})
+
+    assert pending_task_ids(report) == ["cf-long-project"]
+    assert report["scoped"]["excluded_by_lineage"] == 0
+    # Metadata had to be bounded and its identity marked incomplete; the listing
+    # recovered the identity from the complete JSON value.
+    meta = report["metadata"]["task:cf-long-project"]
+    assert meta["lineage_in_metadata_complete"] is False
+    assert len(meta["project_id"]) < len(long_project)
+
+
+def test_r2_shared_prefix_identities_never_cross_associate() -> None:
+    shared = "p" * 400
+    a = lineage_task("cf-prefix-a", project_id=shared + "A")
+    b = lineage_task("cf-prefix-b", project_id=shared + "B")
+    report = run_worker_lineage_readback_probe([a, b], {"project_id": shared + "A"})
+
+    assert pending_task_ids(report) == ["cf-prefix-a"]
+    assert report["scoped"]["excluded_by_lineage"] == 1
+
+
+def test_r2_long_root_identity_and_parent_chain_resolve_correctly() -> None:
+    long_root = "r" * 400
+    parent = lineage_task("cf-chain-parent", root_task_id=long_root)
+    child = lineage_task("cf-chain-child", parent_task_id="cf-chain-parent")
+    report = run_worker_lineage_readback_probe([parent, child], {"root_task_id": long_root})
+
+    assert sorted(pending_task_ids(report)) == ["cf-chain-child", "cf-chain-parent"]
+    assert report["scoped"]["excluded_by_lineage"] == 0
+
+
+def test_r2_normal_short_identity_still_uses_the_plain_listing_path() -> None:
+    short_project = "cloud-assets-activation"
+    short = lineage_task("cf-short", project_id=short_project)
+    other = lineage_task("cf-other", project_id="other-project")
+    report = run_worker_lineage_readback_probe([short, other], {"project_id": short_project})
+
+    assert pending_task_ids(report) == ["cf-short"]
+    assert report["scoped"]["excluded_by_lineage"] == 1
+    meta = report["metadata"]["task:cf-short"]
+    assert meta.get("lineage_in_metadata_complete") is not False
+    assert meta.get("metadata_bounded") is not True
+
+
+def test_r2_long_title_squeezing_identity_is_recovered_from_value() -> None:
+    long_project = "p" * 300
+    task = lineage_task(
+        "cf-squeezed",
+        project_id=long_project,
+        root_task_id="r" * 300,
+        parent_task_id="a" * 300,
+        title="标题" * 500,
+        updated_at="2026-10-11T23:00:00.000Z",
+    )
+    report = run_worker_lineage_readback_probe([task], {"project_id": long_project})
+
+    assert pending_task_ids(report) == ["cf-squeezed"]
+    assert report["scoped"]["excluded_by_lineage"] == 0

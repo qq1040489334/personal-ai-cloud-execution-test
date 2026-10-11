@@ -1770,6 +1770,8 @@ function lineageInScope(record, scope, index) {
 }
 var TASK_METADATA_MAX_BYTES = 1024;
 var TASK_METADATA_STRING_LIMIT = 256;
+var TASK_METADATA_LINEAGE_FIELDS = ["project_id", "root_task_id", "parent_task_id"];
+var TASK_METADATA_LINEAGE_COMPLETE_FLAG = "lineage_in_metadata_complete";
 var TASK_METADATA_CORE_FIELDS = [
   "status",
   "normalized_status",
@@ -1825,6 +1827,13 @@ function truncateUtf8Bytes(text, maxBytes) {
 function metadataUtf8Bytes(metadata) {
   return utf8ByteLength(JSON.stringify(metadata));
 }
+function lineageFieldsAltered(original, candidate) {
+  for (const key of TASK_METADATA_LINEAGE_FIELDS) {
+    if (!(key in original)) continue;
+    if (candidate[key] !== original[key]) return true;
+  }
+  return false;
+}
 function boundTaskMetadata(metadata, maxBytes) {
   if (metadataUtf8Bytes(metadata) <= maxBytes) return metadata;
   const limits = [128, 64, 32, 16, 8, 0];
@@ -1834,18 +1843,37 @@ function boundTaskMetadata(metadata, maxBytes) {
       const value = metadata[key];
       next[key] = typeof value === "string" ? truncateUtf8Bytes(value, limit) : value;
     }
-    if (metadataUtf8Bytes(next) <= maxBytes) {
-      next.metadata_bounded = true;
-      return next;
+    next.metadata_bounded = true;
+    next[TASK_METADATA_LINEAGE_COMPLETE_FLAG] = !lineageFieldsAltered(metadata, next);
+    if (metadataUtf8Bytes(next) <= maxBytes) return next;
+  }
+  for (const limit of [32, 16, 8, 4, 2, 1, 0]) {
+    const minimal = { metadata_bounded: true, [TASK_METADATA_LINEAGE_COMPLETE_FLAG]: false };
+    for (const key of TASK_METADATA_CORE_FIELDS) {
+      if (!(key in metadata)) continue;
+      const value = metadata[key];
+      minimal[key] = typeof value === "string" ? truncateUtf8Bytes(value, limit) : value;
     }
+    if (metadataUtf8Bytes(minimal) <= maxBytes) return minimal;
   }
-  const minimal = { metadata_bounded: true };
-  for (const key of TASK_METADATA_CORE_FIELDS) {
-    if (!(key in metadata)) continue;
-    const value = metadata[key];
-    minimal[key] = typeof value === "string" ? truncateUtf8Bytes(value, 32) : value;
+  return { metadata_bounded: true, [TASK_METADATA_LINEAGE_COMPLETE_FLAG]: false };
+}
+function metadataLineageComplete(record) {
+  if (!record || typeof record !== "object") return true;
+  if (record[TASK_METADATA_LINEAGE_COMPLETE_FLAG] === false) return false;
+  if (record.metadata_bounded === true) return false;
+  return true;
+}
+async function readTaskMetadataForLineage(env, task) {
+  if (!metadataLineageComplete(task)) {
+    try {
+      const full = await readTask(env, task.task_id);
+      if (full && typeof full === "object") return full;
+    } catch {
+    }
+    return null;
   }
-  return minimal;
+  return task;
 }
 function buildTaskMetadata(entry) {
   const source = entry && typeof entry === "object" && !Array.isArray(entry) ? entry : {};
@@ -1865,7 +1893,9 @@ function buildTaskMetadata(entry) {
     if (value === null || typeof value === "number" || typeof value === "boolean") {
       metadata[field] = value;
     } else if (typeof value === "string") {
-      metadata[field] = truncateUtf8Bytes(value, TASK_METADATA_STRING_LIMIT);
+      metadata[field] = TASK_METADATA_LINEAGE_FIELDS.includes(field)
+        ? value
+        : truncateUtf8Bytes(value, TASK_METADATA_STRING_LIMIT);
     }
     // Objects/arrays (review_event, review_dispatch, dispatch_contract,
     // dispatch_events, unknown blobs) are intentionally excluded; the full
@@ -1952,6 +1982,19 @@ async function listPendingResults(env, scope) {
   const tasks = await listTasks(env);
   const index = /* @__PURE__ */ new Map();
   for (const task of tasks) index.set(String(task.task_id), task);
+  const scopeActive = Boolean(scope && (scope.project_id || scope.root_task_id));
+  const lineageUnresolved = /* @__PURE__ */ new Set();
+  if (scopeActive) {
+    for (const task of tasks) {
+      if (metadataLineageComplete(task)) continue;
+      const full = await readTaskMetadataForLineage(env, task);
+      if (full) {
+        index.set(String(task.task_id), { ...task, ...full });
+      } else {
+        lineageUnresolved.add(String(task.task_id));
+      }
+    }
+  }
   const now = Date.now();
   const pending = [];
   const pending_review = [];
@@ -1960,7 +2003,11 @@ async function listPendingResults(env, scope) {
   const unconfirmed = [];
   let excluded_by_lineage = 0;
   for (const task of tasks) {
-    if (!lineageInScope(task, scope, index)) {
+    const record = index.get(String(task.task_id)) || task;
+    if (scopeActive && lineageUnresolved.has(String(task.task_id))) {
+      // The identity could not be read back, so a scope mismatch cannot be
+      // confirmed. Keep the task rather than silently dropping it.
+    } else if (!lineageInScope(record, scope, index)) {
       excluded_by_lineage += 1;
       continue;
     }
@@ -2015,10 +2062,10 @@ async function listPendingResults(env, scope) {
       requires_review: resultAvailable && task.reviewed !== true,
       recommended_action: resultAvailable ? "review" : "wait"
     };
-    if (task.project_id) entry.project_id = String(task.project_id);
-    if (task.root_task_id) entry.root_task_id = String(task.root_task_id);
-    if (task.parent_task_id) entry.parent_task_id = String(task.parent_task_id);
-    entry.lineage = resolveLineage(task, index);
+    if (record.project_id) entry.project_id = String(record.project_id);
+    if (record.root_task_id) entry.root_task_id = String(record.root_task_id);
+    if (record.parent_task_id) entry.parent_task_id = String(record.parent_task_id);
+    entry.lineage = resolveLineage(record, index);
     if (resultAvailable && task.reviewed !== true) {
       pending.push(entry);
       pending_review.push(entry);
@@ -2078,6 +2125,7 @@ async function listPendingResults(env, scope) {
   if (scope) {
     report.scope = scope;
     report.excluded_by_lineage = excluded_by_lineage;
+    report.lineage_unresolved = lineageUnresolved.size;
   }
   return report;
 }
