@@ -1,0 +1,89 @@
+{
+  "review_baseline": "bd3d6ca6febf5722363d3e3e64d781abcb318fd1",
+  "verified_code_commit": "873c5336b9e56dcc7d6582ab52ecb4399e9a3db4",
+  "scope": "Code and isolated tests only; no production or real D1 execution",
+  "overlap_notice": "Test sets overlap and must not be added together",
+  "p2_scenarios": {
+    "command": "node --test --test-reporter=tap site/tests/pr8-p2-regressions.mjs",
+    "baseline": {
+      "passed": 6,
+      "failed": 121,
+      "original_four_safe_expectations": "all fail"
+    },
+    "repaired": {
+      "passed": 127,
+      "failed": 0
+    },
+    "transport": "isolated Node SQLite",
+    "verifier": "synthetic Ed25519; not deployed WebAuthn"
+  },
+  "original_bridge": {
+    "passed": 26
+  },
+  "site_security_readonly": {
+    "passed": 17
+  },
+  "targeted_pytest": {
+    "passed": 54,
+    "includes": "bridge and P2 scenario wrappers"
+  },
+  "local_runtime": {
+    "os": "Windows",
+    "python": "3.11.9",
+    "node": "26.7.0"
+  },
+  "code_ci": {
+    "run_id": 38018275254,
+    "job_id": 114113357869,
+    "url": "https://github.com/qq1040489334/personal-ai-cloud-execution-test/actions/runs/38018275254/job/114113357869",
+    "status": "completed",
+    "conclusion": "success",
+    "passed": 1589,
+    "skipped": 1,
+    "seconds": 59.7,
+    "python": "3.11.17",
+    "node": "24.21.0",
+    "os": "Linux"
+  },
+  "windows_full_diagnostic": {
+    "status": "TIMED_OUT",
+    "timeout_seconds": 240,
+    "elapsed_seconds": 240.03,
+    "collected_separately": 1590,
+    "passed": null,
+    "failed": null,
+    "skipped": null,
+    "command": "python -u -m pytest -q --tb=short --durations=10",
+    "note": "No final pytest summary; timeout is not a counted test failure or PASS. Root cause unestablished."
+  },
+  "golden_0003": {
+    "sha256": "9a51d3a53ad5ac3e78e07fc9720ad5492443f5a1f6ac677018570fdfc337927a",
+    "git_blob": "0398d1787aeb2ddc400a638e79ae8188be548f67",
+    "unchanged": true
+  },
+  "source_hashes": {
+    "worker/index.js": "a3a463ff423034304320c10dbb5059d6f2e78464af6a1a42eea937632e5fa134",
+    "site/worker/index.js": "df2eaabf1bad185435319d0b5412ac2a7616e0a8252dd3bd6da5f6c83682bb3a",
+    "site/worker/knowledge-approval.js": "ac9551cf71ad1f511a9ec1a47d3ab45ac1565c0e4750824460bef00d010f48e6",
+    "worker/knowledge-ledger-migrations.js": "810c5c0d27568689d2cd580fb53c2f47ddf2aa86356b95d154868e98f6abe9a0",
+    "worker/migrations/0002z_knowledge_approval_ledger_compat.sql": "e9221650ae7f0befd69ad17ca9685a305f9b7099c8b1bf4927c703fd091034ed",
+    "worker/migrations/0003_knowledge_candidate_golden_pipeline.sql": "9a51d3a53ad5ac3e78e07fc9720ad5492443f5a1f6ac677018570fdfc337927a",
+    "tests/conftest.py": "63fc3f7175892d7c2c47aa6c4fa8b7d04b80aa3a6fadc0cebc3f4175f7c12592"
+  },
+  "log_sha256": {
+    "baseline": "1fa767fe17222e730cce27914de1e715105a50bcd5679858e7d5942b089157fd",
+    "repaired": "8e30f9b2bac5ea4ea107f420b95a15febdf76a69ef5970cdeeafd072da56e44d",
+    "bridge_site": "2f94648e5042be7222b4a921530a21d2c38c06209d2c50bf3325b037666fc9a9",
+    "targeted": "039c6f82b1abdbc9f0cc77614abf50ab342fcf68020e1300b11f76e6ae81d9c4",
+    "linux_ci": "669258d12ee029399eadc7d38e81b01fd4574c9a7726656c4c262adbc8f60bbe",
+    "windows_timeout": "3c2ba573911f514041a2ce1305997c3c2bdb52640281129eaec51c7c01ed02d8"
+  },
+  "acceptance": {
+    "code": "CODE_PASS",
+    "site_worker": "SITE_WORKER_BLOCKED",
+    "real_d1": "REAL_D1_UNVERIFIED",
+    "release": "RELEASE_NOT_PERFORMED",
+    "production_ready": false
+  },
+  "final_documentation_head_ci": "Recorded in PR description after the documentation-only commit; source/tests unchanged from verified_code_commit"
+}

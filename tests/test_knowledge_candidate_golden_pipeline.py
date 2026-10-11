@@ -581,10 +581,11 @@ function runStatement(sql, args) {
     return { success: true, meta: { changes: 1 } };
   }
   if (sql.indexOf("UPDATE knowledge_candidates SET status = ?, review_state = ?, review_result = ?") === 0) {
-    const row = candidateRows.get(args[4]);
+    const row = candidateRows.get(args[5]);
     if (!row) return { success: true, meta: { changes: 0 } };
     if (!["DRAFT", "PENDING_REVIEW", "APPROVED_FOR_PROMOTION"].includes(String(row.status))) return { success: true, meta: { changes: 0 } };
-    row.status = args[0]; row.review_state = args[1]; row.review_result = args[2]; row.reviewed_at = args[3];
+    row.status = args[0]; row.review_state = args[1]; row.review_result = args[2];
+    row.reviewed_at = Date.parse(row.reviewed_at) >= Date.parse(args[3]) ? new Date(Date.parse(row.reviewed_at) + 1).toISOString() : args[3];
     return { success: true, meta: { changes: 1 } };
   }
   if (sql.indexOf("UPDATE knowledge_candidates SET status = ?, review_state = ?") === 0) {
@@ -611,9 +612,9 @@ function runStatement(sql, args) {
     return { success: true, meta: { changes: 1 } };
   }
   if (sql.indexOf("INSERT INTO personal_ai_approval_ledger") === 0) {
-    const [approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, created_at] = args;
+    const [approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, created_at, exact_target, payload_sha256] = args;
     if (approvalRows.has(approval_id)) throw new Error("UNIQUE constraint failed: personal_ai_approval_ledger");
-    approvalRows.set(approval_id, { approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state: "REGISTERED", consumed: 0, consume_count: 0, invalidated: 0, invalidated_at: null, created_at });
+    approvalRows.set(approval_id, { approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state: "REGISTERED", consumed: 0, consume_count: 0, invalidated: 0, invalidated_at: null, created_at, exact_target, payload_sha256 });
     return { success: true, meta: { changes: 1 } };
   }
   if (sql.indexOf("UPDATE personal_ai_approval_ledger SET invalidated = 1") === 0) {
@@ -642,7 +643,7 @@ function queryFirst(sql, args) {
   if (sql.indexOf("SELECT approval_id, operation, asset_type") === 0) {
     let best = null;
     for (const row of approvalRows.values()) {
-      if (row.operation === args[0] && row.candidate_id === args[1] && Number(row.candidate_version) === Number(args[2]) && row.content_hash === args[3] && Number(row.consumed) === 0 && Number(row.invalidated) === 0) {
+      if (row.operation === args[0] && row.candidate_id === args[1] && Number(row.candidate_version) === Number(args[2]) && row.content_hash === args[3] && Number(row.consumed) === 0 && Number(row.invalidated) === 0 && (args.length < 6 || (row.exact_target === args[4] && row.payload_sha256 === args[5]))) {
         if (!best || String(row.expires_at) > String(best.expires_at)) best = row;
       }
     }
@@ -726,11 +727,11 @@ def _approve_worker(candidate_id: str, expires="2999-01-01T00:00:00.000Z") -> st
         "const cand = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
         + json.dumps(candidate_id)
         + ").first();\n"
-        + "await env.ASSET_DB.prepare('INSERT INTO personal_ai_approval_ledger (approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind("
+        + "await env.ASSET_DB.prepare('INSERT INTO personal_ai_approval_ledger (approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, created_at, exact_target, payload_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind("
         + json.dumps(receipt)
         + ", 'KNOWLEDGE_PROMOTION', 'KNOWLEDGE', cand.candidate_id, cand.version, cand.content_hash, 'PASS', 'human-operator', "
         + json.dumps(expires)
-        + ", new Date().toISOString()).run();\n"
+        + ", new Date().toISOString(), JSON.stringify({operation: 'KNOWLEDGE_PROMOTION', candidate_id: cand.candidate_id, candidate_version: cand.version, content_hash: cand.content_hash, asset_id: cand.asset_id, review_result: 'PASS', reviewed_at: cand.reviewed_at}), await sha256Hex(JSON.stringify({operation: 'KNOWLEDGE_PROMOTION', candidate_id: cand.candidate_id, candidate_version: cand.version, content_hash: cand.content_hash, asset_id: cand.asset_id, review_result: 'PASS', reviewed_at: cand.reviewed_at}))).run();\n"
         + "const approval = await env.ASSET_DB.prepare(APPROVAL_LEDGER_SELECT).bind('KNOWLEDGE_PROMOTION', cand.candidate_id, cand.version, cand.content_hash).first();\n"
     )
 
@@ -746,11 +747,11 @@ def _worker_approval_insert(
         f"const {var} = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
         + json.dumps(candidate_id)
         + ").first();\n"
-        + "await env.ASSET_DB.prepare('INSERT INTO personal_ai_approval_ledger (approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind("
+        + "await env.ASSET_DB.prepare('INSERT INTO personal_ai_approval_ledger (approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, created_at, exact_target, payload_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind("
         + json.dumps(receipt)
         + f", 'KNOWLEDGE_PROMOTION', 'KNOWLEDGE', {var}.candidate_id, {var}.version, {var}.content_hash, 'PASS', 'human-operator', "
         + json.dumps(expires)
-        + ", new Date().toISOString()).run();\n"
+        + f", new Date().toISOString(), JSON.stringify({{operation: 'KNOWLEDGE_PROMOTION', candidate_id: {var}.candidate_id, candidate_version: {var}.version, content_hash: {var}.content_hash, asset_id: {var}.asset_id, review_result: 'PASS', reviewed_at: {var}.reviewed_at}}), await sha256Hex(JSON.stringify({{operation: 'KNOWLEDGE_PROMOTION', candidate_id: {var}.candidate_id, candidate_version: {var}.version, content_hash: {var}.content_hash, asset_id: {var}.asset_id, review_result: 'PASS', reviewed_at: {var}.reviewed_at}}))).run();\n"
     )
 
 
