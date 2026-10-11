@@ -142,7 +142,7 @@
     "root_task_id": "cf-3b1edc97a277",
     "risk_level": "LOW",
     "baseline_head": "f86589564c858e8bfe5e894f25cf9a038a79715a",
-    "candidate_commit": "__CANDIDATE_COMMIT__",
+    "candidate_commit": "cecf0e3fda4f9be19f2295c42ed66a9a10152abb",
     "scope": "Same approved 3-file BUGFIX continuation of the review-registration metadata repair.",
     "prior_round_verification": "Round 1 workflow reported the full suite passing (1688 passed, 1 skipped) and reported the metadata bound as satisfied, yet independent acceptance remained CHANGES_REQUIRED: two defects were still reproducible from the same source. This round repairs only those source-reproducible defects; it does not re-litigate round 1's recorded evidence.",
     "defects": {
