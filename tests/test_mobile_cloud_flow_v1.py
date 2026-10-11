@@ -345,6 +345,28 @@ def verify_promotion_tuple(
         "review_result",
         "reviewed_at",
     )
+
+    def is_integer(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    before_absent = before.get("absent")
+    before_version = before.get("version")
+    after_version = after.get("version")
+    # An explainable transition is either a fresh absence -> a present after, or
+    # a present previous version that strictly increases to the after version.
+    # A decrease, a missing version, or an inconsistent absence is not evidence.
+    if before_absent is True:
+        valid_transition = after.get("absent") is False and is_integer(after_version)
+    elif before_absent is False:
+        valid_transition = (
+            after.get("absent") is False
+            and is_integer(before_version)
+            and is_integer(after_version)
+            and before_version < after_version
+        )
+    else:
+        valid_transition = False
+
     return {
         "approved_target_complete": all(
             approved.get(field) not in (None, "", []) for field in required_target_fields
@@ -352,7 +374,9 @@ def verify_promotion_tuple(
         "receipt_matches_target": bool(receipt)
         and receipt.get("asset_id") == approved.get("asset_id")
         and receipt.get("candidate_id") == approved.get("candidate_id")
-        and receipt.get("content_hash") == approved.get("content_hash"),
+        and receipt.get("candidate_version") == approved.get("candidate_version")
+        and receipt.get("content_hash") == approved.get("content_hash")
+        and receipt.get("promotion_event_ref") == promotion_ref,
         "readback_identity": bool(readback)
         and readback.get("asset_id") == approved.get("asset_id")
         and readback.get("candidate_id") == approved.get("candidate_id")
@@ -366,11 +390,14 @@ def verify_promotion_tuple(
         and provenance.get("candidate_version") == approved.get("candidate_version"),
         "same_asset_before_after": before.get("asset_id") == approved.get("asset_id")
         and after.get("asset_id") == approved.get("asset_id"),
-        "valid_transition": bool(before.get("absent"))
-        or before.get("version") != after.get("version"),
-        "after_matches_target": after.get("candidate_id") == approved.get("candidate_id")
+        "valid_transition": valid_transition,
+        "after_matches_target": after.get("absent") is False
+        and after.get("candidate_id") == approved.get("candidate_id")
         and after.get("candidate_version") == approved.get("candidate_version")
-        and after.get("content_hash") == approved.get("content_hash"),
+        and after.get("content_hash") == approved.get("content_hash")
+        # The canonical asset version produced by the write must equal the
+        # receipt's canonical version (candidate_version stays separate).
+        and after.get("version") == receipt.get("canonical_version"),
         "route": route == expected_route,
     }
 
@@ -502,12 +529,15 @@ class MobileCloudFlowEngine:
 
         if self.scenario_id == "F10_READBACK_MISMATCH":
             # Stated precondition: the fixture writer already returned WRITTEN
-            # under a complete fixture-only approval target.
+            # under a complete fixture-only approval target. This happens once
+            # at construction (setup), never on a read/board path.
             self.content_review_status = "APPROVED"
             self.application_approval_status = "VERIFIED_FIXTURE_ONLY"
             self.execution_status = "PASS"
             self.business_status = "PASS"
             self.approved_target = self._fixture_approved_target()
+            self._perform_fixture_write(ack="OK")
+            self.canonical_status = "WRITTEN"
 
     def _fixture_approved_target(self) -> dict:
         candidate = self.fixture["input"]["candidate"]
@@ -661,10 +691,42 @@ class MobileCloudFlowEngine:
         self.approval_expired = False
         self.pending_approval_token = None
 
+    def _current_target(self) -> dict:
+        candidate = self.fixture["input"]["candidate"]
+        return {
+            "operation": "promote",
+            "candidate_id": self.candidate_id or candidate["candidate_id"],
+            "candidate_version": self.candidate_version,
+            "asset_id": self.asset_id,
+            "content_hash": self.content_hash,
+            "review_result": candidate["review_result"],
+            "reviewed_at": candidate["reviewed_at"],
+        }
+
+    def _approved_target_matches_current(self) -> bool:
+        """The old approved target may only authorize the exact current tuple."""
+        target = self.approved_target
+        if target is None:
+            return False
+        current = self._current_target()
+        for field in (
+            "operation",
+            "candidate_id",
+            "candidate_version",
+            "asset_id",
+            "content_hash",
+            "review_result",
+            "reviewed_at",
+        ):
+            if target.get(field) in (None, "", []) or target.get(field) != current[field]:
+                return False
+        return True
+
     def _write_authorized(self) -> bool:
         return (
             self.application_approval_status == "VERIFIED_FIXTURE_ONLY"
             and self.approved_target is not None
+            and self._approved_target_matches_current()
             and not self.approval_expired
             and not self.approval_invalidated
             and not self.platform_denied
@@ -744,9 +806,17 @@ class MobileCloudFlowEngine:
         result = self._perform_fixture_write(ack="OK", provenance=provenance)
         if result == "WRITTEN":
             self.canonical_status = "WRITTEN"
+            self.pipeline_status = "VERIFYING_READBACK"
         elif result == "UNKNOWN":
             self.canonical_status = "WRITE_ACK_UNKNOWN"
-        self.pipeline_status = "VERIFYING_READBACK"
+            self.pipeline_status = "VERIFYING_READBACK"
+        elif result == "IDEMPOTENT":
+            self.pipeline_status = "VERIFYING_READBACK"
+        else:
+            # A refused write must not project a promoting/verifying pipeline;
+            # the stale approved target cannot authorize a different tuple.
+            self.pipeline_status = "BLOCKED"
+            self.done_badge = False
 
     def _read_canonical_record(self) -> dict | None:
         candidate = self.fixture["input"]["candidate"]
@@ -775,15 +845,9 @@ class MobileCloudFlowEngine:
     def _verify_readback(self, readback: dict | None) -> dict:
         approved = self.approved_target
         provenance = (readback or {}).get("provenance", {})
-        if self.scenario_id == "F10_READBACK_MISMATCH":
-            receipt = {
-                "asset_id": (approved or {}).get("asset_id"),
-                "candidate_id": (approved or {}).get("candidate_id"),
-                "content_hash": (approved or {}).get("content_hash"),
-                "canonical_version": (approved or {}).get("candidate_version"),
-            }
-        else:
-            receipt = self.promotion_receipt
+        # F10 reuses the complete receipt produced by the stated precondition
+        # write; it is not exempt from the corrected receipt checks.
+        receipt = self.promotion_receipt
         return verify_promotion_tuple(
             approved_target=approved,
             receipt=receipt,
@@ -798,10 +862,9 @@ class MobileCloudFlowEngine:
 
     def _canonical_read(self, match: bool) -> None:
         # R04: truth comes from an independent synthetic readback record fed
-        # through the same tuple verifier, never from the event name.
-        if self.scenario_id == "F10_READBACK_MISMATCH" and self.promotion_receipt is None:
-            # Stated precondition: the fixture writer returned WRITTEN.
-            self._perform_fixture_write(ack="OK")
+        # through the same tuple verifier, never from the event name. A read
+        # path never writes: the F10 "writer already returned WRITTEN"
+        # precondition is performed once at construction, not here.
         readback = self._read_canonical_record()
         checks = self._verify_readback(readback)
         self.tuple_evidence = checks
@@ -859,9 +922,9 @@ class MobileCloudFlowEngine:
 
         self.required_evidence = evidence
         self.reconciled_from_readback = self.tuple_verified
-        # Never automatically write again when reconciliation is incomplete.
-        if self.promotion_receipt is None:
-            self._perform_fixture_write(ack="OK", reason="hide_mismatch")
+        # A read/reconciliation/board path never writes. Missing or incomplete
+        # evidence is reported as BLOCKED_ACK_UNKNOWN_REQUIRE_RECONCILIATION;
+        # it is never patched by issuing an extra fixture write.
         self.insufficient_evidence_state = "BLOCKED_ACK_UNKNOWN_REQUIRE_RECONCILIATION"
         if self.reconciled_from_readback:
             self.readback_status = "MATCH"
@@ -893,8 +956,15 @@ class MobileCloudFlowEngine:
                 self.board = retained
                 self.retains_last_good_data = True
                 self.last_successful_read_at = retained.get("last_successful_read_at")
-            if self.completed:
+            if self.completed or self.done_badge or self.pipeline_status == "COMPLETE":
                 self.completion_stale = True
+            # The historical last-good projection may stay visible with
+            # is_stale=true, but the *current* completion state and badge must
+            # not stay latched while the tuple is unverified.
+            self.completed = False
+            self.done_badge = False
+            if self.pipeline_status == "COMPLETE":
+                self.pipeline_status = "BLOCKED"
             self.empty_success = False
             self.generated_at_unchanged = True
             return
@@ -975,8 +1045,16 @@ class MobileCloudFlowEngine:
             self.done_badge = True
             self.completed = True
             self.completion_stale = False
-        elif self.completed:
-            self.completion_stale = True
+        else:
+            if self.completed or self.done_badge or self.pipeline_status == "COMPLETE":
+                self.completion_stale = True
+            # A no-longer-satisfied predicate retracts the current completion
+            # rather than latching the external state at COMPLETE. Historical
+            # last-good data may remain visible with stale=true.
+            self.completed = False
+            self.done_badge = False
+            if self.pipeline_status == "COMPLETE":
+                self.pipeline_status = "BLOCKED"
 
     def _task_route_selection(self) -> None:
         runtime = self.fixture["runtime"]
@@ -1608,10 +1686,14 @@ def test_r03_success_with_wrong_tuple_stays_stale() -> None:
 def test_r04_mismatching_hash_is_blocked_without_extra_write() -> None:
     monitor = LiveCallMonitor()
     engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F10_READBACK_MISMATCH")
+    # The stated "writer already returned WRITTEN" precondition is performed
+    # once at construction, outside any read/board path.
+    assert engine.canonical.write_count == 1
+    assert engine.canonical.write_attempt_count == 1
     writes_before = engine.canonical.write_count
     engine.handle_event("CANONICAL_READ_MISMATCH_FIXTURE")
     assert engine.readback_status == "MISMATCH"
-    assert engine.canonical.write_count == writes_before + 1  # only the precondition write
+    assert engine.canonical.write_count == writes_before  # reads never write
     engine._board_refresh(ok=True)
     assert engine.pipeline_status == "BLOCKED"
     assert engine.pipeline_status != "COMPLETE"
@@ -1957,12 +2039,13 @@ def _not_observed_phase(command: str) -> dict:
         "phase": None,
         "source": None,
         "commit": None,
+        "tested_revision": "not_observed",
     }
 
 
 def default_run_metadata() -> dict:
     return {
-        "checkout_baseline_sha": "5fc9efbc2102725dd36dba68f630ec15df0e20ca",
+        "checkout_baseline_sha": "11df59bc927dbb54141c89b77f21a156778ed025",
         "produced_commit_note": (
             "the produced commit SHA is recorded by the runner's execution_result.json after "
             "this report is committed; it is intentionally not self-referenced here"
@@ -1989,19 +2072,23 @@ def default_run_metadata() -> dict:
             },
         },
         "previous_run_evidence": {
-            "run_id": 38142051686,
-            "head_sha": "171758f1f75883e84bfca5fc7ea6355dea902d1b",
-            "produced_commit": "5fc9efbc2102725dd36dba68f630ec15df0e20ca",
-            "note": "historical evidence from the reviewed original run; never this repair's results",
-            "focused": "python -m pytest -q tests/test_mobile_cloud_flow_v1.py: 27 passed",
+            "run_id": 38144001460,
+            "head_sha": "11df59bc927dbb54141c89b77f21a156778ed025",
+            "produced_commit": "11df59bc927dbb54141c89b77f21a156778ed025",
+            "note": (
+                "historical previous-repair-run evidence only; never this continuation's results"
+            ),
+            "focused": "python -m pytest -q tests/test_mobile_cloud_flow_v1.py: 68 passed",
             "combined": (
                 "python -m pytest -q tests/test_mobile_cloud_flow_v1.py "
-                "tests/test_status_contract_v0_2.py tests/test_result_normalization.py: 74 passed in 0.52s"
+                "tests/test_status_contract_v0_2.py tests/test_result_normalization.py: 115 passed"
             ),
-            "agent_full_suite": "python -m pytest -q: 1614 passed, 1 skipped in 70.40s before commit",
+            "agent_full_suite": (
+                "python -m pytest -q: 1655 passed, 1 skipped in 48.20s/48.73s before commit"
+            ),
             "workflow_verify_full_suite": (
-                "python -m pytest -q: 1614 passed, 1 skipped in 66.40s on produced commit "
-                "5fc9efbc2102725dd36dba68f630ec15df0e20ca"
+                "python -m pytest -q: 1655 passed, 1 skipped in 48.77s on produced commit "
+                "11df59bc927dbb54141c89b77f21a156778ed025"
             ),
         },
         "fixture_io_observation": {
@@ -2016,6 +2103,30 @@ def default_run_metadata() -> dict:
     }
 
 
+REQUIRED_AGENT_PHASES = ("agent_focused", "agent_affected_combined", "agent_full_suite")
+
+
+def _phase_verdict(record: dict) -> str:
+    """Reduce one phase record to PASS / FAIL / NOT_OBSERVED."""
+    if not record.get("observed"):
+        return "NOT_OBSERVED"
+    return "PASS" if record.get("status") == "PASS" else "FAIL"
+
+
+def _aggregate_agent_phases(phases: dict) -> str:
+    """Aggregate only from actually observed phase records.
+
+    Any observed required FAIL fails the aggregate; any unobserved required
+    phase keeps it pending. It is never CONTRACT_PASS without observations.
+    """
+    verdicts = [_phase_verdict(phases.get(key, {})) for key in REQUIRED_AGENT_PHASES]
+    if any(verdict == "FAIL" for verdict in verdicts):
+        return "FAIL"
+    if any(verdict == "NOT_OBSERVED" for verdict in verdicts):
+        return "PENDING"
+    return "PASS"
+
+
 def build_report(suite: dict | None = None, run_metadata: dict | None = None) -> dict:
     """Build the fixture report. Pure: performs no file writes."""
     suite = suite if suite is not None else run_fixture_suite()
@@ -2026,6 +2137,15 @@ def build_report(suite: dict | None = None, run_metadata: dict | None = None) ->
     workflow_actions = metadata.get("workflow_actions", {})
     focused_phase = phases.get("agent_focused", {})
     full_phase = phases.get("agent_full_suite", {})
+    workflow_phase = phases.get("workflow_verify_full_suite", {})
+    scenario_evaluation = "PASS" if suite["all_ok"] else "FAIL"
+    process_status = _aggregate_agent_phases(phases)
+    if scenario_evaluation == "FAIL" or process_status == "FAIL":
+        aggregate_verdict = "FAIL"
+    elif process_status == "PENDING":
+        aggregate_verdict = "PENDING"
+    else:
+        aggregate_verdict = "CONTRACT_PASS"
     return {
         "schema": "personal-ai-mobile-cloud-flow-report/v1",
         "run_id": "mobile-cloud-flow-v1-fixture-run",
@@ -2065,9 +2185,13 @@ def build_report(suite: dict | None = None, run_metadata: dict | None = None) ->
         "produced_commit_note": metadata.get("produced_commit_note"),
         "previous_run_evidence": metadata.get("previous_run_evidence"),
         "fixture_io_observation": metadata.get("fixture_io_observation", default_run_metadata()["fixture_io_observation"]),
+        "scenario_evaluation": scenario_evaluation,
+        "process_status": process_status,
+        "workflow_verify_status": workflow_phase.get("status", NOT_OBSERVED),
+        "workflow_verify_receipt": workflow_phase,
         "focused_suite": {
             "command": focused_phase.get("command", "python -m pytest -q tests/test_mobile_cloud_flow_v1.py"),
-            "status": "PASS" if suite["all_ok"] else "FAIL",
+            "status": focused_phase.get("status", NOT_OBSERVED),
             "scenario_pass_count": sum(1 for e in suite["results"].values() if e["match"]),
             "scenario_total": len(suite["results"]),
         },
@@ -2075,8 +2199,8 @@ def build_report(suite: dict | None = None, run_metadata: dict | None = None) ->
             "tests/test_status_contract_v0_2.py",
             "tests/test_result_normalization.py",
         ],
-        "execution_result": "CONTRACT_PASS" if suite["all_ok"] else "FAIL",
-        "business_final_status": "CONTRACT_PASS" if suite["all_ok"] else "FAIL",
+        "execution_result": aggregate_verdict,
+        "business_final_status": aggregate_verdict,
         "not_claimed": [
             "phone access / mobile E2E",
             "real passkey or live application approval",
@@ -2102,7 +2226,7 @@ def build_report(suite: dict | None = None, run_metadata: dict | None = None) ->
 
 def test_report_builder_is_pure_and_serializes_to_tmp(tmp_path: Path) -> None:
     before = REPORT_PATH.read_bytes() if REPORT_PATH.exists() else None
-    report = build_report()
+    report = build_report(run_metadata=_all_agent_phases_pass())
     # A pure builder must never touch the committed report.
     after = REPORT_PATH.read_bytes() if REPORT_PATH.exists() else None
     assert before == after
@@ -2117,6 +2241,8 @@ def test_report_builder_is_pure_and_serializes_to_tmp(tmp_path: Path) -> None:
     assert reloaded["release_status"] == "NOT_PERFORMED"
     assert len(reloaded["scenarios"]) == 15
     assert all(scenario["status"] == "PASS" for scenario in reloaded["scenarios"])
+    assert reloaded["scenario_evaluation"] == "PASS"
+    assert reloaded["process_status"] == "PASS"
     assert reloaded["execution_result"] == "CONTRACT_PASS"
     assert reloaded["source_manifest_sha256"] is None
     assert reloaded["contract_planned_full_repository_suite_status"] == CONTRACT_PLANNED_FULL_SUITE_STATUS
@@ -2154,3 +2280,347 @@ def test_committed_report_exists_and_labels_contract_only() -> None:
     assert report["release_status"] == "NOT_PERFORMED"
     for action in FIXTURE_WORKFLOW_SCOPED_ACTIONS:
         assert report["workflow_actions"][action]["scope"] == "workflow_record_not_fixture_counter"
+
+
+# ---------------------------------------------------------------------------
+# S01: complete promotion tuple (receipt candidate_version/ref, after version,
+# and an explicit, explainable before/after transition)
+# ---------------------------------------------------------------------------
+
+
+def test_s01_unit_after_version_must_equal_receipt_canonical_version() -> None:
+    inputs = _valid_tuple_inputs()
+    # Only after.version changes; receipt.canonical_version and readback.version
+    # stay 1. The canonical asset version is what the write produced.
+    inputs["after"]["version"] = 999
+    checks = _verify(inputs)
+    assert checks["after_matches_target"] is False
+    assert not all(checks.values())
+
+
+def test_s01_unit_receipt_candidate_version_must_match_approved() -> None:
+    inputs = _valid_tuple_inputs()
+    inputs["receipt"]["candidate_version"] = 999
+    checks = _verify(inputs)
+    assert checks["receipt_matches_target"] is False
+    assert not all(checks.values())
+
+
+def test_s01_unit_receipt_promotion_ref_must_match_expected() -> None:
+    inputs = _valid_tuple_inputs()
+    inputs["receipt"]["promotion_event_ref"] = "other-ref"
+    checks = _verify(inputs)
+    assert checks["receipt_matches_target"] is False
+    assert not all(checks.values())
+
+
+def test_s01_unit_decreased_before_version_is_invalid_transition() -> None:
+    inputs = _valid_tuple_inputs()
+    inputs["before"] = {"asset_id": "a1", "version": 999, "absent": False}
+    checks = _verify(inputs)
+    assert checks["same_asset_before_after"] is True
+    assert checks["valid_transition"] is False
+    assert not all(checks.values())
+
+
+def test_s01_unit_missing_before_version_is_invalid_transition() -> None:
+    inputs = _valid_tuple_inputs()
+    inputs["before"] = {"asset_id": "a1", "absent": False}
+    checks = _verify(inputs)
+    assert checks["valid_transition"] is False
+    assert not all(checks.values())
+
+
+def test_s01_unit_after_absent_is_not_a_real_after() -> None:
+    inputs = _valid_tuple_inputs()
+    # Same target fields and version, but the after record says the asset is
+    # absent; that cannot be the record this promotion produced.
+    inputs["after"]["absent"] = True
+    checks = _verify(inputs)
+    assert checks["after_matches_target"] is False
+    assert not all(checks.values())
+
+
+def test_s01_unit_distinct_candidate_and_canonical_versions_are_supported() -> None:
+    inputs = _valid_tuple_inputs()
+    # candidate_version (what was approved) and canonical asset version (what
+    # the write produced) are deliberately different concepts.
+    inputs["approved_target"]["candidate_version"] = 2
+    inputs["receipt"]["candidate_version"] = 2
+    inputs["receipt"]["canonical_version"] = 3
+    inputs["readback"]["version"] = 3
+    inputs["after"]["candidate_version"] = 2
+    inputs["after"]["version"] = 3
+    inputs["provenance"]["candidate_version"] = 2
+    inputs["readback"]["provenance"]["candidate_version"] = 2
+    checks = _verify(inputs)
+    assert checks["receipt_matches_target"] is True
+    assert checks["readback_version_is_receipt"] is True
+    assert checks["after_matches_target"] is True
+    assert all(checks.values()), checks
+
+
+def test_s01_integration_after_version_999_cannot_reconcile() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F09_WRITE_ACK_UNKNOWN")
+    engine.handle_event("PROMOTE_FIXTURE_ACK_UNKNOWN")
+    engine.after_record["version"] = 999
+    engine._canonical_read_exact_provenance()
+    assert engine.tuple_evidence["after_matches_target"] is False
+    assert engine.reconciled_from_readback is False
+    assert engine.insufficient_evidence_state == "BLOCKED_ACK_UNKNOWN_REQUIRE_RECONCILIATION"
+    assert engine.done_badge is False
+    engine._board_refresh(ok=True, fresh=True)
+    assert engine.pipeline_status == "BLOCKED"
+    assert engine.pipeline_status != "COMPLETE"
+
+
+# ---------------------------------------------------------------------------
+# S02: readback / reconciliation / board paths never call the writer
+# ---------------------------------------------------------------------------
+
+
+def test_s02_read_without_receipt_never_writes() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F09_WRITE_ACK_UNKNOWN")
+    assert engine.promotion_receipt is None
+    writes_before = engine.canonical.write_count
+    attempts_before = engine.canonical.write_attempt_count
+    engine._canonical_read_exact_provenance()
+    assert engine.canonical.write_count == writes_before
+    assert engine.canonical.write_attempt_count == attempts_before
+    assert engine.insufficient_evidence_state == "BLOCKED_ACK_UNKNOWN_REQUIRE_RECONCILIATION"
+    assert engine.pipeline_status == "BLOCKED"
+    assert engine.reconciled_from_readback is False
+
+
+def test_s02_repeated_read_and_board_events_never_write() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F09_WRITE_ACK_UNKNOWN")
+    writes_before = engine.canonical.write_count
+    attempts_before = engine.canonical.write_attempt_count
+    for _ in range(3):
+        engine._canonical_read_exact_provenance()
+        engine._board_refresh(ok=True)
+    assert engine.canonical.write_count == writes_before
+    assert engine.canonical.write_attempt_count == attempts_before
+    assert engine.reconciled_from_readback is False
+    assert engine.pipeline_status != "COMPLETE"
+
+
+def test_s02_wrong_tuple_read_never_adds_writes() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F09_WRITE_ACK_UNKNOWN")
+    engine.handle_event("PROMOTE_FIXTURE_ACK_UNKNOWN")
+    writes_after_promote = engine.canonical.write_count
+    attempts_after_promote = engine.canonical.write_attempt_count
+    engine.canonical._assets[engine.asset_id]["content_hash"] = "0" * 64
+    for _ in range(3):
+        engine._canonical_read_exact_provenance()
+        engine._board_refresh(ok=True)
+    assert engine.canonical.write_count == writes_after_promote
+    assert engine.canonical.write_attempt_count == attempts_after_promote
+    assert engine.reconciled_from_readback is False
+    assert engine.pipeline_status != "COMPLETE"
+
+
+# ---------------------------------------------------------------------------
+# S03: the first write is bound to the approved target
+# ---------------------------------------------------------------------------
+
+
+def _approved_f01_engine() -> MobileCloudFlowEngine:
+    engine = MobileCloudFlowEngine(
+        CONTRACT, FIXTURE, LiveCallMonitor(), "F01_COMPLETE_PATH"
+    )
+    engine.handle_event("PHONE_SUBMIT")
+    engine.handle_event("CONTENT_APPROVED")
+    engine.handle_event("APPLICATION_APPROVED_FIXTURE")
+    return engine
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("candidate_version", 999),
+        ("candidate_id", "other-candidate"),
+        ("asset_id", "other-asset"),
+        ("content_hash", "0" * 64),
+    ],
+)
+def test_s03_first_write_refuses_mutated_current_target(field: str, value: object) -> None:
+    engine = _approved_f01_engine()
+    setattr(engine, field, value)
+    result = engine._perform_fixture_write(ack="OK")
+    assert result == "REFUSED"
+    assert engine.canonical.write_count == 0
+    assert engine.canonical.write_attempt_count == 0
+    assert engine.done_badge is False
+    assert engine.pipeline_status != "COMPLETE"
+
+
+def test_s03_write_event_after_target_mutation_is_blocked() -> None:
+    engine = _approved_f01_engine()
+    engine.candidate_version = 999
+    engine.handle_event("CANONICAL_WRITTEN_FIXTURE")
+    assert engine.canonical.write_count == 0
+    assert engine.canonical_status != "WRITTEN"
+    assert engine.done_badge is False
+    assert engine.pipeline_status != "COMPLETE"
+
+
+# ---------------------------------------------------------------------------
+# S04: stale / invalid refresh clears the current COMPLETE state and done badge
+# ---------------------------------------------------------------------------
+
+
+def test_s04_failed_refresh_clears_current_completion_and_badge() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F01_COMPLETE_PATH")
+    for event in SCENARIOS["F01_COMPLETE_PATH"]["events"]:
+        engine.handle_event(event)
+    assert engine.pipeline_status == "COMPLETE"
+    assert engine.done_badge is True
+    engine.handle_event("BOARD_REFRESH_FAIL")
+    assert engine.pipeline_status != "COMPLETE"
+    assert engine.done_badge is False
+    assert engine.completion_stale is True
+    assert engine.board["is_stale"] is True
+
+
+def test_s04_invalid_tuple_refresh_clears_current_completion_and_badge() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F01_COMPLETE_PATH")
+    for event in SCENARIOS["F01_COMPLETE_PATH"]["events"]:
+        engine.handle_event(event)
+    engine.candidate_version = 999
+    engine.handle_event("BOARD_REFRESH")
+    assert engine.pipeline_status != "COMPLETE"
+    assert engine.done_badge is False
+    assert engine.board["is_stale"] is True
+
+
+def test_s04_full_revalidation_restores_current_completion() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F01_COMPLETE_PATH")
+    for event in SCENARIOS["F01_COMPLETE_PATH"]["events"]:
+        engine.handle_event(event)
+    engine.handle_event("BOARD_REFRESH_FAIL")
+    assert engine.pipeline_status != "COMPLETE"
+    assert engine.done_badge is False
+    engine.handle_event("BOARD_REFRESH")
+    assert engine.pipeline_status == "COMPLETE"
+    assert engine.done_badge is True
+
+
+# ---------------------------------------------------------------------------
+# S05: aggregate report verdict derives from observed phase records
+# ---------------------------------------------------------------------------
+
+CMD_FOCUSED = "python -m pytest -q tests/test_mobile_cloud_flow_v1.py"
+CMD_COMBINED = (
+    "python -m pytest -q tests/test_mobile_cloud_flow_v1.py "
+    "tests/test_status_contract_v0_2.py tests/test_result_normalization.py"
+)
+CMD_FULL = "python -m pytest -q"
+
+
+def _observed_phase(
+    command: str,
+    passed: int,
+    failed: int = 0,
+    skipped: int = 0,
+    duration: float = 0.0,
+    status: str = "PASS",
+    exit_code: int = 0,
+) -> dict:
+    return {
+        "command": command,
+        "status": status,
+        "observed": True,
+        "exit_code": exit_code,
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "duration_seconds": duration,
+        "phase": None,
+        "source": "agent local run before commit (working tree)",
+        "commit": None,
+        "tested_revision": "working_tree_uncommitted",
+    }
+
+
+def _metadata_with_agent_phases(
+    focused: dict | None = None,
+    combined: dict | None = None,
+    full: dict | None = None,
+) -> dict:
+    metadata = default_run_metadata()
+    if focused is not None:
+        metadata["phases"]["agent_focused"] = focused
+    if combined is not None:
+        metadata["phases"]["agent_affected_combined"] = combined
+    if full is not None:
+        metadata["phases"]["agent_full_suite"] = full
+    return metadata
+
+
+def _all_agent_phases_pass() -> dict:
+    return _metadata_with_agent_phases(
+        focused=_observed_phase(CMD_FOCUSED, 100),
+        combined=_observed_phase(CMD_COMBINED, 150),
+        full=_observed_phase(CMD_FULL, 1655, skipped=1),
+    )
+
+
+def test_s05_observed_focused_failure_forces_artifact_fail() -> None:
+    metadata = _metadata_with_agent_phases(
+        focused=_observed_phase(CMD_FOCUSED, 1, failed=1, status="FAIL", exit_code=1),
+        combined=_observed_phase(CMD_COMBINED, 150),
+        full=_observed_phase(CMD_FULL, 1655, skipped=1),
+    )
+    report = build_report(run_metadata=metadata)
+    assert report["scenario_evaluation"] == "PASS"
+    assert report["process_status"] == "FAIL"
+    assert report["execution_result"] == "FAIL"
+    assert report["business_final_status"] == "FAIL"
+    assert report["focused_suite"]["status"] == "FAIL"
+
+
+def test_s05_observed_full_suite_failure_forces_artifact_fail() -> None:
+    metadata = _metadata_with_agent_phases(
+        focused=_observed_phase(CMD_FOCUSED, 100),
+        combined=_observed_phase(CMD_COMBINED, 150),
+        full=_observed_phase(CMD_FULL, 1655, failed=1, status="FAIL", exit_code=1),
+    )
+    report = build_report(run_metadata=metadata)
+    assert report["execution_result"] == "FAIL"
+    assert report["business_final_status"] == "FAIL"
+
+
+def test_s05_default_metadata_is_pending_not_contract_pass() -> None:
+    report = build_report(run_metadata=default_run_metadata())
+    assert report["scenario_evaluation"] == "PASS"
+    assert report["process_status"] == "PENDING"
+    assert report["execution_result"] == "PENDING"
+    assert report["execution_result"] != "CONTRACT_PASS"
+    assert report["focused_suite"]["status"] == NOT_OBSERVED
+
+
+def test_s05_all_agent_phases_observed_pass_yields_contract_pass() -> None:
+    report = build_report(run_metadata=_all_agent_phases_pass())
+    assert report["execution_result"] == "CONTRACT_PASS"
+    assert report["business_final_status"] == "CONTRACT_PASS"
+    assert report["scenario_evaluation"] == "PASS"
+    assert report["process_status"] == "PASS"
+    # The eventual workflow Verify receipt is separate and genuinely pending.
+    assert report["workflow_verify_status"] == NOT_OBSERVED
+
+
+def test_s05_precommit_phase_revision_is_not_checkout_baseline() -> None:
+    report = build_report(run_metadata=default_run_metadata())
+    baseline = report["checkout_baseline_sha"]
+    for key in ("agent_focused", "agent_affected_combined", "agent_full_suite"):
+        phase = report["execution_phases"][key]
+        assert phase["commit"] != baseline
+        assert phase.get("tested_revision") in ("working_tree_uncommitted", "not_observed")
