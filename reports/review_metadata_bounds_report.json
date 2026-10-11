@@ -236,7 +236,7 @@
     "root_task_id": "cf-3b1edc97a277",
     "risk_level": "LOW",
     "baseline_head": "5a331e126105c1f397b8bf553fcde79c68f0c96b",
-    "candidate_commit": "__CANDIDATE_COMMIT__",
+    "candidate_commit": "ee9df1142ed40a80ac42a0cbada8c34e6816e80c",
     "scope": "Same approved 3-file BUGFIX continuation of the review-registration metadata/lineage fidelity repair.",
     "prior_round_verification": "Round 2 reported the full suite passing (1697 passed, 1 skipped) and the identity/lineage semantics satisfied, yet independent acceptance remained CHANGES_REQUIRED: two list read-back defects were still reproducible from the same bounded-identity counterexample. This round writes the exact R2a/R2b counterexamples first and obtains a red baseline before touching source (test-first), then repairs only those two source-reproducible defects without widening scope.",
     "defects": {
