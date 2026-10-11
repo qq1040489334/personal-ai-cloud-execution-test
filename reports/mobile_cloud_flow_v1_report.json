@@ -1,0 +1,346 @@
+{
+  "schema": "personal-ai-mobile-cloud-flow-report/v1",
+  "run_id": "mobile-cloud-flow-v1-fixture-run",
+  "validation_level": "CONTRACT_ONLY",
+  "generated_at_utc": "2026-10-11T12:00:00Z",
+  "time_source": "deterministic fixture clock (not wall clock)",
+  "fixture_contract_sha256": "3af27d66158bc52a35ec3e894d3ab90081d7a740d601fc58a6e3b700482e7f4b",
+  "fixture_data_sha256": "63be28972835dac3c9f12cf38e933f6bd12069bf6e708ff2da24261102b8ac7e",
+  "source_manifest_sha256": null,
+  "input_gaps": [
+    "unpublished Site v32 source bytes are unavailable",
+    "unpublished 33-file patch bytes are unavailable",
+    "no source manifest bytes are present to hash; source_manifest_sha256 is null and no equivalence is claimed",
+    "no in-repo machine-readable prior full-suite receipt is available for the historical head"
+  ],
+  "scenarios": [
+    {
+      "id": "F01_COMPLETE_PATH",
+      "status": "PASS",
+      "actual": {
+        "pipeline_status": "COMPLETE",
+        "validation_level": "CONTRACT_ONLY",
+        "canonical_fixture_write_count": 1,
+        "board_asset_version": 1,
+        "board_is_stale": false,
+        "live_phone_e2e": false
+      },
+      "expected": {
+        "pipeline_status": "COMPLETE",
+        "validation_level": "CONTRACT_ONLY",
+        "canonical_fixture_write_count": 1,
+        "board_asset_version": 1,
+        "board_is_stale": false,
+        "live_phone_e2e": false
+      }
+    },
+    {
+      "id": "F02_WORKFLOW_PASS_BUSINESS_PARTIAL",
+      "status": "PASS",
+      "actual": {
+        "pipeline_status": "PARTIAL",
+        "execution_status": "PASS",
+        "business_status": "PARTIAL",
+        "canonical_fixture_write_count": 0,
+        "done_badge": false
+      },
+      "expected": {
+        "pipeline_status": "PARTIAL",
+        "execution_status": "PASS",
+        "business_status": "PARTIAL",
+        "canonical_fixture_write_count": 0,
+        "done_badge": false
+      }
+    },
+    {
+      "id": "F03_PROCESSING_PENDING",
+      "status": "PASS",
+      "actual": {
+        "pipeline_status": "PROCESSING",
+        "execution_status": "PENDING",
+        "terminal": false,
+        "canonical_fixture_write_count": 0,
+        "application_approval_prompted": false
+      },
+      "expected": {
+        "pipeline_status": "PROCESSING",
+        "execution_status": "PENDING",
+        "terminal": false,
+        "canonical_fixture_write_count": 0,
+        "application_approval_prompted": false
+      }
+    },
+    {
+      "id": "F04_PROCESSING_FAILURE",
+      "status": "PASS",
+      "actual": {
+        "pipeline_status": "BLOCKED",
+        "execution_status": "FAIL",
+        "canonical_fixture_write_count": 0
+      },
+      "expected": {
+        "pipeline_status": "BLOCKED",
+        "execution_status": "FAIL",
+        "canonical_fixture_write_count": 0
+      }
+    },
+    {
+      "id": "F05_ORDINARY_EXISTING_ROUTE",
+      "status": "PASS",
+      "actual": {
+        "execution_route": "ordinary_cloudagent",
+        "current_workflow_model": "opencode-go/deepseek-v4.1-flash",
+        "requires_new_model_parameter": false,
+        "requires_Sol_alignment": false,
+        "new_infrastructure_count": 0
+      },
+      "expected": {
+        "execution_route": "ordinary_cloudagent",
+        "current_workflow_model": "opencode-go/deepseek-v4.1-flash",
+        "requires_new_model_parameter": false,
+        "requires_Sol_alignment": false,
+        "new_infrastructure_count": 0
+      }
+    },
+    {
+      "id": "F06_CONTENT_APPROVAL_ONLY",
+      "status": "PASS",
+      "actual": {
+        "pipeline_status": "WAITING_APPLICATION_APPROVAL",
+        "canonical_fixture_write_count": 0,
+        "application_approval_status": "NOT_COMPLETED"
+      },
+      "expected": {
+        "pipeline_status": "WAITING_APPLICATION_APPROVAL",
+        "canonical_fixture_write_count": 0,
+        "application_approval_status": "NOT_COMPLETED"
+      }
+    },
+    {
+      "id": "F07_PHONE_RELOAD_RESUME",
+      "status": "PASS",
+      "actual": {
+        "same_task_id": true,
+        "same_candidate_id": true,
+        "new_candidate_count": 0,
+        "new_dispatch_count": 0,
+        "behavior_scope": "PROPOSED_STUB_ONLY_NOT_EXISTING_SUBMIT_GUARANTEE",
+        "live_submit_replayed": false
+      },
+      "expected": {
+        "same_task_id": true,
+        "same_candidate_id": true,
+        "new_candidate_count": 0,
+        "new_dispatch_count": 0,
+        "behavior_scope": "PROPOSED_STUB_ONLY_NOT_EXISTING_SUBMIT_GUARANTEE",
+        "live_submit_replayed": false
+      }
+    },
+    {
+      "id": "F08_APP_APPROVAL_EXPIRED",
+      "status": "PASS",
+      "actual": {
+        "pipeline_status": "WAITING_APPLICATION_APPROVAL",
+        "canonical_fixture_write_count": 0,
+        "automatic_passkey_attempt_count": 0,
+        "requires_user_action": true
+      },
+      "expected": {
+        "pipeline_status": "WAITING_APPLICATION_APPROVAL",
+        "canonical_fixture_write_count": 0,
+        "automatic_passkey_attempt_count": 0,
+        "requires_user_action": true
+      }
+    },
+    {
+      "id": "F09_WRITE_ACK_UNKNOWN",
+      "status": "PASS",
+      "actual": {
+        "pipeline_status": "COMPLETE",
+        "canonical_fixture_write_count": 1,
+        "automatic_second_write_count": 0,
+        "reconciled_from_readback": true,
+        "required_evidence": [
+          "matching approved candidate_id/candidate_version/asset_id/content_hash",
+          "matching promotion_event provenance",
+          "before/after version or absence evidence attributing this write",
+          "fresh board matching same target"
+        ],
+        "hash_only_sufficient": false,
+        "insufficient_evidence_state": "BLOCKED_ACK_UNKNOWN_REQUIRE_RECONCILIATION"
+      },
+      "expected": {
+        "pipeline_status": "COMPLETE",
+        "canonical_fixture_write_count": 1,
+        "automatic_second_write_count": 0,
+        "reconciled_from_readback": true,
+        "required_evidence": [
+          "matching approved candidate_id/candidate_version/asset_id/content_hash",
+          "matching promotion_event provenance",
+          "before/after version or absence evidence attributing this write",
+          "fresh board matching same target"
+        ],
+        "hash_only_sufficient": false,
+        "insufficient_evidence_state": "BLOCKED_ACK_UNKNOWN_REQUIRE_RECONCILIATION"
+      }
+    },
+    {
+      "id": "F10_READBACK_MISMATCH",
+      "status": "PASS",
+      "actual": {
+        "pipeline_status": "BLOCKED",
+        "readback_status": "MISMATCH",
+        "done_badge": false,
+        "new_write_to_hide_mismatch_count": 0
+      },
+      "expected": {
+        "pipeline_status": "BLOCKED",
+        "readback_status": "MISMATCH",
+        "done_badge": false,
+        "new_write_to_hide_mismatch_count": 0
+      }
+    },
+    {
+      "id": "F11_BOARD_REFRESH_ERROR",
+      "status": "PASS",
+      "actual": {
+        "retains_last_good_data": true,
+        "board_is_stale": true,
+        "empty_success": false,
+        "generated_at_unchanged": true
+      },
+      "expected": {
+        "retains_last_good_data": true,
+        "board_is_stale": true,
+        "empty_success": false,
+        "generated_at_unchanged": true
+      }
+    },
+    {
+      "id": "F12_USER_REQUESTS_REVISION",
+      "status": "PASS",
+      "actual": {
+        "pipeline_status": "CONTENT_REVIEW",
+        "canonical_fixture_write_count": 0,
+        "application_approval_prompted": false
+      },
+      "expected": {
+        "pipeline_status": "CONTENT_REVIEW",
+        "canonical_fixture_write_count": 0,
+        "application_approval_prompted": false
+      }
+    },
+    {
+      "id": "F13_PLATFORM_ACTION_DENIED",
+      "status": "PASS",
+      "actual": {
+        "pipeline_status": "BLOCKED",
+        "alternate_tool_or_environment_attempt_count": 0,
+        "retry_without_new_valid_authority_count": 0,
+        "reason": "ACTION_AUTHORITY_REQUIRED"
+      },
+      "expected": {
+        "pipeline_status": "BLOCKED",
+        "alternate_tool_or_environment_attempt_count": 0,
+        "retry_without_new_valid_authority_count": 0,
+        "reason": "ACTION_AUTHORITY_REQUIRED"
+      }
+    },
+    {
+      "id": "F14_SOURCE_BYTES_MISSING",
+      "status": "PASS",
+      "actual": {
+        "pipeline_status": "BLOCKED",
+        "reason": "SOURCE_BYTES_REQUIRED",
+        "reconstructed_same_version": false
+      },
+      "expected": {
+        "pipeline_status": "BLOCKED",
+        "reason": "SOURCE_BYTES_REQUIRED",
+        "reconstructed_same_version": false
+      }
+    },
+    {
+      "id": "F15_PHONE_END_TO_END_EVIDENCE_GAP",
+      "status": "PASS",
+      "actual": {
+        "reported_status": "CONTRACT_PASS",
+        "mobile_e2e_status": "NOT_RUN",
+        "production_write_status": "NOT_RUN",
+        "release_status": "NOT_PERFORMED"
+      },
+      "expected": {
+        "reported_status": "CONTRACT_PASS",
+        "mobile_e2e_status": "NOT_RUN",
+        "production_write_status": "NOT_RUN",
+        "release_status": "NOT_PERFORMED"
+      }
+    }
+  ],
+  "live_call_counters": {
+    "network_call_count": 0,
+    "live_passkey_call_count": 0,
+    "live_db_call_count": 0,
+    "real_dispatch_count": 0,
+    "external_mutation_count": 0,
+    "canonical_mcp_write_count": 0,
+    "production_site_request_count": 0,
+    "git_push_count": 0,
+    "external_notification_count": 0,
+    "repository_code_executed": false
+  },
+  "network_call_count": 0,
+  "live_passkey_call_count": 0,
+  "live_db_call_count": 0,
+  "real_dispatch_count": 0,
+  "external_mutation_count": 0,
+  "repository_code_executed": false,
+  "mobile_e2e_status": "NOT_RUN",
+  "production_write_status": "NOT_RUN",
+  "release_status": "NOT_PERFORMED",
+  "full_repository_suite_status": "NOT_RUN_THIS_ROUND",
+  "full_repository_suite_note": "The unchanged full repository suite is NOT_RUN_THIS_ROUND as contract evidence; the dispatch workflow runs it independently in its Verify step.",
+  "historical_full_suite_evidence": {
+    "head": "171758f1f75883e84bfca5fc7ea6355dea902d1b",
+    "note": "last public commit before this round; no in-repo machine-readable full-suite receipt exists, so no prior pass count is counted as this run"
+  },
+  "focused_suite": {
+    "command": "python -m pytest -q tests/test_mobile_cloud_flow_v1.py",
+    "status": "PASS",
+    "scenario_pass_count": 15,
+    "scenario_total": 15
+  },
+  "directly_affected_existing_tests": [
+    "tests/test_status_contract_v0_2.py",
+    "tests/test_result_normalization.py"
+  ],
+  "execution_result": "CONTRACT_PASS",
+  "business_final_status": "CONTRACT_PASS",
+  "not_claimed": [
+    "phone access / mobile E2E",
+    "real passkey or live application approval",
+    "real D1 or Canonical production write",
+    "deployed dashboard freshness",
+    "source equivalence with unpublished Site v32 / 33-file patches"
+  ],
+  "f07_scope": "PROPOSED_STUB_ONLY_NOT_EXISTING_SUBMIT_GUARANTEE",
+  "f09_scope": "hash equality alone is insufficient; requires exact approved target, matching promotion provenance, before/after evidence, fresh board",
+  "forbidden_io": [
+    "network",
+    "repository_dispatch",
+    "live_D1",
+    "passkey API",
+    "real approval receipt",
+    "Canonical MCP write",
+    "production Site request",
+    "Git push",
+    "external notification"
+  ],
+  "ordinary_execution_route": {
+    "execution_route": "ordinary_cloudagent",
+    "current_workflow_model": "opencode-go/deepseek-v4.1-flash",
+    "new_model_interface_added": false,
+    "new_infrastructure_added": false
+  },
+  "golden_fixture_convention": "no root execution_result.json is written or committed"
+}

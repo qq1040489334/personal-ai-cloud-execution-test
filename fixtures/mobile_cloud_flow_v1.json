@@ -1,0 +1,182 @@
+{
+  "schema": "personal-ai-mobile-cloud-fixture-data/v1",
+  "derived_from": "contracts/mobile_cloud_flow_v1.json",
+  "deterministic": true,
+  "generated_at_utc": "2026-10-11T12:00:00Z",
+  "validation_level": "CONTRACT_ONLY",
+  "input": {
+    "client": "phone_fixture",
+    "windows": "OFF",
+    "project_id": "fixture-project",
+    "root_task_id": "fixture-root-001",
+    "request_id": "fixture-submit-001",
+    "task_id": "fixture-task-001",
+    "candidate": {
+      "candidate_id": "fixture-candidate-001",
+      "asset_id": "fixture-knowledge-001",
+      "candidate_version": 1,
+      "content": "fixture-only: mobile cloud",
+      "content_hash": "608c698c49db462bc148e9a5d75f211cb66d106d04b3c6858adba850e3d3de13",
+      "review_result": "PASS",
+      "reviewed_at": "2026-10-11T12:00:00.001Z"
+    },
+    "execution_route": "ordinary_cloudagent"
+  },
+  "runtime": {
+    "current_workflow_model": "opencode-go/deepseek-v4.1-flash",
+    "requires_new_model_parameter": false,
+    "requires_Sol_alignment": false,
+    "new_infrastructure_count": 0
+  },
+  "board": {
+    "source_commit": "fixture-commit-0002",
+    "model": "opencode-go/deepseek-v4.1-flash",
+    "generated_at": "2026-10-11T12:00:03Z",
+    "last_successful_read_at": "2026-10-11T12:00:03Z",
+    "promotion_event_ref": "fixture-promotion-001"
+  },
+  "previous_good_board": {
+    "task_id": "fixture-task-001",
+    "candidate_id": "fixture-candidate-001",
+    "asset_id": "fixture-knowledge-001",
+    "execution_status": "PASS",
+    "business_status": "PASS",
+    "content_review_status": "APPROVED",
+    "application_approval_status": "VERIFIED_FIXTURE_ONLY",
+    "canonical_status": "WRITTEN",
+    "readback_status": "MATCH",
+    "pipeline_status": "COMPLETE",
+    "generated_at": "2026-10-11T11:59:00Z",
+    "last_successful_read_at": "2026-10-11T11:59:00Z",
+    "is_stale": false,
+    "source_commit": "fixture-commit-0001",
+    "model": "opencode-go/deepseek-v4.1-flash",
+    "candidate_version": 1,
+    "promotion_event_ref": "fixture-promotion-000"
+  },
+  "scenario_inputs": {
+    "F01_COMPLETE_PATH": {},
+    "F02_WORKFLOW_PASS_BUSINESS_PARTIAL": {
+      "cloud_result": {
+        "workflow_conclusion": "success",
+        "advisory_status": "success",
+        "final_status": "PARTIAL"
+      }
+    },
+    "F03_PROCESSING_PENDING": {
+      "result_read": {
+        "terminal": false,
+        "workflow_conclusion": null,
+        "advisory_status": "submitted",
+        "execution_status": "PENDING"
+      }
+    },
+    "F04_PROCESSING_FAILURE": {
+      "result_read": {
+        "terminal": true,
+        "workflow_conclusion": "failure",
+        "advisory_status": "success"
+      }
+    },
+    "F05_ORDINARY_EXISTING_ROUTE": {},
+    "F06_CONTENT_APPROVAL_ONLY": {},
+    "F07_PHONE_RELOAD_RESUME": {
+      "resume": {
+        "durable_map": {
+          "fixture-submit-001": {
+            "task_id": "fixture-task-001",
+            "candidate_id": "fixture-candidate-001"
+          }
+        }
+      },
+      "result_read": {
+        "terminal": true,
+        "workflow_conclusion": "success",
+        "final_status": "PASS"
+      }
+    },
+    "F08_APP_APPROVAL_EXPIRED": {
+      "approval": {
+        "window_seconds": 300,
+        "opened_at": "2026-10-11T12:00:00Z",
+        "expires_at": "2026-10-11T12:05:00Z"
+      }
+    },
+    "F09_WRITE_ACK_UNKNOWN": {
+      "preconditions": {
+        "execution_status": "PASS",
+        "business_status": "PASS",
+        "content_review_status": "APPROVED",
+        "application_approval_status": "VERIFIED_FIXTURE_ONLY"
+      },
+      "promotion": {
+        "ack": "UNKNOWN",
+        "before": {
+          "asset_id": "fixture-knowledge-001",
+          "version": 0,
+          "absent": true
+        },
+        "after": {
+          "asset_id": "fixture-knowledge-001",
+          "candidate_id": "fixture-candidate-001",
+          "candidate_version": 1,
+          "content_hash": "608c698c49db462bc148e9a5d75f211cb66d106d04b3c6858adba850e3d3de13",
+          "version": 1,
+          "absent": false
+        },
+        "provenance": {
+          "promotion_event_ref": "fixture-promotion-001",
+          "candidate_id": "fixture-candidate-001",
+          "candidate_version": 1
+        }
+      }
+    },
+    "F10_READBACK_MISMATCH": {
+      "readback": {
+        "expected_hash": "608c698c49db462bc148e9a5d75f211cb66d106d04b3c6858adba850e3d3de13",
+        "actual_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "expected_version": 1,
+        "actual_version": 1
+      }
+    },
+    "F11_BOARD_REFRESH_ERROR": {
+      "board": {
+        "refresh_ok": false
+      }
+    },
+    "F12_USER_REQUESTS_REVISION": {
+      "content_review": {
+        "review_result": "CHANGES_REQUESTED"
+      }
+    },
+    "F13_PLATFORM_ACTION_DENIED": {
+      "platform": {
+        "action": "promote",
+        "decision": "DENIED",
+        "reason": "ACTION_AUTHORITY_REQUIRED"
+      }
+    },
+    "F14_SOURCE_BYTES_MISSING": {
+      "handoff": {
+        "have": [
+          "manifest_hash"
+        ],
+        "have_bytes": false,
+        "reason": "SOURCE_BYTES_REQUIRED"
+      }
+    },
+    "F15_PHONE_END_TO_END_EVIDENCE_GAP": {}
+  },
+  "forbidden_counters": {
+    "network_call_count": 0,
+    "live_passkey_call_count": 0,
+    "live_db_call_count": 0,
+    "real_dispatch_count": 0,
+    "external_mutation_count": 0,
+    "canonical_mcp_write_count": 0,
+    "production_site_request_count": 0,
+    "git_push_count": 0,
+    "external_notification_count": 0,
+    "repository_code_executed": false
+  }
+}

@@ -1,0 +1,458 @@
+{
+  "schema": "personal-ai-mobile-cloud-fixture-contract/v1",
+  "purpose": "验证手机输入到云端结果、应用审批、Canonical回读与看板状态的产品逻辑合同；不连接真实系统",
+  "validation_level": "CONTRACT_ONLY",
+  "live_phone_e2e": false,
+  "repository_code_executed": false,
+  "runtime_dependencies": [],
+  "forbidden_io": [
+    "network",
+    "repository_dispatch",
+    "live_D1",
+    "passkey API",
+    "real approval receipt",
+    "Canonical MCP write",
+    "production Site request",
+    "Git push",
+    "external notification"
+  ],
+  "clocks": {
+    "now": "2026-10-11T12:00:00Z",
+    "approval_window_seconds": 300
+  },
+  "input": {
+    "client": "phone_fixture",
+    "windows": "OFF",
+    "project_id": "fixture-project",
+    "root_task_id": "fixture-root-001",
+    "request_id": "fixture-submit-001",
+    "source": {
+      "type": "synthetic_text",
+      "text": "fixture-only: mobile cloud"
+    },
+    "candidate": {
+      "candidate_id": "fixture-candidate-001",
+      "asset_id": "fixture-knowledge-001",
+      "candidate_version": 1,
+      "content": "fixture-only: mobile cloud",
+      "content_hash": "608c698c49db462bc148e9a5d75f211cb66d106d04b3c6858adba850e3d3de13",
+      "review_result": "PASS",
+      "reviewed_at": "2026-10-11T12:00:00.001Z"
+    },
+    "execution_route": "ordinary_cloudagent"
+  },
+  "interfaces": [
+    {
+      "id": "INPUT_SUBMIT",
+      "kind": "existing_connected_submit_tool_contract",
+      "request": {
+        "goal": "string",
+        "instructions": "nonempty array of strings",
+        "acceptance": "nonempty array of strings",
+        "expected_files": "array of permitted exact repository paths",
+        "project_id": "string (optional)",
+        "root_task_id": "string (optional)",
+        "parent_task_id": "string (optional)"
+      },
+      "response": {
+        "task_id": "string",
+        "accepted": "boolean or native provider acceptance",
+        "state": "native task state"
+      },
+      "availability": "existing submit_task; parent decides dispatch; uses fixed workflow model opencode-go/deepseek-v4.1-flash",
+      "idempotency_limit": "The current connected submit_task has no public request_id/idempotency parameter. Fixture deduplication is a proposed stub only. Never infer that replaying the live tool is safe."
+    },
+    {
+      "id": "RESULT_READ",
+      "kind": "existing_tool_contract",
+      "tool": "get_task_result",
+      "request": {
+        "task_id": "string"
+      },
+      "response": {
+        "execution_status": "PASS|FAIL|BLOCKED|PENDING",
+        "terminal": "boolean",
+        "workflow_conclusion": "string|null",
+        "execution_result_json": "object"
+      },
+      "business_status_source": "execution_result_json.final_status; keep PARTIAL separate"
+    },
+    {
+      "id": "CANDIDATE_LIFECYCLE",
+      "kind": "existing_repo_future_tool_alignment",
+      "tool": "write_knowledge_candidate",
+      "request": {
+        "candidate_operation": "create|read|submit_review|review|promote",
+        "candidate_id": "string",
+        "candidate_version": "integer where exact operation needs it",
+        "content_hash": "sha256 where exact operation needs it",
+        "review_result": "PASS|FAIL where review needs it"
+      },
+      "availability": "repo operations exist; connected schema not aligned; this is not a ready-to-call live request"
+    },
+    {
+      "id": "APPLICATION_APPROVE",
+      "kind": "existing_PR8_candidate_route_not_verified_live",
+      "route": "POST /knowledge/approve",
+      "request": {
+        "candidate_id": "string",
+        "candidate_version": "integer",
+        "content_hash": "sha256",
+        "assertion": "USER_BROWSER_ONLY_NO_FIXTURE_ASSERTION"
+      },
+      "fixture_seam": "Test driver emits an abstract APPLICATION_APPROVED event tagged fixture_only; never fabricates or serializes a usable passkey assertion/receipt",
+      "verified_target_fields": [
+        "operation",
+        "candidate_id",
+        "candidate_version",
+        "content_hash",
+        "asset_id",
+        "review_result",
+        "reviewed_at"
+      ]
+    },
+    {
+      "id": "CANONICAL_READ",
+      "kind": "existing_read_only_tool",
+      "tool": "CloudAssetRead.get_asset",
+      "request": {
+        "asset_id": "string"
+      },
+      "response": {
+        "asset_id": "same asset",
+        "version": "integer",
+        "content_hash": "matching sha256",
+        "canonical_content": "same content",
+        "provenance": "object"
+      },
+      "fixture_provider": "in-memory data only; no service calls"
+    },
+    {
+      "id": "BOARD_READ",
+      "kind": "proposed_existing_Site_read_only_view",
+      "route": "GET /api/personal-ai/progress?project_id=fixture-project&root_task_id=fixture-root-001",
+      "source": "read-through projection from existing task metadata and Canonical; no separate durable database",
+      "response_fields": [
+        "task_id",
+        "candidate_id",
+        "asset_id",
+        "execution_status",
+        "business_status",
+        "content_review_status",
+        "application_approval_status",
+        "canonical_status",
+        "readback_status",
+        "pipeline_status",
+        "generated_at",
+        "last_successful_read_at",
+        "is_stale",
+        "source_commit",
+        "model",
+        "candidate_version",
+        "promotion_event_ref"
+      ]
+    }
+  ],
+  "states": [
+    "SUBMITTED",
+    "PROCESSING",
+    "CONTENT_REVIEW",
+    "WAITING_APPLICATION_APPROVAL",
+    "PROMOTING",
+    "VERIFYING_READBACK",
+    "COMPLETE",
+    "PARTIAL",
+    "BLOCKED"
+  ],
+  "completion_predicate": {
+    "all": [
+      "execution_status == PASS and business_status == PASS",
+      "content_review_status == APPROVED",
+      "application_approval_status == VERIFIED_LIVE (or VERIFIED_FIXTURE_ONLY inside fixture runner only)",
+      "canonical_status in WRITTEN,IDEMPOTENT",
+      "readback_status == MATCH",
+      "read asset/version/hash matches promotion receipt",
+      "board is fresh and projects same tuple",
+      "ordinary processing uses existing CloudAgent route; difficult processing is a separate Codex handoff if needed",
+      "write attribution is supported by exact approved candidate/version, promotion provenance, and before/after evidence; hash equality alone is insufficient"
+    ],
+    "fixture_output_label": "CONTRACT_PASS",
+    "live_output_label": "MOBILE_E2E_PASS only with genuine phone and production or expressly authorized test receipts"
+  },
+  "scenario_defaults": {
+    "external_mutation_count": 0,
+    "network_call_count": 0,
+    "live_passkey_call_count": 0,
+    "live_db_call_count": 0,
+    "real_dispatch_count": 0,
+    "repository_code_executed": false
+  },
+  "scenarios": [
+    {
+      "id": "F01_COMPLETE_PATH",
+      "given": "全部fixture接口可用；模型匹配；合成候选PASS",
+      "events": [
+        "PHONE_SUBMIT",
+        "CLOUD_RESULT_PASS",
+        "CONTENT_APPROVED",
+        "APPLICATION_APPROVED_FIXTURE",
+        "CANONICAL_WRITTEN_FIXTURE",
+        "CANONICAL_READ_MATCH_FIXTURE",
+        "BOARD_REFRESH"
+      ],
+      "expect": {
+        "pipeline_status": "COMPLETE",
+        "validation_level": "CONTRACT_ONLY",
+        "canonical_fixture_write_count": 1,
+        "board_asset_version": 1,
+        "board_is_stale": false,
+        "live_phone_e2e": false
+      }
+    },
+    {
+      "id": "F02_WORKFLOW_PASS_BUSINESS_PARTIAL",
+      "given": "执行外层PASS；execution_result_json.final_status=PARTIAL",
+      "events": [
+        "CLOUD_RESULT_READ",
+        "BOARD_REFRESH"
+      ],
+      "expect": {
+        "pipeline_status": "PARTIAL",
+        "execution_status": "PASS",
+        "business_status": "PARTIAL",
+        "canonical_fixture_write_count": 0,
+        "done_badge": false
+      }
+    },
+    {
+      "id": "F03_PROCESSING_PENDING",
+      "given": "run尚未完成",
+      "events": [
+        "RESULT_READ",
+        "BOARD_REFRESH"
+      ],
+      "expect": {
+        "pipeline_status": "PROCESSING",
+        "execution_status": "PENDING",
+        "terminal": false,
+        "canonical_fixture_write_count": 0,
+        "application_approval_prompted": false
+      }
+    },
+    {
+      "id": "F04_PROCESSING_FAILURE",
+      "given": "workflow_conclusion=failure，advisory status=success",
+      "events": [
+        "RESULT_READ",
+        "BOARD_REFRESH"
+      ],
+      "expect": {
+        "pipeline_status": "BLOCKED",
+        "execution_status": "FAIL",
+        "canonical_fixture_write_count": 0
+      }
+    },
+    {
+      "id": "F05_ORDINARY_EXISTING_ROUTE",
+      "given": "普通产品fixture任务；现有CloudAgent使用OpenCode CLI/OpenCodeGo DeepSeek4.1",
+      "events": [
+        "TASK_ROUTE_SELECTION"
+      ],
+      "expect": {
+        "execution_route": "ordinary_cloudagent",
+        "current_workflow_model": "opencode-go/deepseek-v4.1-flash",
+        "requires_new_model_parameter": false,
+        "requires_Sol_alignment": false,
+        "new_infrastructure_count": 0
+      }
+    },
+    {
+      "id": "F06_CONTENT_APPROVAL_ONLY",
+      "given": "用户只采纳内容，尚未授权persist/promotion或完成应用HumanGate",
+      "events": [
+        "CONTENT_APPROVED"
+      ],
+      "expect": {
+        "pipeline_status": "WAITING_APPLICATION_APPROVAL",
+        "canonical_fixture_write_count": 0,
+        "application_approval_status": "NOT_COMPLETED"
+      }
+    },
+    {
+      "id": "F07_PHONE_RELOAD_RESUME",
+      "given": "Proposed fixture-only coordinator already has a durable synthetic request_id->task/candidate map. Current live submit_task provides no public idempotency parameter; existing API guarantees are not being tested.",
+      "events": [
+        "PHONE_CLOSE",
+        "PHONE_REOPEN",
+        "PROPOSED_STUB_RESUME_SAME_REQUEST",
+        "RESULT_READ_FIXTURE"
+      ],
+      "expect": {
+        "same_task_id": true,
+        "same_candidate_id": true,
+        "new_candidate_count": 0,
+        "new_dispatch_count": 0,
+        "behavior_scope": "PROPOSED_STUB_ONLY_NOT_EXISTING_SUBMIT_GUARANTEE",
+        "live_submit_replayed": false
+      }
+    },
+    {
+      "id": "F08_APP_APPROVAL_EXPIRED",
+      "given": "用户尚未完成或批准已过期",
+      "events": [
+        "PHONE_OPEN_APPROVAL",
+        "APP_APPROVAL_TIMEOUT"
+      ],
+      "expect": {
+        "pipeline_status": "WAITING_APPLICATION_APPROVAL",
+        "canonical_fixture_write_count": 0,
+        "automatic_passkey_attempt_count": 0,
+        "requires_user_action": true
+      }
+    },
+    {
+      "id": "F09_WRITE_ACK_UNKNOWN",
+      "given": "One fixture promotion acknowledgement is unknown. The test has a before-write absence/previous-version snapshot, a specific already-verified fixture approval target, and an after-write record with the same approved candidate_id/candidate_version/content_hash/asset_id, matching promotion-event provenance, and version transition. A matching hash alone is insufficient.",
+      "events": [
+        "PROMOTE_FIXTURE_ACK_UNKNOWN",
+        "CANONICAL_READ_MATCH_EXACT_TARGET_AND_PROVENANCE_FIXTURE",
+        "BOARD_REFRESH_MATCH_FRESH"
+      ],
+      "expect": {
+        "pipeline_status": "COMPLETE",
+        "canonical_fixture_write_count": 1,
+        "automatic_second_write_count": 0,
+        "reconciled_from_readback": true,
+        "required_evidence": [
+          "matching approved candidate_id/candidate_version/asset_id/content_hash",
+          "matching promotion_event provenance",
+          "before/after version or absence evidence attributing this write",
+          "fresh board matching same target"
+        ],
+        "hash_only_sufficient": false,
+        "insufficient_evidence_state": "BLOCKED_ACK_UNKNOWN_REQUIRE_RECONCILIATION"
+      }
+    },
+    {
+      "id": "F10_READBACK_MISMATCH",
+      "given": "fixture writer返回WRITTEN；独立read返回不同hash或version",
+      "events": [
+        "CANONICAL_READ_MISMATCH_FIXTURE",
+        "BOARD_REFRESH"
+      ],
+      "expect": {
+        "pipeline_status": "BLOCKED",
+        "readback_status": "MISMATCH",
+        "done_badge": false,
+        "new_write_to_hide_mismatch_count": 0
+      }
+    },
+    {
+      "id": "F11_BOARD_REFRESH_ERROR",
+      "given": "旧成功投影存在；新读取暂时失败",
+      "events": [
+        "BOARD_REFRESH_FAIL"
+      ],
+      "expect": {
+        "retains_last_good_data": true,
+        "board_is_stale": true,
+        "empty_success": false,
+        "generated_at_unchanged": true
+      }
+    },
+    {
+      "id": "F12_USER_REQUESTS_REVISION",
+      "given": "内容review为CHANGES_REQUESTED",
+      "events": [
+        "CONTENT_CHANGES_REQUESTED",
+        "BOARD_REFRESH"
+      ],
+      "expect": {
+        "pipeline_status": "CONTENT_REVIEW",
+        "canonical_fixture_write_count": 0,
+        "application_approval_prompted": false
+      }
+    },
+    {
+      "id": "F13_PLATFORM_ACTION_DENIED",
+      "given": "执行平台拒绝指定动作",
+      "events": [
+        "PLATFORM_DENIED"
+      ],
+      "expect": {
+        "pipeline_status": "BLOCKED",
+        "alternate_tool_or_environment_attempt_count": 0,
+        "retry_without_new_valid_authority_count": 0,
+        "reason": "ACTION_AUTHORITY_REQUIRED"
+      }
+    },
+    {
+      "id": "F14_SOURCE_BYTES_MISSING",
+      "given": "只有最新入口/manifest hash，无实际字节",
+      "events": [
+        "SOURCE_HANDOFF_CHECK"
+      ],
+      "expect": {
+        "pipeline_status": "BLOCKED",
+        "reason": "SOURCE_BYTES_REQUIRED",
+        "reconstructed_same_version": false
+      }
+    },
+    {
+      "id": "F15_PHONE_END_TO_END_EVIDENCE_GAP",
+      "given": "所有fixture案例通过，手机登录/passkey与真实Canonical未运行",
+      "events": [
+        "BUILD_ACCEPTANCE_REPORT"
+      ],
+      "expect": {
+        "reported_status": "CONTRACT_PASS",
+        "mobile_e2e_status": "NOT_RUN",
+        "production_write_status": "NOT_RUN",
+        "release_status": "NOT_PERFORMED"
+      }
+    }
+  ],
+  "required_result_artifact": {
+    "fields": [
+      "schema",
+      "run_id",
+      "validation_level",
+      "generated_at_utc",
+      "fixture_contract_sha256",
+      "source_manifest_sha256",
+      "scenarios[].id",
+      "scenarios[].status",
+      "scenarios[].actual",
+      "scenarios[].expected",
+      "network_call_count",
+      "live_passkey_call_count",
+      "live_db_call_count",
+      "real_dispatch_count",
+      "repository_code_executed",
+      "mobile_e2e_status",
+      "full_repository_suite_status"
+    ],
+    "pass_rule": "Every scenario matches expected and all forbidden live counts equal 0",
+    "fail_rule": "Any unexpected call or mismatch fails; preserve failing evidence",
+    "current_execution_state": "NOT_RUN; contract JSON structural check only",
+    "full_repository_suite_status": "NOT_RUN_THIS_ROUND; cite prior exact head evidence separately if relevant"
+  },
+  "next_real_phone_acceptance": {
+    "prerequisites": [
+      "exact source reconciliation and authorized implementation complete",
+      "deployed tool/UI contract consistent",
+      "valid specific authorization for one named synthetic candidate promotion",
+      "user mobile authenticated normally"
+    ],
+    "evidence": [
+      "user confirms Windows off with start/end timestamp",
+      "phone submission receipt and task/candidate ID",
+      "existing processing-route/result receipt (no new model-selection interface)",
+      "real user application approval ceremony reference, without assertion/private key",
+      "one promotion outcome",
+      "independent CloudAssetRead same asset/version/hash",
+      "phone close/reopen fresh board projection"
+    ],
+    "stop": "任何步骤被拒绝、来源不一致、写入结果不明或需要新认证/权限就暂停该步骤；无替代路由"
+  }
+}
