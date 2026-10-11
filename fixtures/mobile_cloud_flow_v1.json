@@ -22,6 +22,29 @@
     },
     "execution_route": "ordinary_cloudagent"
   },
+  "fixture_only_approval_target": {
+    "operation": "promote",
+    "candidate_id": "fixture-candidate-001",
+    "candidate_version": 1,
+    "asset_id": "fixture-knowledge-001",
+    "content_hash": "608c698c49db462bc148e9a5d75f211cb66d106d04b3c6858adba850e3d3de13",
+    "review_result": "PASS",
+    "reviewed_at": "2026-10-11T12:00:00.001Z",
+    "assertion": "FIXTURE_ONLY_ABSTRACT_TARGET_NO_LIVE_PASSKEY_ASSERTION"
+  },
+  "instrumented_forbidden_boundaries": [
+    "socket.socket",
+    "socket.create_connection",
+    "subprocess.Popen"
+  ],
+  "not_instrumented_boundaries": [
+    "live D1",
+    "passkey provider",
+    "Canonical MCP write",
+    "production Site request",
+    "workflow git push (recorded as workflow action, outside fixture counters)",
+    "ServerChan notification (recorded as workflow action, outside fixture counters)"
+  ],
   "runtime": {
     "current_workflow_model": "opencode-go/deepseek-v4.1-flash",
     "requires_new_model_parameter": false,
@@ -109,6 +132,16 @@
         "content_review_status": "APPROVED",
         "application_approval_status": "VERIFIED_FIXTURE_ONLY"
       },
+      "approval_target": {
+        "operation": "promote",
+        "candidate_id": "fixture-candidate-001",
+        "candidate_version": 1,
+        "asset_id": "fixture-knowledge-001",
+        "content_hash": "608c698c49db462bc148e9a5d75f211cb66d106d04b3c6858adba850e3d3de13",
+        "review_result": "PASS",
+        "reviewed_at": "2026-10-11T12:00:00.001Z",
+        "assertion": "FIXTURE_ONLY_ABSTRACT_TARGET_NO_LIVE_PASSKEY_ASSERTION"
+      },
       "promotion": {
         "ack": "UNKNOWN",
         "before": {
@@ -132,6 +165,24 @@
       }
     },
     "F10_READBACK_MISMATCH": {
+      "approval_target": {
+        "operation": "promote",
+        "candidate_id": "fixture-candidate-001",
+        "candidate_version": 1,
+        "asset_id": "fixture-knowledge-001",
+        "content_hash": "608c698c49db462bc148e9a5d75f211cb66d106d04b3c6858adba850e3d3de13",
+        "review_result": "PASS",
+        "reviewed_at": "2026-10-11T12:00:00.001Z",
+        "assertion": "FIXTURE_ONLY_ABSTRACT_TARGET_NO_LIVE_PASSKEY_ASSERTION"
+      },
+      "written_precondition": {
+        "writer_result": "WRITTEN",
+        "canonical_version": 1,
+        "candidate_id": "fixture-candidate-001",
+        "asset_id": "fixture-knowledge-001",
+        "content_hash": "608c698c49db462bc148e9a5d75f211cb66d106d04b3c6858adba850e3d3de13",
+        "promotion_event_ref": "fixture-promotion-001"
+      },
       "readback": {
         "expected_hash": "608c698c49db462bc148e9a5d75f211cb66d106d04b3c6858adba850e3d3de13",
         "actual_hash": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -177,6 +228,7 @@
     "production_site_request_count": 0,
     "git_push_count": 0,
     "external_notification_count": 0,
+    "subprocess_execution_count": 0,
     "repository_code_executed": false
   }
 }

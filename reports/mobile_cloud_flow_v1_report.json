@@ -5,7 +5,7 @@
   "generated_at_utc": "2026-10-11T12:00:00Z",
   "time_source": "deterministic fixture clock (not wall clock)",
   "fixture_contract_sha256": "3af27d66158bc52a35ec3e894d3ab90081d7a740d601fc58a6e3b700482e7f4b",
-  "fixture_data_sha256": "63be28972835dac3c9f12cf38e933f6bd12069bf6e708ff2da24261102b8ac7e",
+  "fixture_data_sha256": "ad13556de2f83ff67a17213b8ded93cff6eca5b2d458c0900372dd3179935362",
   "source_manifest_sha256": null,
   "input_gaps": [
     "unpublished Site v32 source bytes are unavailable",
@@ -287,6 +287,7 @@
     "production_site_request_count": 0,
     "git_push_count": 0,
     "external_notification_count": 0,
+    "subprocess_execution_count": 0,
     "repository_code_executed": false
   },
   "network_call_count": 0,
@@ -294,15 +295,111 @@
   "live_db_call_count": 0,
   "real_dispatch_count": 0,
   "external_mutation_count": 0,
+  "subprocess_execution_count": 0,
   "repository_code_executed": false,
   "mobile_e2e_status": "NOT_RUN",
   "production_write_status": "NOT_RUN",
   "release_status": "NOT_PERFORMED",
-  "full_repository_suite_status": "NOT_RUN_THIS_ROUND",
-  "full_repository_suite_note": "The unchanged full repository suite is NOT_RUN_THIS_ROUND as contract evidence; the dispatch workflow runs it independently in its Verify step.",
-  "historical_full_suite_evidence": {
-    "head": "171758f1f75883e84bfca5fc7ea6355dea902d1b",
-    "note": "last public commit before this round; no in-repo machine-readable full-suite receipt exists, so no prior pass count is counted as this run"
+  "full_repository_suite_status": "PASS",
+  "contract_planned_full_repository_suite_status": "NOT_RUN_THIS_ROUND",
+  "full_repository_suite_note": "actual execution status is recorded per phase; the original contract value NOT_RUN_THIS_ROUND is retained only as a historical planned value",
+  "execution_phases": {
+    "agent_focused": {
+      "command": "python -m pytest -q tests/test_mobile_cloud_flow_v1.py",
+      "status": "PASS",
+      "observed": true,
+      "exit_code": 0,
+      "passed": 68,
+      "failed": 0,
+      "skipped": 0,
+      "duration_seconds": 0.06,
+      "wall_clock_seconds": 0.2,
+      "phase": "agent_focused",
+      "source": "agent local run before commit",
+      "commit": "5fc9efbc2102725dd36dba68f630ec15df0e20ca"
+    },
+    "agent_affected_combined": {
+      "command": "python -m pytest -q tests/test_mobile_cloud_flow_v1.py tests/test_status_contract_v0_2.py tests/test_result_normalization.py",
+      "status": "PASS",
+      "observed": true,
+      "exit_code": 0,
+      "passed": 115,
+      "failed": 0,
+      "skipped": 0,
+      "duration_seconds": 0.4,
+      "wall_clock_seconds": 0.54,
+      "phase": "agent_affected_combined",
+      "source": "agent local run before commit",
+      "commit": "5fc9efbc2102725dd36dba68f630ec15df0e20ca"
+    },
+    "agent_full_suite": {
+      "command": "python -m pytest -q",
+      "status": "PASS",
+      "observed": true,
+      "exit_code": 0,
+      "passed": 1655,
+      "failed": 0,
+      "skipped": 1,
+      "duration_seconds": 48.2,
+      "wall_clock_seconds": 48.4,
+      "phase": "agent_full_suite",
+      "source": "agent local run before commit",
+      "commit": "5fc9efbc2102725dd36dba68f630ec15df0e20ca"
+    },
+    "workflow_verify_full_suite": {
+      "command": "python -m pytest -q",
+      "status": "NOT_OBSERVED_YET",
+      "observed": false,
+      "exit_code": null,
+      "passed": null,
+      "failed": null,
+      "skipped": null,
+      "duration_seconds": null,
+      "phase": null,
+      "source": null,
+      "commit": null
+    }
+  },
+  "workflow_actions": {
+    "main_push": {
+      "scope": "workflow_record_not_fixture_counter",
+      "status": "NOT_OBSERVED_YET",
+      "note": "main push is performed by the dispatch workflow after this commit"
+    },
+    "serverchan_notification": {
+      "scope": "workflow_record_not_fixture_counter",
+      "status": "NOT_OBSERVED_YET",
+      "note": "ServerChan delivery is performed by the dispatch workflow after this commit"
+    }
+  },
+  "checkout_baseline_sha": "5fc9efbc2102725dd36dba68f630ec15df0e20ca",
+  "produced_commit_note": "the produced commit SHA is recorded by the runner's execution_result.json after this report is committed; it is intentionally not self-referenced here",
+  "previous_run_evidence": {
+    "run_id": 38142051686,
+    "head_sha": "171758f1f75883e84bfca5fc7ea6355dea902d1b",
+    "produced_commit": "5fc9efbc2102725dd36dba68f630ec15df0e20ca",
+    "note": "historical evidence from the reviewed original run; never this repair's results",
+    "focused": "python -m pytest -q tests/test_mobile_cloud_flow_v1.py: 27 passed",
+    "combined": "python -m pytest -q tests/test_mobile_cloud_flow_v1.py tests/test_status_contract_v0_2.py tests/test_result_normalization.py: 74 passed in 0.52s",
+    "agent_full_suite": "python -m pytest -q: 1614 passed, 1 skipped in 70.40s before commit",
+    "workflow_verify_full_suite": "python -m pytest -q: 1614 passed, 1 skipped in 66.40s on produced commit 5fc9efbc2102725dd36dba68f630ec15df0e20ca"
+  },
+  "fixture_io_observation": {
+    "instrumented_boundaries": [
+      "socket.socket",
+      "socket.create_connection",
+      "subprocess.Popen"
+    ],
+    "not_instrumented_boundaries": [
+      "live D1",
+      "passkey provider",
+      "Canonical MCP write",
+      "production Site request",
+      "workflow git push (recorded as workflow action, outside fixture counters)",
+      "ServerChan notification (recorded as workflow action, outside fixture counters)"
+    ],
+    "observed_forbidden_calls": 0,
+    "note": "zero observed calls is scoped to the stated instrumented boundary only; un-instrumented live services remain UNKNOWN/NOT_INSTRUMENTED"
   },
   "focused_suite": {
     "command": "python -m pytest -q tests/test_mobile_cloud_flow_v1.py",

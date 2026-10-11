@@ -18,12 +18,20 @@ never claims the existing API deduplicates replaying. F09 only reconciles an
 unknown fixture write from independent readback that carries the exact
 approved target and matching promotion provenance plus before/after evidence;
 a matching content hash alone is insufficient.
+
+The independent static review identified deterministic control-flow gaps that
+are now executed in memory as regression coverage (R01-R09). Each condition is
+tested independently so that a single broken guard is not hidden by another.
 """
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import socket
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -33,7 +41,8 @@ CONTRACT_PATH = REPO_ROOT / "contracts" / "mobile_cloud_flow_v1.json"
 FIXTURE_PATH = REPO_ROOT / "fixtures" / "mobile_cloud_flow_v1.json"
 REPORT_PATH = REPO_ROOT / "reports" / "mobile_cloud_flow_v1_report.json"
 
-FULL_REPOSITORY_SUITE_STATUS = "NOT_RUN_THIS_ROUND"
+CONTRACT_PLANNED_FULL_SUITE_STATUS = "NOT_RUN_THIS_ROUND"
+NOT_OBSERVED = "NOT_OBSERVED_YET"
 
 LIVE_FORBIDDEN_COUNTERS = (
     "network_call_count",
@@ -45,6 +54,27 @@ LIVE_FORBIDDEN_COUNTERS = (
     "production_site_request_count",
     "git_push_count",
     "external_notification_count",
+    "subprocess_execution_count",
+)
+
+FIXTURE_WORKFLOW_SCOPED_ACTIONS = (
+    "main_push",
+    "serverchan_notification",
+)
+
+GUARD_INSTRUMENTED_BOUNDARIES = (
+    "socket.socket",
+    "socket.create_connection",
+    "subprocess.Popen",
+)
+
+GUARD_NOT_INSTRUMENTED_BOUNDARIES = (
+    "live D1",
+    "passkey provider",
+    "Canonical MCP write",
+    "production Site request",
+    "workflow git push (recorded as workflow action, outside fixture counters)",
+    "ServerChan notification (recorded as workflow action, outside fixture counters)",
 )
 
 
@@ -60,16 +90,21 @@ SCENARIOS = {scenario["id"]: scenario for scenario in CONTRACT["scenarios"]}
 
 
 # ---------------------------------------------------------------------------
-# Live-call monitor and fixture-only stub providers
+# Forbidden-operation monitor and synthetic providers
 # ---------------------------------------------------------------------------
+
+
+class ForbiddenOperationError(RuntimeError):
+    """Raised by a forbidden seam before any real external I/O can occur."""
 
 
 class LiveCallMonitor:
     """Counts every forbidden live operation. A pure run must leave it at zero.
 
-    No fixture code path ever calls a ``record_*`` method; the monitor exists so
-    the suite can prove, with machine-readable counters, that no forbidden live
-    call happened.
+    Seams are *connected* to this monitor: a forbidden seam increments the
+    counter and then refuses before contacting any real service. The monitor is
+    the observable proof for the instrumented boundary only; un-instrumented
+    live services remain UNKNOWN/NOT_INSTRUMENTED.
     """
 
     def __init__(self) -> None:
@@ -85,6 +120,7 @@ class LiveCallMonitor:
         self.production_site_request_count = 0
         self.git_push_count = 0
         self.external_notification_count = 0
+        self.subprocess_execution_count = 0
         self.repository_code_executed = False
 
     def record_network(self) -> None:
@@ -99,11 +135,23 @@ class LiveCallMonitor:
     def record_dispatch(self) -> None:
         self.real_dispatch_count += 1
 
+    def record_external_mutation(self) -> None:
+        self.external_mutation_count += 1
+
     def record_canonical_mcp_write(self) -> None:
         self.canonical_mcp_write_count += 1
 
     def record_production_site_request(self) -> None:
         self.production_site_request_count += 1
+
+    def record_git_push(self) -> None:
+        self.git_push_count += 1
+
+    def record_external_notification(self) -> None:
+        self.external_notification_count += 1
+
+    def record_subprocess(self) -> None:
+        self.subprocess_execution_count += 1
 
     def as_dict(self) -> dict:
         return {
@@ -116,8 +164,71 @@ class LiveCallMonitor:
             "production_site_request_count": self.production_site_request_count,
             "git_push_count": self.git_push_count,
             "external_notification_count": self.external_notification_count,
+            "subprocess_execution_count": self.subprocess_execution_count,
             "repository_code_executed": self.repository_code_executed,
         }
+
+
+class ForbiddenSeam:
+    """A synthetic provider seam that must never be reached at runtime.
+
+    Calling the seam records into the monitor and immediately raises before any
+    real external I/O. The seam is a pure in-memory callable.
+    """
+
+    def __init__(self, monitor: LiveCallMonitor, record, name: str) -> None:
+        self.monitor = monitor
+        self._record = record
+        self.name = name
+        self.call_count = 0
+
+    def __call__(self, *args: object, **kwargs: object) -> None:
+        self.call_count += 1
+        self._record()
+        raise ForbiddenOperationError(f"forbidden live operation refused: {self.name}")
+
+
+class ScopedForbiddenIOGuard:
+    """Scoped guard that blocks and counts network/subprocess calls.
+
+    Only the stated instrumented boundary is covered. Any code that reaches for
+    a real socket or subprocess inside the ``with`` block is recorded on the
+    monitor and refused. Original callables are restored on exit.
+    """
+
+    def __init__(self, monitor: LiveCallMonitor) -> None:
+        self.monitor = monitor
+        self._saved: list[tuple[object, str, object]] = []
+
+    def _patch(self, target: object, attribute: str, replacement: object) -> None:
+        self._saved.append((target, attribute, getattr(target, attribute)))
+        setattr(target, attribute, replacement)
+
+    def __enter__(self) -> "ScopedForbiddenIOGuard":
+        monitor = self.monitor
+
+        def _blocked_network(*args: object, **kwargs: object) -> None:
+            monitor.record_network()
+            raise ForbiddenOperationError("network I/O is forbidden in the fixture boundary")
+
+        class _BlockedSocket:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                _blocked_network()
+
+        def _blocked_subprocess(*args: object, **kwargs: object) -> None:
+            monitor.record_subprocess()
+            raise ForbiddenOperationError("subprocess execution is forbidden in the fixture boundary")
+
+        self._patch(socket, "socket", _BlockedSocket)
+        self._patch(socket, "create_connection", _blocked_network)
+        self._patch(subprocess, "Popen", _blocked_subprocess)
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        for target, attribute, original in reversed(self._saved):
+            setattr(target, attribute, original)
+        self._saved.clear()
+        return False
 
 
 class FixtureCanonicalStore:
@@ -156,6 +267,114 @@ class FixtureCanonicalStore:
         return dict(asset) if asset is not None else None
 
 
+class FixtureCoordinator:
+    """Durable synthetic ``request_id`` -> task/candidate mapping.
+
+    This models a *proposed* stub coordinator only. The connected submit_task
+    has no public idempotency parameter and is never called or replayed here.
+    Creation and dispatch counts are derived from the observable call log, not
+    from counters that are manually reset.
+    """
+
+    def __init__(self) -> None:
+        self.requests: dict[str, dict] = {}
+        self.creation_calls: list[str] = []
+        self.dispatch_calls: list[str] = []
+
+    def seed(self, request_id: str, task_id: str, candidate_id: str) -> None:
+        if request_id not in self.requests:
+            self.requests[request_id] = {"task_id": task_id, "candidate_id": candidate_id}
+
+    def submit(self, request_id: str, task_id: str, candidate_id: str) -> dict:
+        if request_id not in self.requests:
+            self.requests[request_id] = {"task_id": task_id, "candidate_id": candidate_id}
+            self.creation_calls.append(request_id)
+            self.dispatch_calls.append(request_id)
+        return dict(self.requests[request_id])
+
+    def resume(self, request_id: str) -> dict | None:
+        entry = self.requests.get(request_id)
+        return dict(entry) if entry is not None else None
+
+    @property
+    def creation_count(self) -> int:
+        return len(self.creation_calls)
+
+    @property
+    def dispatch_count(self) -> int:
+        return len(self.dispatch_calls)
+
+
+# ---------------------------------------------------------------------------
+# Shared tuple verifier (R01 / R02 / R04)
+# ---------------------------------------------------------------------------
+
+
+def verify_promotion_tuple(
+    *,
+    approved_target: dict | None,
+    receipt: dict | None,
+    readback: dict | None,
+    provenance: dict | None,
+    promotion_ref: str,
+    before: dict | None,
+    after: dict | None,
+    route: str | None,
+    expected_content: str,
+    expected_route: str = "ordinary_cloudagent",
+) -> dict:
+    """Verify the full promotion/readback/board tuple from independent evidence.
+
+    Each condition is returned independently so a caller (and its tests) can
+    see exactly which piece of evidence failed. A same-hash record with a
+    different version or candidate is not sufficient.
+    """
+    approved = approved_target or {}
+    receipt = receipt or {}
+    readback = readback or {}
+    provenance = provenance or {}
+    before = before or {}
+    after = after or {}
+
+    required_target_fields = (
+        "operation",
+        "candidate_id",
+        "candidate_version",
+        "asset_id",
+        "content_hash",
+        "review_result",
+        "reviewed_at",
+    )
+    return {
+        "approved_target_complete": all(
+            approved.get(field) not in (None, "", []) for field in required_target_fields
+        ),
+        "receipt_matches_target": bool(receipt)
+        and receipt.get("asset_id") == approved.get("asset_id")
+        and receipt.get("candidate_id") == approved.get("candidate_id")
+        and receipt.get("content_hash") == approved.get("content_hash"),
+        "readback_identity": bool(readback)
+        and readback.get("asset_id") == approved.get("asset_id")
+        and readback.get("candidate_id") == approved.get("candidate_id")
+        and readback.get("content_hash") == approved.get("content_hash"),
+        "readback_content": bool(readback) and readback.get("content") == expected_content,
+        "readback_version_is_receipt": bool(readback)
+        and readback.get("version") == receipt.get("canonical_version"),
+        "provenance_ref": bool(provenance.get("promotion_event_ref"))
+        and provenance.get("promotion_event_ref") == promotion_ref,
+        "provenance_candidate": provenance.get("candidate_id") == approved.get("candidate_id")
+        and provenance.get("candidate_version") == approved.get("candidate_version"),
+        "same_asset_before_after": before.get("asset_id") == approved.get("asset_id")
+        and after.get("asset_id") == approved.get("asset_id"),
+        "valid_transition": bool(before.get("absent"))
+        or before.get("version") != after.get("version"),
+        "after_matches_target": after.get("candidate_id") == approved.get("candidate_id")
+        and after.get("candidate_version") == approved.get("candidate_version")
+        and after.get("content_hash") == approved.get("content_hash"),
+        "route": route == expected_route,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pure state machine
 # ---------------------------------------------------------------------------
@@ -164,13 +383,23 @@ class FixtureCanonicalStore:
 class MobileCloudFlowEngine:
     """Deterministic product-logic state machine for the fixture contract."""
 
-    def __init__(self, contract: dict, fixture: dict, monitor: LiveCallMonitor, scenario_id: str) -> None:
+    def __init__(
+        self,
+        contract: dict,
+        fixture: dict,
+        monitor: LiveCallMonitor,
+        scenario_id: str,
+        coordinator: FixtureCoordinator | None = None,
+    ) -> None:
         self.contract = contract
-        self.fixture = fixture
+        # R09: each engine gets a deep copy so a negative case can never mutate
+        # the shared fixture/inputs.
+        self.fixture = copy.deepcopy(fixture)
         self.monitor = monitor
         self.scenario_id = scenario_id
-        self.inputs = fixture.get("scenario_inputs", {}).get(scenario_id, {})
+        self.inputs = copy.deepcopy(self.fixture.get("scenario_inputs", {}).get(scenario_id, {}))
         self.canonical = FixtureCanonicalStore()
+        self.coordinator = coordinator if coordinator is not None else FixtureCoordinator()
         self.reset()
 
     # -- construction -------------------------------------------------------
@@ -182,6 +411,9 @@ class MobileCloudFlowEngine:
         self.asset_id = candidate["asset_id"]
         self.candidate_version = candidate["candidate_version"]
         self.content_hash = candidate["content_hash"]
+        self.expected_promotion_ref = self.fixture["board"]["promotion_event_ref"]
+        self.current_workflow_model = self.fixture["runtime"]["current_workflow_model"]
+        self.execution_route = self.fixture["input"]["execution_route"]
 
         self.execution_status = "PENDING"
         self.business_status: str | None = None
@@ -196,16 +428,14 @@ class MobileCloudFlowEngine:
         self.requires_user_action = False
         self.application_approval_prompted = False
         self.reason: str | None = None
-        self.execution_route: str | None = None
 
         self.board: dict | None = None
         self.last_good_board: dict | None = None
         self.board_is_stale = False
         self.generated_at: str | None = None
+        self.last_successful_read_at: str | None = None
 
         self.canonical_fixture_write_count = 0
-        self.automatic_second_write_count = 0
-        self.new_write_to_hide_mismatch_count = 0
         self.new_candidate_count = 0
         self.new_dispatch_count = 0
         self.automatic_passkey_attempt_count = 0
@@ -224,6 +454,28 @@ class MobileCloudFlowEngine:
         self.behavior_scope: str | None = None
         self.same_task_id = False
         self.same_candidate_id = False
+        self.restored_task_id: str | None = None
+        self.restored_candidate_id: str | None = None
+        self.stub_creation_count = 0
+        self.stub_dispatch_count = 0
+
+        self.approved_target: dict | None = None
+        self.promotion_receipt: dict | None = None
+        self.before_snapshot: dict | None = None
+        self.after_record: dict | None = None
+        self.write_attributed = False
+        self.tuple_verified = False
+        self.tuple_evidence: dict = {}
+        self.write_attempt_log: list[dict] = []
+        self.approval_token = 0
+        self.pending_approval_token: int | None = None
+        self.approval_expired = False
+        self.approval_invalidated = False
+        self.platform_denied = False
+        self.refused_approval_event_count = 0
+        self.completed = False
+        self.completion_stale = False
+        self.completion_evidence: dict = {}
 
         preconditions = self.inputs.get("preconditions", {})
         self.execution_status = preconditions.get("execution_status", self.execution_status)
@@ -233,12 +485,65 @@ class MobileCloudFlowEngine:
             "application_approval_status", self.application_approval_status
         )
 
+        if self.inputs.get("approval_target"):
+            self.approved_target = copy.deepcopy(self.inputs["approval_target"])
+
+        resume_map = self.inputs.get("resume", {}).get("durable_map", {})
+        for request_id, entry in resume_map.items():
+            self.coordinator.seed(request_id, entry["task_id"], entry["candidate_id"])
+
         if self.scenario_id == "F11_BOARD_REFRESH_ERROR":
             previous = self.fixture.get("previous_good_board")
             if previous is not None:
                 self.last_good_board = dict(previous)
                 self.board = dict(previous)
                 self.generated_at = previous["generated_at"]
+                self.last_successful_read_at = previous["last_successful_read_at"]
+
+        if self.scenario_id == "F10_READBACK_MISMATCH":
+            # Stated precondition: the fixture writer already returned WRITTEN
+            # under a complete fixture-only approval target.
+            self.content_review_status = "APPROVED"
+            self.application_approval_status = "VERIFIED_FIXTURE_ONLY"
+            self.execution_status = "PASS"
+            self.business_status = "PASS"
+            self.approved_target = self._fixture_approved_target()
+
+    def _fixture_approved_target(self) -> dict:
+        candidate = self.fixture["input"]["candidate"]
+        return {
+            "operation": "promote",
+            "candidate_id": self.candidate_id or candidate["candidate_id"],
+            "candidate_version": self.candidate_version,
+            "asset_id": self.asset_id,
+            "content_hash": self.content_hash,
+            "review_result": candidate["review_result"],
+            "reviewed_at": candidate["reviewed_at"],
+        }
+
+    # -- derived counters ---------------------------------------------------
+
+    @property
+    def refused_write_count(self) -> int:
+        return sum(1 for attempt in self.write_attempt_log if not attempt.get("authorized"))
+
+    @property
+    def repeated_write_skipped_count(self) -> int:
+        return sum(
+            1 for attempt in self.write_attempt_log if attempt.get("outcome") == "IDEMPOTENT_SKIPPED"
+        )
+
+    @property
+    def automatic_second_write_count(self) -> int:
+        return sum(
+            1
+            for attempt in self.write_attempt_log
+            if attempt.get("outcome") == "IDEMPOTENT_SKIPPED" and attempt.get("automatic")
+        )
+
+    @property
+    def new_write_to_hide_mismatch_count(self) -> int:
+        return sum(1 for attempt in self.write_attempt_log if attempt.get("reason") == "hide_mismatch")
 
     # -- event dispatch -----------------------------------------------------
 
@@ -335,100 +640,228 @@ class MobileCloudFlowEngine:
         self.content_review_status = "CHANGES_REQUESTED"
         self.pipeline_status = "CONTENT_REVIEW"
         self.application_approval_prompted = False
+        # R07: a candidate revision invalidates any prior fixture approval.
+        self.application_approval_status = "NOT_COMPLETED"
+        self.approved_target = None
+        self.approval_invalidated = True
 
     def _application_approved_fixture(self) -> None:
         # Fixture-only approval event. Never serializes a passkey assertion.
+        # R07: a denied or expired approval cannot be revived by an old event.
+        if self.platform_denied or self.approval_invalidated:
+            self.refused_approval_event_count += 1
+            return
+        if self.approval_expired and self.pending_approval_token is None:
+            self.refused_approval_event_count += 1
+            return
         self.application_approval_status = "VERIFIED_FIXTURE_ONLY"
+        self.approved_target = self._fixture_approved_target()
         self.pipeline_status = "PROMOTING"
         self.application_approval_prompted = False
+        self.approval_expired = False
+        self.pending_approval_token = None
 
-    def _canonical_write_fixture(self) -> None:
+    def _write_authorized(self) -> bool:
+        return (
+            self.application_approval_status == "VERIFIED_FIXTURE_ONLY"
+            and self.approved_target is not None
+            and not self.approval_expired
+            and not self.approval_invalidated
+            and not self.platform_denied
+            and self.content_review_status == "APPROVED"
+        )
+
+    def _perform_fixture_write(
+        self,
+        ack: str = "OK",
+        before: dict | None = None,
+        after: dict | None = None,
+        provenance: dict | None = None,
+        reason: str | None = None,
+    ) -> str:
+        candidate = self.fixture["input"]["candidate"]
+        candidate_id = self.candidate_id or candidate["candidate_id"]
+        if provenance is None:
+            provenance = {
+                "promotion_event_ref": self.expected_promotion_ref,
+                "candidate_id": candidate_id,
+                "candidate_version": self.candidate_version,
+            }
+        if not self._write_authorized():
+            self.write_attempt_log.append(
+                {"authorized": False, "outcome": "REFUSED", "ack": ack, "reason": reason}
+            )
+            return "REFUSED"
+        if self.promotion_receipt is not None:
+            self.write_attempt_log.append(
+                {"authorized": True, "outcome": "IDEMPOTENT_SKIPPED", "ack": ack, "reason": reason}
+            )
+            return "IDEMPOTENT"
         result = self.canonical.write(
             self.asset_id,
-            self.candidate_id or self.fixture["input"]["candidate"]["candidate_id"],
+            candidate_id,
             self.candidate_version,
             self.content_hash,
-            {"promotion_event_ref": self.fixture["board"]["promotion_event_ref"]},
+            provenance,
+            ack=ack,
         )
-        self.canonical_status = "WRITTEN" if result == "WRITTEN" else "WRITE_ACK_UNKNOWN"
+        self.promotion_receipt = {
+            "asset_id": self.asset_id,
+            "candidate_id": candidate_id,
+            "candidate_version": self.candidate_version,
+            "canonical_version": self.candidate_version,
+            "content_hash": self.content_hash,
+            "promotion_event_ref": provenance.get("promotion_event_ref"),
+        }
         self.canonical_fixture_write_count = self.canonical.write_count
+        self.before_snapshot = (
+            dict(before) if before is not None else {"asset_id": self.asset_id, "version": 0, "absent": True}
+        )
+        self.after_record = (
+            dict(after)
+            if after is not None
+            else {
+                "asset_id": self.asset_id,
+                "candidate_id": candidate_id,
+                "candidate_version": self.candidate_version,
+                "version": self.candidate_version,
+                "content_hash": self.content_hash,
+                "absent": False,
+            }
+        )
+        self.write_attributed = True
+        self.write_attempt_log.append(
+            {"authorized": True, "outcome": result, "ack": ack, "reason": reason}
+        )
+        return result
+
+    def _canonical_write_fixture(self) -> None:
+        provenance = {
+            "promotion_event_ref": self.expected_promotion_ref,
+            "candidate_id": self.candidate_id or self.fixture["input"]["candidate"]["candidate_id"],
+            "candidate_version": self.candidate_version,
+        }
+        result = self._perform_fixture_write(ack="OK", provenance=provenance)
+        if result == "WRITTEN":
+            self.canonical_status = "WRITTEN"
+        elif result == "UNKNOWN":
+            self.canonical_status = "WRITE_ACK_UNKNOWN"
         self.pipeline_status = "VERIFYING_READBACK"
+
+    def _read_canonical_record(self) -> dict | None:
+        candidate = self.fixture["input"]["candidate"]
+        if self.scenario_id == "F10_READBACK_MISMATCH" and self.inputs.get("readback"):
+            readback = self.inputs["readback"]
+            approved = self.approved_target or {}
+            return {
+                "asset_id": approved.get("asset_id", candidate["asset_id"]),
+                "candidate_id": approved.get("candidate_id", candidate["candidate_id"]),
+                "version": readback.get("actual_version"),
+                "content_hash": readback.get("actual_hash"),
+                "content": candidate["content"],
+                "provenance": {
+                    "promotion_event_ref": self.expected_promotion_ref,
+                    "candidate_id": approved.get("candidate_id", candidate["candidate_id"]),
+                    "candidate_version": approved.get("candidate_version", candidate["candidate_version"]),
+                },
+            }
+        asset = self.canonical.read(self.asset_id)
+        if asset is None:
+            return None
+        record = dict(asset)
+        record["content"] = candidate["content"]
+        return record
+
+    def _verify_readback(self, readback: dict | None) -> dict:
+        approved = self.approved_target
+        provenance = (readback or {}).get("provenance", {})
+        if self.scenario_id == "F10_READBACK_MISMATCH":
+            receipt = {
+                "asset_id": (approved or {}).get("asset_id"),
+                "candidate_id": (approved or {}).get("candidate_id"),
+                "content_hash": (approved or {}).get("content_hash"),
+                "canonical_version": (approved or {}).get("candidate_version"),
+            }
+        else:
+            receipt = self.promotion_receipt
+        return verify_promotion_tuple(
+            approved_target=approved,
+            receipt=receipt,
+            readback=readback,
+            provenance=provenance,
+            promotion_ref=self.expected_promotion_ref,
+            before=self.before_snapshot,
+            after=self.after_record,
+            route=self.execution_route,
+            expected_content=self.fixture["input"]["candidate"]["content"],
+        )
 
     def _canonical_read(self, match: bool) -> None:
-        if match:
-            asset = self.canonical.read(self.asset_id)
-            if asset is not None and asset["content_hash"] == self.content_hash:
-                self.readback_status = "MATCH"
-            else:
-                self.readback_status = "MISMATCH"
-                self.pipeline_status = "BLOCKED"
-                self.done_badge = False
-            if self.readback_status == "MATCH":
-                self.pipeline_status = "VERIFYING_READBACK"
-            return
-        self.readback_status = "MISMATCH"
-        self.pipeline_status = "BLOCKED"
-        self.done_badge = False
-        self.new_write_to_hide_mismatch_count = 0
+        # R04: truth comes from an independent synthetic readback record fed
+        # through the same tuple verifier, never from the event name.
+        if self.scenario_id == "F10_READBACK_MISMATCH" and self.promotion_receipt is None:
+            # Stated precondition: the fixture writer returned WRITTEN.
+            self._perform_fixture_write(ack="OK")
+        readback = self._read_canonical_record()
+        checks = self._verify_readback(readback)
+        self.tuple_evidence = checks
+        self.tuple_verified = all(checks.values())
+        if self.tuple_verified:
+            self.readback_status = "MATCH"
+            self.pipeline_status = "VERIFYING_READBACK"
+        else:
+            self.readback_status = "MISMATCH"
+            self.pipeline_status = "BLOCKED"
+            self.done_badge = False
 
     def _promote_ack_unknown(self) -> None:
-        candidate = self.fixture["input"]["candidate"]
         promotion = self.inputs.get("promotion", {})
-        provenance = promotion.get("provenance", {"promotion_event_ref": self.fixture["board"]["promotion_event_ref"]})
-        self.canonical.write(
-            candidate["asset_id"],
-            candidate["candidate_id"],
-            candidate["candidate_version"],
-            candidate["content_hash"],
-            provenance,
+        provenance = promotion.get(
+            "provenance",
+            {
+                "promotion_event_ref": self.expected_promotion_ref,
+                "candidate_id": self.candidate_id or self.fixture["input"]["candidate"]["candidate_id"],
+                "candidate_version": self.candidate_version,
+            },
+        )
+        self._perform_fixture_write(
             ack=promotion.get("ack", "UNKNOWN"),
+            before=promotion.get("before"),
+            after=promotion.get("after"),
+            provenance=provenance,
         )
         self.canonical_status = "WRITE_ACK_UNKNOWN"
-        self.canonical_fixture_write_count = self.canonical.write_count
         self.pipeline_status = "VERIFYING_READBACK"
-        self.automatic_second_write_count = 0
         self.hash_only_sufficient = False
         self.insufficient_evidence_state = "BLOCKED_ACK_UNKNOWN_REQUIRE_RECONCILIATION"
         self.required_evidence = []
 
     def _canonical_read_exact_provenance(self) -> None:
-        candidate = self.fixture["input"]["candidate"]
-        promotion = self.inputs.get("promotion", {})
-        provenance = promotion.get("provenance", {})
-        after = promotion.get("after", {})
-        before = promotion.get("before", {})
+        readback = self._read_canonical_record()
+        checks = self._verify_readback(readback)
+        self.tuple_evidence = checks
+        self.tuple_verified = all(checks.values())
 
-        asset = self.canonical.read(candidate["asset_id"])
         evidence: list[str] = []
-
-        target_match = (
-            asset is not None
-            and asset["candidate_id"] == candidate["candidate_id"]
-            and asset["version"] == candidate["candidate_version"]
-            and asset["content_hash"] == candidate["content_hash"]
-            and after.get("candidate_id") == candidate["candidate_id"]
-            and after.get("candidate_version") == candidate["candidate_version"]
-            and after.get("content_hash") == candidate["content_hash"]
-        )
-        provenance_match = (
-            asset is not None
-            and asset["provenance"].get("promotion_event_ref") == provenance.get("promotion_event_ref")
-        )
-        version_transition = bool(before.get("absent")) or before.get("version", 0) != after.get("version")
-
-        if target_match:
-            evidence.append(
-                "matching approved candidate_id/candidate_version/asset_id/content_hash"
-            )
-        if provenance_match:
+        if (
+            checks["approved_target_complete"]
+            and checks["receipt_matches_target"]
+            and checks["readback_identity"]
+            and checks["readback_content"]
+            and checks["readback_version_is_receipt"]
+            and checks["after_matches_target"]
+        ):
+            evidence.append("matching approved candidate_id/candidate_version/asset_id/content_hash")
+        if checks["provenance_ref"] and checks["provenance_candidate"]:
             evidence.append("matching promotion_event provenance")
-        if version_transition:
+        if checks["same_asset_before_after"] and checks["valid_transition"]:
             evidence.append("before/after version or absence evidence attributing this write")
 
         self.required_evidence = evidence
-        self.reconciled_from_readback = target_match and provenance_match and version_transition
-        # The named fallback state is always reported so a caller knows which
-        # state to use when the evidence is insufficient.
+        self.reconciled_from_readback = self.tuple_verified
+        # Never automatically write again when reconciliation is incomplete.
+        if self.promotion_receipt is None:
+            self._perform_fixture_write(ack="OK", reason="hide_mismatch")
         self.insufficient_evidence_state = "BLOCKED_ACK_UNKNOWN_REQUIRE_RECONCILIATION"
         if self.reconciled_from_readback:
             self.readback_status = "MATCH"
@@ -437,26 +870,54 @@ class MobileCloudFlowEngine:
             self.readback_status = "MISMATCH"
             self.pipeline_status = "BLOCKED"
 
+    def _board_tuple_matches(self, board: dict) -> bool:
+        approved = self.approved_target or {}
+        if self.approved_target is None or self.promotion_receipt is None:
+            return False
+        return (
+            board.get("candidate_id") == approved.get("candidate_id")
+            and board.get("asset_id") == approved.get("asset_id")
+            and board.get("candidate_version") == approved.get("candidate_version")
+            and board.get("promotion_event_ref") == self.expected_promotion_ref
+            and board.get("model") == self.current_workflow_model
+        )
+
     def _board_refresh(self, ok: bool, fresh: bool = False) -> None:
         if not ok:
-            if self.last_good_board is not None:
-                self.board = dict(self.last_good_board)
-                self.retains_last_good_data = True
+            # R03: the *visible* projection must carry is_stale=true and retain
+            # the last successful tuple/timestamps.
             self.board_is_stale = True
+            if self.last_good_board is not None:
+                retained = dict(self.last_good_board)
+                retained["is_stale"] = True
+                self.board = retained
+                self.retains_last_good_data = True
+                self.last_successful_read_at = retained.get("last_successful_read_at")
+            if self.completed:
+                self.completion_stale = True
             self.empty_success = False
             self.generated_at_unchanged = True
             return
 
-        self.board_is_stale = False
-        self.board = self._project_board()
-        self.generated_at = self.board["generated_at"]
-        self.last_good_board = dict(self.board)
+        projected = self._project_board()
+        # R03: a successful refresh must revalidate the tuple before clearing
+        # the stale flag.
+        self.board_is_stale = not self._board_tuple_matches(projected)
+        self.board = projected
+        self.generated_at = projected["generated_at"]
+        self.last_successful_read_at = projected["last_successful_read_at"]
+        if not self.board_is_stale:
+            self.last_good_board = dict(projected)
+
         if fresh and "fresh board matching same target" not in self.required_evidence:
             if self.scenario_id == "F09_WRITE_ACK_UNKNOWN":
                 self.required_evidence.append("fresh board matching same target")
+
         self._finalize_completion()
         self.board = self._project_board()
-        self.last_good_board = dict(self.board)
+        self.board["is_stale"] = self.board_is_stale
+        if not self.board_is_stale:
+            self.last_good_board = dict(self.board)
 
     def _project_board(self) -> dict:
         candidate = self.fixture["input"]["candidate"]
@@ -478,24 +939,44 @@ class MobileCloudFlowEngine:
             "source_commit": board["source_commit"],
             "model": board["model"],
             "candidate_version": self.candidate_version,
-            "promotion_event_ref": self.fixture["board"]["promotion_event_ref"],
+            "promotion_event_ref": self.expected_promotion_ref,
+        }
+
+    def _completion_predicate(self) -> dict:
+        approved = self.approved_target or {}
+        board = self.board or {}
+        return {
+            "execution_pass": self.execution_status == "PASS",
+            "business_pass": self.business_status == "PASS",
+            "content_approved": self.content_review_status == "APPROVED",
+            "approval_fixture": self.application_approval_status == "VERIFIED_FIXTURE_ONLY",
+            "canonical_ok": self.canonical_status in ("WRITTEN", "IDEMPOTENT"),
+            "readback_match": self.readback_status == "MATCH",
+            "tuple_verified": bool(self.tuple_verified),
+            "write_attributed": bool(self.write_attributed),
+            "board_present": bool(board),
+            "board_fresh": not self.board_is_stale,
+            "board_tuple_matches": bool(self.approved_target)
+            and bool(self.promotion_receipt)
+            and board.get("candidate_id") == approved.get("candidate_id")
+            and board.get("asset_id") == approved.get("asset_id")
+            and board.get("candidate_version") == approved.get("candidate_version")
+            and board.get("promotion_event_ref") == self.expected_promotion_ref
+            and board.get("model") == self.current_workflow_model,
+            "route_ok": self.execution_route == self.fixture["input"]["execution_route"],
         }
 
     def _finalize_completion(self) -> None:
-        predicate_met = (
-            self.execution_status == "PASS"
-            and self.business_status == "PASS"
-            and self.content_review_status == "APPROVED"
-            and self.application_approval_status == "VERIFIED_FIXTURE_ONLY"
-            and self.canonical_status in ("WRITTEN", "IDEMPOTENT")
-            and self.readback_status == "MATCH"
-            and self.board is not None
-            and not self.board_is_stale
-        )
-        if predicate_met:
+        evidence = self._completion_predicate()
+        self.completion_evidence = evidence
+        if all(evidence.values()):
             self.pipeline_status = "COMPLETE"
             self.terminal = True
             self.done_badge = True
+            self.completed = True
+            self.completion_stale = False
+        elif self.completed:
+            self.completion_stale = True
 
     def _task_route_selection(self) -> None:
         runtime = self.fixture["runtime"]
@@ -504,15 +985,23 @@ class MobileCloudFlowEngine:
 
     def _stub_resume(self) -> None:
         request_id = self.fixture["input"]["request_id"]
-        mapping = self.inputs.get("resume", {}).get("durable_map", {})
-        entry = mapping.get(request_id)
-        self.same_task_id = entry is not None
-        self.same_candidate_id = entry is not None
+        original_task_id = self.fixture["input"]["task_id"]
+        original_candidate_id = self.fixture["input"]["candidate"]["candidate_id"]
+        entry = self.coordinator.resume(request_id)
+        self.restored_task_id = entry["task_id"] if entry is not None else None
+        self.restored_candidate_id = entry["candidate_id"] if entry is not None else None
+        # R05: compare *actual restored IDs* to the original IDs.
+        self.same_task_id = entry is not None and entry["task_id"] == original_task_id
+        self.same_candidate_id = entry is not None and entry["candidate_id"] == original_candidate_id
         if entry is not None:
             self.task_id = entry["task_id"]
             self.candidate_id = entry["candidate_id"]
-        self.new_candidate_count = 0
-        self.new_dispatch_count = 0
+        # Counts are derived from the observable coordinator call log; a pure
+        # resume never creates or dispatches.
+        self.stub_creation_count = self.coordinator.creation_count
+        self.stub_dispatch_count = self.coordinator.dispatch_count
+        self.new_candidate_count = self.stub_creation_count
+        self.new_dispatch_count = self.stub_dispatch_count
         self.live_submit_replayed = False
         self.behavior_scope = "PROPOSED_STUB_ONLY_NOT_EXISTING_SUBMIT_GUARANTEE"
 
@@ -520,18 +1009,26 @@ class MobileCloudFlowEngine:
         self.pipeline_status = "WAITING_APPLICATION_APPROVAL"
         self.application_approval_prompted = True
         self.requires_user_action = True
+        self.approval_token += 1
+        self.pending_approval_token = self.approval_token
+        self.approval_expired = False
 
     def _app_approval_timeout(self) -> None:
         self.pipeline_status = "WAITING_APPLICATION_APPROVAL"
         self.application_approval_status = "NOT_COMPLETED"
         self.automatic_passkey_attempt_count = 0
         self.requires_user_action = True
+        self.approval_expired = True
+        self.pending_approval_token = None
 
     def _platform_denied(self) -> None:
         platform = self.inputs.get("platform", {})
         self.pipeline_status = "BLOCKED"
         self.terminal = True
+        self.platform_denied = True
         self.reason = platform.get("reason", "ACTION_AUTHORITY_REQUIRED")
+        self.application_approval_status = "NOT_COMPLETED"
+        self.approved_target = None
         self.alternate_tool_or_environment_attempt_count = 0
         self.retry_without_new_valid_authority_count = 0
 
@@ -662,8 +1159,15 @@ ALL_SCENARIO_IDS = [scenario["id"] for scenario in CONTRACT["scenarios"]]
 FIXTURE_SCENARIO_IDS = [sid for sid in ALL_SCENARIO_IDS if sid != "F15_PHONE_END_TO_END_EVIDENCE_GAP"]
 
 
-def run_scenario(scenario_id: str, monitor: LiveCallMonitor) -> dict:
-    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, scenario_id)
+def run_scenario(
+    scenario_id: str,
+    monitor: LiveCallMonitor,
+    coordinator: FixtureCoordinator | None = None,
+    fixture: dict | None = None,
+) -> dict:
+    engine = MobileCloudFlowEngine(
+        CONTRACT, fixture if fixture is not None else FIXTURE, monitor, scenario_id, coordinator=coordinator
+    )
     for event in SCENARIOS[scenario_id]["events"]:
         engine.handle_event(event)
     return engine.actual(scenario_id)
@@ -673,10 +1177,13 @@ def compare(actual: dict, expected: dict) -> dict:
     return {key: actual.get(key) == value for key, value in expected.items()}
 
 
-def run_fixture_suite() -> dict:
-    monitor = LiveCallMonitor()
+def run_fixture_suite(
+    monitor: LiveCallMonitor | None = None,
+    order: list[str] | None = None,
+) -> dict:
+    monitor = monitor if monitor is not None else LiveCallMonitor()
     results: dict[str, dict] = {}
-    for scenario_id in FIXTURE_SCENARIO_IDS:
+    for scenario_id in order if order is not None else FIXTURE_SCENARIO_IDS:
         actual = run_scenario(scenario_id, monitor)
         expected = SCENARIOS[scenario_id]["expect"]
         matches = compare(actual, expected)
@@ -745,7 +1252,7 @@ def test_no_live_forbidden_calls_occurred() -> None:
 
 
 # ---------------------------------------------------------------------------
-# One test per fixture scenario
+# One test per fixture scenario (all 15 retain original expected outputs)
 # ---------------------------------------------------------------------------
 
 
@@ -837,17 +1344,596 @@ def test_f14_missing_source_bytes_is_not_reconstructed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Machine-readable report
+# R01: full tuple verification for COMPLETE
 # ---------------------------------------------------------------------------
 
 
-def build_report() -> dict:
-    contract_bytes = CONTRACT_PATH.read_bytes()
-    contract_sha256 = hashlib.sha256(contract_bytes).hexdigest()
-    scenario_entries = []
+def _valid_tuple_inputs() -> dict:
+    content = CONTRACT["input"]["candidate"]["content"]
+    return {
+        "approved_target": {
+            "operation": "promote",
+            "candidate_id": "c1",
+            "candidate_version": 1,
+            "asset_id": "a1",
+            "content_hash": "h1",
+            "review_result": "PASS",
+            "reviewed_at": "2026-10-11T12:00:00.001Z",
+        },
+        "receipt": {
+            "asset_id": "a1",
+            "candidate_id": "c1",
+            "candidate_version": 1,
+            "canonical_version": 1,
+            "content_hash": "h1",
+            "promotion_event_ref": "p1",
+        },
+        "readback": {
+            "asset_id": "a1",
+            "candidate_id": "c1",
+            "version": 1,
+            "content_hash": "h1",
+            "content": content,
+            "provenance": {"promotion_event_ref": "p1", "candidate_id": "c1", "candidate_version": 1},
+        },
+        "provenance": {"promotion_event_ref": "p1", "candidate_id": "c1", "candidate_version": 1},
+        "promotion_ref": "p1",
+        "before": {"asset_id": "a1", "version": 0, "absent": True},
+        "after": {
+            "asset_id": "a1",
+            "candidate_id": "c1",
+            "candidate_version": 1,
+            "version": 1,
+            "content_hash": "h1",
+            "absent": False,
+        },
+        "route": "ordinary_cloudagent",
+        "expected_content": content,
+    }
+
+
+def _verify(inputs: dict) -> dict:
+    return verify_promotion_tuple(
+        approved_target=inputs["approved_target"],
+        receipt=inputs["receipt"],
+        readback=inputs["readback"],
+        provenance=inputs["provenance"],
+        promotion_ref=inputs["promotion_ref"],
+        before=inputs["before"],
+        after=inputs["after"],
+        route=inputs["route"],
+        expected_content=inputs["expected_content"],
+    )
+
+
+def test_r01_normal_full_tuple_verifies() -> None:
+    checks = _verify(_valid_tuple_inputs())
+    assert all(checks.values()), checks
+
+
+def test_r01_wrong_candidate_id_is_blocked() -> None:
+    inputs = _valid_tuple_inputs()
+    inputs["readback"]["candidate_id"] = "different-candidate"
+    checks = _verify(inputs)
+    assert checks["readback_identity"] is False
+    assert not all(checks.values())
+
+
+def test_r01_wrong_asset_id_is_blocked() -> None:
+    inputs = _valid_tuple_inputs()
+    inputs["readback"]["asset_id"] = "different-asset"
+    checks = _verify(inputs)
+    assert checks["readback_identity"] is False
+
+
+def test_r01_wrong_hash_is_blocked() -> None:
+    inputs = _valid_tuple_inputs()
+    inputs["readback"]["content_hash"] = "different-hash"
+    checks = _verify(inputs)
+    assert checks["readback_identity"] is False
+
+
+def test_r01_same_hash_wrong_version_is_blocked() -> None:
+    inputs = _valid_tuple_inputs()
+    # Same hash, but canonical asset version is 999 while the receipt is 1.
+    inputs["readback"]["version"] = 999
+    checks = _verify(inputs)
+    assert checks["readback_identity"] is True  # hash/id still match
+    assert checks["readback_version_is_receipt"] is False
+    assert not all(checks.values())
+
+
+def test_r01_wrong_promotion_ref_is_blocked() -> None:
+    inputs = _valid_tuple_inputs()
+    inputs["provenance"]["promotion_event_ref"] = "other-ref"
+    inputs["readback"]["provenance"]["promotion_event_ref"] = "other-ref"
+    checks = _verify(inputs)
+    assert checks["provenance_ref"] is False
+
+
+def test_r01_wrong_route_is_blocked() -> None:
+    inputs = _valid_tuple_inputs()
+    inputs["route"] = "alternate_tool"
+    checks = _verify(inputs)
+    assert checks["route"] is False
+
+
+def test_r01_missing_reviewed_at_is_blocked() -> None:
+    inputs = _valid_tuple_inputs()
+    inputs["approved_target"]["reviewed_at"] = ""
+    checks = _verify(inputs)
+    assert checks["approved_target_complete"] is False
+
+
+def test_r01_integration_same_hash_version_999_cannot_complete() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F09_WRITE_ACK_UNKNOWN")
+    engine.handle_event("PROMOTE_FIXTURE_ACK_UNKNOWN")
+    asset = engine.canonical.read(engine.asset_id)
+    assert asset is not None
+    # Keep the hash but change the canonical version to 999.
+    asset["version"] = 999
+    engine.canonical._assets[engine.asset_id] = asset
+    engine._canonical_read_exact_provenance()
+    assert engine.tuple_evidence["readback_version_is_receipt"] is False
+    engine._board_refresh(ok=True, fresh=True)
+    assert engine.pipeline_status != "COMPLETE"
+
+
+def test_r01_positive_flow_still_completes() -> None:
+    monitor = LiveCallMonitor()
+    result = run_scenario("F01_COMPLETE_PATH", monitor)
+    assert result["pipeline_status"] == "COMPLETE"
+
+
+# ---------------------------------------------------------------------------
+# R02: F09 reconciliation requires complete independent evidence
+# ---------------------------------------------------------------------------
+
+
+def test_r02_positive_evidence_is_complete() -> None:
+    entry = SUITE["results"]["F09_WRITE_ACK_UNKNOWN"]["actual"]
+    assert entry["reconciled_from_readback"] is True
+    assert entry["pipeline_status"] == "COMPLETE"
+    assert entry["required_evidence"] == [
+        "matching approved candidate_id/candidate_version/asset_id/content_hash",
+        "matching promotion_event provenance",
+        "before/after version or absence evidence attributing this write",
+        "fresh board matching same target",
+    ]
+
+
+def test_r02_missing_after_candidate_version_is_blocked() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F09_WRITE_ACK_UNKNOWN")
+    engine.handle_event("PROMOTE_FIXTURE_ACK_UNKNOWN")
+    engine.after_record["candidate_version"] = 999
+    engine._canonical_read_exact_provenance()
+    assert engine.tuple_evidence["after_matches_target"] is False
+    assert engine.reconciled_from_readback is False
+    assert engine.readback_status == "MISMATCH"
+    assert engine.pipeline_status == "BLOCKED"
+
+
+def test_r02_unrelated_before_asset_is_blocked() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F09_WRITE_ACK_UNKNOWN")
+    engine.handle_event("PROMOTE_FIXTURE_ACK_UNKNOWN")
+    engine.before_snapshot["asset_id"] = "unrelated-asset"
+    engine._canonical_read_exact_provenance()
+    assert engine.tuple_evidence["same_asset_before_after"] is False
+    assert engine.reconciled_from_readback is False
+
+
+def test_r02_missing_provenance_candidate_is_blocked() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F09_WRITE_ACK_UNKNOWN")
+    engine.handle_event("PROMOTE_FIXTURE_ACK_UNKNOWN")
+    engine.canonical._assets[engine.asset_id]["provenance"] = {"promotion_event_ref": "fixture-promotion-001"}
+    engine._canonical_read_exact_provenance()
+    assert engine.tuple_evidence["provenance_candidate"] is False
+    assert engine.reconciled_from_readback is False
+
+
+def test_r02_inconsistent_evidence_never_writes_again() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F09_WRITE_ACK_UNKNOWN")
+    engine.handle_event("PROMOTE_FIXTURE_ACK_UNKNOWN")
+    writes_after_first = engine.canonical.write_count
+    engine.canonical._assets[engine.asset_id]["content_hash"] = "0" * 64
+    engine._canonical_read_exact_provenance()
+    assert engine.tuple_evidence["readback_identity"] is False
+    assert engine.reconciled_from_readback is False
+    assert engine.canonical.write_count == writes_after_first
+    assert engine.automatic_second_write_count == 0
+
+
+# ---------------------------------------------------------------------------
+# R03: F11 visible stale projection and revalidation
+# ---------------------------------------------------------------------------
+
+
+def test_r03_failed_refresh_visible_projection_is_stale() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F11_BOARD_REFRESH_ERROR")
+    before_generated = engine.board["generated_at"]
+    before_read = engine.board["last_successful_read_at"]
+    before_task = engine.board["task_id"]
+    engine.handle_event("BOARD_REFRESH_FAIL")
+    assert engine.board["is_stale"] is True
+    assert engine.board["generated_at"] == before_generated
+    assert engine.board["last_successful_read_at"] == before_read
+    assert engine.board["task_id"] == before_task
+
+
+def test_r03_completed_refresh_failure_makes_evidence_stale() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F01_COMPLETE_PATH")
+    for event in SCENARIOS["F01_COMPLETE_PATH"]["events"]:
+        engine.handle_event(event)
+    assert engine.completed is True
+    engine._board_refresh(ok=False)
+    assert engine.completion_stale is True
+    assert engine.board["is_stale"] is True
+
+
+def test_r03_later_success_revalidates_matching_tuple() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F01_COMPLETE_PATH")
+    for event in SCENARIOS["F01_COMPLETE_PATH"]["events"]:
+        engine.handle_event(event)
+    engine._board_refresh(ok=False)
+    assert engine.board["is_stale"] is True
+    engine._board_refresh(ok=True)
+    assert engine.board["is_stale"] is False
+    assert engine.completion_stale is False
+
+
+def test_r03_success_with_wrong_tuple_stays_stale() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F01_COMPLETE_PATH")
+    for event in SCENARIOS["F01_COMPLETE_PATH"]["events"]:
+        engine.handle_event(event)
+    engine._board_refresh(ok=False)
+    engine.candidate_version = 999
+    engine._board_refresh(ok=True)
+    assert engine.board["is_stale"] is True
+
+
+# ---------------------------------------------------------------------------
+# R04: F10 readback truth from an independent synthetic reader
+# ---------------------------------------------------------------------------
+
+
+def test_r04_mismatching_hash_is_blocked_without_extra_write() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F10_READBACK_MISMATCH")
+    writes_before = engine.canonical.write_count
+    engine.handle_event("CANONICAL_READ_MISMATCH_FIXTURE")
+    assert engine.readback_status == "MISMATCH"
+    assert engine.canonical.write_count == writes_before + 1  # only the precondition write
+    engine._board_refresh(ok=True)
+    assert engine.pipeline_status == "BLOCKED"
+    assert engine.pipeline_status != "COMPLETE"
+    assert engine.new_write_to_hide_mismatch_count == 0
+
+
+def test_r04_differing_version_same_hash_is_blocked() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F10_READBACK_MISMATCH")
+    engine.inputs["readback"]["actual_hash"] = engine.inputs["readback"]["expected_hash"]
+    engine.inputs["readback"]["actual_version"] = 999
+    engine.handle_event("CANONICAL_READ_MISMATCH_FIXTURE")
+    assert engine.readback_status == "MISMATCH"
+    assert engine.tuple_evidence["readback_identity"] is True
+    assert engine.tuple_evidence["readback_version_is_receipt"] is False
+
+
+def test_r04_matching_control_record_yields_match() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F10_READBACK_MISMATCH")
+    engine.inputs["readback"]["actual_hash"] = engine.inputs["readback"]["expected_hash"]
+    engine.inputs["readback"]["actual_version"] = engine.inputs["readback"]["expected_version"]
+    engine.handle_event("CANONICAL_READ_MISMATCH_FIXTURE")
+    assert engine.readback_status == "MATCH"
+    assert engine.tuple_verified is True
+
+
+def test_r04_wrong_ids_and_provenance_are_blocked() -> None:
+    inputs = _valid_tuple_inputs()
+    inputs["readback"]["candidate_id"] = "imposter"
+    inputs["provenance"]["candidate_id"] = "imposter"
+    checks = _verify(inputs)
+    assert checks["readback_identity"] is False
+    assert checks["provenance_candidate"] is False
+    assert not all(checks.values())
+
+
+# ---------------------------------------------------------------------------
+# R05: F07 durable mapping and observable stub counts
+# ---------------------------------------------------------------------------
+
+
+def test_r05_f07_mapping_survives_engine_reconstruction() -> None:
+    coordinator = FixtureCoordinator()
+    monitor = LiveCallMonitor()
+    engine_a = MobileCloudFlowEngine(
+        CONTRACT, FIXTURE, monitor, "F07_PHONE_RELOAD_RESUME", coordinator=coordinator
+    )
+    for event in SCENARIOS["F07_PHONE_RELOAD_RESUME"]["events"]:
+        engine_a.handle_event(event)
+    assert engine_a.same_task_id is True
+    assert engine_a.same_candidate_id is True
+
+    engine_b = MobileCloudFlowEngine(
+        CONTRACT, FIXTURE, monitor, "F07_PHONE_RELOAD_RESUME", coordinator=coordinator
+    )
+    engine_b.handle_event("PROPOSED_STUB_RESUME_SAME_REQUEST")
+    assert engine_b.restored_task_id == FIXTURE["input"]["task_id"]
+    assert engine_b.restored_candidate_id == FIXTURE["input"]["candidate"]["candidate_id"]
+    assert engine_b.same_task_id is True
+    assert engine_b.same_candidate_id is True
+    assert coordinator.creation_count == 0
+    assert coordinator.dispatch_count == 0
+    assert len(coordinator.requests) == 1
+
+
+def test_r05_repeated_reopen_does_not_create_or_dispatch() -> None:
+    coordinator = FixtureCoordinator()
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(
+        CONTRACT, FIXTURE, monitor, "F07_PHONE_RELOAD_RESUME", coordinator=coordinator
+    )
+    for _ in range(5):
+        engine.handle_event("PROPOSED_STUB_RESUME_SAME_REQUEST")
+    assert engine.stub_creation_count == 0
+    assert engine.stub_dispatch_count == 0
+    assert engine.live_submit_replayed is False
+    assert engine.behavior_scope == "PROPOSED_STUB_ONLY_NOT_EXISTING_SUBMIT_GUARANTEE"
+
+
+def test_r05_missing_mapping_is_not_falsely_reused() -> None:
+    coordinator = FixtureCoordinator()
+    assert coordinator.resume("unknown-request") is None
+    assert coordinator.creation_count == 0
+
+    # Different-request positive counting control: a genuinely new request is
+    # created and dispatched exactly once.
+    coordinator.submit("request-2", "task-2", "candidate-2")
+    coordinator.submit("request-2", "task-2", "candidate-2")
+    assert coordinator.creation_count == 1
+    assert coordinator.dispatch_count == 1
+    assert coordinator.resume("request-2") == {"task_id": "task-2", "candidate_id": "candidate-2"}
+
+
+def test_r05_incorrect_ids_are_not_reported_as_same() -> None:
+    coordinator = FixtureCoordinator()
+    coordinator.seed("fixture-submit-001", "wrong-task", "wrong-candidate")
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(
+        CONTRACT, FIXTURE, monitor, "F07_PHONE_RELOAD_RESUME", coordinator=coordinator
+    )
+    engine.handle_event("PROPOSED_STUB_RESUME_SAME_REQUEST")
+    assert engine.restored_task_id == "wrong-task"
+    assert engine.same_task_id is False
+    assert engine.same_candidate_id is False
+
+
+# ---------------------------------------------------------------------------
+# R06: forbidden-operation monitor/guard self-tests
+# ---------------------------------------------------------------------------
+
+
+def test_r06_forbidden_seam_increments_and_rejects_before_io() -> None:
+    monitor = LiveCallMonitor()
+    seam = ForbiddenSeam(monitor, monitor.record_network, "synthetic-network")
+    with pytest.raises(ForbiddenOperationError):
+        seam()
+    assert monitor.network_call_count == 1
+    assert seam.call_count == 1
+
+
+def test_r06_scoped_guard_blocks_and_restores() -> None:
+    monitor = LiveCallMonitor()
+    original_socket = socket.socket
+    original_popen = subprocess.Popen
+    with ScopedForbiddenIOGuard(monitor):
+        with pytest.raises(ForbiddenOperationError):
+            socket.create_connection(("example.invalid", 80))
+        with pytest.raises(ForbiddenOperationError):
+            subprocess.Popen(["true"])
+    assert monitor.network_call_count == 1
+    assert monitor.subprocess_execution_count == 1
+    assert socket.socket is original_socket
+    assert subprocess.Popen is original_popen
+
+
+def test_r06_normal_fixture_boundary_observes_zero_forbidden_calls() -> None:
+    monitor = LiveCallMonitor()
+    with ScopedForbiddenIOGuard(monitor):
+        suite = run_fixture_suite(monitor=monitor)
+    assert suite["all_ok"] is True
+    observed = monitor.as_dict()
+    for name in LIVE_FORBIDDEN_COUNTERS:
+        assert observed[name] == 0, name
+    assert observed["repository_code_executed"] is False
+
+
+# ---------------------------------------------------------------------------
+# R07: explicit fixture state guards
+# ---------------------------------------------------------------------------
+
+
+def test_r07_f06_followed_by_write_does_not_write() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F06_CONTENT_APPROVAL_ONLY")
+    engine.handle_event("CONTENT_APPROVED")
+    result = engine._perform_fixture_write(ack="OK")
+    assert result == "REFUSED"
+    assert engine.canonical.write_count == 0
+    assert engine.refused_write_count == 1
+
+
+def test_r07_expired_approval_cannot_be_revived() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F08_APP_APPROVAL_EXPIRED")
+    engine.handle_event("PHONE_OPEN_APPROVAL")
+    engine.handle_event("APP_APPROVAL_TIMEOUT")
+    engine.handle_event("APPLICATION_APPROVED_FIXTURE")  # old approval event
+    assert engine.application_approval_status == "NOT_COMPLETED"
+    assert engine.approved_target is None
+    assert engine.refused_approval_event_count == 1
+    assert engine._perform_fixture_write(ack="OK") == "REFUSED"
+    assert engine.canonical.write_count == 0
+
+
+def test_r07_platform_denial_cannot_be_bypassed() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F13_PLATFORM_ACTION_DENIED")
+    engine.handle_event("PLATFORM_DENIED")
+    engine.handle_event("CONTENT_APPROVED")
+    engine.handle_event("APPLICATION_APPROVED_FIXTURE")
+    assert engine._perform_fixture_write(ack="OK") == "REFUSED"
+    assert engine.canonical.write_count == 0
+    assert engine.alternate_tool_or_environment_attempt_count == 0
+    assert engine.retry_without_new_valid_authority_count == 0
+
+
+def test_r07_repeated_approved_promotion_does_not_write_again() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F01_COMPLETE_PATH")
+    for event in SCENARIOS["F01_COMPLETE_PATH"]["events"]:
+        engine.handle_event(event)
+    assert engine.canonical.write_count == 1
+    second = engine._perform_fixture_write(ack="OK")
+    assert second == "IDEMPOTENT"
+    assert engine.canonical.write_count == 1
+    assert engine.repeated_write_skipped_count == 1
+
+
+def test_r07_candidate_revision_invalidates_approval() -> None:
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F01_COMPLETE_PATH")
+    engine.handle_event("PHONE_SUBMIT")
+    engine.handle_event("CONTENT_APPROVED")
+    engine.handle_event("APPLICATION_APPROVED_FIXTURE")
+    assert engine.application_approval_status == "VERIFIED_FIXTURE_ONLY"
+    engine.handle_event("CONTENT_CHANGES_REQUESTED")
+    assert engine.approval_invalidated is True
+    assert engine.approved_target is None
+    assert engine._perform_fixture_write(ack="OK") == "REFUSED"
+    assert engine.canonical.write_count == 0
+
+
+# ---------------------------------------------------------------------------
+# R09: input isolation, determinism and test-order independence
+# ---------------------------------------------------------------------------
+
+
+def test_r09_negative_case_cannot_mutate_shared_fixture() -> None:
+    shared_before = json.dumps(FIXTURE, sort_keys=True)
+    monitor = LiveCallMonitor()
+    engine = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F09_WRITE_ACK_UNKNOWN")
+    engine.inputs["promotion"]["before"]["asset_id"] = "mutated-in-engine"
+    engine.inputs["promotion"]["before"]["version"] = 12345
+    assert engine.inputs["promotion"]["before"]["asset_id"] == "mutated-in-engine"
+    assert json.dumps(FIXTURE, sort_keys=True) == shared_before
+    assert "mutated-in-engine" not in json.dumps(FIXTURE)
+
+
+def test_r09_positive_case_still_passes_after_negative_case() -> None:
+    # Run the mutating negative case first, then a positive run in-process.
+    negative = MobileCloudFlowEngine(CONTRACT, FIXTURE, LiveCallMonitor(), "F09_WRITE_ACK_UNKNOWN")
+    negative.handle_event("PROMOTE_FIXTURE_ACK_UNKNOWN")
+    negative.inputs["promotion"]["before"]["asset_id"] = "mutated"
+    positive = run_scenario("F01_COMPLETE_PATH", LiveCallMonitor())
+    assert positive["pipeline_status"] == "COMPLETE"
+
+
+def test_r09_suite_reruns_are_identical() -> None:
+    first = run_fixture_suite()
+    second = run_fixture_suite()
+    assert first["results"] == second["results"]
+    assert first["forbidden"] == second["forbidden"]
+    assert first["all_ok"] == second["all_ok"] is True
+
+
+def test_r09_test_order_does_not_change_results() -> None:
+    forward = run_fixture_suite(order=list(FIXTURE_SCENARIO_IDS))
+    backward = run_fixture_suite(order=list(reversed(FIXTURE_SCENARIO_IDS)))
+    for scenario_id in FIXTURE_SCENARIO_IDS:
+        assert forward["results"][scenario_id]["actual"] == backward["results"][scenario_id]["actual"]
+        assert forward["results"][scenario_id]["match"] is True
+
+
+# ---------------------------------------------------------------------------
+# Consolidated negative guarantee (cannot incorrectly become COMPLETE)
+# ---------------------------------------------------------------------------
+
+
+def _completion_evidence_for_engine(engine: MobileCloudFlowEngine) -> dict:
+    return engine._completion_predicate()
+
+
+def test_no_incorrect_flow_can_become_complete_or_write_again() -> None:
+    monitor = LiveCallMonitor()
+
+    # Unapproved: F06 write attempt.
+    f06 = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F06_CONTENT_APPROVAL_ONLY")
+    f06.handle_event("CONTENT_APPROVED")
+    assert f06._perform_fixture_write(ack="OK") == "REFUSED"
+    assert f06.pipeline_status != "COMPLETE"
+
+    # Expired: F08.
+    f08 = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F08_APP_APPROVAL_EXPIRED")
+    f08.handle_event("PHONE_OPEN_APPROVAL")
+    f08.handle_event("APP_APPROVAL_TIMEOUT")
+    f08.handle_event("APPLICATION_APPROVED_FIXTURE")
+    assert f08.pipeline_status != "COMPLETE"
+    assert f08.canonical.write_count == 0
+
+    # Denied: F13.
+    f13 = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F13_PLATFORM_ACTION_DENIED")
+    f13.handle_event("PLATFORM_DENIED")
+    assert f13._perform_fixture_write(ack="OK") == "REFUSED"
+    assert f13.pipeline_status != "COMPLETE"
+
+    # Insufficient ack evidence: F09 hash-only.
+    f09 = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F09_WRITE_ACK_UNKNOWN")
+    f09.handle_event("PROMOTE_FIXTURE_ACK_UNKNOWN")
+    f09.inputs["promotion"]["before"] = {"asset_id": f09.asset_id, "version": 1, "absent": False}
+    f09.canonical._assets[f09.asset_id]["provenance"] = {"promotion_event_ref": "other"}
+    f09._canonical_read_exact_provenance()
+    f09._board_refresh(ok=True, fresh=True)
+    assert f09.pipeline_status != "COMPLETE"
+
+    # Wrong tuple: run F01 up to (but not including) the board refresh, then
+    # corrupt the tuple and refresh. The board must not project COMPLETE.
+    f01 = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F01_COMPLETE_PATH")
+    for event in SCENARIOS["F01_COMPLETE_PATH"]["events"][:-1]:
+        f01.handle_event(event)
+    f01.candidate_version = 999
+    f01.handle_event("BOARD_REFRESH")
+    assert f01.pipeline_status != "COMPLETE"
+
+    # Repeated write: F01 then another promotion.
+    f01b = MobileCloudFlowEngine(CONTRACT, FIXTURE, monitor, "F01_COMPLETE_PATH")
+    for event in SCENARIOS["F01_COMPLETE_PATH"]["events"]:
+        f01b.handle_event(event)
+    assert f01b._perform_fixture_write(ack="OK") == "IDEMPOTENT"
+    assert f01b.canonical.write_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Machine-readable report (pure builder; tests never overwrite the committed file)
+# ---------------------------------------------------------------------------
+
+
+def evaluate_scenarios(suite: dict) -> list[dict]:
+    entries = []
     for scenario_id in ALL_SCENARIO_IDS:
-        entry = SUITE["results"][scenario_id]
-        scenario_entries.append(
+        entry = suite["results"][scenario_id]
+        entries.append(
             {
                 "id": scenario_id,
                 "status": "PASS" if entry["match"] else "FAIL",
@@ -855,6 +1941,91 @@ def build_report() -> dict:
                 "expected": entry["expected"],
             }
         )
+    return entries
+
+
+def _not_observed_phase(command: str) -> dict:
+    return {
+        "command": command,
+        "status": NOT_OBSERVED,
+        "observed": False,
+        "exit_code": None,
+        "passed": None,
+        "failed": None,
+        "skipped": None,
+        "duration_seconds": None,
+        "phase": None,
+        "source": None,
+        "commit": None,
+    }
+
+
+def default_run_metadata() -> dict:
+    return {
+        "checkout_baseline_sha": "5fc9efbc2102725dd36dba68f630ec15df0e20ca",
+        "produced_commit_note": (
+            "the produced commit SHA is recorded by the runner's execution_result.json after "
+            "this report is committed; it is intentionally not self-referenced here"
+        ),
+        "phases": {
+            "agent_focused": _not_observed_phase("python -m pytest -q tests/test_mobile_cloud_flow_v1.py"),
+            "agent_affected_combined": _not_observed_phase(
+                "python -m pytest -q tests/test_mobile_cloud_flow_v1.py "
+                "tests/test_status_contract_v0_2.py tests/test_result_normalization.py"
+            ),
+            "agent_full_suite": _not_observed_phase("python -m pytest -q"),
+            "workflow_verify_full_suite": _not_observed_phase("python -m pytest -q"),
+        },
+        "workflow_actions": {
+            "main_push": {
+                "scope": "workflow_record_not_fixture_counter",
+                "status": NOT_OBSERVED,
+                "note": "main push is performed by the dispatch workflow after this commit",
+            },
+            "serverchan_notification": {
+                "scope": "workflow_record_not_fixture_counter",
+                "status": NOT_OBSERVED,
+                "note": "ServerChan delivery is performed by the dispatch workflow after this commit",
+            },
+        },
+        "previous_run_evidence": {
+            "run_id": 38142051686,
+            "head_sha": "171758f1f75883e84bfca5fc7ea6355dea902d1b",
+            "produced_commit": "5fc9efbc2102725dd36dba68f630ec15df0e20ca",
+            "note": "historical evidence from the reviewed original run; never this repair's results",
+            "focused": "python -m pytest -q tests/test_mobile_cloud_flow_v1.py: 27 passed",
+            "combined": (
+                "python -m pytest -q tests/test_mobile_cloud_flow_v1.py "
+                "tests/test_status_contract_v0_2.py tests/test_result_normalization.py: 74 passed in 0.52s"
+            ),
+            "agent_full_suite": "python -m pytest -q: 1614 passed, 1 skipped in 70.40s before commit",
+            "workflow_verify_full_suite": (
+                "python -m pytest -q: 1614 passed, 1 skipped in 66.40s on produced commit "
+                "5fc9efbc2102725dd36dba68f630ec15df0e20ca"
+            ),
+        },
+        "fixture_io_observation": {
+            "instrumented_boundaries": list(GUARD_INSTRUMENTED_BOUNDARIES),
+            "not_instrumented_boundaries": list(GUARD_NOT_INSTRUMENTED_BOUNDARIES),
+            "observed_forbidden_calls": 0,
+            "note": (
+                "zero observed calls is scoped to the stated instrumented boundary only; "
+                "un-instrumented live services remain UNKNOWN/NOT_INSTRUMENTED"
+            ),
+        },
+    }
+
+
+def build_report(suite: dict | None = None, run_metadata: dict | None = None) -> dict:
+    """Build the fixture report. Pure: performs no file writes."""
+    suite = suite if suite is not None else run_fixture_suite()
+    metadata = run_metadata if run_metadata is not None else default_run_metadata()
+    contract_bytes = CONTRACT_PATH.read_bytes()
+    contract_sha256 = hashlib.sha256(contract_bytes).hexdigest()
+    phases = metadata.get("phases", {})
+    workflow_actions = metadata.get("workflow_actions", {})
+    focused_phase = phases.get("agent_focused", {})
+    full_phase = phases.get("agent_full_suite", {})
     return {
         "schema": "personal-ai-mobile-cloud-flow-report/v1",
         "run_id": "mobile-cloud-flow-v1-fixture-run",
@@ -870,41 +2041,42 @@ def build_report() -> dict:
             "no source manifest bytes are present to hash; source_manifest_sha256 is null and no equivalence is claimed",
             "no in-repo machine-readable prior full-suite receipt is available for the historical head",
         ],
-        "scenarios": scenario_entries,
-        "live_call_counters": SUITE["forbidden"],
-        "network_call_count": SUITE["forbidden"]["network_call_count"],
-        "live_passkey_call_count": SUITE["forbidden"]["live_passkey_call_count"],
-        "live_db_call_count": SUITE["forbidden"]["live_db_call_count"],
-        "real_dispatch_count": SUITE["forbidden"]["real_dispatch_count"],
-        "external_mutation_count": SUITE["forbidden"]["external_mutation_count"],
-        "repository_code_executed": SUITE["forbidden"]["repository_code_executed"],
+        "scenarios": evaluate_scenarios(suite),
+        "live_call_counters": suite["forbidden"],
+        "network_call_count": suite["forbidden"]["network_call_count"],
+        "live_passkey_call_count": suite["forbidden"]["live_passkey_call_count"],
+        "live_db_call_count": suite["forbidden"]["live_db_call_count"],
+        "real_dispatch_count": suite["forbidden"]["real_dispatch_count"],
+        "external_mutation_count": suite["forbidden"]["external_mutation_count"],
+        "subprocess_execution_count": suite["forbidden"]["subprocess_execution_count"],
+        "repository_code_executed": suite["forbidden"]["repository_code_executed"],
         "mobile_e2e_status": "NOT_RUN",
         "production_write_status": "NOT_RUN",
         "release_status": "NOT_PERFORMED",
-        "full_repository_suite_status": FULL_REPOSITORY_SUITE_STATUS,
+        "full_repository_suite_status": full_phase.get("status", NOT_OBSERVED),
+        "contract_planned_full_repository_suite_status": CONTRACT_PLANNED_FULL_SUITE_STATUS,
         "full_repository_suite_note": (
-            "The unchanged full repository suite is NOT_RUN_THIS_ROUND as contract "
-            "evidence; the dispatch workflow runs it independently in its Verify step."
+            "actual execution status is recorded per phase; the original contract value "
+            "NOT_RUN_THIS_ROUND is retained only as a historical planned value"
         ),
-        "historical_full_suite_evidence": {
-            "head": "171758f1f75883e84bfca5fc7ea6355dea902d1b",
-            "note": (
-                "last public commit before this round; no in-repo machine-readable "
-                "full-suite receipt exists, so no prior pass count is counted as this run"
-            ),
-        },
+        "execution_phases": phases,
+        "workflow_actions": workflow_actions,
+        "checkout_baseline_sha": metadata.get("checkout_baseline_sha"),
+        "produced_commit_note": metadata.get("produced_commit_note"),
+        "previous_run_evidence": metadata.get("previous_run_evidence"),
+        "fixture_io_observation": metadata.get("fixture_io_observation", default_run_metadata()["fixture_io_observation"]),
         "focused_suite": {
-            "command": "python -m pytest -q tests/test_mobile_cloud_flow_v1.py",
-            "status": "PASS" if SUITE["all_ok"] else "FAIL",
-            "scenario_pass_count": sum(1 for e in SUITE["results"].values() if e["match"]),
-            "scenario_total": len(SUITE["results"]),
+            "command": focused_phase.get("command", "python -m pytest -q tests/test_mobile_cloud_flow_v1.py"),
+            "status": "PASS" if suite["all_ok"] else "FAIL",
+            "scenario_pass_count": sum(1 for e in suite["results"].values() if e["match"]),
+            "scenario_total": len(suite["results"]),
         },
         "directly_affected_existing_tests": [
             "tests/test_status_contract_v0_2.py",
             "tests/test_result_normalization.py",
         ],
-        "execution_result": "CONTRACT_PASS" if SUITE["all_ok"] else "FAIL",
-        "business_final_status": "CONTRACT_PASS" if SUITE["all_ok"] else "FAIL",
+        "execution_result": "CONTRACT_PASS" if suite["all_ok"] else "FAIL",
+        "business_final_status": "CONTRACT_PASS" if suite["all_ok"] else "FAIL",
         "not_claimed": [
             "phone access / mobile E2E",
             "real passkey or live application approval",
@@ -913,7 +2085,10 @@ def build_report() -> dict:
             "source equivalence with unpublished Site v32 / 33-file patches",
         ],
         "f07_scope": "PROPOSED_STUB_ONLY_NOT_EXISTING_SUBMIT_GUARANTEE",
-        "f09_scope": "hash equality alone is insufficient; requires exact approved target, matching promotion provenance, before/after evidence, fresh board",
+        "f09_scope": (
+            "hash equality alone is insufficient; requires exact approved target, matching "
+            "promotion provenance, before/after evidence, fresh board"
+        ),
         "forbidden_io": CONTRACT["forbidden_io"],
         "ordinary_execution_route": {
             "execution_route": "ordinary_cloudagent",
@@ -925,29 +2100,37 @@ def build_report() -> dict:
     }
 
 
-def test_report_is_written_and_consistent() -> None:
+def test_report_builder_is_pure_and_serializes_to_tmp(tmp_path: Path) -> None:
+    before = REPORT_PATH.read_bytes() if REPORT_PATH.exists() else None
     report = build_report()
-    REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REPORT_PATH.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # A pure builder must never touch the committed report.
+    after = REPORT_PATH.read_bytes() if REPORT_PATH.exists() else None
+    assert before == after
 
-    reloaded = load_json(REPORT_PATH)
+    out = tmp_path / "mobile_cloud_flow_v1_report.json"
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    reloaded = load_json(out)
     assert reloaded["schema"] == "personal-ai-mobile-cloud-flow-report/v1"
     assert reloaded["validation_level"] == "CONTRACT_ONLY"
     assert reloaded["mobile_e2e_status"] == "NOT_RUN"
     assert reloaded["production_write_status"] == "NOT_RUN"
     assert reloaded["release_status"] == "NOT_PERFORMED"
-    assert reloaded["full_repository_suite_status"] == "NOT_RUN_THIS_ROUND"
-    assert reloaded["execution_result"] == "CONTRACT_PASS"
-    assert reloaded["source_manifest_sha256"] is None
     assert len(reloaded["scenarios"]) == 15
     assert all(scenario["status"] == "PASS" for scenario in reloaded["scenarios"])
+    assert reloaded["execution_result"] == "CONTRACT_PASS"
+    assert reloaded["source_manifest_sha256"] is None
+    assert reloaded["contract_planned_full_repository_suite_status"] == CONTRACT_PLANNED_FULL_SUITE_STATUS
     assert reloaded["network_call_count"] == 0
     assert reloaded["live_passkey_call_count"] == 0
     assert reloaded["live_db_call_count"] == 0
     assert reloaded["real_dispatch_count"] == 0
+    assert reloaded["subprocess_execution_count"] == 0
     assert reloaded["repository_code_executed"] is False
-    # The report must never label a fixture run as real mobile E2E.
     assert reloaded["execution_result"] != "MOBILE_E2E_PASS"
+    # Unobserved phases must be honestly pending, never invented.
+    assert reloaded["execution_phases"]["workflow_verify_full_suite"]["status"] == NOT_OBSERVED
+    for action in FIXTURE_WORKFLOW_SCOPED_ACTIONS:
+        assert reloaded["workflow_actions"][action]["scope"] == "workflow_record_not_fixture_counter"
 
 
 def test_reported_status_is_never_mobile_e2e_pass() -> None:
@@ -957,3 +2140,17 @@ def test_reported_status_is_never_mobile_e2e_pass() -> None:
     assert entry["mobile_e2e_status"] == "NOT_RUN"
     assert entry["production_write_status"] == "NOT_RUN"
     assert entry["release_status"] == "NOT_PERFORMED"
+
+
+def test_committed_report_exists_and_labels_contract_only() -> None:
+    if not REPORT_PATH.exists():
+        pytest.skip("committed report is generated deliberately after validations")
+    report = load_json(REPORT_PATH)
+    assert report["validation_level"] == "CONTRACT_ONLY"
+    assert report["execution_result"] in ("CONTRACT_PASS", "FAIL")
+    assert report["execution_result"] != "MOBILE_E2E_PASS"
+    assert report["mobile_e2e_status"] == "NOT_RUN"
+    assert report["production_write_status"] == "NOT_RUN"
+    assert report["release_status"] == "NOT_PERFORMED"
+    for action in FIXTURE_WORKFLOW_SCOPED_ACTIONS:
+        assert report["workflow_actions"][action]["scope"] == "workflow_record_not_fixture_counter"
