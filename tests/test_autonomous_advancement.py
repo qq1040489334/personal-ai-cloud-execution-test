@@ -1278,3 +1278,306 @@ def test_r2_long_title_squeezing_identity_is_recovered_from_value() -> None:
 
     assert pending_task_ids(report) == ["cf-squeezed"]
     assert report["scoped"]["excluded_by_lineage"] == 0
+
+
+# -- Round 3: list read-back membership fidelity (R2a/R2b) -------------------
+#
+# Round 2 repaired the metadata *bound* and the truncation of identity fields in
+# the projection. Independent acceptance still reproduced two list read-back
+# defects from the same counterexample:
+#
+# R2a: the complete-value hydration in ``listPendingResults`` was gated on a
+#      scope being present, so an *unscoped* call returned the bounded/truncated
+#      identity (``project_id`` and ``lineage.key`` narrowed to <=128 bytes) as
+#      if it were the real id. Complete identity must be preserved for scoped
+#      *and* unscoped calls; a short string must never be reported as a real id.
+# R2b: an identity whose value could not be read back was retained but still
+#      routed into the confirmed actionable buckets (``pending`` /
+#      ``pending_review`` with ``requires_review`` and
+#      ``recommended_action=review``), and a descendant whose parent chain passed
+#      through an unresolved ancestor was *excluded* by comparing the ancestor's
+#      compressed identity. Unknown identity and its descendants must be neither
+#      match nor nonmatch: they are visible and retryable on their own, never
+#      silently mixed into a confirmed match list nor counted as excluded.
+#
+# Membership is therefore tri-state (match / nonmatch / unresolved). These
+# probes drive the production source and first fail on the committed source.
+
+WORKER_LINEAGE_MEMBERSHIP_HARNESS = r"""
+const valueStore = new Map();
+const metaStore = new Map();
+const getFail = __GET_FAIL__;
+const getCalls = {};
+function seedTask(task) {
+  const copy = JSON.parse(JSON.stringify(task));
+  const task_id = copy.task_id;
+  const rest = Object.assign({}, copy);
+  delete rest.task_id;
+  valueStore.set("task:" + task_id, JSON.stringify(copy));
+  metaStore.set("task:" + task_id, buildTaskMetadata(rest));
+}
+const env = {
+  GITHUB_REPO: "owner/repo",
+  GITHUB_TOKEN: "test-token",
+  TASK_REGISTRY: {
+    get: async function(key, type) {
+      getCalls[key] = (getCalls[key] || 0) + 1;
+      const fail = getFail[key];
+      if (fail && (fail.times == null || getCalls[key] <= fail.times)) {
+        if (fail.mode === "throw") throw new Error("readback failed");
+        return null;
+      }
+      const raw = valueStore.has(key) ? valueStore.get(key) : null;
+      if (raw == null) return null;
+      return type === "json" ? JSON.parse(raw) : raw;
+    },
+    put: async function(key, value, opts) {
+      valueStore.set(key, value);
+      const parsed = JSON.parse(value);
+      const rest = Object.assign({}, parsed);
+      delete rest.task_id;
+      metaStore.set(key, opts && opts.metadata ? opts.metadata : buildTaskMetadata(rest));
+    },
+    list: async function() {
+      return { keys: Array.from(valueStore.keys()).map(function(name) {
+        return { name: name, metadata: metaStore.get(name) || {} };
+      }) };
+    }
+  }
+};
+globalThis.fetch = async function(url) {
+  if (String(url).indexOf("/actions/artifacts") !== -1) {
+    return {
+      ok: true, status: 200,
+      headers: { get: function() { return null; } },
+      json: async function() { return { artifacts: [] }; },
+      text: async function() { return ""; }
+    };
+  }
+  throw new Error("unexpected non-artifact fetch during listing");
+};
+const TASKS = __TASKS__;
+for (const task of TASKS) seedTask(task);
+const scope = __SCOPE__;
+const scopedArgs = scope ? { scope: scope } : {};
+const first = JSON.parse((await toolListPendingResults(env, scopedArgs)).text);
+const second = JSON.parse((await toolListPendingResults(env, scopedArgs)).text);
+const unscoped = JSON.parse((await toolListPendingResults(env, {})).text);
+console.log(JSON.stringify({ first: first, second: second, unscoped: unscoped }));
+"""
+
+
+def run_worker_lineage_membership_probe(
+    tasks: list[dict],
+    *,
+    scope: dict | None = None,
+    get_fail: dict | None = None,
+) -> dict:
+    script = WORKER_LINEAGE_MEMBERSHIP_HARNESS
+    script = script.replace("__TASKS__", json.dumps(tasks))
+    script = script.replace("__SCOPE__", json.dumps(scope))
+    script = script.replace("__GET_FAIL__", json.dumps(get_fail or {}))
+    return run_worker_probe(script)
+
+
+def r2_identity_task(task_id: str = "cf-probe", **overrides) -> dict:
+    base = {
+        "task_id": task_id,
+        "status": "PASS",
+        "normalized_status": "PASS",
+        "execution_status": "PASS",
+        "terminal": True,
+        "result_available": True,
+        "workflow_verified": True,
+        "reviewed": False,
+        "review_verdict": None,
+        "title": "t" * 600,
+        "project_id": "p" * 400,
+        "root_task_id": "r" * 400,
+        "parent_task_id": "a" * 400,
+        "created_at": "2026-10-11T22:00:00.000Z",
+        "updated_at": "2026-10-11T23:00:00.000Z",
+    }
+    base.update(overrides)
+    return base
+
+
+def r2_lineage_child(task_id: str, parent_task_id: str) -> dict:
+    return {
+        "task_id": task_id,
+        "status": "PASS",
+        "normalized_status": "PASS",
+        "execution_status": "PASS",
+        "terminal": True,
+        "result_available": True,
+        "workflow_verified": True,
+        "reviewed": False,
+        "review_verdict": None,
+        "title": "child readback",
+        "parent_task_id": parent_task_id,
+        "created_at": "2026-10-11T22:00:00.000Z",
+        "updated_at": "2026-10-11T23:00:00.000Z",
+    }
+
+
+def membership_ids(report: dict, bucket: str, phase: str = "first") -> list[str]:
+    return [item["task_id"] for item in report[phase][bucket]]
+
+
+def test_r2a_complete_identity_survives_scoped_and_unscoped_readback() -> None:
+    long_project = "p" * 400
+    task = r2_identity_task()
+    report = run_worker_lineage_membership_probe([task], scope={"project_id": long_project})
+
+    # The scoped listing already recovered the identity in round 2.
+    scoped_entry = report["first"]["pending"][0]
+    assert scoped_entry["project_id"] == long_project
+    assert scoped_entry["lineage"] == {"kind": "project", "key": long_project}
+
+    # The unscoped listing must preserve the exact identity too (R2a defect:
+    # hydration was gated on a scope, so this used to be the 128-byte prefix).
+    unscoped_entry = report["unscoped"]["pending"][0]
+    assert unscoped_entry["task_id"] == "cf-probe"
+    assert len(unscoped_entry["project_id"]) == 400
+    assert unscoped_entry["project_id"] == long_project
+    assert unscoped_entry["lineage"]["kind"] == "project"
+    assert unscoped_entry["lineage"]["key"] == long_project
+    assert unscoped_entry["lineage"]["key"] != long_project[:128]
+
+
+def test_r2a_unscoped_root_and_parent_identities_are_complete() -> None:
+    long_root = "r" * 400
+    long_parent = "a" * 400
+    task = r2_identity_task(project_id=None, root_task_id=long_root, parent_task_id=long_parent)
+    report = run_worker_lineage_membership_probe([task], scope=None)
+
+    entry = report["unscoped"]["pending"][0]
+    assert entry["root_task_id"] == long_root
+    assert entry["parent_task_id"] == long_parent
+    assert entry["lineage"] == {"kind": "root", "key": long_root}
+
+
+@pytest.mark.parametrize("mode", ["null", "throw"])
+def test_r2b_self_unreadable_identity_is_not_a_confirmed_actionable_match(mode: str) -> None:
+    task = r2_identity_task()
+    report = run_worker_lineage_membership_probe(
+        [task],
+        scope={"project_id": "other-project"},
+        get_fail={"task:cf-probe": {"mode": mode}},
+    )
+
+    first = report["first"]
+    # Unknown identity must not be mixed into the confirmed actionable buckets.
+    assert first["pending"] == []
+    assert first["pending_review"] == []
+    assert first["failed"] == []
+    assert first["blocked"] == []
+    # Nor may it be counted as a confirmed nonmatch.
+    assert first["excluded_by_lineage"] == 0
+    assert first["lineage_unresolved"] == 1
+    # It must remain visible and explicitly retryable, without a forged short id.
+    assert membership_ids(report, "unresolved") == ["cf-probe"]
+    unresolved = first["unresolved"][0]
+    assert unresolved["retryable"] is True
+    assert unresolved["identity_resolved"] is False
+    assert "project_id" not in unresolved
+    assert unresolved["lineage"] is None or "key" not in unresolved["lineage"]
+
+
+@pytest.mark.parametrize("mode", ["null", "throw"])
+def test_r2b_unreadable_ancestor_does_not_exclude_its_descendant(mode: str) -> None:
+    long_project = "p" * 400
+    parent = r2_identity_task("cf-parent", project_id=long_project, root_task_id=None)
+    child = r2_lineage_child("cf-child", "cf-parent")
+    report = run_worker_lineage_membership_probe(
+        [parent, child],
+        scope={"project_id": long_project},
+        get_fail={"task:cf-parent": {"mode": mode}},
+    )
+
+    first = report["first"]
+    assert first["pending"] == []
+    assert first["pending_review"] == []
+    # The compressed ancestor identity must never exclude the descendant.
+    assert first["excluded_by_lineage"] == 0
+    assert first["lineage_unresolved"] == 1
+    assert sorted(membership_ids(report, "unresolved")) == ["cf-child", "cf-parent"]
+
+
+def test_r2b_unknown_propagates_through_a_multi_level_ancestor_chain() -> None:
+    long_project = "p" * 400
+    root = r2_identity_task("cf-root", project_id=long_project)
+    mid = r2_lineage_child("cf-mid", "cf-root")
+    leaf = r2_lineage_child("cf-leaf", "cf-mid")
+    report = run_worker_lineage_membership_probe(
+        [root, mid, leaf],
+        scope={"project_id": long_project},
+        get_fail={"task:cf-root": {"mode": "null"}},
+    )
+
+    first = report["first"]
+    assert first["pending"] == []
+    assert first["excluded_by_lineage"] == 0
+    assert sorted(membership_ids(report, "unresolved")) == ["cf-leaf", "cf-mid", "cf-root"]
+
+
+def test_r2b_membership_recovers_after_identity_readback_succeeds() -> None:
+    long_project = "p" * 400
+    parent = r2_identity_task("cf-parent", project_id=long_project, root_task_id=None)
+    child = r2_lineage_child("cf-child", "cf-parent")
+    report = run_worker_lineage_membership_probe(
+        [parent, child],
+        scope={"project_id": long_project},
+        get_fail={"task:cf-parent": {"mode": "null", "times": 1}},
+    )
+
+    # First read fails: both the unknown ancestor and its descendant are unresolved.
+    assert report["first"]["pending"] == []
+    assert report["first"]["excluded_by_lineage"] == 0
+    assert sorted(membership_ids(report, "unresolved", "first")) == ["cf-child", "cf-parent"]
+
+    # Once the read-back succeeds there is no permanently cached unknown.
+    second = report["second"]
+    assert sorted(membership_ids(report, "pending", "second")) == ["cf-child", "cf-parent"]
+    assert sorted(membership_ids(report, "pending_review", "second")) == ["cf-child", "cf-parent"]
+    assert second["excluded_by_lineage"] == 0
+    assert second["lineage_unresolved"] == 0
+    assert second["unresolved"] == []
+    for entry in second["pending"]:
+        assert entry["lineage"] == {"kind": "project", "key": long_project}
+        assert entry["membership"] == "match"
+
+
+def test_r2b_shared_long_prefix_project_is_not_cross_associated() -> None:
+    shared = "p" * 400
+    matched = r2_identity_task("cf-match", project_id=shared)
+    other = r2_identity_task("cf-other", project_id=shared[:-1] + "X")
+    report = run_worker_lineage_membership_probe([matched, other], scope={"project_id": shared})
+
+    assert membership_ids(report, "pending") == ["cf-match"]
+    assert report["first"]["excluded_by_lineage"] == 1
+    assert report["first"]["unresolved"] == []
+
+
+def test_r2b_unrelated_project_is_excluded_without_identities_being_fabricated() -> None:
+    task = r2_identity_task("cf-other", project_id="other-project")
+    report = run_worker_lineage_membership_probe([task], scope={"project_id": "p" * 400})
+
+    assert report["first"]["pending"] == []
+    assert report["first"]["excluded_by_lineage"] == 1
+    assert report["first"]["lineage_unresolved"] == 0
+
+
+def test_r2b_unscoped_unknown_identity_is_still_visible_and_not_forged() -> None:
+    task = r2_identity_task()
+    report = run_worker_lineage_membership_probe(
+        [task], scope=None, get_fail={"task:cf-probe": {"mode": "null"}}
+    )
+
+    unscoped = report["unscoped"]
+    # No scope means no confirmed match is asserted; the task is still visible.
+    assert membership_ids(report, "unresolved", "unscoped") == ["cf-probe"]
+    assert unscoped["pending"] == []
+    entry = unscoped["unresolved"][0]
+    assert entry["identity_resolved"] is False
+    assert "project_id" not in entry

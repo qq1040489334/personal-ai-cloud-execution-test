@@ -134,8 +134,8 @@
     "workflow / binding / schema / secret / permission changes"
   ],
   "workflow_untouched": true,
-  "updated_by_task": "cf-8566e7edf408",
-  "latest_round": "round_2",
+  "updated_by_task": "cf-c7a5c4d9e250",
+  "latest_round": "round_3",
   "round_2": {
     "task_id": "cf-8566e7edf408",
     "parent_task_id": "cf-3b1edc97a277",
@@ -212,6 +212,111 @@
     "online_evidence_boundary": {
       "observation": "A 79-byte note also fails online and the review fields remain null.",
       "interpretation": "This round repairs only reproducible source-level defects. The online root cause and the online fix effect remain unverified.",
+      "online_fix": "NOT_PERFORMED"
+    },
+    "files_changed": [
+      "worker/index.js",
+      "tests/test_autonomous_advancement.py",
+      "reports/review_metadata_bounds_report.json"
+    ],
+    "not_executed": [
+      "production Worker deployment (wrangler deploy / Canonical write)",
+      "remote KV (TASK_REGISTRY) write",
+      "real Cloudflare D1 (ASSET_DB) read or write",
+      "real mark_reviewed against production",
+      "real next-task dispatch to production GitHub",
+      "mobile/phone acceptance",
+      "workflow / binding / schema / secret / permission changes"
+    ],
+    "workflow_untouched": true
+  },
+  "round_3": {
+    "task_id": "cf-c7a5c4d9e250",
+    "parent_task_id": "cf-8566e7edf408",
+    "root_task_id": "cf-3b1edc97a277",
+    "risk_level": "LOW",
+    "baseline_head": "5a331e126105c1f397b8bf553fcde79c68f0c96b",
+    "candidate_commit": "__CANDIDATE_COMMIT__",
+    "scope": "Same approved 3-file BUGFIX continuation of the review-registration metadata/lineage fidelity repair.",
+    "prior_round_verification": "Round 2 reported the full suite passing (1697 passed, 1 skipped) and the identity/lineage semantics satisfied, yet independent acceptance remained CHANGES_REQUIRED: two list read-back defects were still reproducible from the same bounded-identity counterexample. This round writes the exact R2a/R2b counterexamples first and obtains a red baseline before touching source (test-first), then repairs only those two source-reproducible defects without widening scope.",
+    "defects": {
+      "R2a": {
+        "summary": "listPendingResults gated the complete-value hydration on a scope being present, so an unscoped call returned the bounded/truncated identity (project_id and lineage.key narrowed to <=128 bytes) as if it were the real id. The scoped call already recovered the full 400-byte identity.",
+        "counterexample": "task_id='cf-probe'; status/normalized_status/execution_status='PASS'; terminal/result_available/workflow_verified=true; reviewed=false; title='t'*600; project_id='p'*400; root_task_id='r'*400; parent_task_id='a'*400; created_at='2026-10-11T22:00:00.000Z'; updated_at='2026-10-11T23:00:00.000Z'",
+        "measured_pre_fix_unscoped_project_id_length": 64,
+        "measured_pre_fix_unscoped_lineage_key_length": 64,
+        "measured_post_fix_unscoped_project_id_length": 400,
+        "measured_post_fix_unscoped_lineage_key_length": 400
+      },
+      "R2b": {
+        "summary": "An identity whose value could not be read back was retained but still routed into the confirmed actionable buckets (pending/pending_review with requires_review=true and recommended_action=review), and a descendant whose parent chain passed through an unresolved ancestor was excluded by comparing the ancestor's compressed identity. Unknown identity (and its descendants) must be neither a confirmed match nor a confirmed nonmatch.",
+        "counterexample_self": "KV list returns the projected metadata of the cf-probe project p*400 task, KV get returns null or throws; request scope project_id='other-project'.",
+        "counterexample_ancestor": "cf-parent carries the bounded project p*400 metadata and its get returns null/throws; cf-child has no project/root and parent_task_id='cf-parent' and reads normally; request scope project_id=p*400.",
+        "measured_pre_fix_self": "task mixed into pending/pending_review with requires_review=true, recommended_action=review (lineage_unresolved=1 did not stop it).",
+        "measured_pre_fix_ancestor": "the unknown parent was collected while the readable descendant was excluded_by_lineage=1 from the ancestor's compressed identity.",
+        "measured_post_fix": "self and ancestor-unknown tasks (and multi-level descendants) appear only in the new retryable unresolved bucket; excluded_by_lineage=0; no truncated id emitted; membership recovers exactly after a successful read-back."
+      }
+    },
+    "fix": {
+      "approach": "listPendingResults now hydrates the complete JSON value for every task whose lineage metadata is incomplete, independent of scope, and classifies membership as a tri-state (match / nonmatch / unresolved).",
+      "membership": {
+        "match": "only a confirmed identity match enters the actionable buckets (pending/pending_review/failed/blocked/unconfirmed); identity fields and lineage are the complete values.",
+        "nonmatch": "only a confirmed identity mismatch increments excluded_by_lineage.",
+        "unresolved": "a task whose own identity could not be read back, or whose parent chain passes through an unresolved ancestor, is routed to a dedicated visible, retryable 'unresolved' bucket; it is never mixed into a confirmed list, never counted as excluded, and never given a forged short id (identity_resolved=false, lineage=null)."
+      },
+      "propagation": "resolveLineageState carries resolved=false when the parent walk reaches a member of the unresolved read-back set; truly missing ancestors, cycles and parentless tasks keep the original self-root compatibility semantics.",
+      "no_permanent_unknown_cache": "the unresolved set is rebuilt per invocation from fresh read-backs, so a successful read-back restores exact membership with no cached unknown.",
+      "no_second_state_store": true,
+      "short_normal_records": "records whose lineage metadata is complete still use the plain listing path with no extra read-back."
+    },
+    "red_evidence": {
+      "command": "git checkout HEAD -- worker/index.js && python -m pytest tests/test_autonomous_advancement.py -k \"r2a_ or r2b_\" -q",
+      "result": "10 failed, 1 passed, 50 deselected in 0.57s",
+      "log_md5": "01fc80d1588e95b9b3812804351e238c",
+      "note": "The single passing case is test_r2b_unrelated_project_is_excluded_without_identities_being_fabricated, whose assertions already held on the unmodified source; the 10 R2a/R2b counterexamples fail on the original source. Recorded before the source edit (test-first)."
+    },
+    "green_evidence": {
+      "command": "python -m pytest tests/test_autonomous_advancement.py -k \"r2a_ or r2b_\" -q",
+      "result": "11 passed, 50 deselected in 0.44s",
+      "log_md5": "1c9642ed283cb5b0c474eda968e7f6f2"
+    },
+    "new_tests": [
+      "test_r2a_complete_identity_survives_scoped_and_unscoped_readback",
+      "test_r2a_unscoped_root_and_parent_identities_are_complete",
+      "test_r2b_self_unreadable_identity_is_not_a_confirmed_actionable_match[null]",
+      "test_r2b_self_unreadable_identity_is_not_a_confirmed_actionable_match[throw]",
+      "test_r2b_unreadable_ancestor_does_not_exclude_its_descendant[null]",
+      "test_r2b_unreadable_ancestor_does_not_exclude_its_descendant[throw]",
+      "test_r2b_unknown_propagates_through_a_multi_level_ancestor_chain",
+      "test_r2b_membership_recovers_after_identity_readback_succeeds",
+      "test_r2b_shared_long_prefix_project_is_not_cross_associated",
+      "test_r2b_unrelated_project_is_excluded_without_identities_being_fabricated",
+      "test_r2b_unscoped_unknown_identity_is_still_visible_and_not_forged"
+    ],
+    "regression_coverage": {
+      "scoped_and_unscoped_identity_and_lineage_key_exact": true,
+      "no_truncated_or_shared_prefix_id_emitted": true,
+      "self_unreadable_identity_not_confirmed_actionable": true,
+      "unreadable_ancestor_does_not_exclude_descendant": true,
+      "multi_level_unknown_propagation": true,
+      "membership_recovers_after_successful_readback": true,
+      "unrelated_project_excluded": true,
+      "metadata_bound_1024_and_full_note_value_preserved": true,
+      "pass_fail_blocked_idempotence_and_zero_unauthorized_dispatch_preserved": true,
+      "legacy_assertions_weakened_or_removed": false
+    },
+    "test_suites": {
+      "autonomous_advancement_file": "61 passed in 1.46s",
+      "focused_suite": "155 passed in 2.92s",
+      "full_suite": {
+        "command": "python -m pytest -q",
+        "result": "1708 passed, 1 skipped in 50.76s",
+        "log_md5": "654d986ac7ea5ffc2f1ea546ef7fe069"
+      }
+    },
+    "online_evidence_boundary": {
+      "observation": "The online short-note failure and the null review fields remain observed.",
+      "interpretation": "This round repairs only reproducible source-level list read-back defects. Source repair does not prove the online root cause nor that the production error is fixed.",
       "online_fix": "NOT_PERFORMED"
     },
     "files_changed": [

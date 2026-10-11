@@ -1768,6 +1768,44 @@ function lineageInScope(record, scope, index) {
   if (projectId) return resolved.kind === LINEAGE_KIND_PROJECT && resolved.key === String(projectId);
   return resolved.kind === LINEAGE_KIND_ROOT && resolved.key === String(rootTaskId);
 }
+function resolveLineageState(record, index, unresolved) {
+  const taskId = String(record && record.task_id || "");
+  const projectId = record && record.project_id;
+  if (projectId) return { kind: LINEAGE_KIND_PROJECT, key: String(projectId), resolved: true };
+  const root = record && record.root_task_id;
+  if (root) return { kind: LINEAGE_KIND_ROOT, key: String(root), resolved: true };
+  let parent = record && record.parent_task_id;
+  const seen = /* @__PURE__ */ new Set();
+  while (parent && !seen.has(String(parent)) && seen.size < MAX_LINEAGE_WALK) {
+    seen.add(String(parent));
+    if (unresolved && unresolved.has(String(parent))) {
+      return { kind: null, key: null, resolved: false };
+    }
+    const ancestor = index.get(String(parent));
+    if (!ancestor) break;
+    if (ancestor.root_task_id) return { kind: LINEAGE_KIND_ROOT, key: String(ancestor.root_task_id), resolved: true };
+    if (ancestor.project_id) return { kind: LINEAGE_KIND_PROJECT, key: String(ancestor.project_id), resolved: true };
+    parent = ancestor.parent_task_id;
+  }
+  return { kind: LINEAGE_KIND_ROOT, key: taskId, resolved: true };
+}
+var LINEAGE_MEMBERSHIP_MATCH = "match";
+var LINEAGE_MEMBERSHIP_NONMATCH = "nonmatch";
+var LINEAGE_MEMBERSHIP_UNRESOLVED = "unresolved";
+function classifyLineageMembership(record, scope, index, unresolved, taskId) {
+  const id = String(taskId != null ? taskId : record && record.task_id || "");
+  if (unresolved && unresolved.has(id)) return LINEAGE_MEMBERSHIP_UNRESOLVED;
+  const state = resolveLineageState(record, index, unresolved);
+  if (!state.resolved) return LINEAGE_MEMBERSHIP_UNRESOLVED;
+  if (!scope) return LINEAGE_MEMBERSHIP_MATCH;
+  const projectId = scope.project_id;
+  const rootTaskId = scope.root_task_id;
+  if (!projectId && !rootTaskId) return LINEAGE_MEMBERSHIP_MATCH;
+  if (projectId) {
+    return state.kind === LINEAGE_KIND_PROJECT && state.key === String(projectId) ? LINEAGE_MEMBERSHIP_MATCH : LINEAGE_MEMBERSHIP_NONMATCH;
+  }
+  return state.kind === LINEAGE_KIND_ROOT && state.key === String(rootTaskId) ? LINEAGE_MEMBERSHIP_MATCH : LINEAGE_MEMBERSHIP_NONMATCH;
+}
 var TASK_METADATA_MAX_BYTES = 1024;
 var TASK_METADATA_STRING_LIMIT = 256;
 var TASK_METADATA_LINEAGE_FIELDS = ["project_id", "root_task_id", "parent_task_id"];
@@ -1982,17 +2020,14 @@ async function listPendingResults(env, scope) {
   const tasks = await listTasks(env);
   const index = /* @__PURE__ */ new Map();
   for (const task of tasks) index.set(String(task.task_id), task);
-  const scopeActive = Boolean(scope && (scope.project_id || scope.root_task_id));
   const lineageUnresolved = /* @__PURE__ */ new Set();
-  if (scopeActive) {
-    for (const task of tasks) {
-      if (metadataLineageComplete(task)) continue;
-      const full = await readTaskMetadataForLineage(env, task);
-      if (full) {
-        index.set(String(task.task_id), { ...task, ...full });
-      } else {
-        lineageUnresolved.add(String(task.task_id));
-      }
+  for (const task of tasks) {
+    if (metadataLineageComplete(task)) continue;
+    const full = await readTaskMetadataForLineage(env, task);
+    if (full) {
+      index.set(String(task.task_id), { ...task, ...full, task_id: task.task_id });
+    } else {
+      lineageUnresolved.add(String(task.task_id));
     }
   }
   const now = Date.now();
@@ -2001,14 +2036,39 @@ async function listPendingResults(env, scope) {
   const failed = [];
   const blocked = [];
   const unconfirmed = [];
+  const unresolved = [];
   let excluded_by_lineage = 0;
   for (const task of tasks) {
-    const record = index.get(String(task.task_id)) || task;
-    if (scopeActive && lineageUnresolved.has(String(task.task_id))) {
-      // The identity could not be read back, so a scope mismatch cannot be
-      // confirmed. Keep the task rather than silently dropping it.
-    } else if (!lineageInScope(record, scope, index)) {
+    const taskId = String(task.task_id);
+    const record = index.get(taskId) || task;
+    const membership = classifyLineageMembership(record, scope, index, lineageUnresolved, taskId);
+    if (membership === LINEAGE_MEMBERSHIP_NONMATCH) {
       excluded_by_lineage += 1;
+      continue;
+    }
+    if (membership === LINEAGE_MEMBERSHIP_UNRESOLVED) {
+      // The identity (or an ancestor's identity) could not be read back. A
+      // scope match can be neither confirmed nor refuted, and a bounded/compressed
+      // identity must never be treated as the real id. Surface the task in a
+      // dedicated, retryable bucket instead of a confirmed actionable list.
+      unresolved.push({
+        task_id: task.task_id,
+        status: task.normalized_status || task.status || EXECUTION_STATUS_PENDING,
+        normalized_status: task.normalized_status || task.status || EXECUTION_STATUS_PENDING,
+        execution_status: task.execution_status || task.status || EXECUTION_STATUS_PENDING,
+        terminal: task.terminal === true,
+        title: task.title || "",
+        updated_at: task.updated_at || task.created_at || "",
+        result_available: Boolean(task.result_available),
+        reviewed: task.reviewed === true,
+        review_verdict: task.review_verdict ?? null,
+        membership: LINEAGE_MEMBERSHIP_UNRESOLVED,
+        identity_resolved: false,
+        lineage: null,
+        retryable: true,
+        recommended_action: TASK_DISPATCH_ACTION_RETRY,
+        reason: "LINEAGE_IDENTITY_UNRESOLVED"
+      });
       continue;
     }
     let status = task.normalized_status || task.status || EXECUTION_STATUS_PENDING;
@@ -2062,6 +2122,8 @@ async function listPendingResults(env, scope) {
       requires_review: resultAvailable && task.reviewed !== true,
       recommended_action: resultAvailable ? "review" : "wait"
     };
+    entry.membership = LINEAGE_MEMBERSHIP_MATCH;
+    entry.identity_resolved = true;
     if (record.project_id) entry.project_id = String(record.project_id);
     if (record.root_task_id) entry.root_task_id = String(record.root_task_id);
     if (record.parent_task_id) entry.parent_task_id = String(record.parent_task_id);
@@ -2113,12 +2175,14 @@ async function listPendingResults(env, scope) {
     failed,
     blocked,
     unconfirmed,
+    unresolved,
     counts: {
       pending: pending.length,
       pending_review: pending_review.length,
       failed: failed.length,
       blocked: blocked.length,
       unconfirmed: unconfirmed.length,
+      unresolved: unresolved.length,
       total: tasks.length
     }
   };
