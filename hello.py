@@ -10339,7 +10339,8 @@ def _run_production_golden_runtime_probe() -> dict:
     probe = source + "\n" + harness
     try:
         completed = subprocess.run(
-            [node, "--input-type=module", "-e", probe],
+            [node, "--input-type=module"],
+            input=probe,
             capture_output=True,
             text=True,
             timeout=120,
