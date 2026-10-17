@@ -1,0 +1,106 @@
+{
+  "source": "worker.list_pending_results",
+  "observed_at": "2026-10-17T12:00:00Z",
+  "now": "2026-10-17T12:01:00Z",
+  "ttl_seconds": 300,
+  "records": [
+    {
+      "task_id": "cf-completed-unreviewed",
+      "parent_task_id": null,
+      "status": "PASS",
+      "execution_status": "PASS",
+      "normalized_status": "PASS",
+      "workflow_conclusion": "success",
+      "result_available": true,
+      "reviewed": false,
+      "requires_review": true,
+      "updated_at": "2026-10-17T11:58:00Z",
+      "completed_at": "2026-10-17T11:57:30Z"
+    },
+    {
+      "task_id": "cf-reviewed",
+      "status": "PASS",
+      "execution_status": "PASS",
+      "workflow_conclusion": "success",
+      "result_available": true,
+      "reviewed": true,
+      "review_verdict": "PASS",
+      "review_state": "reviewed",
+      "updated_at": "2026-10-17T11:59:00Z"
+    },
+    {
+      "task_id": "cf-running",
+      "status": "running",
+      "dispatch_state": "CONFIRMED",
+      "run_status": "in_progress",
+      "updated_at": "2026-10-17T11:59:30Z"
+    },
+    {
+      "task_id": "cf-queued",
+      "status": "queued",
+      "dispatch_state": "ACCEPTED",
+      "updated_at": "2026-10-17T11:59:45Z"
+    },
+    {
+      "task_id": "cf-failed",
+      "status": "FAIL",
+      "execution_status": "FAIL",
+      "workflow_conclusion": "failure",
+      "result_available": true,
+      "reviewed": false,
+      "updated_at": "2026-10-17T11:56:00Z"
+    },
+    {
+      "task_id": "cf-blocked",
+      "status": "BLOCKED",
+      "execution_status": "BLOCKED",
+      "workflow_conclusion": "timed_out",
+      "result_available": false,
+      "updated_at": "2026-10-17T11:55:00Z"
+    },
+    {
+      "task_id": "cf-unverified-self-report",
+      "status": "success",
+      "updated_at": "2026-10-17T11:54:00Z"
+    },
+    {
+      "task_id": "cf-duplicate",
+      "status": "running",
+      "dispatch_state": "CONFIRMED",
+      "updated_at": "2026-10-17T11:53:00Z"
+    },
+    {
+      "task_id": "cf-duplicate",
+      "status": "PASS",
+      "execution_status": "PASS",
+      "workflow_conclusion": "success",
+      "result_available": true,
+      "reviewed": false,
+      "updated_at": "2026-10-17T11:58:30Z"
+    },
+    {
+      "task_id": "cf-parent",
+      "status": "PASS",
+      "execution_status": "PASS",
+      "workflow_conclusion": "success",
+      "result_available": true,
+      "reviewed": true,
+      "review_verdict": "PASS",
+      "updated_at": "2026-10-17T11:50:00Z"
+    },
+    {
+      "task_id": "cf-child",
+      "parent_task_id": "cf-parent",
+      "root_task_id": "cf-parent",
+      "status": "FAIL",
+      "execution_status": "FAIL",
+      "workflow_conclusion": "failure",
+      "result_available": true,
+      "reviewed": false,
+      "updated_at": "2026-10-17T11:52:00Z"
+    },
+    {
+      "note": "this record has no task_id and must be skipped"
+    }
+  ]
+}
