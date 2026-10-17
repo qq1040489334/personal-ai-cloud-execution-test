@@ -486,3 +486,161 @@ def test_invalid_ttl_is_rejected(ttl):
             now="2026-10-17T12:01:00Z",
             ttl_seconds=ttl,
         )
+
+
+def test_workflow_success_does_not_let_pass_mask_normalized_failure():
+    records = [
+        {
+            "task_id": "cf-masked-failure",
+            "workflow_conclusion": "success",
+            "execution_status": "PASS",
+            "normalized_status": "FAIL",
+            "result_available": True,
+            "updated_at": "2026-10-17T11:58:00Z",
+        }
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["runtime_state"] == FAILED
+    assert task["evidence"] == "conflict"
+    assert task["blocker"] == "workflow_success_execution_failure"
+
+
+def test_workflow_success_field_order_does_not_hide_execution_failure():
+    records = [
+        {
+            "task_id": "cf-masked-failure-order",
+            "workflow_conclusion": "success",
+            "execution_status": "FAIL",
+            "normalized_status": "PASS",
+            "updated_at": "2026-10-17T11:58:00Z",
+        }
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["runtime_state"] == FAILED
+    assert task["evidence"] == "conflict"
+    assert task["blocker"] == "workflow_success_execution_failure"
+
+
+def test_workflow_success_status_failure_not_masked_by_execution_pass():
+    records = [
+        {
+            "task_id": "cf-masked-status-failure",
+            "workflow_conclusion": "success",
+            "execution_status": "PASS",
+            "status": "FAIL",
+            "updated_at": "2026-10-17T11:58:00Z",
+        }
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["runtime_state"] == FAILED
+    assert task["evidence"] == "conflict"
+    assert task["blocker"] == "workflow_success_execution_failure"
+
+
+def test_workflow_success_pass_does_not_mask_normalized_blocked():
+    records = [
+        {
+            "task_id": "cf-masked-blocked",
+            "workflow_conclusion": "success",
+            "execution_status": "PASS",
+            "normalized_status": "BLOCKED",
+            "updated_at": "2026-10-17T11:58:00Z",
+        }
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["runtime_state"] == BLOCKED
+    assert task["evidence"] == "conflict"
+    assert task["blocker"] == "workflow_success_execution_blocked"
+
+
+def test_workflow_success_with_all_pass_fields_stays_completed():
+    records = [
+        {
+            "task_id": "cf-all-pass",
+            "workflow_conclusion": "success",
+            "execution_status": "PASS",
+            "normalized_status": "PASS",
+            "status": "PASS",
+            "updated_at": "2026-10-17T11:58:00Z",
+        }
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["runtime_state"] == COMPLETED
+    assert task["evidence"] == "workflow_conclusion"
+    assert task["blocker"] is None
+
+
+def test_same_event_reviewed_pass_and_pending_review_are_conflict():
+    records = [
+        {
+            "task_id": "cf-review-state-tie",
+            "execution_status": "PASS",
+            "reviewed": True,
+            "review_verdict": "PASS",
+            "review_state": "reviewed",
+            "updated_at": "2026-10-17T11:58:00Z",
+        },
+        {
+            "task_id": "cf-review-state-tie",
+            "execution_status": "PASS",
+            "reviewed": False,
+            "review_state": "pending_review",
+            "updated_at": "2026-10-17T11:58:00Z",
+        },
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["runtime_state"] == COMPLETED
+    assert task["review_state"] == "conflict"
+    assert task["review_blocker"] == "conflicting_review_evidence"
+    assert "review_verdict" not in task
+    assert any(conflict.startswith("review:") for conflict in task["conflicts"])
+
+
+def test_same_event_review_conflict_is_independent_of_record_order():
+    records = [
+        {
+            "task_id": "cf-review-state-tie-order",
+            "execution_status": "PASS",
+            "reviewed": False,
+            "review_state": "pending_review",
+            "updated_at": "2026-10-17T11:58:00Z",
+        },
+        {
+            "task_id": "cf-review-state-tie-order",
+            "execution_status": "PASS",
+            "reviewed": True,
+            "review_verdict": "PASS",
+            "review_state": "reviewed",
+            "updated_at": "2026-10-17T11:58:00Z",
+        },
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["review_state"] == "conflict"
+    assert task["review_blocker"] == "conflicting_review_evidence"
+    assert "review_verdict" not in task
+
+
+def test_review_conflict_converges_only_with_newer_sequence():
+    records = [
+        {
+            "task_id": "cf-review-sequence",
+            "execution_status": "PASS",
+            "reviewed": True,
+            "review_verdict": "PASS",
+            "review_state": "reviewed",
+            "run_sequence": 1,
+            "updated_at": "2026-10-17T11:58:00Z",
+        },
+        {
+            "task_id": "cf-review-sequence",
+            "execution_status": "PASS",
+            "reviewed": False,
+            "review_state": "pending_review",
+            "run_sequence": 2,
+            "updated_at": "2026-10-17T11:58:00Z",
+        },
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["review_state"] == PENDING_REVIEW
+    assert "review_verdict" not in task
+    assert "conflicts" not in task

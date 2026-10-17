@@ -210,21 +210,36 @@ def _event_rank(
     return stamp, sequence if sequence is not None else float("-inf")
 
 
+def _execution_signals(record: Mapping[str, Any]) -> list[str]:
+    """Collect every explicit terminal execution field, not just the first.
+
+    Fields are visited in a fixed order so a lone signal resolves exactly as
+    before, while a disagreement between fields is still visible. ``status``
+    only contributes FAIL/BLOCKED because a self-reported PASS is not
+    execution evidence.
+    """
+    signals: list[str] = []
+    for key, allowed in (
+        ("execution_status", _TERMINAL_EXECUTION),
+        ("normalized_status", _TERMINAL_EXECUTION),
+        ("status", {"FAIL", "BLOCKED"}),
+    ):
+        value = _upper(record.get(key))
+        if value in allowed:
+            signals.append(value)
+    return signals
+
+
 def _derive_runtime(record: Mapping[str, Any]) -> tuple[str, str, str | None]:
     conclusion = _lower(record.get("workflow_conclusion"))
-    execution = _upper(record.get("execution_status"))
-    if execution not in _TERMINAL_EXECUTION:
-        execution = _upper(record.get("normalized_status"))
-    if execution not in _TERMINAL_EXECUTION:
-        fallback = _upper(record.get("status"))
-        if fallback in {"FAIL", "BLOCKED"}:
-            execution = fallback
+    signals = _execution_signals(record)
+    execution = signals[0] if signals else None
 
     if conclusion:
         if conclusion in _SUCCESS_CONCLUSIONS:
-            if execution == "FAIL":
+            if "FAIL" in signals:
                 return FAILED, "conflict", "workflow_success_execution_failure"
-            if execution == "BLOCKED":
+            if "BLOCKED" in signals:
                 return BLOCKED, "conflict", "workflow_success_execution_blocked"
             return COMPLETED, "workflow_conclusion", None
         if conclusion in _FAILURE_CONCLUSIONS:
@@ -426,7 +441,8 @@ def _select_review(
         stamp, sequence = _event_rank(record, boundary)
         candidates.append(
             {
-                "key": (stamp, sequence, strength),
+                "event": (stamp, sequence),
+                "strength": strength,
                 "state": state,
                 "verdict": verdict,
                 "explicit": _has_explicit_review(record),
@@ -437,9 +453,12 @@ def _select_review(
         return None
     explicit = [candidate for candidate in candidates if candidate["explicit"]]
     pool = explicit or candidates
-    best_key = max(candidate["key"] for candidate in pool)
-    top = [candidate for candidate in pool if candidate["key"] == best_key]
-    chosen = max(top, key=lambda candidate: _stable(candidate["record"]))
+    best_event = max(candidate["event"] for candidate in pool)
+    top = [candidate for candidate in pool if candidate["event"] == best_event]
+    chosen = max(
+        top,
+        key=lambda candidate: (candidate["strength"], _stable(candidate["record"])),
+    )
     outcomes = {(candidate["state"], candidate["verdict"]) for candidate in top}
     if len(outcomes) > 1:
         verdicts = {

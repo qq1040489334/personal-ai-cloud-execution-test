@@ -300,6 +300,14 @@
 - **待审列表不等于全量活跃列表**：`list_pending_results` 的桶不能用于“当前所有任务”计数。
 - **失败/阻塞结果也可能待审**：只要 `result_available=true` 且未审，`review_state=pending_review`。
 - **review verdict 只透传**：投影器不产生、不推断 verdict。
+- **执行字段逐项检查，不受字段顺序影响**：`workflow_conclusion=success` 时，只要
+  `execution_status` / `normalized_status` / `status` 中任意一项明确为 `FAIL`（优先）或
+  `BLOCKED`，就输出 `failed` / `blocked` + `evidence=conflict`，绝不让同一记录里的 `PASS`
+  掩盖另一个字段的明确失败；两个字段互换位置结果相同。
+- **review 冲突先于证据强度判定**：同一时间/序列上出现不同的 review 状态或 verdict 时，
+  先输出 `review_state=conflict`，`_REVIEW_STRENGTH` 只用于没有冲突时的确定性选择，不能
+  用“已审比待审强”把同时间的 `pending_review` 淘汰掉；只有存在明确更新的时间或
+  sequence 时才收敛到较新结论。
 
 ## 7. 新鲜度与时间规则
 
@@ -355,6 +363,11 @@
   `empty_response_is_full_idle=false`，不能宣称“全量空闲”。
 - 只有调用方明确声明全量任务列表来源（例如 `list_tasks`）时，才可能
   `full_task_coverage=true`。
+- **来源覆盖声明必须由适配层固定并验证**：`full_task_coverage` 完全取决于调用方传入的
+  `source` 字符串，投影器本身不校验该来源是否真的返回全量任务。因此适配层必须把
+  `source` 固定为已验证接口名（如 `worker.list_tasks`），不得让任意来源名、用户输入或
+  拼接字符串表示全量覆盖；任何未声明的来源一律归类为 `unknown`，`full_task_coverage=false`。
+  把任意来源名当成全量来源是适配层的错误，不是投影器可以替调用方推断的结论。
 
 ### 8.3 父子关系
 
@@ -487,10 +500,14 @@ python -m pytest -q tools/ai-company-status-projection/test_projector.py
 - **去重**：重复 `task_id` 只计一次、证据最强记录胜出、同证据等级时较新源事件胜出；
   同时间/序列的 runtime 冲突输出 `unknown` + conflict，同时间 review 冲突输出 `conflict`；
 - **矛盾状态**：`workflow_conclusion=success` 与 `execution_status=FAIL` / `BLOCKED` 冲突时
-  保留实际失败/阻塞或显式冲突，不再输出 `completed`；重复记录中冲突的 `parent_task_id`
-  被置空并告警；
+  保留实际失败/阻塞或显式冲突，不再输出 `completed`；**逐项检查全部规范执行字段**，
+  当同一记录 `execution_status=PASS` 而 `normalized_status` / `status` 为 `FAIL` / `BLOCKED`
+  时仍输出显式冲突（互换字段顺序结果相同，纯 PASS 组合才保持 `completed`）；
+  重复记录中冲突的 `parent_task_id` 被置空并告警；
 - **review / runtime 独立合并**：旧 workflow-success pending-review + 新 reviewed FAIL
-  不丢失新 verdict；缺排序证据的 review 冲突不猜；
+  不丢失新 verdict；缺排序证据的 review 冲突不猜；**同一时间/序列上 `reviewed=true` +
+  verdict 与 `reviewed=false` + `review_state=pending_review` 输出 `conflict` 而非任选一个
+  （记录顺序无关），只有更新的时间或 sequence 才收敛**；
 - **review / runtime 分离**：失败任务可已审、`review_verdict` 存在不会把无运行证据的任务
   升级为完成、缺 `observed_at` 时已审 verdict 仍保留；
 - **覆盖范围**：空 `list_pending_results` 仅批次完成，不是全量空闲；声明全量来源才可
@@ -504,24 +521,34 @@ python -m pytest -q tools/ai-company-status-projection/test_projector.py
 - `python -m py_compile tools/ai-company-status-projection/projector.py tools/ai-company-status-projection/test_projector.py` -> 通过；
 - `python -c "json.load(open('tools/ai-company-status-projection/fixtures.json'))"` -> 通过；
 - **agent 手跑组件定向测试**：`python -m pytest -q tools/ai-company-status-projection/test_projector.py`
-  -> `37 passed`；
-- **工作流自动全仓测试**（本次也按交付步骤执行）：`python -m pytest -q`
-  -> `1745 passed, 1 skipped`；
+  -> `45 passed`（既有 37 + 本次新增 8 项定向回归）；
+- **全仓测试**（本次也按交付步骤执行）：`python -m pytest -q`
+  -> `1753 passed, 1 skipped`；
 - 独立语义探针确认未来+120s 为 `invalid`、未来+30s 为 `fresh`、过期/缺时间/连接失败均为
   `unknown` 且 `complete=false`、workflow-success 与执行失败冲突不再绿灯、review 证据
-  独立合并、未来 source event 不赢去重、非法 TTL 被拒绝、空 pending 列表不宣称全量空闲。
+  独立合并、未来 source event 不赢去重、非法 TTL 被拒绝、空 pending 列表不宣称全量空闲；
+- 本次两处复现修复后的定向探针：`workflow_conclusion=success` + `execution_status=PASS` +
+  `normalized_status=FAIL` 输出 `failed` + `evidence=conflict` +
+  `blocker=workflow_success_execution_failure`（不再 `completed`）；同一时间/序列
+  `reviewed=true` + verdict `PASS` 与 `reviewed=false` + `review_state=pending_review`
+  输出 `review_state=conflict` 且不输出 verdict（不再 `reviewed=PASS`）。
 
 本组件**未部署、未接入 Windows UI、未实现实时能力**，产出是可集成组件与规范，不是已上线功能。
 
 ## 14. 变更清单与执行报告
 
-基线：`02e1c4b8174b459b96bd73a6e7c84976860181fe`。本任务只修改以下四个文件：
+基线：`247de5abfffa4ca3d9173a3b21d4c9d36be21b33`。本任务只修改以下三个文件：
 
-- `projector.py`：修复 workflow-success 掩盖执行失败、runtime/review 独立合并、
-  同等级同时间冲突、未来 source event 排序、非法 TTL、coverage/scope 输出；
-- `test_projector.py`：为上述每项增加复现与修复后回归，并更新旧的错误断言；
-- `fixtures.json`：保持脱敏合成数据不变（新增边界场景由测试 override）；
-- `README.md`：同步新语义、覆盖范围、测试证据与限制。
+- `projector.py`：`_derive_runtime` 改为逐项收集全部规范执行字段（`execution_status` /
+  `normalized_status` / `status`），任一明确 `FAIL` / `BLOCKED` 都不被同记录的 `PASS` 掩盖，
+  保留显式 `conflict` 与保守失败，结果与字段顺序无关；`_select_review` 先在同一时间/序列
+  上识别不同 review 状态或 verdict 的冲突，`_REVIEW_STRENGTH` 不再在冲突检查前淘汰
+  `pending_review`，只有更新的时间/sequence 才收敛；
+- `test_projector.py`：新增 8 项定向回归，覆盖 `PASS` 掩盖 `normalized_status` / `status`
+  的 `FAIL` / `BLOCKED`、字段互换顺序、纯 `PASS` 组合，以及同时间/序列 review 冲突、
+  记录顺序无关、新 sequence 收敛；
+- `README.md`：同步执行字段逐项检查、review 冲突优先、来源覆盖声明须由适配层固定验证、
+  测试证据与本变更清单。
 
 未修改该目录以外的任何文件，未删除文件，未新增部署/定时任务，未触碰
 `.github/workflows/`、secret/token/credential/`.env`/`.pem`/`.key` 路径。
@@ -545,4 +572,6 @@ python -m pytest -q tools/ai-company-status-projection/test_projector.py
 5. 重复记录冲突只有在存在可排序的时间、sequence 或 run identity 时才能收敛；证据不足时
    输出 `unknown` / `conflict`，需要上游补齐关联信息。
 6. `full_task_coverage` 只在调用方明确声明全量任务列表来源时为 `true`；现有
-   `list_pending_results` / `get_task_result` 都不能提供全量覆盖。
+   `list_pending_results` / `get_task_result` 都不能提供全量覆盖。该来源声明必须由适配层
+   固定并验证：不得把任意来源名（含用户输入或拼接字符串）当作全量来源，投影器不会替
+   调用方校验来源语义，UI 也不得据未验证的来源名宣称“全公司任务总览”。
