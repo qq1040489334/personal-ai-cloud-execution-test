@@ -28,8 +28,13 @@
 
 - 明确的输入/输出契约；
 - `queued` / `running` / `completed` / `failed` / `blocked` / `pending_review` /
-  `reviewed` / `unknown` 的语义映射；
+  `reviewed` / `unknown` / `conflict` 的语义映射；
 - 新鲜度、缺时间、连接失败、重复 `task_id`、父子关系的确定性规则；
+- workflow conclusion 成功但 execution status 失败时保留失败或显式冲突，不伪装绿灯；
+- runtime 证据与 review 证据独立合并，新审查结论不会被旧 workflow-success 记录覆盖；
+- 同等级同时间冲突不再按词典序挑 `completed`；考虑 sequence / run identity，缺序时输出冲突；
+- 拒绝 NaN / Inf / 负 TTL；未来 source event 不参与去重排序；
+- 明确 `coverage` / `scope`，区分“本批次处理完成”与“全量任务覆盖”；
 - 可导入的纯函数实现 `projector.py`（仅 Python 标准库，无网络、无凭据、不读本地时钟）；
 - 覆盖正常、失败、部分覆盖、重复、缺时间、过期、父子关系、结果已完未审等场景的
   脱敏合成夹具 `fixtures.json` 与定向测试 `test_projector.py`；
@@ -189,6 +194,17 @@
   "projected_at": "2026-10-17T12:01:00Z",
   "ttl_seconds": 300.0,
   "complete": true,
+  "batch_complete": true,
+  "scope": "pending_results_subset",
+  "full_task_coverage": false,
+  "coverage": {
+    "scope": "pending_results_subset",
+    "full_task_coverage": false,
+    "batch_complete": true,
+    "task_count": 1,
+    "empty_response_is_full_idle": false,
+    "reason": "list_pending_results returns only pending/failed/blocked buckets, not the full active-task set"
+  },
   "batch_blocker": null,
   "tasks": [
     {
@@ -237,16 +253,21 @@
 | 字段 | 语义 |
 | --- | --- |
 | `runtime_state` | `queued` / `running` / `completed` / `failed` / `blocked` / `unknown`，只描述运行生命周期 |
-| `review_state` | `pending_review` / `reviewed` / `not_applicable` / `blocked_awaiting_inspection` / `legacy_orphan` / `unknown`；与运行状态分离 |
+| `review_state` | `pending_review` / `reviewed` / `not_applicable` / `blocked_awaiting_inspection` / `legacy_orphan` / `unknown` / `conflict`；与运行状态分离 |
 | `blocker` | 明确阻塞原因代码；无阻塞为 `null`。不是验收结论 |
-| `last_source_event_at` | 源记录中的 `updated_at` / `completed_at` 等，**绝不是** `now` 或本地刷新时间 |
-| `evidence` | 运行状态依据：`workflow_conclusion` / `execution_status` / `workflow_run` / `result_available` / `advisory_lifecycle` / `none` |
+| `review_blocker` | 仅在 review 证据冲突时出现，例如 `conflicting_review_evidence` |
+| `conflicts` | 去重/合并时发现的确定性冲突说明；没有冲突时不输出 |
+| `last_source_event_at` | 源记录中的 `updated_at` / `completed_at` 等，**绝不是** `now` 或本地刷新时间；未来事件不参与去重 |
+| `evidence` | 运行状态依据：`conflict` / `workflow_conclusion` / `execution_status` / `workflow_run` / `result_available` / `advisory_lifecycle` / `none` |
 | `freshness` | `fresh` / `stale` / `missing` / `invalid`；连接失败时批次 `batch_blocker` 为 `connection_failure` |
 | `last_known_runtime_state` | 仅在非 fresh 且此前有运行证据时出现；表示“上次已知”，不是当前状态 |
-| `review_verdict` | 仅当源记录已有 verdict 时透传（`PASS` / `FAIL` / `BLOCKED`） |
+| `review_verdict` | 仅当源记录已有 verdict 时透传（`PASS` / `FAIL` / `BLOCKED`）；冲突时不透传 |
 | `duplicate_count` | 同一 `task_id` 的原始记录数；任务本身只计一次 |
 | `counts.total_unique_tasks` | **唯一任务数**；父子关系不会让父/子重复计数 |
-| `complete` | 本批次是否可用于“当前完整视图”；缺时间/过期/连接失败/跳过非法记录时为 `false` |
+| `complete` / `batch_complete` | **仅表示本批次处理完成**；缺时间/过期/连接失败/跳过非法记录时为 `false`。不代表全量任务覆盖 |
+| `scope` | 数据源覆盖范围：`pending_results_subset` / `single_task` / `full_task_set` / `unknown` |
+| `full_task_coverage` | 是否覆盖全量任务；`list_pending_results` 与 `get_task_result` 恒为 `false` |
+| `coverage.empty_response_is_full_idle` | 只有在声明为全量来源、批次完整且任务数为 0 时才为 `true`；空 `list_pending_results` 不得宣称全量空闲 |
 
 **绝不输出**：`acceptance`、`acceptance_status`、`verdict`（本组件不判定）、
 `instructions`、`prompt`、`logs`、`raw_log`、`secret`、`token`、artifact 正文。
@@ -257,11 +278,15 @@
 | --- | --- | --- | --- |
 | `status` 为 `queued` / `submitted` / `created` / `dispatched` / `accepted` / `pending_dispatch` 等 | `queued` | `not_applicable` | advisory 生命周期；不是运行证明 |
 | `status` / `run_status` 为 `running` / `in_progress` / `started` | `running` | `not_applicable` | 仍在进行；没有结果可审 |
-| `workflow_conclusion=success`，或 `execution_status=PASS`，或 `run_conclusion=success` | `completed` | 有可审结果且未审 -> `pending_review`，已审 -> `reviewed` | **`completed` ≠ 验收 `PASS`** |
+| `workflow_conclusion=success` 且无相反执行证据，或 `execution_status=PASS`，或 `run_conclusion=success` | `completed` | 有可审结果且未审 -> `pending_review`，已审 -> `reviewed` | **`completed` ≠ 验收 `PASS`** |
+| `workflow_conclusion=success` 但 `execution_status` / `normalized_status` / `status` 明确为 `FAIL` | `failed` | 按结果可审性决定 | `evidence=conflict`，`blocker=workflow_success_execution_failure`；不得绿灯 |
+| `workflow_conclusion=success` 但执行证据明确为 `BLOCKED` | `blocked` | 按结果可审性决定 | `evidence=conflict`，`blocker=workflow_success_execution_blocked` |
+| 同等级同时间的重复记录分别给出成功与失败，且没有 sequence / run identity 足以排序 | `unknown` | 由独立 review 证据决定 | `evidence=conflict`，`blocker=conflicting_runtime_evidence`；不猜 |
 | `workflow_conclusion` 为 `failure` / `startup_failure` / `error`，或 `execution_status=FAIL` | `failed` | 有可审结果且未审 -> `pending_review`，否则 `not_applicable` | 失败是运行结果，不是验收结论 |
 | `workflow_conclusion` 为 `cancelled` / `timed_out` / `action_required` / `stale` / `neutral` / `skipped`，或 `execution_status=BLOCKED` | `blocked` | 有可审结果且未审 -> `pending_review`，否则 `not_applicable` | `blocker` 给出 `workflow_<conclusion>` 或 `execution_blocked` |
 | 源记录明确 `review_state=pending_review` / `status=pending_review`，或 `result_available=true` 且未审 | 由运行证据决定；若运行证据为终态则对应 `completed`/`failed`/`blocked` | `pending_review` | “结果已完但未审”场景 |
-| 源记录 `reviewed=true` / `review_verdict` 存在 / `review_state=reviewed` | 由运行证据决定 | `reviewed` | 人工 verdict 与运行状态分离 |
+| 源记录 `reviewed=true` / `review_verdict` 存在 / `review_state=reviewed` | 由运行证据决定 | `reviewed` | 人工 verdict 与运行状态分离；较新的 review 证据独立合并 |
+| 同一时间/序列上出现互相冲突的 review 状态或 verdict | 由运行证据决定 | `conflict` | `review_blocker=conflicting_review_evidence`，不输出猜测的 verdict |
 | 只有自报 `status=success` / `completed`，没有 workflow conclusion / run 证据 / result 证据 | `unknown` | `not_applicable` | `blocker=unverified_self_report`，不把自报成功升级为完成 |
 | 没有任何运行证据 | `unknown` | `not_applicable` | `blocker=no_run_evidence` |
 | `observed_at` 缺失 | `unknown` | 未审 -> `unknown`；已审保留 `reviewed` | `blocker=missing_observed_at` |
@@ -289,9 +314,11 @@
    `invalid_observed_at`，`complete=false`。
 6. `observed_at` 比 `now` 超前超过 60 秒 -> 视为 `invalid`（`observed_at_in_future`）。
    超前不超过 60 秒的时钟抖动被容忍为 `fresh`。
-7. 连接失败 -> 不返回“0 个任务”的正常视图；批次 `batch_blocker=connection_failure`，
+7. `ttl_seconds` 必须是有限数字且 `>= 0`；NaN、Inf、-Inf 与负数一律抛 `ValueError`。
+8. 源事件时间晚于 `observed_at` 超过 60 秒时，不参与去重排序，不能靠未来时间赢得合并。
+9. 连接失败 -> 不返回“0 个任务”的正常视图；批次 `batch_blocker=connection_failure`，
    所有已知任务 `runtime_state=unknown`，`review_state=unknown`。
-8. 过期时保留 `last_known_runtime_state` 仅供 UI 灰显“上次已知”，并明确标注不是当前状态。
+10. 过期时保留 `last_known_runtime_state` 仅供 UI 灰显“上次已知”，并明确标注不是当前状态。
 
 建议：UI 轮询 120–300 秒时使用 `ttl_seconds` 略大于轮询间隔；如果响应延迟或网络抖动，
 宁可显示 `unknown`，也不要显示过期状态。
@@ -301,15 +328,35 @@
 ### 8.1 重复 `task_id`
 
 - 按 `task_id` 分组；同一 `task_id` 只输出一条任务、只计一次。
-- 选择“证据最强”的记录作为主记录，优先级：
-  `workflow_conclusion` > `execution_status` > `workflow_run` > `result_available` >
-  `advisory_lifecycle` > `none`；同等级按源事件时间更新者优先，再按稳定序列化排序保证确定性。
+- **runtime 与 review 分开选择证据**。runtime 选择“证据最强”的记录，优先级：
+  `conflict` > `workflow_conclusion` > `execution_status` > `workflow_run` >
+  `result_available` > `advisory_lifecycle` > `none`；同等级按有效源事件时间、再按
+  sequence、最后按稳定序列化排序保证确定性。
+- review 证据独立按有效时间 / sequence / 证据强度选择：较新的 `reviewed` + verdict 不会被
+  旧的 `pending_review` 覆盖；较新的明确 review 结论优先于旧结论。
+- 同等级同时间出现成功/失败等不同 runtime 状态时，不再用 JSON 词典序挑一个；若无
+  sequence 或可排序的 run identity，输出 `unknown` + `blocker=conflicting_runtime_evidence`。
+- 同一时间/序列出现不同 review 状态或 verdict 时，输出 `review_state=conflict` 与
+  `review_blocker=conflicting_review_evidence`，不输出猜测的 verdict。
+- workflow-success 完成与执行失败并列时：更新的执行失败会保留；同一时间/序列则输出冲突，
+  不允许 `completed` 绿灯掩盖失败。
+- 晚于 `observed_at` 超过 60 秒的未来源事件不能赢得去重排序。
 - `duplicate_count` 记录原始条数；`counts.duplicate_records` 记录被合并掉的重复条数。
 - 重复记录中 `parent_task_id` / `project_id` / `root_task_id` 冲突时，输出 `null` 并写入
   `warnings`，不猜造。
 - 重复记录不会让 `counts.total_unique_tasks` 增加。
 
-### 8.2 父子关系
+### 8.2 覆盖范围不是全量结论
+
+- `complete` / `batch_complete` 只说明本批次是否被完整处理，不说明已看到全公司所有任务。
+- `scope` 与 `coverage` 明确数据源覆盖限制；`list_pending_results` 是
+  `pending_results_subset`，`get_task_result` 是 `single_task`。
+- 空 `list_pending_results` 只在 `batch_complete=true` 意义上成功，`full_task_coverage=false`，
+  `empty_response_is_full_idle=false`，不能宣称“全量空闲”。
+- 只有调用方明确声明全量任务列表来源（例如 `list_tasks`）时，才可能
+  `full_task_coverage=true`。
+
+### 8.3 父子关系
 
 - `parent_task_id` 只作为元数据输出，不展开、不递归计数。
 - 父任务和子任务各自是唯一任务，各计一次；不会因为父子关系重复计数。
@@ -333,9 +380,12 @@ UI 渲染建议：
 
 - `runtime_state` 决定运行态颜色：`queued` 灰蓝、`running` 蓝、`completed` 绿、`failed` 红、
   `blocked` 橙、`unknown` 灰。
-- `review_state=pending_review` 显示“待审核”徽标；`reviewed` 显示已有 verdict（若提供）。
+- `review_state=pending_review` 显示“待审核”徽标；`reviewed` 显示已有 verdict（若提供）；
+  `review_state=conflict` 显示“审查证据冲突”，不要选一个 verdict 展示为事实。
 - `completed` 不得显示为“验收 PASS”；验收/评审结论只来自 `review_verdict` 与既有 review 流程。
-- `freshness != fresh` 或 `complete=false` 时，顶部显示“状态未知/可能过期”，不要把旧状态当实时。
+- `runtime_state=unknown` 且 `evidence=conflict` 时显示“证据冲突/无法判定”，不要按旧状态点亮。
+- `freshness != fresh` 或 `batch_complete=false` 时，顶部显示“状态未知/可能过期”，不要把旧状态当实时。
+- `coverage.full_task_coverage=false` 时，不要把当前列表渲染成“全公司任务总览”或“全部空闲”。
 - `blocker` 显示为原因代码或文案映射；未知 blocker 原样显示代码，不要猜。
 - 列表计数使用 `counts.total_unique_tasks`，不要对原始 `records` 直接 `len()`。
 - 父子任务用 `parent_task_id` 建立轻量缩进/链接；父任务缺失时显示“父任务不在当前范围”。
@@ -353,8 +403,11 @@ const projected = projectTasks(responseRecords, {
   ttl_seconds: 300,
   connection_error: transportError,
 });
-if (!projected.complete) {
+if (!projected.batch_complete) {
   renderUnknownBanner(projected.batch_blocker);
+}
+if (!projected.coverage.full_task_coverage) {
+  renderPartialCoverageBanner(projected.coverage.reason);
 }
 renderTasks(projected.tasks);
 renderCounts(projected.counts);
@@ -388,7 +441,7 @@ projected = project_tasks(
 | --- | --- |
 | `project_tasks(records, *, source, observed_at, now, ttl_seconds, connection_error=None)` | 唯一公开入口。返回第 5 节的输出字典 |
 | `QUEUED` / `RUNNING` / `COMPLETED` / `FAILED` / `BLOCKED` / `UNKNOWN` | `runtime_state` 常量 |
-| `PENDING_REVIEW` / `REVIEWED` / `NOT_APPLICABLE` / `REVIEW_UNKNOWN` | `review_state` 常量 |
+| `PENDING_REVIEW` / `REVIEWED` / `NOT_APPLICABLE` / `REVIEW_UNKNOWN` / `REVIEW_CONFLICT` | `review_state` 常量 |
 | `RUNTIME_STATES` / `REVIEW_STATES` | 合法取值元组（用于计数键） |
 
 约束：
@@ -412,8 +465,9 @@ projected = project_tasks(
 - 结果已完但未审。
 
 `fixtures.json` 含 12 条原始记录，其中 1 条无 `task_id`、1 个重复 `task_id`，因此
-`total_unique_tasks = 10`、`duplicate_records = 1`。缺 `observed_at`、过期、连接失败等
-变体由测试在运行时通过 override 覆盖，不固化在夹具里。
+`total_unique_tasks = 10`、`duplicate_records = 1`。缺 `observed_at`、过期、连接失败、
+workflow-success 与执行失败冲突、review 证据冲突、同时间重复冲突、未来 source event、
+非法 TTL、coverage 边界等变体由测试在运行时通过 override 覆盖，不固化在夹具里。
 
 ## 12. 定向测试（`test_projector.py`）
 
@@ -429,11 +483,18 @@ python -m pytest -q tools/ai-company-status-projection/test_projector.py
 - `completed` 与验收 PASS 的分离；
 - **freshness**：恰好等于 TTL 为 `fresh`、刚超过 TTL 为 `stale`、缺 `observed_at`、
   未来时间拒绝、60 秒内时钟抖动容忍、源事件时间不被本地 `now` 替代、缺源事件时间不猜造；
+- **非法 TTL**：NaN、Inf、-Inf、负数一律拒绝；未来 source event 不能赢得去重；
 - **去重**：重复 `task_id` 只计一次、证据最强记录胜出、同证据等级时较新源事件胜出；
-- **矛盾状态**：`workflow_conclusion=success` 与 `execution_status=FAIL` 冲突时按声明的
-  证据优先级确定性解析；重复记录中冲突的 `parent_task_id` 被置空并告警；
+  同时间/序列的 runtime 冲突输出 `unknown` + conflict，同时间 review 冲突输出 `conflict`；
+- **矛盾状态**：`workflow_conclusion=success` 与 `execution_status=FAIL` / `BLOCKED` 冲突时
+  保留实际失败/阻塞或显式冲突，不再输出 `completed`；重复记录中冲突的 `parent_task_id`
+  被置空并告警；
+- **review / runtime 独立合并**：旧 workflow-success pending-review + 新 reviewed FAIL
+  不丢失新 verdict；缺排序证据的 review 冲突不猜；
 - **review / runtime 分离**：失败任务可已审、`review_verdict` 存在不会把无运行证据的任务
   升级为完成、缺 `observed_at` 时已审 verdict 仍保留；
+- **覆盖范围**：空 `list_pending_results` 仅批次完成，不是全量空闲；声明全量来源才可
+  声称全量覆盖；
 - 连接失败、缺 `task_id` 跳过、自指父任务、空响应、`now`/TTL 必填。
 
 ## 13. 本地验证证据
@@ -442,24 +503,28 @@ python -m pytest -q tools/ai-company-status-projection/test_projector.py
 
 - `python -m py_compile tools/ai-company-status-projection/projector.py tools/ai-company-status-projection/test_projector.py` -> 通过；
 - `python -c "json.load(open('tools/ai-company-status-projection/fixtures.json'))"` -> 通过；
-- `python -m pytest -q tools/ai-company-status-projection/test_projector.py` -> `24 passed`；
+- **agent 手跑组件定向测试**：`python -m pytest -q tools/ai-company-status-projection/test_projector.py`
+  -> `37 passed`；
+- **工作流自动全仓测试**（本次也按交付步骤执行）：`python -m pytest -q`
+  -> `1745 passed, 1 skipped`；
 - 独立语义探针确认未来+120s 为 `invalid`、未来+30s 为 `fresh`、过期/缺时间/连接失败均为
-  `unknown` 且 `complete=false`、矛盾证据按优先级解析、同证据等级去重取较新记录。
+  `unknown` 且 `complete=false`、workflow-success 与执行失败冲突不再绿灯、review 证据
+  独立合并、未来 source event 不赢去重、非法 TTL 被拒绝、空 pending 列表不宣称全量空闲。
 
 本组件**未部署、未接入 Windows UI、未实现实时能力**，产出是可集成组件与规范，不是已上线功能。
 
 ## 14. 变更清单与执行报告
 
-本任务在仓库 `tools/ai-company-status-projection/` 下新增：
+基线：`02e1c4b8174b459b96bd73a6e7c84976860181fe`。本任务只修改以下四个文件：
 
-- `projector.py`：从父任务 README 提取的可导入纯函数实现；
-- `fixtures.json`：从父任务 README 提取的脱敏合成夹具；
-- `test_projector.py`：从父任务 README 提取的参考测试，并补充 freshness 边界、矛盾状态、
-  review/runtime 分离、去重排序的定向用例；
-- `README.md`：改为实际模块使用说明（保留规范，不再内嵌可复制代码块）。
+- `projector.py`：修复 workflow-success 掩盖执行失败、runtime/review 独立合并、
+  同等级同时间冲突、未来 source event 排序、非法 TTL、coverage/scope 输出；
+- `test_projector.py`：为上述每项增加复现与修复后回归，并更新旧的错误断言；
+- `fixtures.json`：保持脱敏合成数据不变（新增边界场景由测试 override）；
+- `README.md`：同步新语义、覆盖范围、测试证据与限制。
 
-未修改该目录以外的任何文件，未删除文件，未触碰 `.github/workflows/`、secret/token/
-credential/`.env`/`.pem`/`.key` 路径。
+未修改该目录以外的任何文件，未删除文件，未新增部署/定时任务，未触碰
+`.github/workflows/`、secret/token/credential/`.env`/`.pem`/`.key` 路径。
 
 执行报告（`/home/runner/work/_temp/agent_result.json`）包含：
 
@@ -477,3 +542,7 @@ credential/`.env`/`.pem`/`.key` 路径。
    `list_pending_results` 的桶或 `counts.total` 当作全量。
 3. 若要支持实时，需要新增事件流契约与背压/断线语义；本组件不声称实时。
 4. 若要自动验收，必须复用既有 review/verification 流程；本组件永远不输出验收 PASS。
+5. 重复记录冲突只有在存在可排序的时间、sequence 或 run identity 时才能收敛；证据不足时
+   输出 `unknown` / `conflict`，需要上游补齐关联信息。
+6. `full_task_coverage` 只在调用方明确声明全量任务列表来源时为 `true`；现有
+   `list_pending_results` / `get_task_result` 都不能提供全量覆盖。

@@ -14,6 +14,7 @@ It never writes a second state store and never derives an acceptance verdict.
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
@@ -29,6 +30,7 @@ PENDING_REVIEW = "pending_review"
 REVIEWED = "reviewed"
 NOT_APPLICABLE = "not_applicable"
 REVIEW_UNKNOWN = "unknown"
+REVIEW_CONFLICT = "conflict"
 REVIEW_STATES = (
     PENDING_REVIEW,
     REVIEWED,
@@ -36,6 +38,7 @@ REVIEW_STATES = (
     "blocked_awaiting_inspection",
     "legacy_orphan",
     REVIEW_UNKNOWN,
+    REVIEW_CONFLICT,
 )
 
 FRESH = "fresh"
@@ -43,6 +46,11 @@ STALE = "stale"
 MISSING = "missing"
 INVALID = "invalid"
 CONNECTION_ERROR = "connection_error"
+
+_SUBJECT_SUBSET = "pending_results_subset"
+_SUBJECT_SINGLE = "single_task"
+_SUBJECT_FULL = "full_task_set"
+_SUBJECT_UNKNOWN = "unknown"
 
 _SUCCESS_CONCLUSIONS = frozenset({"success"})
 _FAILURE_CONCLUSIONS = frozenset({"failure", "startup_failure", "error"})
@@ -75,6 +83,7 @@ _SELF_REPORTED_FAILURE = frozenset(
 _ALLOWED_CLOCK_SKEW_SECONDS = 60
 
 _EVIDENCE_RANK = {
+    "conflict": 6,
     "workflow_conclusion": 5,
     "execution_status": 4,
     "workflow_run": 3,
@@ -82,6 +91,30 @@ _EVIDENCE_RANK = {
     "advisory_lifecycle": 1,
     "none": 0,
 }
+
+_REVIEW_STRENGTH = {
+    REVIEWED: 3,
+    PENDING_REVIEW: 2,
+    "blocked_awaiting_inspection": 1,
+    "legacy_orphan": 1,
+}
+
+_RUN_ID_FIELDS = (
+    "run_id",
+    "workflow_run_id",
+    "execution_id",
+    "run_identity",
+    "github_run_id",
+)
+_SEQUENCE_FIELDS = (
+    "sequence",
+    "event_sequence",
+    "source_sequence",
+    "run_sequence",
+    "run_attempt",
+    "attempt",
+    "round",
+)
 
 
 def _text(value: Any) -> str:
@@ -132,39 +165,72 @@ def _source_event_at(record: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _evidence(record: Mapping[str, Any]) -> str:
-    if _text(record.get("workflow_conclusion")):
-        return "workflow_conclusion"
-    if _upper(record.get("execution_status")) in _TERMINAL_EXECUTION:
-        return "execution_status"
-    if _upper(record.get("normalized_status")) in _TERMINAL_EXECUTION:
-        return "execution_status"
-    if _text(record.get("run_status")) or _text(record.get("run_conclusion")):
-        return "workflow_run"
-    if record.get("result_available") is True:
-        return "result_available"
-    status = _lower(record.get("status"))
+def _sequence(record: Mapping[str, Any]) -> float | None:
+    for key in _SEQUENCE_FIELDS:
+        value = record.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed):
+            return parsed
+    return None
+
+
+def _run_identity(record: Mapping[str, Any]) -> str | None:
+    for key in _RUN_ID_FIELDS:
+        value = _text(record.get(key))
+        if value:
+            return value
+    return None
+
+
+def _safe_event_at(
+    record: Mapping[str, Any], boundary: datetime | None
+) -> datetime | None:
+    parsed = _parse_iso(_source_event_at(record))
+    if parsed is None:
+        return None
     if (
-        status in _QUEUED_STATUSES
-        or status in _RUNNING_STATUSES
-        or _text(record.get("dispatch_state"))
+        boundary is not None
+        and (parsed - boundary).total_seconds() > _ALLOWED_CLOCK_SKEW_SECONDS
     ):
-        return "advisory_lifecycle"
-    return "none"
+        return None
+    return parsed
+
+
+def _event_rank(
+    record: Mapping[str, Any], boundary: datetime | None
+) -> tuple[float, float]:
+    parsed = _safe_event_at(record, boundary)
+    stamp = parsed.timestamp() if parsed is not None else float("-inf")
+    sequence = _sequence(record)
+    return stamp, sequence if sequence is not None else float("-inf")
 
 
 def _derive_runtime(record: Mapping[str, Any]) -> tuple[str, str, str | None]:
     conclusion = _lower(record.get("workflow_conclusion"))
+    execution = _upper(record.get("execution_status"))
+    if execution not in _TERMINAL_EXECUTION:
+        execution = _upper(record.get("normalized_status"))
+    if execution not in _TERMINAL_EXECUTION:
+        fallback = _upper(record.get("status"))
+        if fallback in {"FAIL", "BLOCKED"}:
+            execution = fallback
+
     if conclusion:
         if conclusion in _SUCCESS_CONCLUSIONS:
+            if execution == "FAIL":
+                return FAILED, "conflict", "workflow_success_execution_failure"
+            if execution == "BLOCKED":
+                return BLOCKED, "conflict", "workflow_success_execution_blocked"
             return COMPLETED, "workflow_conclusion", None
         if conclusion in _FAILURE_CONCLUSIONS:
             return FAILED, "workflow_conclusion", None
         return BLOCKED, "workflow_conclusion", f"workflow_{conclusion}"
 
-    execution = _upper(record.get("execution_status"))
-    if execution not in _TERMINAL_EXECUTION:
-        execution = _upper(record.get("normalized_status"))
     if execution in _TERMINAL_EXECUTION:
         state = _TERMINAL_EXECUTION[execution]
         blocker = "execution_blocked" if state == BLOCKED else None
@@ -234,21 +300,195 @@ def _derive_review(
     return NOT_APPLICABLE, verdict
 
 
+def _has_explicit_review(record: Mapping[str, Any]) -> bool:
+    return bool(
+        record.get("reviewed") is not None
+        or _text(record.get("review_state"))
+        or _text(record.get("review_verdict"))
+        or record.get("requires_review") is True
+        or _lower(record.get("status")) in {"reviewed", PENDING_REVIEW}
+    )
+
+
 def _stable(record: Mapping[str, Any]) -> str:
     return json.dumps(record, sort_keys=True, default=str, ensure_ascii=False)
 
 
-def _rank(record: Mapping[str, Any]) -> tuple[int, float, str]:
-    parsed = _parse_iso(_source_event_at(record))
-    stamp = parsed.timestamp() if parsed is not None else float("-inf")
-    return (_EVIDENCE_RANK.get(_evidence(record), 0), stamp, _stable(record))
+def _select_runtime(
+    records: list[Mapping[str, Any]], boundary: datetime | None
+) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    for record in records:
+        state, evidence, blocker = _derive_runtime(record)
+        stamp, sequence = _event_rank(record, boundary)
+        rank = _EVIDENCE_RANK.get(evidence, 0)
+        candidates.append(
+            {
+                "key": (rank, stamp, sequence),
+                "state": state,
+                "evidence": evidence,
+                "blocker": blocker,
+                "record": record,
+            }
+        )
+    best_key = max(candidate["key"] for candidate in candidates)
+    top = [candidate for candidate in candidates if candidate["key"] == best_key]
+    chosen = max(top, key=lambda candidate: _stable(candidate["record"]))
+    states = {candidate["state"] for candidate in top}
+    if len(states) == 1 and chosen["state"] == COMPLETED:
+        best_event = best_key[1:]
+        tied_failures: list[dict[str, Any]] = []
+        newer_failures: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if candidate["state"] not in {FAILED, BLOCKED}:
+                continue
+            if candidate["evidence"] not in {"execution_status", "conflict"}:
+                continue
+            candidate_event = candidate["key"][1:]
+            if candidate_event == best_event:
+                tied_failures.append(candidate)
+            elif candidate_event > best_event:
+                newer_failures.append(candidate)
+        if tied_failures:
+            return {
+                "state": UNKNOWN,
+                "evidence": "conflict",
+                "blocker": "conflicting_runtime_evidence",
+                "record": chosen["record"],
+                "conflicts": [
+                    "runtime: completion and execution failure share the "
+                    "same time/sequence evidence"
+                ],
+            }
+        if newer_failures:
+            candidate = max(
+                newer_failures,
+                key=lambda item: (
+                    item["key"][1],
+                    item["key"][2],
+                    item["key"][0],
+                    _stable(item["record"]),
+                ),
+            )
+            return {
+                "state": candidate["state"],
+                "evidence": candidate["evidence"],
+                "blocker": candidate["blocker"],
+                "record": candidate["record"],
+                "conflicts": [
+                    "runtime: newer execution evidence contradicts "
+                    "workflow-success completion"
+                ],
+            }
+    if len(states) > 1:
+        identities = {_run_identity(candidate["record"]) for candidate in top}
+        if len(identities) > 1:
+            detail = (
+                "runtime: same evidence rank/time but differing run identities; "
+                "association insufficient"
+            )
+        elif None in identities:
+            detail = (
+                "runtime: same evidence rank/time but run identity missing; "
+                "association insufficient"
+            )
+        else:
+            detail = (
+                "runtime: same evidence rank/time but contradictory execution "
+                "states for the same run identity"
+            )
+        return {
+            "state": UNKNOWN,
+            "evidence": "conflict",
+            "blocker": "conflicting_runtime_evidence",
+            "record": chosen["record"],
+            "conflicts": [detail],
+        }
+    return {
+        "state": chosen["state"],
+        "evidence": chosen["evidence"],
+        "blocker": chosen["blocker"],
+        "record": chosen["record"],
+        "conflicts": [],
+    }
+
+
+def _select_review(
+    records: list[Mapping[str, Any]], boundary: datetime | None
+) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for record in records:
+        runtime, _, _ = _derive_runtime(record)
+        state, verdict = _derive_review(record, runtime)
+        strength = _REVIEW_STRENGTH.get(state)
+        if not strength:
+            continue
+        stamp, sequence = _event_rank(record, boundary)
+        candidates.append(
+            {
+                "key": (stamp, sequence, strength),
+                "state": state,
+                "verdict": verdict,
+                "explicit": _has_explicit_review(record),
+                "record": record,
+            }
+        )
+    if not candidates:
+        return None
+    explicit = [candidate for candidate in candidates if candidate["explicit"]]
+    pool = explicit or candidates
+    best_key = max(candidate["key"] for candidate in pool)
+    top = [candidate for candidate in pool if candidate["key"] == best_key]
+    chosen = max(top, key=lambda candidate: _stable(candidate["record"]))
+    outcomes = {(candidate["state"], candidate["verdict"]) for candidate in top}
+    if len(outcomes) > 1:
+        verdicts = {
+            candidate["verdict"] for candidate in top if candidate["verdict"] is not None
+        }
+        if len(verdicts) > 1:
+            detail = (
+                "review: same time/sequence evidence carries conflicting "
+                "verdicts; no ordering evidence"
+            )
+        else:
+            detail = (
+                "review: same time/sequence evidence carries conflicting review "
+                "states; no ordering evidence"
+            )
+        return {
+            "state": REVIEW_CONFLICT,
+            "verdict": None,
+            "record": chosen["record"],
+            "conflicts": [detail],
+        }
+    return {
+        "state": chosen["state"],
+        "verdict": chosen["verdict"],
+        "record": chosen["record"],
+        "conflicts": [],
+    }
 
 
 def _merge_duplicates(
-    task_id: str, records: list[Mapping[str, Any]]
-) -> tuple[dict[str, Any], list[str]]:
-    merged = dict(max(records, key=_rank))
+    task_id: str,
+    records: list[Mapping[str, Any]],
+    boundary: datetime | None,
+) -> tuple[
+    dict[str, Any],
+    list[str],
+    dict[str, Any],
+    dict[str, Any] | None,
+    str | None,
+    list[str],
+]:
+    runtime_selection = _select_runtime(records, boundary)
+    review_selection = _select_review(records, boundary)
+    merged = dict(runtime_selection["record"])
     warnings: list[str] = []
+    conflicts = list(runtime_selection.get("conflicts", []))
+    if review_selection is not None:
+        conflicts.extend(review_selection.get("conflicts", []))
+
     for field in ("parent_task_id", "project_id", "root_task_id"):
         values = {
             _text(record.get(field))
@@ -261,7 +501,20 @@ def _merge_duplicates(
             warnings.append(f"{task_id}: conflicting {field}; omitted")
         elif not chosen and len(values) == 1:
             merged[field] = next(iter(values))
-    return merged, warnings
+
+    last_event: datetime | None = None
+    for record in records:
+        parsed = _safe_event_at(record, boundary)
+        if parsed is not None and (last_event is None or parsed > last_event):
+            last_event = parsed
+    return (
+        merged,
+        warnings,
+        runtime_selection,
+        review_selection,
+        _iso(last_event) if last_event is not None else None,
+        conflicts,
+    )
 
 
 def _freshness(
@@ -280,6 +533,44 @@ def _freshness(
     return FRESH, _iso(observed), None, max(0.0, age)
 
 
+def _coverage(
+    source_name: str, batch_complete: bool, task_count: int
+) -> dict[str, Any]:
+    lowered = source_name.lower()
+    if "list_pending_results" in lowered:
+        scope = _SUBJECT_SUBSET
+        full = False
+        reason = (
+            "list_pending_results returns only pending/failed/blocked buckets, "
+            "not the full active-task set"
+        )
+    elif "get_task_result" in lowered:
+        scope = _SUBJECT_SINGLE
+        full = False
+        reason = "get_task_result covers only the requested task"
+    elif any(
+        token in lowered
+        for token in ("list_tasks", "list_all_tasks", "full_task_list")
+    ):
+        scope = _SUBJECT_FULL
+        full = True
+        reason = "caller declared a full task-list source"
+    else:
+        scope = _SUBJECT_UNKNOWN
+        full = False
+        reason = "source scope is not declared; full task coverage cannot be claimed"
+    return {
+        "scope": scope,
+        "full_task_coverage": full,
+        "batch_complete": batch_complete,
+        "task_count": task_count,
+        "empty_response_is_full_idle": bool(
+            full and batch_complete and task_count == 0
+        ),
+        "reason": reason,
+    }
+
+
 def _project_one(
     task_id: str,
     record: Mapping[str, Any],
@@ -291,9 +582,24 @@ def _project_one(
     age_seconds: float | None,
     connection_error: bool,
     duplicate_count: int,
+    runtime_selection: Mapping[str, Any] | None = None,
+    review_selection: Mapping[str, Any] | None = None,
+    last_source_event_at: str | None = None,
+    conflicts: list[str] | None = None,
 ) -> dict[str, Any]:
-    runtime, evidence, blocker = _derive_runtime(record)
-    review, verdict = _derive_review(record, runtime)
+    if runtime_selection is None:
+        runtime, evidence, blocker = _derive_runtime(record)
+    else:
+        runtime = runtime_selection["state"]
+        evidence = runtime_selection["evidence"]
+        blocker = runtime_selection["blocker"]
+
+    if review_selection is None:
+        review, verdict = _derive_review(record, runtime)
+    else:
+        review = review_selection["state"]
+        verdict = review_selection["verdict"]
+
     last_known = None
     if connection_error:
         runtime, blocker, evidence = UNKNOWN, "connection_failure", "none"
@@ -318,7 +624,7 @@ def _project_one(
         "review_state": review,
         "blocker": blocker,
         "parent_task_id": parent,
-        "last_source_event_at": _source_event_at(record),
+        "last_source_event_at": last_source_event_at,
         "evidence": evidence,
         "freshness": freshness,
         "duplicate_count": duplicate_count,
@@ -327,6 +633,10 @@ def _project_one(
         projected["last_known_runtime_state"] = last_known
     if verdict is not None:
         projected["review_verdict"] = verdict
+    if review == REVIEW_CONFLICT:
+        projected["review_blocker"] = "conflicting_review_evidence"
+    if conflicts:
+        projected["conflicts"] = list(conflicts)
     for field in ("project_id", "root_task_id"):
         value = _text(record.get(field))
         if value:
@@ -363,12 +673,16 @@ def project_tasks(
         raise ValueError("now must be a datetime or ISO-8601 string")
     if ttl_seconds is None:
         raise ValueError("ttl_seconds is required and must be caller-supplied")
-    ttl = float(ttl_seconds)
-    if ttl < 0:
-        raise ValueError("ttl_seconds must be >= 0")
+    try:
+        ttl = float(ttl_seconds)
+    except (TypeError, ValueError):
+        raise ValueError("ttl_seconds must be a finite number >= 0") from None
+    if not math.isfinite(ttl) or ttl < 0:
+        raise ValueError("ttl_seconds must be a finite number >= 0")
     freshness, observed_iso, freshness_blocker, age_seconds = _freshness(
         observed_at, now_dt, ttl
     )
+    observed_dt = _parse_iso(observed_at)
 
     groups: dict[str, list[Mapping[str, Any]]] = {}
     for record in record_list:
@@ -384,7 +698,14 @@ def project_tasks(
     tasks: list[dict[str, Any]] = []
     duplicate_notes: list[dict[str, Any]] = []
     for task_id, group in groups.items():
-        merged, merge_warnings = _merge_duplicates(task_id, group)
+        (
+            merged,
+            merge_warnings,
+            runtime_selection,
+            review_selection,
+            last_event,
+            conflicts,
+        ) = _merge_duplicates(task_id, group, observed_dt)
         warnings.extend(merge_warnings)
         if len(group) > 1:
             duplicate_notes.append(
@@ -402,6 +723,10 @@ def project_tasks(
                 age_seconds=age_seconds,
                 connection_error=connection_failed,
                 duplicate_count=len(group),
+                runtime_selection=runtime_selection,
+                review_selection=review_selection,
+                last_source_event_at=last_event,
+                conflicts=conflicts,
             )
         )
 
@@ -411,7 +736,7 @@ def project_tasks(
         runtime_counts[task["runtime_state"]] += 1
         review_counts[task["review_state"]] += 1
 
-    complete = (
+    batch_complete = (
         freshness == FRESH
         and not connection_failed
         and not any(
@@ -425,12 +750,22 @@ def project_tasks(
     elif freshness != FRESH:
         batch_blocker = freshness_blocker
 
+    coverage = _coverage(source_name, batch_complete, len(tasks))
+    if not tasks and not coverage["full_task_coverage"]:
+        warnings.append(
+            "empty response from a partial source is not proof that all tasks are idle"
+        )
+
     return {
         "source": source_name,
         "observed_at": observed_iso,
         "projected_at": _iso(now_dt),
         "ttl_seconds": ttl,
-        "complete": complete,
+        "complete": batch_complete,
+        "batch_complete": batch_complete,
+        "scope": coverage["scope"],
+        "full_task_coverage": coverage["full_task_coverage"],
+        "coverage": coverage,
         "batch_blocker": batch_blocker,
         "tasks": sorted(tasks, key=lambda item: item["task_id"]),
         "counts": {

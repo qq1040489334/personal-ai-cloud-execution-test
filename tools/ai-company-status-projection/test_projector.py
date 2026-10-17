@@ -181,11 +181,27 @@ def test_self_parent_is_not_reported_as_lineage():
     assert task["parent_task_id"] is None
 
 
-def test_empty_fresh_response_is_complete():
+def test_empty_fresh_pending_results_is_batch_complete_not_full_idle():
     result = run(records=[])
     assert result["complete"] is True
+    assert result["batch_complete"] is True
     assert result["counts"]["total_unique_tasks"] == 0
     assert result["batch_blocker"] is None
+    assert result["scope"] == "pending_results_subset"
+    assert result["full_task_coverage"] is False
+    assert result["coverage"]["batch_complete"] is True
+    assert result["coverage"]["full_task_coverage"] is False
+    assert result["coverage"]["empty_response_is_full_idle"] is False
+    assert any("not proof" in warning for warning in result["warnings"])
+
+
+def test_declared_full_task_source_can_claim_full_coverage():
+    result = run(records=[], source="worker.list_tasks")
+    assert result["scope"] == "full_task_set"
+    assert result["full_task_coverage"] is True
+    assert result["coverage"]["full_task_coverage"] is True
+    assert result["coverage"]["empty_response_is_full_idle"] is True
+    assert not any("not proof" in warning for warning in result["warnings"])
 
 
 def test_now_and_ttl_are_required():
@@ -243,10 +259,12 @@ def test_missing_observed_at_preserves_existing_reviewed_verdict():
     assert reviewed["review_verdict"] == "PASS"
 
 
-def test_contradictory_runtime_evidence_resolves_by_declared_priority():
+def test_workflow_success_does_not_mask_execution_failure():
     records = [
         {
             "task_id": "cf-contradiction",
+            "status": "FAIL",
+            "normalized_status": "FAIL",
             "workflow_conclusion": "success",
             "execution_status": "FAIL",
             "result_available": True,
@@ -254,8 +272,44 @@ def test_contradictory_runtime_evidence_resolves_by_declared_priority():
         }
     ]
     task = run(records=records)["tasks"][0]
-    assert task["runtime_state"] == COMPLETED
-    assert task["evidence"] == "workflow_conclusion"
+    assert task["runtime_state"] == FAILED
+    assert task["evidence"] == "conflict"
+    assert task["blocker"] == "workflow_success_execution_failure"
+    assert task["review_state"] == PENDING_REVIEW
+
+
+def test_newer_execution_failure_is_not_masked_by_older_workflow_success_duplicate():
+    records = [
+        {
+            "task_id": "cf-cross-record-failure",
+            "workflow_conclusion": "success",
+            "updated_at": "2026-10-17T11:50:00Z",
+        },
+        {
+            "task_id": "cf-cross-record-failure",
+            "execution_status": "FAIL",
+            "updated_at": "2026-10-17T11:59:00Z",
+        },
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["runtime_state"] == FAILED
+    assert task["evidence"] == "execution_status"
+    assert task["last_source_event_at"] == "2026-10-17T11:59:00Z"
+
+
+def test_workflow_success_with_blocked_execution_is_not_green():
+    records = [
+        {
+            "task_id": "cf-blocked-conflict",
+            "workflow_conclusion": "success",
+            "execution_status": "BLOCKED",
+            "updated_at": "2026-10-17T11:58:00Z",
+        }
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["runtime_state"] == BLOCKED
+    assert task["evidence"] == "conflict"
+    assert task["blocker"] == "workflow_success_execution_blocked"
 
 
 def test_review_and_runtime_are_independent_dimensions():
@@ -304,3 +358,131 @@ def test_duplicate_equal_evidence_prefers_newer_source_event():
     assert task["runtime_state"] == QUEUED
     assert task["duplicate_count"] == 2
     assert task["last_source_event_at"] == "2026-10-17T11:59:00Z"
+
+
+def test_duplicate_merges_newer_review_verdict_independently_of_runtime_evidence():
+    records = [
+        {
+            "task_id": "cf-merge",
+            "workflow_conclusion": "success",
+            "execution_status": "PASS",
+            "result_available": True,
+            "reviewed": False,
+            "review_state": "pending_review",
+            "updated_at": "2026-10-17T11:50:00Z",
+        },
+        {
+            "task_id": "cf-merge",
+            "execution_status": "PASS",
+            "result_available": True,
+            "reviewed": True,
+            "review_verdict": "FAIL",
+            "review_state": "reviewed",
+            "updated_at": "2026-10-17T11:59:00Z",
+        },
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["runtime_state"] == COMPLETED
+    assert task["evidence"] == "workflow_conclusion"
+    assert task["review_state"] == REVIEWED
+    assert task["review_verdict"] == "FAIL"
+    assert task["last_source_event_at"] == "2026-10-17T11:59:00Z"
+    assert task["duplicate_count"] == 2
+
+
+def test_conflicting_review_verdicts_without_ordering_evidence_are_conflict():
+    records = [
+        {
+            "task_id": "cf-review-tie",
+            "execution_status": "PASS",
+            "reviewed": True,
+            "review_verdict": "PASS",
+        },
+        {
+            "task_id": "cf-review-tie",
+            "execution_status": "PASS",
+            "reviewed": True,
+            "review_verdict": "FAIL",
+        },
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["runtime_state"] == COMPLETED
+    assert task["review_state"] == "conflict"
+    assert task["review_blocker"] == "conflicting_review_evidence"
+    assert "review_verdict" not in task
+    assert any(conflict.startswith("review:") for conflict in task["conflicts"])
+
+
+def test_same_rank_and_time_success_failure_duplicates_are_conflict():
+    records = [
+        {
+            "task_id": "cf-runtime-tie",
+            "execution_status": "PASS",
+            "run_id": "run-a",
+            "updated_at": "2026-10-17T11:58:00Z",
+        },
+        {
+            "task_id": "cf-runtime-tie",
+            "execution_status": "FAIL",
+            "run_id": "run-b",
+            "updated_at": "2026-10-17T11:58:00Z",
+        },
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["runtime_state"] == UNKNOWN
+    assert task["evidence"] == "conflict"
+    assert task["blocker"] == "conflicting_runtime_evidence"
+    assert any(conflict.startswith("runtime:") for conflict in task["conflicts"])
+
+
+def test_sequence_evidence_resolves_same_time_duplicate_without_lexical_tiebreak():
+    records = [
+        {
+            "task_id": "cf-sequence",
+            "execution_status": "PASS",
+            "run_sequence": 1,
+            "updated_at": "2026-10-17T11:58:00Z",
+        },
+        {
+            "task_id": "cf-sequence",
+            "execution_status": "FAIL",
+            "run_sequence": 2,
+            "updated_at": "2026-10-17T11:58:00Z",
+        },
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["runtime_state"] == FAILED
+    assert task["blocker"] is None
+
+
+def test_future_source_event_cannot_win_duplicate_selection():
+    records = [
+        {
+            "task_id": "cf-future-event",
+            "execution_status": "FAIL",
+            "updated_at": "2026-10-17T11:50:00Z",
+        },
+        {
+            "task_id": "cf-future-event",
+            "execution_status": "PASS",
+            "updated_at": "2026-10-18T00:00:00Z",
+        },
+    ]
+    task = run(records=records)["tasks"][0]
+    assert task["runtime_state"] == FAILED
+    assert task["last_source_event_at"] == "2026-10-17T11:50:00Z"
+
+
+@pytest.mark.parametrize(
+    "ttl",
+    [float("nan"), float("inf"), float("-inf"), -1, -0.5],
+)
+def test_invalid_ttl_is_rejected(ttl):
+    with pytest.raises(ValueError):
+        project_tasks(
+            [],
+            source="worker.list_pending_results",
+            observed_at="2026-10-17T12:00:00Z",
+            now="2026-10-17T12:01:00Z",
+            ttl_seconds=ttl,
+        )
