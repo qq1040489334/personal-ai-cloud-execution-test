@@ -1,0 +1,860 @@
+{
+  "schema_version": "HUASHU_EVIDENCE_INDEX_V1",
+  "task_id": "cf-ba136532196a",
+  "project_id": "huashu-orange-book-evaluation",
+  "goal": "HUASHU_ORANGE_BOOK_PERSONAL_AI_READONLY_EVALUATION_V1",
+  "generated_at_utc": "2026-10-21T08:12:51Z",
+  "audit_mode": "cloud_readonly",
+  "risk_level": "LOW",
+  "status": {
+    "workflow_status": "success",
+    "execution_status": "success",
+    "deliverable_status": "PASS",
+    "final_status": "PARTIAL",
+    "live_runtime_validation": "BLOCKED",
+    "source_claim_verification": "PARTIAL",
+    "production_state": "UNKNOWN",
+    "canonical_write_performed": false,
+    "note": "Workflow/execution success is kept separate from the business final_status. PARTIAL means the read-only evaluation completed, but author claims and live Codex/Hermes behavior were not independently reproduced."
+  },
+  "repository": {
+    "head": "749f7e9831c9aa0ab5815fe14089fc28a8e6a742",
+    "head_commit_time": "2026-10-21T03:01:37Z",
+    "head_subject": "cloud agent: gpt task",
+    "worker_source": {
+      "path": "worker/index.js",
+      "sha256": "03f781781dea349ed6155d93c6325cbbc6871e050437a8a59d647abd49488e69",
+      "bytes": 189957,
+      "lines": 4372
+    },
+    "declared_production_baseline": {
+      "path": "worker/PRODUCTION-BASELINE.json",
+      "production_version": "3e2fed43",
+      "source_sha256": "8D0EFBDC394A9E847C70C05D5D0AA6411D72E3BA03E9C9AF43C95EAEE8F20CA1",
+      "source_bytes": 55278,
+      "source_lines": 1543
+    },
+    "baseline_parity": {
+      "sha256_matches": false,
+      "bytes_match": false,
+      "lines_match": false,
+      "conclusion": "The checked-in production baseline is stale relative to the current worker source. Actual Cloudflare production state was not read and remains UNKNOWN.",
+      "evidence_class": "FACT for the repository mismatch; UNKNOWN for production."
+    },
+    "test_run": {
+      "command": "python -m pytest -q",
+      "result": "1753 passed, 1 skipped in 65.47s (0:01:05)",
+      "skipped_test": "tests/test_hermes_golden_poc.py:370",
+      "skip_reason": "set HERMES_GOLDEN_RUNTIME=1 and provide a real Hermes gateway",
+      "targeted_run": "python -m pytest -q -rs tests/test_hermes_golden_poc.py -> 53 passed, 1 skipped",
+      "evidence_class": "FACT"
+    },
+    "inventory": {
+      "src_python_modules": 20,
+      "test_python_files": 39,
+      "markdown_files_total": 66,
+      "top_level_markdown_files": 45
+    }
+  },
+  "sources": [
+    {
+      "source_id": "S1",
+      "title": "Harness Engineering - Orange Book page",
+      "url": "https://www.huasheng.ai/orange-books/harness/",
+      "kind": "author_website",
+      "retrieved_at_utc": "2026-10-21T08:10:53Z",
+      "http_status": 200,
+      "version": "v1.1.0",
+      "bytes": 65179,
+      "sha256": "50c057c883d86b0d3217873eea1d3cc1eee5ddb5dc3375e0ea759d1a4f81951a",
+      "facts": [
+        "HTTP 200 on 2026-10-21T08:10:53Z.",
+        "Page identifies No. 09 and v1.1.0 by 花叔 / Alchain.",
+        "Table of contents lists 18 chapters and 7 deep case studies.",
+        "Chapters cover the five-component framework, subtraction philosophy, instruction/constraint/capability-memory/orchestration layers, and experience engineering."
+      ],
+      "inferences": [
+        "The five-layer framework can be used as an audit checklist for the existing Personal AI stack.",
+        "The page is a chapter map, not a technical proof of any implementation."
+      ],
+      "author_claims": [
+        "Case-study performance numbers such as $9 vs $200 and 1,300 PRs/week were not independently verified."
+      ],
+      "verification_status": "PARTIAL"
+    },
+    {
+      "source_id": "S1-GitHub",
+      "title": "Harness Engineering Orange Book repository",
+      "url": "https://github.com/alchaincyf/harness-engineering-orange-book",
+      "kind": "author_repository",
+      "retrieved_at_utc": "2026-10-21T08:10:53Z",
+      "http_status": 200,
+      "version": "README/PDF v260411",
+      "bytes": 3713,
+      "sha256": "a3b9046d374d199a62224c744e0d293ee743b5ceb2442a6c06aa88e5a7af6d65",
+      "facts": [
+        "Default branch main; pushed_at 2026-08-23T14:18:32Z; 110 stars at read time.",
+        "README describes Agent = Model + Harness, five components, and the subtraction philosophy.",
+        "README links Chinese and English PDFs labelled v260411."
+      ],
+      "inferences": [
+        "The website v1.1.0 and repository PDF v260411 edition mapping is UNKNOWN; they should not be treated as the same artifact without a manifest."
+      ],
+      "author_claims": [
+        "Chapter-level case studies and benchmark figures were not reproduced."
+      ],
+      "verification_status": "PARTIAL"
+    },
+    {
+      "source_id": "S2",
+      "title": "Darwin Skill 2.0 SKILL.md",
+      "url": "https://github.com/alchaincyf/darwin-skill/blob/master/SKILL.md",
+      "raw_url": "https://raw.githubusercontent.com/alchaincyf/darwin-skill/8a8b66258e3c45d6ae4aea39719468c6428fcb0a/SKILL.md",
+      "kind": "third_party_skill_source_read_only",
+      "retrieved_at_utc": "2026-10-21T08:10:53Z",
+      "http_status": 200,
+      "pinned_commit": "8a8b66258e3c45d6ae4aea39719468c6428fcb0a",
+      "pinned_commit_time": "2026-09-18T13:16:41Z",
+      "version": "v2.1 (2026-06-10) per source",
+      "license": "MIT",
+      "stars_at_read": 6492,
+      "bytes": 31456,
+      "sha256": "3d57422079687a3aa641cb0c6c78ea8a5c6fa0c8645a37dfbcde4fdb870f7150",
+      "facts": [
+        "Raw SKILL.md is 31,456 bytes and 519 lines at the pinned commit.",
+        "9 dimensions with weights 7, 12, 12, 6, 18, 4, 12, 23, 6; weights sum to 100.",
+        "Score formula is sum(dimension score x weight) / 10, with dimension scores from 1 to 10.",
+        "Absolute score is triage-only; keep/revert uses paired same-judge comparison with odd N (default 3, close call 5) and majority better vs worse.",
+        "Human checkpoints are mandatory; test prompts are 2-3 per skill; a dry_run ratio above 30% triggers the source's evaluation-invalid warning.",
+        "Revert uses git revert, not git reset --hard; optimized SKILL.md must not exceed 150% of original size.",
+        "results.tsv columns include timestamp, commit, skill, old_score, new_score, status, dimension, note, eval_mode.",
+        "Runtime-neutrality scan is a gate."
+      ],
+      "inferences": [
+        "The rubric arithmetic and paired-majority rule are deterministic and can be unit-tested without a model.",
+        "The model-based dimension scoring is not reproducible without an independent judge and test prompts."
+      ],
+      "author_claims": [
+        "SkillLens accuracy 46.4% to 73.8%; +46.5 mean delta; HL-1 to HL-4 score gains; 5-judge consensus claims were not independently replicated.",
+        "The author states absolute LLM-judge scores have about +/-8 noise, which supports paired comparison but is itself an author claim."
+      ],
+      "verification_status": "PARTIAL",
+      "installation_performed": false
+    },
+    {
+      "source_id": "S3",
+      "title": "OpenAI Codex 从入门到精通 - Orange Book page",
+      "url": "https://www.huasheng.ai/orange-books/codex/",
+      "kind": "author_website",
+      "retrieved_at_utc": "2026-10-21T08:10:53Z",
+      "http_status": 200,
+      "version": "v261020; CLI 0.163.0 claimed",
+      "bytes": 62915,
+      "sha256": "58cc5ba16d1edd534411b772caf5645c2e91abd826e797f7a148300b34ab7372",
+      "facts": [
+        "HTTP 200 on 2026-10-21T08:10:53Z.",
+        "Page labels itself v261020 and says it is based on real-machine testing of Codex CLI 0.163.0.",
+        "Page lists a ChatGPT-account model with six entry points and chapters for CLI, desktop app, cloud, Skills/plugins/MCP/hooks/scheduled tasks, and /goal.",
+        "Page says Codex and Work share subscription and usage."
+      ],
+      "inferences": [
+        "The page is product documentation/marketing; its screenshots and test claims are not evidence for this repository.",
+        "Exact context-window and quota figures are not exposed by the fetched page and remain UNKNOWN."
+      ],
+      "author_claims": [
+        "GPT-6.1 Sol / GPT-6 Astra / GPT-6 Luna, removal of --full-auto and --api-key, 24 real-machine screenshots, and shared subscription/usage behavior are author claims."
+      ],
+      "verification_status": "PARTIAL"
+    },
+    {
+      "source_id": "S3-official",
+      "title": "OpenAI Codex official release and npm version",
+      "url": "https://github.com/openai/codex/releases/latest",
+      "kind": "official_upstream",
+      "retrieved_at_utc": "2026-10-21T08:10:53Z",
+      "http_status": 200,
+      "version": "rust-v0.163.0",
+      "published_at_utc": "2026-10-15T21:30:38Z",
+      "facts": [
+        "Official latest release is rust-v0.163.0, published 2026-10-15T21:30:38Z.",
+        "npm view @openai/codex version returned 0.163.0."
+      ],
+      "inferences": [
+        "The claimed CLI version exists, but this does not verify the book's screenshots, quota behavior or pricing."
+      ],
+      "author_claims": [],
+      "verification_status": "PASS",
+      "verification_detail": "version existence only; behavior and screenshots not verified"
+    },
+    {
+      "source_id": "S4",
+      "title": "Hermes Agent 从入门到精通 - Orange Book page",
+      "url": "https://www.huasheng.ai/orange-books/hermes-agent/",
+      "kind": "author_website",
+      "retrieved_at_utc": "2026-10-21T08:10:53Z",
+      "http_status": 200,
+      "version": "v261020; based on Hermes Agent v0.22.2",
+      "bytes": 74647,
+      "sha256": "f4269ee9596935585a8faa0fe24b43c256e741db6e710ab9ca69b46209f333fb",
+      "facts": [
+        "HTTP 200 on 2026-10-21T08:10:53Z.",
+        "Page says it is the third edition v261020 based on Hermes Agent v0.22.2.",
+        "Page claims self-improvement engines, Curator, three-layer memory, Skill creation/evolution, Kanban multi-agent orchestration, about 90 tools with on-demand exposure, MCP in both directions, and a 20+ platform gateway."
+      ],
+      "inferences": [
+        "The described capabilities overlap with Personal AI orchestration, memory, skills and task dispatch, but the page is not a runtime test.",
+        "Full replacement would duplicate state and increase attack surface."
+      ],
+      "author_claims": [
+        "40 isolated-environment screenshots and all feature behavior claims were not reproduced."
+      ],
+      "verification_status": "PARTIAL"
+    },
+    {
+      "source_id": "S4-official",
+      "title": "NousResearch hermes-agent official release",
+      "url": "https://api.github.com/repos/NousResearch/hermes-agent/releases/latest",
+      "kind": "official_upstream",
+      "retrieved_at_utc": "2026-10-21T08:10:53Z",
+      "http_status": 200,
+      "version": "v0.22.2",
+      "published_at_utc": "2026-10-15T08:21:32Z",
+      "facts": [
+        "Latest release is v0.22.2, published 2026-10-15T08:21:32Z."
+      ],
+      "inferences": [
+        "The cited upstream version exists, but no live Hermes integration was tested here."
+      ],
+      "author_claims": [],
+      "verification_status": "PASS",
+      "verification_detail": "version existence only; behavior and screenshots not verified"
+    }
+  ],
+  "author_claims_not_pass": [
+    {
+      "claim": "Harness case-study metrics such as $9 vs $200 and 1,300 PRs per week",
+      "source_id": "S1",
+      "classification": "AUTHOR_CLAIM",
+      "reason": "Underlying case data was not read or reproduced."
+    },
+    {
+      "claim": "Darwin/SkillLens accuracy 46.4% to 73.8%, +46.5 delta, and HL score gains",
+      "source_id": "S2",
+      "classification": "AUTHOR_CLAIM",
+      "reason": "No independent experiment, dataset or judge transcript was run."
+    },
+    {
+      "claim": "Codex CLI 0.163.0 24-screenshot real-machine test and quota behavior",
+      "source_id": "S3",
+      "classification": "AUTHOR_CLAIM_OR_UNKNOWN",
+      "reason": "CLI release exists, but no authenticated Codex run or quota observation was performed."
+    },
+    {
+      "claim": "Hermes 40-screenshot real-machine test and Curator/memory/Kanban behavior",
+      "source_id": "S4",
+      "classification": "AUTHOR_CLAIM_OR_UNKNOWN",
+      "reason": "No Hermes runtime was available or tested."
+    }
+  ],
+  "independent_version_checks": [
+    {
+      "target": "openai/codex",
+      "method": "GitHub API latest release + npm view",
+      "result": "rust-v0.163.0 published 2026-10-15T21:30:38Z; npm 0.163.0",
+      "verified": "version existence only",
+      "not_verified": "author screenshots, quota, pricing, behavior"
+    },
+    {
+      "target": "NousResearch/hermes-agent",
+      "method": "GitHub API latest release",
+      "result": "v0.22.2 published 2026-10-15T08:21:32Z",
+      "verified": "version existence only",
+      "not_verified": "author screenshots, feature behavior, runtime availability"
+    },
+    {
+      "target": "alchaincyf/darwin-skill",
+      "method": "GitHub API repository + pinned raw SKILL.md hash",
+      "result": "MIT, 6,492 stars, master commit 8a8b66258e3c45d6ae4aea39719468c6428fcb0a, raw SHA-256 3d57422079687a3aa641cb0c6c78ea8a5c6fa0c8645a37dfbcde4fdb870f7150",
+      "verified": "source identity and content hash",
+      "not_verified": "quality claims"
+    }
+  ],
+  "capability_matrix": [
+    {
+      "capability": "Task contract and scope gates",
+      "evidence": [
+        "scripts/task_contract.py",
+        "scripts/scope_guard.py",
+        "tests/test_task_contract.py",
+        "tests/test_scope_guard.py"
+      ],
+      "status": "PASS",
+      "reuse": "Reuse unchanged; readonly/write modes and forbidden-path checks are fail-closed.",
+      "gap": null
+    },
+    {
+      "capability": "Workflow-authoritative status normalization",
+      "evidence": [
+        "src/personal_ai_execution/status_contract.py",
+        "src/personal_ai_execution/result_normalization.py:116",
+        "src/personal_ai_execution/result_normalization.py:189",
+        "tests/test_status_contract_v0_2.py"
+      ],
+      "status": "PASS",
+      "reuse": "Single source of terminal truth; artifacts and narratives cannot uplift a failed workflow conclusion.",
+      "gap": "Deployed production parity is UNKNOWN because the checked-in baseline is stale."
+    },
+    {
+      "capability": "Advisory review assistant",
+      "evidence": [
+        "src/personal_ai_execution/review_assistant.py:96",
+        "src/personal_ai_execution/review_assistant.py:343",
+        "tests/test_review_assistant.py"
+      ],
+      "status": "PARTIAL",
+      "status_detail": "advisory review passes; independent blind scoring is missing",
+      "reuse": "Deterministic evidence refs, fail-closed downgrade, advisory-only, never auto-reviews.",
+      "gap": "Not a blind skill judge and has no paired A/B scoring."
+    },
+    {
+      "capability": "Human review and approval",
+      "evidence": [
+        "src/personal_ai_execution/event_sync.py:550",
+        "worker/index.js:2197",
+        "tests/test_autonomous_advancement.py",
+        "worker/migrations/0002_dispatch_idempotency.sql"
+      ],
+      "status": "PASS",
+      "reuse": "Human final verdict and explicit approval can gate any future skill promotion.",
+      "gap": "Live production approval state was not read."
+    },
+    {
+      "capability": "Event sync and provenance",
+      "evidence": [
+        "src/personal_ai_execution/event_sync.py",
+        "src/personal_ai_execution/provenance_contract.py",
+        "tests/test_runtime_provenance_v0_2.py"
+      ],
+      "status": "PASS",
+      "reuse": "Canonical provenance, read-back and fail-closed reconciliation.",
+      "gap": "No Canonical write performed."
+    },
+    {
+      "capability": "Autonomous child-task advancement",
+      "evidence": [
+        "src/personal_ai_execution/advancement.py:67",
+        "src/personal_ai_execution/advancement.py:148",
+        "worker/index.js:1356",
+        "worker/index.js:1418",
+        "tests/test_autonomous_advancement.py"
+      ],
+      "status": "PASS",
+      "status_detail": "in-repo tests pass; deployed behavior UNKNOWN",
+      "reuse": "Explicit approved_next_task, D1 idempotency marker, exactly-once replay behavior.",
+      "gap": "Deployed Worker behavior is UNKNOWN."
+    },
+    {
+      "capability": "Hermes A2A orchestration client",
+      "evidence": [
+        "src/personal_ai_execution/hermes_orchestration.py:245",
+        "src/personal_ai_execution/hermes_orchestration.py:429",
+        "src/personal_ai_execution/hermes_orchestration.py:701",
+        "tests/test_hermes_golden_poc.py"
+      ],
+      "status": "PARTIAL",
+      "reuse": "Runtime identification, A2A client, non-Codex executor rejection, idempotent transport, normalization.",
+      "gap": "Live integration BLOCKED: runtime_present=false."
+    },
+    {
+      "capability": "Independent skill scoring",
+      "evidence": [
+        "No rubric/judge/eval-ledger module found in src/, worker/ or tests/",
+        "Darwin SKILL.md defines a reusable rubric"
+      ],
+      "status": "BLOCKED",
+      "status_detail": "new component required",
+      "reuse": "Only the deterministic arithmetic and paired-majority logic.",
+      "gap": "No rubric schema, test prompts, blind judge runner, or results ledger."
+    },
+    {
+      "capability": "Codex context and quota telemetry",
+      "evidence": [
+        "No AGENTS.md in repository",
+        "No token/usage/quota fields in src/, worker/, tests/ or scripts/",
+        ".github/workflows/agent-dispatch.yml uses OpenCode/DeepSeek, not Codex"
+      ],
+      "status": "UNKNOWN",
+      "reuse": "Task-contract context pattern; no Codex-specific instrumentation.",
+      "gap": "No authenticated Codex run; exact context window and quota are not observable."
+    },
+    {
+      "capability": "Regression suite",
+      "evidence": [
+        "python -m pytest -q -> 1753 passed, 1 skipped",
+        "tests/test_hermes_golden_poc.py live test is skipped without HERMES_GOLDEN_RUNTIME=1"
+      ],
+      "status": "PASS",
+      "reuse": "Use as the regression ratchet for any future evaluation harness.",
+      "gap": "Green tests do not prove a live external runtime."
+    },
+    {
+      "capability": "Instruction/documentation layer",
+      "evidence": [
+        "66 Markdown files total",
+        "45 top-level Markdown files",
+        "no AGENTS.md"
+      ],
+      "status": "PARTIAL",
+      "reuse": "Harness instruction-layer concept is applicable.",
+      "gap": "Possible documentation sprawl; consolidation is likely higher value than adding another framework. This is an INFERENCE from file counts."
+    }
+  ],
+  "reuse_classification": {
+    "existing_capabilities": [
+      "Task contract validation and readonly/write scope gates",
+      "Workflow-authoritative status contract and result normalization",
+      "Advisory review assistant with deterministic evidence references",
+      "Human review gate and approval ledger",
+      "EVENT_SYNC canonical provenance and read-back",
+      "Explicit approved_next_task child dispatch with D1 idempotency",
+      "Hermes A2A client and runtime-identification honesty contract",
+      "Large pytest regression suite"
+    ],
+    "reusable": [
+      "Darwin 9-dimension weights and weighted-total formula",
+      "Darwin paired same-judge odd-N majority decision",
+      "Darwin dry-run ratio guard and human checkpoint",
+      "Darwin results.tsv evidence fields",
+      "Harness five-layer audit checklist",
+      "Codex AGENTS.md-style durable instruction map (concept only)",
+      "Hermes Curator-style gate-before-learning (concept only)"
+    ],
+    "missing_adapter": [
+      "Codex CLI usage/context event parser",
+      "Blind independent judge runner",
+      "Real Hermes gateway connector with approved endpoint and bearer token",
+      "Skill test-prompt runner and results writer"
+    ],
+    "new_component": [
+      "Deterministic skill-rubric core and schema",
+      "Skill evaluation fixture/test-prompt set",
+      "Evaluation results ledger",
+      "Optional model usage/quota ledger"
+    ],
+    "do_not_reuse": [
+      "Third-party Skill installation or vendoring",
+      "Full Hermes runtime replacement",
+      "20+ platform gateway integration",
+      "Kanban or second memory/state store",
+      "Automatic approval or automatic Canonical promotion"
+    ]
+  },
+  "source_reuse_assessment": [
+    {
+      "source_id": "S1",
+      "theme": "Harness Engineering",
+      "status": "PARTIAL",
+      "reuse": [
+        "Five-layer checklist: instruction, constraint, feedback, memory, orchestration",
+        "Rule-per-failure regression pattern",
+        "Subtraction philosophy"
+      ],
+      "missing": [
+        "No AGENTS.md or explicit context-budget policy",
+        "No periodic harness-health review",
+        "Source is a chapter map, not implementation evidence"
+      ],
+      "decision": "Use as an audit checklist; do not add a new framework. Consolidate docs before adding prose.",
+      "priority": "P1"
+    },
+    {
+      "source_id": "S2",
+      "theme": "Darwin Skill",
+      "status": "PARTIAL",
+      "reuse": [
+        "9-dimension rubric weights",
+        "Paired same-judge majority",
+        "Human checkpoints",
+        "Test prompts and results ledger",
+        "Git revert ratchet",
+        "150% size guard"
+      ],
+      "missing": [
+        "Rubric implementation",
+        "Independent judge",
+        "Skill test prompts",
+        "Results ledger"
+      ],
+      "decision": "Implement deterministic core first. Any judge call needs separate approval and budget. Do not install the Skill.",
+      "priority": "P0 core / P1 judge"
+    },
+    {
+      "source_id": "S3",
+      "theme": "Codex",
+      "status": "UNKNOWN",
+      "reuse": [
+        "AGENTS.md instruction-map pattern",
+        "Usage/quota awareness",
+        "Context layering"
+      ],
+      "missing": [
+        "Codex integration in the active dispatch path",
+        "Token/quota telemetry",
+        "Context compaction policy"
+      ],
+      "decision": "Do not adopt Codex without a concrete use case. If adopted, add a read-only usage parser and fail-closed quota preflight behind approval.",
+      "priority": "P1 conditional / otherwise P2"
+    },
+    {
+      "source_id": "S4",
+      "theme": "Hermes Agent",
+      "status": "PARTIAL",
+      "reuse": [
+        "Existing Hermes A2A client and honest runtime probe",
+        "Curator gate-before-learning concept",
+        "Replaceable executor boundary"
+      ],
+      "missing": [
+        "Reachable Hermes runtime",
+        "Credential and endpoint approval",
+        "Evidence of live A2A task completion"
+      ],
+      "decision": "Keep Canonical store authoritative. Do not replace Personal AI, add a second state store, or adopt the platform gateway. Live test is BLOCKED until a real gateway is approved.",
+      "priority": "P0 boundary doc / P2 live"
+    }
+  ],
+  "deterministic_checks": [
+    {
+      "check_id": "T1",
+      "name": "Source retrieval and hash pinning",
+      "method": "curl -L + sha256sum for four sources",
+      "result": "4/4 HTTP 200; hashes recorded in sources[]",
+      "status": "PASS",
+      "reproducible": true
+    },
+    {
+      "check_id": "T2",
+      "name": "Full repository regression",
+      "method": "python -m pytest -q",
+      "result": "1753 passed, 1 skipped in 65.47s (0:01:05)",
+      "status": "PASS",
+      "reproducible": true
+    },
+    {
+      "check_id": "T3",
+      "name": "Hermes runtime readiness",
+      "method": "probe_hermes_runtime() via PYTHONPATH=src",
+      "result": "runtime_present=false; missing_dependency=reachable_real_hermes_runtime",
+      "status": "BLOCKED",
+      "reproducible": true,
+      "note": "This is an honest absence result, not a test failure."
+    },
+    {
+      "check_id": "T4",
+      "name": "Darwin scoring arithmetic and paired majority",
+      "method": "/tmp/opencode/skill_eval_probe.py",
+      "result": "PASS skill-eval arithmetic probe; weights_sum=100; equal_score_total=50.0; 2:1 keep; 1:2 revert; dry-run >30% warns",
+      "status": "PASS",
+      "reproducible": true,
+      "probe_sha256": "3606e7e60dbef8fa0f6701dfe5275285c1d5a1e303bb956a4fefdfb82f4a8d1a",
+      "output_sha256": "489dd6934b7cfad195517586dbfba20d28826b3f34798973e8db99440a2cc1c8"
+    },
+    {
+      "check_id": "T5",
+      "name": "Task-contract Gate 1",
+      "method": "python scripts/task_contract.py /tmp/opencode/task.json",
+      "result": "PASS: structured task contract valid",
+      "status": "PASS",
+      "reproducible": true
+    },
+    {
+      "check_id": "T6",
+      "name": "Scope guard",
+      "method": "python scripts/scope_guard.py <base> /tmp/opencode/task.json",
+      "result": "Only the two expected outputs; no deletions; no forbidden paths. See scope_guard_result.",
+      "status": "PASS",
+      "reproducible": true
+    },
+    {
+      "check_id": "T7",
+      "name": "Production baseline parity",
+      "method": "Compare worker/PRODUCTION-BASELINE.json with sha256sum/wc of worker/index.js",
+      "result": "Declared sha 8D0E... vs current 03f7...; 55,278/1,543 vs 189,957/4,372",
+      "status": "PASS",
+      "status_detail": "mismatch confirmed; production state UNKNOWN",
+      "reproducible": true,
+      "note": "Production state remains UNKNOWN; no Cloudflare access."
+    },
+    {
+      "check_id": "T8",
+      "name": "No production or Canonical write",
+      "method": "git status --short and git diff --name-status",
+      "result": "Only HUASHU_REUSE_AUDIT_V1.md and HUASHU_EVIDENCE_INDEX_V1.json are new",
+      "status": "PASS",
+      "reproducible": true
+    }
+  ],
+  "scope_guard_result": {
+    "base": "749f7e9831c9aa0ab5815fe14089fc28a8e6a742",
+    "contract": "/tmp/opencode/task.json",
+    "mode": "write",
+    "allowlist": [
+      "HUASHU_REUSE_AUDIT_V1.md",
+      "HUASHU_EVIDENCE_INDEX_V1.json"
+    ],
+    "changed_files": [
+      "HUASHU_REUSE_AUDIT_V1.md",
+      "HUASHU_EVIDENCE_INDEX_V1.json"
+    ],
+    "violations": [],
+    "result": "PASS: all changes within allowlist, no deletions, no forbidden paths",
+    "evidence_class": "FACT"
+  },
+  "sandbox_test_plan": [
+    {
+      "plan_id": "S-1",
+      "test": "Rubric arithmetic and paired majority on a synthetic fixture",
+      "preconditions": "Pure Python, no network",
+      "expected": "Exact totals, keep/revert, dry-run warning",
+      "status": "PASS",
+      "status_detail": "executed as T4"
+    },
+    {
+      "plan_id": "S-2",
+      "test": "Score a repository-owned skill document with a human-authored rubric",
+      "preconditions": "2-3 test prompts; no external model",
+      "expected": "Evidence packet with per-dimension reasons and advisory=true",
+      "status": "UNKNOWN",
+      "status_detail": "not run",
+      "unknown_if": "No agreed prompts or rubric semantics."
+    },
+    {
+      "plan_id": "S-3",
+      "test": "Blind A/B with independent judges",
+      "preconditions": "Approved model, budget, same judge sees both versions, odd N",
+      "expected": "Majority decision plus margin and reasons; no absolute-score ratchet",
+      "status": "BLOCKED",
+      "blocked_by": "Requires external model and data policy approval."
+    },
+    {
+      "plan_id": "S-4",
+      "test": "Codex usage parser against a recorded --json event",
+      "preconditions": "Approved real Codex run or redacted fixture",
+      "expected": "Token/usage record; unknown fields null",
+      "status": "UNKNOWN",
+      "blocked_by": "No authenticated Codex run and no usage event."
+    },
+    {
+      "plan_id": "S-5",
+      "test": "Hermes A2A SendMessage smoke test",
+      "preconditions": "Real gateway, bearer token, non-Codex executor, allowlisted prompt",
+      "expected": "Terminal task, executor identity, normalized evidence",
+      "status": "BLOCKED",
+      "blocked_by": "No reachable Hermes runtime or credential."
+    },
+    {
+      "plan_id": "S-6",
+      "test": "Canonical safety regression",
+      "preconditions": "Existing gates and scope guard",
+      "expected": "No write outside allowlist; no secret exposure",
+      "status": "PASS",
+      "status_detail": "by construction; production unverified",
+      "blocked_by": null
+    }
+  ],
+  "priority_backlog": [
+    {
+      "id": "P0-A",
+      "priority": "P0",
+      "action": "Maintain this evidence index as the source pin for Huashu material",
+      "benefit": "Reproducible provenance; no old-report-equals-production assumption",
+      "risk": "Dynamic pages; hashes must be refreshed",
+      "approval_required": false,
+      "status": "DONE"
+    },
+    {
+      "id": "P0-B",
+      "priority": "P0",
+      "action": "Build deterministic Darwin rubric and paired-majority core with a fixture schema",
+      "benefit": "Turns prose method into testable code without model spend",
+      "risk": "Guessed rubric semantics; must be reviewed",
+      "approval_required": false
+    },
+    {
+      "id": "P0-C",
+      "priority": "P0",
+      "action": "Reuse pytest as the regression ratchet and add an advisory eval ledger",
+      "benefit": "Prevents silent quality regression",
+      "risk": "Ledger becoming a second source of truth",
+      "approval_required": false
+    },
+    {
+      "id": "P1-A",
+      "priority": "P1",
+      "action": "Add Codex usage/context adapter with fail-closed unknown quota",
+      "benefit": "Cost and context visibility",
+      "risk": "Quota consumption, credential exposure",
+      "approval_required": true,
+      "gate": "PA-2"
+    },
+    {
+      "id": "P1-B",
+      "priority": "P1",
+      "action": "Run Hermes A2A smoke test against an approved gateway with non-Codex executor",
+      "benefit": "Converts BLOCKED to measured PARTIAL/PASS",
+      "risk": "Endpoint/token exposure, promptware",
+      "approval_required": true,
+      "gate": "PA-3"
+    },
+    {
+      "id": "P1-C",
+      "priority": "P1",
+      "action": "Run independent blind paired judges for skill quality",
+      "benefit": "Reduces self-evaluation bias",
+      "risk": "Judge noise, cost, data leakage, prompt injection",
+      "approval_required": true,
+      "gate": "PA-1"
+    },
+    {
+      "id": "P2-A",
+      "priority": "P2",
+      "action": "Curator-like gate-before-learning skill loop",
+      "benefit": "Safer skill evolution",
+      "risk": "Automating bad learning; Canonical risk",
+      "approval_required": true,
+      "gate": "PA-5"
+    },
+    {
+      "id": "P2-B",
+      "priority": "P2",
+      "action": "Hermes memory/Kanban/gateway adoption",
+      "benefit": "Feature breadth",
+      "risk": "Duplicate state and attack surface",
+      "approval_required": true,
+      "gate": "PA-3/PA-6"
+    },
+    {
+      "id": "P2-C",
+      "priority": "P2",
+      "action": "AGENTS.md and instruction-layer consolidation",
+      "benefit": "Clearer context; less doc drift",
+      "risk": "More prose; scope creep",
+      "approval_required": true,
+      "gate": "PA-7"
+    }
+  ],
+  "pending_approvals": [
+    {
+      "approval_id": "PA-1",
+      "action": "Call an external LLM judge for paired skill evaluation",
+      "why_now_blocked": "Model choice, budget, data-retention and prompt-injection policy are unset",
+      "safe_default": "Use deterministic rubric core only; mark judge dimensions UNKNOWN"
+    },
+    {
+      "approval_id": "PA-2",
+      "action": "Authenticated Codex CLI run and quota consumption",
+      "why_now_blocked": "Requires account credential and may consume paid/shared quota",
+      "safe_default": "Do not run; keep Codex status UNKNOWN"
+    },
+    {
+      "approval_id": "PA-3",
+      "action": "Start or connect a real Hermes A2A gateway",
+      "why_now_blocked": "Requires routable endpoint and bearer token, possibly network exposure",
+      "safe_default": "Keep runtime_present=false; no live test"
+    },
+    {
+      "approval_id": "PA-4",
+      "action": "Install or vendor Darwin Skill or any third-party Skill",
+      "why_now_blocked": "Supply-chain and prompt-code risk; explicitly forbidden in this task",
+      "safe_default": "Read public source only; no install"
+    },
+    {
+      "approval_id": "PA-5",
+      "action": "Write or promote a SKILL to Canonical",
+      "why_now_blocked": "Canonical mutation and human approval ledger requirement",
+      "safe_default": "Evaluation output remains advisory; no write"
+    },
+    {
+      "approval_id": "PA-6",
+      "action": "Deploy Worker changes to Cloudflare production",
+      "why_now_blocked": "Production mutation and separate deploy gate",
+      "safe_default": "No deploy; production state UNKNOWN"
+    },
+    {
+      "approval_id": "PA-7",
+      "action": "Add AGENTS.md or other new repository guidance",
+      "why_now_blocked": "Out of this task's two-file allowlist",
+      "safe_default": "Defer to a dedicated task with its own scope"
+    }
+  ],
+  "next_actions_without_approval": [
+    {
+      "id": "NEXT-A",
+      "action": "In an isolated allowlisted task, implement the pure-Python 9-dimension rubric core, score validation, paired-majority decision, dry-run ratio guard and JSON evidence schema",
+      "constraints": [
+        "No external model call",
+        "No third-party Skill install",
+        "No Canonical write",
+        "No production change"
+      ],
+      "expected_output": "Code, pytest coverage, and a non-Canonical evidence report"
+    },
+    {
+      "id": "NEXT-B",
+      "action": "Refresh source URL hashes and version metadata before any future evaluation",
+      "constraints": [
+        "Read-only HTTP",
+        "No credentials"
+      ],
+      "expected_output": "Updated evidence index"
+    },
+    {
+      "id": "NEXT-C",
+      "action": "Run the existing Hermes readiness probe on any future cloud runner and record runtime_present, endpoint source and missing dependency",
+      "constraints": [
+        "Read-only",
+        "No credential values printed"
+      ],
+      "expected_output": "BLOCKED or PARTIAL evidence with exact missing dependency"
+    }
+  ],
+  "safety": {
+    "repository_files_added": [
+      "HUASHU_REUSE_AUDIT_V1.md",
+      "HUASHU_EVIDENCE_INDEX_V1.json"
+    ],
+    "repository_files_modified_or_deleted": [],
+    "workflow_modified": false,
+    "secret_or_credential_access": false,
+    "secret_or_credential_change": false,
+    "production_worker_write": false,
+    "cloudflare_deploy": false,
+    "canonical_write": false,
+    "third_party_skill_install": false,
+    "pull_request_created": false,
+    "external_model_call_for_evaluation": false,
+    "note": "The Hermes readiness probe performed a local read-only resolution/HTTP attempt and did not print credential values."
+  },
+  "acceptance_mapping": [
+    {
+      "criterion": "List each source link, version or access date, and distinguish fact from inference",
+      "evidence": "sources[], author_claims_not_pass[], independent_version_checks[]",
+      "status": "PASS"
+    },
+    {
+      "criterion": "Compare with existing repository capabilities and include at least one reproducible deterministic check; mark UNKNOWN when untestable",
+      "evidence": "capability_matrix[], deterministic_checks[], test_run, codex status UNKNOWN, production state UNKNOWN",
+      "status": "PASS"
+    },
+    {
+      "criterion": "Classify results PASS/PARTIAL/BLOCKED/UNKNOWN and state a next step that needs no user intervention",
+      "evidence": "status{}, source_reuse_assessment[], next_actions_without_approval[]",
+      "status": "PASS"
+    },
+    {
+      "criterion": "No production or Canonical write",
+      "evidence": "safety{}; scope_guard_result; git diff",
+      "status": "PASS"
+    }
+  ]
+}
