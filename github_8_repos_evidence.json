@@ -1,0 +1,499 @@
+{
+  "schema_version": "1.0",
+  "task_id": "cf-384b983f9068",
+  "project_id": "github-monetization-research",
+  "goal": "RECOVER_AND_PUBLISH_GITHUB_8_REPO_VERIFICATION_REPORTS",
+  "generated_at_utc": "2026-10-21T03:00:04Z",
+  "prior_run": {
+    "task_id": "cf-c9d9adf75064",
+    "checked_at": "2026-10-21T02:02:25Z",
+    "reported_counts": {
+      "VERIFIED": 5,
+      "AMBIGUOUS": 1,
+      "NOT_FOUND": 2
+    },
+    "commit_sha": "2f23d1c590fcdf32ce02abb38497d6a15c2db3c2",
+    "commit_was_pushed": false,
+    "recovery_note": "Prior markdown bytes and hashes were not available in this clone (git cat-file could not resolve the local-only commit), so the reports were reconstructed from fresh read-back and prior-run findings. No prior bytes or hashes are claimed."
+  },
+  "method": {
+    "network": "Direct read-only HTTP GET only: GitHub REST API, raw.githubusercontent.com, and official docs.n8n.io pages.",
+    "web_search_tool_used": false,
+    "identity_checks": [
+      "GET /repos/{owner}/{repo}",
+      "GET /repos/{owner}/{repo}/commits?per_page=1",
+      "GET /repos/{owner}/{repo}/contents?ref={sha}"
+    ],
+    "content_readback": [
+      "raw.githubusercontent.com at pinned commit SHA",
+      "GitHub Contents API base64 at pinned commit SHA"
+    ],
+    "hash_algorithm": "SHA-256",
+    "dual_source_rule": "README/LICENSE body must hash identically from raw.githubusercontent.com and the GitHub Contents API; all checked files matched.",
+    "limitations": [
+      "The source video page was inaccessible beyond its JavaScript shell; repository names came from the user screenshot/task contract, not from a verified transcript.",
+      "The prior local commit 2f23d1c590fcdf32ce02abb38497d6a15c2db3c2 is not present in this clone, so prior file bytes cannot be recovered byte-for-byte.",
+      "docs.n8n.io/sustainable-use-license/ (linked from the n8n README) returned HTTP 404 at check time; current official pages /n8n-community-license and its license-faq returned HTTP 200 and were used.",
+      "Star/fork/issue counts are point-in-time snapshots and will drift.",
+      "awesome-quant and awesome-remote-job have no root LICENSE file; awesome-remote-job declares CC0 in README, awesome-quant declares no license at the pinned commit."
+    ]
+  },
+  "summary": {
+    "total": 8,
+    "VERIFIED": 5,
+    "AMBIGUOUS": 1,
+    "NOT_FOUND": 2
+  },
+  "repositories": [
+    {
+      "row": 1,
+      "requested_name": "n8n",
+      "status": "VERIFIED",
+      "status_reason": "Exact repository n8n-io/n8n exists and was independently read back at a pinned commit.",
+      "repository": {
+        "full_name": "n8n-io/n8n",
+        "html_url": "https://github.com/n8n-io/n8n",
+        "api_url": "https://api.github.com/repos/n8n-io/n8n",
+        "commit_sha": "1ebe2cf55975b220aa63df91fe8e7f6d9659c94f",
+        "commit_url": "https://github.com/n8n-io/n8n/commit/1ebe2cf55975b220aa63df91fe8e7f6d9659c94f",
+        "default_branch": "master",
+        "description": "Fair-code workflow automation platform with native AI capabilities. Combine visual building with custom code, self-host or cloud, 400+ integrations.",
+        "archived": false,
+        "stars": 208166,
+        "forks": 61199,
+        "open_issues": 1209,
+        "created_at": "2019-06-22T09:24:21Z",
+        "pushed_at": "2026-10-20T23:52:29Z",
+        "license_summary": "Sustainable Use License 1.0 (non-.ee source) plus n8n Enterprise License for .ee files; GitHub API reports Other/NOASSERTION; not OSI-approved open source.",
+        "readme": {
+          "path": "README.md",
+          "bytes": 3998,
+          "sha256": "1b2642bc182969047627fc3568c785bad291fb9a2c7d655b19813608bf69ce27",
+          "raw_url": "https://raw.githubusercontent.com/n8n-io/n8n/1ebe2cf55975b220aa63df91fe8e7f6d9659c94f/README.md",
+          "contents_api_url": "https://api.github.com/repos/n8n-io/n8n/contents/README.md?ref=1ebe2cf55975b220aa63df91fe8e7f6d9659c94f",
+          "raw_http_status": 200,
+          "contents_api_http_status": 200,
+          "dual_source_hash_match": true,
+          "git_blob_sha": "567d03f771487fd0be47cb5ac764d359cb281d2a"
+        },
+        "license_file": {
+          "path": "LICENSE.md",
+          "bytes": 4445,
+          "sha256": "d2f621f59aa4c10eab79b6333e59d9d3d5b53307dcfd16dbd75e40e679e84965",
+          "raw_url": "https://raw.githubusercontent.com/n8n-io/n8n/1ebe2cf55975b220aa63df91fe8e7f6d9659c94f/LICENSE.md",
+          "contents_api_url": "https://api.github.com/repos/n8n-io/n8n/contents/LICENSE.md?ref=1ebe2cf55975b220aa63df91fe8e7f6d9659c94f",
+          "raw_http_status": 200,
+          "contents_api_http_status": 200,
+          "dual_source_hash_match": true,
+          "git_blob_sha": "f85f59baa906530c26cee26e0c9ddd6bd5f86dbd"
+        },
+        "enterprise_license_file": {
+          "path": "LICENSE_EE.md",
+          "bytes": 1879,
+          "sha256": "6110c69fd3b92928328a89e863dc2c862ea449f2335c352a9c4a137a36b13040",
+          "raw_url": "https://raw.githubusercontent.com/n8n-io/n8n/1ebe2cf55975b220aa63df91fe8e7f6d9659c94f/LICENSE_EE.md",
+          "contents_api_url": "https://api.github.com/repos/n8n-io/n8n/contents/LICENSE_EE.md?ref=1ebe2cf55975b220aa63df91fe8e7f6d9659c94f",
+          "raw_http_status": 200,
+          "contents_api_http_status": 200,
+          "dual_source_hash_match": true,
+          "git_blob_sha": "b47966a6c05809c90723aa4beaf47cbbd34fac1b"
+        }
+      },
+      "maintenance": "active",
+      "source_urls": [
+        "https://github.com/n8n-io/n8n",
+        "https://api.github.com/repos/n8n-io/n8n",
+        "https://github.com/n8n-io/n8n/commit/1ebe2cf55975b220aa63df91fe8e7f6d9659c94f",
+        "https://raw.githubusercontent.com/n8n-io/n8n/1ebe2cf55975b220aa63df91fe8e7f6d9659c94f/README.md",
+        "https://raw.githubusercontent.com/n8n-io/n8n/1ebe2cf55975b220aa63df91fe8e7f6d9659c94f/LICENSE.md",
+        "https://docs.n8n.io/n8n-community-license",
+        "https://docs.n8n.io/n8n-community-license/community-license/license-faq"
+      ],
+      "notes": "Only runnable software repository among the eight. Self-hostable workflow automation platform; use as an optional execution layer behind the existing control plane, subject to the Sustainable Use License."
+    },
+    {
+      "row": 2,
+      "requested_name": "awesome-remote-job",
+      "status": "VERIFIED",
+      "status_reason": "Exact repository lukasz-madon/awesome-remote-job exists and was independently read back at a pinned commit.",
+      "repository": {
+        "full_name": "lukasz-madon/awesome-remote-job",
+        "html_url": "https://github.com/lukasz-madon/awesome-remote-job",
+        "api_url": "https://api.github.com/repos/lukasz-madon/awesome-remote-job",
+        "commit_sha": "d7c1d773841358f72212c4c1a123adff6af56c78",
+        "commit_url": "https://github.com/lukasz-madon/awesome-remote-job/commit/d7c1d773841358f72212c4c1a123adff6af56c78",
+        "default_branch": "master",
+        "description": "A curated list of awesome remote jobs and resources. Inspired by https://github.com/vinta/awesome-python",
+        "archived": false,
+        "stars": 49731,
+        "forks": 4876,
+        "open_issues": 137,
+        "created_at": "2015-01-02T00:31:34Z",
+        "pushed_at": "2026-09-21T15:00:51Z",
+        "license_summary": "CC0-1.0 declared in the README license section; no root LICENSE file and GitHub API license is null.",
+        "readme": {
+          "path": "README.md",
+          "bytes": 67391,
+          "sha256": "53cb059d10e6c20e33e7c490e88327aa222a7b0de2d6863629a94732952db26c",
+          "raw_url": "https://raw.githubusercontent.com/lukasz-madon/awesome-remote-job/d7c1d773841358f72212c4c1a123adff6af56c78/README.md",
+          "contents_api_url": "https://api.github.com/repos/lukasz-madon/awesome-remote-job/contents/README.md?ref=d7c1d773841358f72212c4c1a123adff6af56c78",
+          "raw_http_status": 200,
+          "contents_api_http_status": 200,
+          "dual_source_hash_match": true,
+          "git_blob_sha": "8c9c6dae92850de7e5d30a9c4ff7fe6f59780627"
+        }
+      },
+      "maintenance": "active",
+      "source_urls": [
+        "https://github.com/lukasz-madon/awesome-remote-job",
+        "https://api.github.com/repos/lukasz-madon/awesome-remote-job",
+        "https://github.com/lukasz-madon/awesome-remote-job/commit/d7c1d773841358f72212c4c1a123adff6af56c78",
+        "https://raw.githubusercontent.com/lukasz-madon/awesome-remote-job/d7c1d773841358f72212c4c1a123adff6af56c78/README.md"
+      ],
+      "notes": "Curated resource directory (Markdown lists), not runnable software. Useful as a research input only."
+    },
+    {
+      "row": 3,
+      "requested_name": "awesome-telegram-groups",
+      "status": "VERIFIED",
+      "status_reason": "Exact repository stkw0/awesome-telegram-groups exists and was independently read back at a pinned commit.",
+      "repository": {
+        "full_name": "stkw0/awesome-telegram-groups",
+        "html_url": "https://github.com/stkw0/awesome-telegram-groups",
+        "api_url": "https://api.github.com/repos/stkw0/awesome-telegram-groups",
+        "commit_sha": "1d7089adc4c8fda86aaa4c5305d2ef9fbb63de34",
+        "commit_url": "https://github.com/stkw0/awesome-telegram-groups/commit/1d7089adc4c8fda86aaa4c5305d2ef9fbb63de34",
+        "default_branch": "master",
+        "description": "List of telegram groups ",
+        "archived": false,
+        "stars": 137,
+        "forks": 19,
+        "open_issues": 1,
+        "created_at": "2016-12-08T15:42:50Z",
+        "pushed_at": "2020-11-17T19:15:58Z",
+        "license_summary": "WTFPL (root LICENSE file); GitHub API license key wtfpl.",
+        "readme": {
+          "path": "README.md",
+          "bytes": 5658,
+          "sha256": "d4f8f665e89bb862f15099840f0006aae52eb682c3525b1874d4fdee91806eb5",
+          "raw_url": "https://raw.githubusercontent.com/stkw0/awesome-telegram-groups/1d7089adc4c8fda86aaa4c5305d2ef9fbb63de34/README.md",
+          "contents_api_url": "https://api.github.com/repos/stkw0/awesome-telegram-groups/contents/README.md?ref=1d7089adc4c8fda86aaa4c5305d2ef9fbb63de34",
+          "raw_http_status": 200,
+          "contents_api_http_status": 200,
+          "dual_source_hash_match": true,
+          "git_blob_sha": "641db74c86fb359f9d79e11861f0d1827dc94c72"
+        },
+        "license_file": {
+          "path": "LICENSE",
+          "bytes": 487,
+          "sha256": "40f2791ae84e097cc964b740cbd974e78296a36aa1490dcb76dcc004bf865ac8",
+          "raw_url": "https://raw.githubusercontent.com/stkw0/awesome-telegram-groups/1d7089adc4c8fda86aaa4c5305d2ef9fbb63de34/LICENSE",
+          "contents_api_url": "https://api.github.com/repos/stkw0/awesome-telegram-groups/contents/LICENSE?ref=1d7089adc4c8fda86aaa4c5305d2ef9fbb63de34",
+          "raw_http_status": 200,
+          "contents_api_http_status": 200,
+          "dual_source_hash_match": true,
+          "git_blob_sha": "456c4889bf600cae752aff995677d4599be876cc"
+        }
+      },
+      "maintenance": "dormant",
+      "source_urls": [
+        "https://github.com/stkw0/awesome-telegram-groups",
+        "https://api.github.com/repos/stkw0/awesome-telegram-groups",
+        "https://github.com/stkw0/awesome-telegram-groups/commit/1d7089adc4c8fda86aaa4c5305d2ef9fbb63de34",
+        "https://raw.githubusercontent.com/stkw0/awesome-telegram-groups/1d7089adc4c8fda86aaa4c5305d2ef9fbb63de34/README.md",
+        "https://raw.githubusercontent.com/stkw0/awesome-telegram-groups/1d7089adc4c8fda86aaa4c5305d2ef9fbb63de34/LICENSE"
+      ],
+      "notes": "Curated Telegram group list, not runnable software. Last push 2020-11-17; treat links as stale and verify before use."
+    },
+    {
+      "row": 4,
+      "requested_name": "awesome",
+      "status": "AMBIGUOUS",
+      "status_reason": "The requested label is generic. sindresorhus/awesome is the leading candidate and exists, but the source video was unreadable beyond its JavaScript shell, so the intended identity cannot be confirmed.",
+      "repository": {
+        "full_name": "sindresorhus/awesome",
+        "html_url": "https://github.com/sindresorhus/awesome",
+        "api_url": "https://api.github.com/repos/sindresorhus/awesome",
+        "commit_sha": "bc98e517ddca672f55f9857d714fc3ea3c3540b2",
+        "commit_url": "https://github.com/sindresorhus/awesome/commit/bc98e517ddca672f55f9857d714fc3ea3c3540b2",
+        "default_branch": "main",
+        "description": "😎 Awesome lists about all kinds of interesting topics [NOTE: Pull requests are temporarily disabled until I have a chance to catch up with the existing ones]",
+        "archived": false,
+        "stars": 521987,
+        "forks": 37598,
+        "open_issues": 105,
+        "created_at": "2014-07-11T13:42:37Z",
+        "pushed_at": "2026-09-02T02:10:47Z",
+        "license_summary": "CC0-1.0 (root license file); GitHub API license key cc0-1.0.",
+        "readme": {
+          "path": "readme.md",
+          "bytes": 78330,
+          "sha256": "465cd781335e44587d238f666800104b63d4fc8ba2395d6422974dcba421c616",
+          "raw_url": "https://raw.githubusercontent.com/sindresorhus/awesome/bc98e517ddca672f55f9857d714fc3ea3c3540b2/readme.md",
+          "contents_api_url": "https://api.github.com/repos/sindresorhus/awesome/contents/readme.md?ref=bc98e517ddca672f55f9857d714fc3ea3c3540b2",
+          "raw_http_status": 200,
+          "contents_api_http_status": 200,
+          "dual_source_hash_match": true,
+          "git_blob_sha": "0acaa99d5f45582ecf70f987213f59ae1855226f"
+        },
+        "license_file": {
+          "path": "license",
+          "bytes": 6478,
+          "sha256": "d06492a8af3ebf435233748dbbc572abc189f2e9abcf0505a0e34a0212c728b3",
+          "raw_url": "https://raw.githubusercontent.com/sindresorhus/awesome/bc98e517ddca672f55f9857d714fc3ea3c3540b2/license",
+          "contents_api_url": "https://api.github.com/repos/sindresorhus/awesome/contents/license?ref=bc98e517ddca672f55f9857d714fc3ea3c3540b2",
+          "raw_http_status": 200,
+          "contents_api_http_status": 200,
+          "dual_source_hash_match": true,
+          "git_blob_sha": "3ad65fdca6c56fc42eadbd442f08f418cdd6ed5e"
+        }
+      },
+      "maintenance": "active",
+      "source_urls": [
+        "https://github.com/sindresorhus/awesome",
+        "https://api.github.com/repos/sindresorhus/awesome",
+        "https://github.com/sindresorhus/awesome/commit/bc98e517ddca672f55f9857d714fc3ea3c3540b2",
+        "https://raw.githubusercontent.com/sindresorhus/awesome/bc98e517ddca672f55f9857d714fc3ea3c3540b2/readme.md",
+        "https://raw.githubusercontent.com/sindresorhus/awesome/bc98e517ddca672f55f9857d714fc3ea3c3540b2/license"
+      ],
+      "notes": "Leading candidate only. The repository itself is verified; the mapping from the source's generic 'awesome' label to this repository is not."
+    },
+    {
+      "row": 5,
+      "requested_name": "awesome-quant",
+      "status": "VERIFIED",
+      "status_reason": "Exact repository wilsonfreitas/awesome-quant exists and was independently read back at a pinned commit.",
+      "repository": {
+        "full_name": "wilsonfreitas/awesome-quant",
+        "html_url": "https://github.com/wilsonfreitas/awesome-quant",
+        "api_url": "https://api.github.com/repos/wilsonfreitas/awesome-quant",
+        "commit_sha": "b52a1a942eda36a6539b886f26a4a391883580d6",
+        "commit_url": "https://github.com/wilsonfreitas/awesome-quant/commit/b52a1a942eda36a6539b886f26a4a391883580d6",
+        "default_branch": "main",
+        "description": "A curated list of insanely awesome libraries, packages and resources for Quants (Quantitative Finance)",
+        "archived": false,
+        "stars": 30225,
+        "forks": 4192,
+        "open_issues": 146,
+        "created_at": "2015-09-30T09:53:49Z",
+        "pushed_at": "2026-10-21T01:17:29Z",
+        "license_summary": "No LICENSE file and no explicit license declaration found at the pinned commit; GitHub API license is null. Treat as all rights reserved unless the owner states otherwise.",
+        "readme": {
+          "path": "README.md",
+          "bytes": 156097,
+          "sha256": "6f2edfb35e721f7614e091435a6e189ebc032a5608e8c736fa8e7c7e8b35f15a",
+          "raw_url": "https://raw.githubusercontent.com/wilsonfreitas/awesome-quant/b52a1a942eda36a6539b886f26a4a391883580d6/README.md",
+          "contents_api_url": "https://api.github.com/repos/wilsonfreitas/awesome-quant/contents/README.md?ref=b52a1a942eda36a6539b886f26a4a391883580d6",
+          "raw_http_status": 200,
+          "contents_api_http_status": 200,
+          "dual_source_hash_match": true,
+          "git_blob_sha": "70c2c2b27e8bb4864e25f8c85df424753346fd9c"
+        }
+      },
+      "maintenance": "active",
+      "source_urls": [
+        "https://github.com/wilsonfreitas/awesome-quant",
+        "https://api.github.com/repos/wilsonfreitas/awesome-quant",
+        "https://github.com/wilsonfreitas/awesome-quant/commit/b52a1a942eda36a6539b886f26a4a391883580d6",
+        "https://raw.githubusercontent.com/wilsonfreitas/awesome-quant/b52a1a942eda36a6539b886f26a4a391883580d6/README.md"
+      ],
+      "notes": "Curated quantitative-finance resource directory, not runnable software. Use as a link catalog only; do not copy contents without a license grant."
+    },
+    {
+      "row": 6,
+      "requested_name": "awesome-public-datasets",
+      "status": "VERIFIED",
+      "status_reason": "Exact repository awesomedata/awesome-public-datasets exists and was independently read back at a pinned commit.",
+      "repository": {
+        "full_name": "awesomedata/awesome-public-datasets",
+        "html_url": "https://github.com/awesomedata/awesome-public-datasets",
+        "api_url": "https://api.github.com/repos/awesomedata/awesome-public-datasets",
+        "commit_sha": "f484e9f66d4633ce35781e62a6fd05bb150b8eee",
+        "commit_url": "https://github.com/awesomedata/awesome-public-datasets/commit/f484e9f66d4633ce35781e62a6fd05bb150b8eee",
+        "default_branch": "master",
+        "description": "A topic-centric list of HQ open datasets.",
+        "archived": false,
+        "stars": 79653,
+        "forks": 11905,
+        "open_issues": 165,
+        "created_at": "2014-11-20T06:20:50Z",
+        "pushed_at": "2026-10-20T17:04:40Z",
+        "license_summary": "MIT (root LICENSE file); GitHub API license key mit.",
+        "readme": {
+          "path": "README.rst",
+          "bytes": 278575,
+          "sha256": "e9da8267a50d32b1707f3bd85eb26d6e9899390c222bf8c76432dac5107a3266",
+          "raw_url": "https://raw.githubusercontent.com/awesomedata/awesome-public-datasets/f484e9f66d4633ce35781e62a6fd05bb150b8eee/README.rst",
+          "contents_api_url": "https://api.github.com/repos/awesomedata/awesome-public-datasets/contents/README.rst?ref=f484e9f66d4633ce35781e62a6fd05bb150b8eee",
+          "raw_http_status": 200,
+          "contents_api_http_status": 200,
+          "dual_source_hash_match": true,
+          "git_blob_sha": "2b084c93d2573c3cfb305b455a23e3b47d2941f8"
+        },
+        "license_file": {
+          "path": "LICENSE",
+          "bytes": 1122,
+          "sha256": "6f1baa6803708ad92643e9f00a7fac14c0c19e39b1fbca732cde94a9adaf981b",
+          "raw_url": "https://raw.githubusercontent.com/awesomedata/awesome-public-datasets/f484e9f66d4633ce35781e62a6fd05bb150b8eee/LICENSE",
+          "contents_api_url": "https://api.github.com/repos/awesomedata/awesome-public-datasets/contents/LICENSE?ref=f484e9f66d4633ce35781e62a6fd05bb150b8eee",
+          "raw_http_status": 200,
+          "contents_api_http_status": 200,
+          "dual_source_hash_match": true,
+          "git_blob_sha": "35fcb87d1b37822e9f31580a4fcc576646740f41"
+        }
+      },
+      "maintenance": "active",
+      "source_urls": [
+        "https://github.com/awesomedata/awesome-public-datasets",
+        "https://api.github.com/repos/awesomedata/awesome-public-datasets",
+        "https://github.com/awesomedata/awesome-public-datasets/commit/f484e9f66d4633ce35781e62a6fd05bb150b8eee",
+        "https://raw.githubusercontent.com/awesomedata/awesome-public-datasets/f484e9f66d4633ce35781e62a6fd05bb150b8eee/README.rst",
+        "https://raw.githubusercontent.com/awesomedata/awesome-public-datasets/f484e9f66d4633ce35781e62a6fd05bb150b8eee/LICENSE"
+      ],
+      "notes": "Curated open-dataset directory, not runnable software. Individual linked datasets have their own licenses."
+    },
+    {
+      "row": 7,
+      "requested_name": "ai-money-mindset",
+      "status": "NOT_FOUND",
+      "status_reason": "No repository with this exact name was found. GitHub search for the quoted name in:name returned 0 results, and the direct repository API path returned HTTP 404.",
+      "repository": null,
+      "search_evidence": {
+        "query": "\"ai-money-mindset\" in:name",
+        "search_url": "https://api.github.com/search/repositories?q=%22ai-money-mindset%22+in%3Aname",
+        "total_count": 0,
+        "direct_repo_api_url": "https://api.github.com/repos/ai-money-mindset/ai-money-mindset",
+        "direct_repo_http_status": 404,
+        "note": "Broader unquoted/token searches returned only unrelated repositories; they are not identity matches."
+      },
+      "maintenance": "not_applicable",
+      "source_urls": [
+        "https://api.github.com/search/repositories?q=%22ai-money-mindset%22+in%3Aname",
+        "https://api.github.com/repos/ai-money-mindset/ai-money-mindset"
+      ],
+      "notes": "Do not treat similarly named third-party repositories as the requested project without independent confirmation."
+    },
+    {
+      "row": 8,
+      "requested_name": "ai-goods-monitor",
+      "status": "NOT_FOUND",
+      "status_reason": "No repository with this exact name was found. GitHub search for the quoted name in:name returned 0 results, and the direct repository API path returned HTTP 404.",
+      "repository": null,
+      "search_evidence": {
+        "query": "\"ai-goods-monitor\" in:name",
+        "search_url": "https://api.github.com/search/repositories?q=%22ai-goods-monitor%22+in%3Aname",
+        "total_count": 0,
+        "direct_repo_api_url": "https://api.github.com/repos/ai-goods-monitor/ai-goods-monitor",
+        "direct_repo_http_status": 404,
+        "note": "Broader unquoted/token searches returned only unrelated repositories; they are not identity matches."
+      },
+      "maintenance": "not_applicable",
+      "source_urls": [
+        "https://api.github.com/search/repositories?q=%22ai-goods-monitor%22+in%3Aname",
+        "https://api.github.com/repos/ai-goods-monitor/ai-goods-monitor"
+      ],
+      "notes": "Do not treat similarly named third-party repositories as the requested project without independent confirmation."
+    }
+  ],
+  "n8n_license_analysis": {
+    "conclusion": "n8n is source-available fair-code, not OSI-approved open source. Non-.ee source is under the Sustainable Use License 1.0; .ee files require the n8n Enterprise License.",
+    "license_file": {
+      "path": "LICENSE.md",
+      "sha256": "d2f621f59aa4c10eab79b6333e59d9d3d5b53307dcfd16dbd75e40e679e84965",
+      "url": "https://raw.githubusercontent.com/n8n-io/n8n/1ebe2cf55975b220aa63df91fe8e7f6d9659c94f/LICENSE.md"
+    },
+    "enterprise_license_file": {
+      "path": "LICENSE_EE.md",
+      "sha256": "6110c69fd3b92928328a89e863dc2c862ea449f2335c352a9c4a137a36b13040",
+      "url": "https://raw.githubusercontent.com/n8n-io/n8n/1ebe2cf55975b220aa63df91fe8e7f6d9659c94f/LICENSE_EE.md"
+    },
+    "github_api_license": {
+      "key": "other",
+      "spdx_id": "NOASSERTION",
+      "name": "Other"
+    },
+    "sustainable_use_summary": "Use or modify only for your own internal business purposes or for non-commercial/personal use. Distribution is allowed only free of charge for non-commercial purposes. Do not remove licensing notices.",
+    "agency_client_workflows": {
+      "allowed_condition": "Building and running workflows for clients on the operator's own n8n instance is permitted only while clients cannot create or edit workflows and do not access the n8n instance or workflow logic.",
+      "not_allowed": "Hosting n8n as a service that lets clients build workflows; letting external end users build/configure workflows through a custom UI, API, MCP, or AI agent; white-labeling; using enterprise features without an Enterprise license.",
+      "multi_client_nuance": "Official FAQ says to contact license@n8n.io for managing n8n across multiple client environments; a partner program for multi-instance management is in development."
+    },
+    "official_docs": [
+      {
+        "url": "https://docs.n8n.io/n8n-community-license",
+        "http_status": 200
+      },
+      {
+        "url": "https://docs.n8n.io/n8n-community-license/community-license/license-faq",
+        "http_status": 200
+      },
+      {
+        "url": "https://docs.n8n.io/sustainable-use-license/",
+        "http_status": 404,
+        "note": "Legacy README link returned 404; current official pages used instead."
+      }
+    ],
+    "docs_readback": [
+      {
+        "url": "https://docs.n8n.io/n8n-community-license",
+        "http_status": 200,
+        "content_sha256": "1520760edfd0e30a5394a67e72a6069b0aa8ef1978da65a94da2799c54a87de6",
+        "bytes": 549102,
+        "note": ""
+      },
+      {
+        "url": "https://docs.n8n.io/n8n-community-license/community-license/license-faq",
+        "http_status": 200,
+        "content_sha256": "7e766918345539fee265ebe1d5280dbf7d8d1464c3b2df39d9ba569a7888fe66",
+        "bytes": 571282,
+        "note": ""
+      },
+      {
+        "url": "https://docs.n8n.io/sustainable-use-license/",
+        "http_status": 404,
+        "content_sha256": null,
+        "bytes": null,
+        "note": "Legacy README link; returned 404 at check time. Used current official docs URLs above instead."
+      }
+    ]
+  },
+  "architecture_reuse_analysis": {
+    "existing_control_plane": "Cloudflare Worker + D1 and the Hermes control plane remain authoritative for ingress, auth, policy, state, provenance, approvals, and scheduling.",
+    "decision": "Do not replace the Cloudflare/Hermes control plane. n8n is at most an optional self-hosted workflow execution adapter behind it.",
+    "recommended_reuse": [
+      "Use n8n only for connector-heavy or human-in-the-loop workflows that are triggered by the existing Worker/Hermes layer via a narrow authenticated webhook.",
+      "Keep all policy, identity, approval, and persistence decisions in the existing control plane; n8n returns results/callbacks rather than owning state.",
+      "Run n8n as an internal tool on an operator-controlled instance; do not expose the n8n editor to clients or end users.",
+      "Pin the n8n image/version and keep .ee features disabled unless an Enterprise license is obtained.",
+      "If multi-client isolation is required, do not assume the community license covers multi-instance management; contact license@n8n.io first."
+    ],
+    "resource_directories": "The five awesome-* repositories are curated lists, not runnable software. Use them only as research/link catalogs; do not add them as runtime dependencies or copy content without checking each declared license.",
+    "not_found_items": "ai-money-mindset and ai-goods-monitor have no verified repository identity; do not build integrations against similarly named unrelated repositories."
+  },
+  "artifacts": {
+    "markdown": {
+      "path": "github_8_repos_verification.md",
+      "sha256": "c5984ae147653cc9a6fa1fbf32b890058f7d598dcdca2e3e69a21f15463d110a",
+      "bytes": 18652
+    },
+    "json": {
+      "path": "github_8_repos_evidence.json",
+      "sha256_note": "Self-hash intentionally omitted to avoid a circular value; read-back content hashes are the integrity anchors."
+    }
+  },
+  "verification_checks": {
+    "row_count": 8,
+    "statuses": {
+      "total": 8,
+      "VERIFIED": 5,
+      "AMBIGUOUS": 1,
+      "NOT_FOUND": 2
+    },
+    "readback_dual_source_all_match": true,
+    "no_secret_or_production_writes": true,
+    "allowlisted_paths": [
+      "github_8_repos_verification.md",
+      "github_8_repos_evidence.json"
+    ]
+  }
+}
