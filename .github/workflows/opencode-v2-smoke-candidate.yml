@@ -1,0 +1,46 @@
+name: opencode-v2-smoke-candidate
+
+on:
+  push:
+    branches:
+      - chore/opencode-v2.1.1-cloud-agent-candidate-20261021
+    paths:
+      - ".github/workflows/agent-dispatch.yml"
+      - ".github/workflows/opencode-v2-smoke-candidate.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: OpenCode 2.1.1 Go auth smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pinned OpenCode 2 CLI
+        run: npm install --global @opencode/cli@2.1.1
+
+      - name: Verify exact CLI version
+        run: |
+          set -euo pipefail
+          version="$(opencode --version)"
+          echo "OpenCode version: $version"
+          [[ "$version" == *"2.1.1"* ]]
+
+      - name: Verify OpenCode Go model call without repository writes
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          set -euo pipefail
+          response="$(opencode run --standalone --model opencode-go/deepseek-v4.1-flash "Reply with exactly OPENCODE_GO_V2_SMOKE_OK. Do not use tools or modify files.")"
+          printf '%s\n' "$response"
+          printf '%s' "$response" | grep -q 'OPENCODE_GO_V2_SMOKE_OK'
