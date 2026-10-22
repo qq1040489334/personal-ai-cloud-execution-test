@@ -16,6 +16,9 @@
 // Human Gate.
 
 export const SITE_NAME = "personal-ai-deploy-write-site";
+// Server-owned mounting seam for the existing /knowledge Human Gate. No live
+// route is enabled until deployed-source reconciliation supplies its verifier.
+export { createKnowledgeApprovalRoute } from "./knowledge-approval.js";
 export const CONTROL_PLANE = "existing-deploy-and-write-site";
 export const SITE_CANDIDATE_CONTRACT =
   "PERSONAL_AI_DEPLOY_WRITE_SITE_CANDIDATE_CONTROL_PLANE_V0.1";
