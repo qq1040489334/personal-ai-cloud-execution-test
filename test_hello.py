@@ -4548,7 +4548,11 @@ def test_personal_ai_autonomous_advancement_alias() -> None:
 
 @pytest.fixture(scope="module")
 def result_schema_preservation_golden_report() -> dict:
-    return result_schema_preservation_golden_verify()
+    # Explicit successful runtime context for this isolated PASS golden fixture.
+    # Agent-provided workflow_status is not trusted runtime evidence.
+    with pytest.MonkeyPatch.context() as context:
+        context.setenv("JOB_STATUS", "success")
+        return result_schema_preservation_golden_verify()
 
 
 def test_result_schema_preservation_report_contract(
@@ -4585,6 +4589,8 @@ def test_result_schema_preservation_keeps_business_and_workflow_status_separate(
 ) -> None:
     artifact = result_schema_preservation_golden_report["execution_result_json"]
     assert artifact["status"] == "success"
+    assert artifact["workflow_status"] == "success"
+    assert artifact["business_status"] == "PASS"
     assert artifact["final_status"] == "PASS"
     assert artifact["task_id"] == RESULT_SCHEMA_PRESERVATION_TASK_ID
 

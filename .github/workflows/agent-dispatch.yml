@@ -186,6 +186,7 @@ jobs:
           raw=agent.get("final_status") if isinstance(agent,dict) else receipt.get("final_status")
           token=raw.strip().upper() if isinstance(raw,str) else ""
           business={"PASS":"PASS","FAIL":"FAILED","FAILED":"FAILED","BLOCKED":"BLOCKED"}.get(token,"UNKNOWN")
+          if token.startswith("BLOCKED_"): business="BLOCKED"
           status="success" if job_status=="success" and receipt["status"]=="success" and business=="PASS" else "failure"
           classification=("FAIL" if job_status!="success" or business=="FAILED" else
                           "PENDING_APPROVAL" if status=="success" else "BLOCKED")

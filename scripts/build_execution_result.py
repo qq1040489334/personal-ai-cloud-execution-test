@@ -19,6 +19,8 @@ def git(*args: str) -> str:
 def business_status(value) -> str:
     # Legacy workflow status/success is not an explicit business verdict.
     token = value.strip().upper() if isinstance(value, str) else ""
+    if token.startswith("BLOCKED_"):
+        return "BLOCKED"
     return {"PASS": "PASS", "FAIL": "FAILED", "FAILED": "FAILED",
             "BLOCKED": "BLOCKED"}.get(token, "UNKNOWN")
 
@@ -34,7 +36,7 @@ def build_result(task: dict, agent_result: dict, base: str, tests_summary: str) 
         {
             "status": "success" if business == "PASS" and workflow == "success" else "failure",
             "business_status": business,
-            "final_status": business,
+            "final_status": agent_result.get("final_status"),
             "workflow_status": workflow,
             "task_id": task.get("task_id", ""),
             "commit": git("rev-parse", "HEAD").strip(),

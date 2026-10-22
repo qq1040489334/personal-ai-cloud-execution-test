@@ -51,10 +51,13 @@ def test_production_generator_preserves_unknown_agent_result_fields(tmp_path):
 
     for key, value in agent_result.items():
         assert result[key] == value
-    assert result["status"] == "success"
+    assert result["status"] == "failure"
+    assert result["business_status"] == "BLOCKED"
+    assert result["tests"] is None
+    assert result["agent_result"] == agent_result
     assert result["task_id"] == "parent-contract-001"
     assert result["commit"]
-    assert result["tests"] == "566 passed"
+    assert result["workflow_tests"] == "566 passed"
     assert isinstance(result["changed_files"], list)
     assert result["summary"] == "Preserve Agent evidence"
 
@@ -73,10 +76,13 @@ def test_compatibility_metadata_wins_agent_field_collisions(tmp_path):
         },
     )
 
-    assert result["status"] == "success"
+    assert result["status"] == "failure"
     assert result["task_id"] == "parent-contract-001"
+    assert result["business_status"] == "UNKNOWN"
+    assert result["tests"] == "agent test claim"
+    assert result["business_tests"] == "agent test claim"
     assert result["commit"] != "agent-commit"
-    assert result["tests"] == "566 passed"
+    assert result["workflow_tests"] == "566 passed"
     assert result["changed_files"] != ["agent.py"]
     assert result["summary"] == "Preserve Agent evidence"
     assert result["future_unknown_field"] is True
