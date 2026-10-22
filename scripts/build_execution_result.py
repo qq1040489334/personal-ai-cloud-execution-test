@@ -6,6 +6,7 @@ Run: python scripts/build_execution_result.py <task_json> <base_rev> <tests_summ
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -15,17 +16,31 @@ def git(*args: str) -> str:
     return subprocess.run(["git", *args], capture_output=True, text=True).stdout
 
 
+def business_status(value) -> str:
+    # Legacy workflow status/success is not an explicit business verdict.
+    token = value.strip().upper() if isinstance(value, str) else ""
+    return {"PASS": "PASS", "FAIL": "FAILED", "FAILED": "FAILED",
+            "BLOCKED": "BLOCKED"}.get(token, "UNKNOWN")
+
+
 def build_result(task: dict, agent_result: dict, base: str, tests_summary: str) -> dict:
     """Preserve Agent fields; computed compatibility metadata wins conflicts."""
     changed = [line for line in git("diff", "--name-only", base).splitlines() if line.strip()]
+    business = business_status(agent_result.get("final_status"))
+    workflow = os.environ.get("JOB_STATUS", "unknown")
     result = dict(agent_result)
     result["agent_result"] = dict(agent_result)
     result.update(
         {
-            "status": "success",
+            "status": "success" if business == "PASS" and workflow == "success" else "failure",
+            "business_status": business,
+            "final_status": business,
+            "workflow_status": workflow,
             "task_id": task.get("task_id", ""),
             "commit": git("rev-parse", "HEAD").strip(),
-            "tests": tests_summary.strip(),
+            "tests": agent_result.get("tests"),
+            "business_tests": agent_result.get("tests"),
+            "workflow_tests": tests_summary.strip(),
             "changed_files": changed,
             "summary": task.get("goal", ""),
         }

@@ -126,6 +126,7 @@ jobs:
 
       - name: Build execution_result.json
         if: always()
+        id: receipt
         env:
           JOB_STATUS: ${{ job.status }}
           PUSH_OUTCOME: ${{ steps.push.outcome }}
@@ -152,8 +153,60 @@ jobs:
             fi
           fi
 
+      - name: Prepare trusted terminal notification
+        id: notification_prepare
+        if: always() && steps.receipt.outcome == 'success' && steps.taskid.outputs.task_id != '' && steps.base.outcome == 'success'
+        env:
+          BASE: ${{ steps.base.outputs.base }}
+          TASK_JSON: ${{ toJSON(github.event.client_payload.task) }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          python -I -S - <<'PY'
+          import hashlib,json,os,re,subprocess,tempfile
+          from pathlib import Path
+          base=os.environ["BASE"]
+          if not re.fullmatch(r"[0-9a-fA-F]{40}",base):
+              raise ValueError("trusted notification base is not a commit SHA")
+          task=json.loads(os.environ["TASK_JSON"])
+          if isinstance(task,str): task=json.loads(task)
+          receipt=json.loads((Path(os.environ["RUNNER_TEMP"])/"execution_result.json").read_text(encoding="utf-8"))
+          task_id=task.get("task_id") if isinstance(task,dict) else None
+          if not isinstance(task_id,str) or not task_id or not isinstance(receipt,dict) or receipt.get("task_id")!=task_id:
+              raise ValueError("trusted notification task identity mismatch")
+          job_status=os.environ["JOB_STATUS"]
+          if receipt.get("status") not in {"success","failure"} or job_status not in {"success","failure","cancelled"}:
+              raise ValueError("trusted notification terminal status unavailable")
+          # Ignore agent-created Git replace refs and never execute working-tree code.
+          source=subprocess.run(["git","--no-replace-objects","show",base+":hello.py"],check=True,capture_output=True).stdout
+          directory=Path(tempfile.mkdtemp(prefix="trusted-notification-",dir=os.environ["RUNNER_TEMP"]))
+          code=directory/"hello.py"
+          code.write_bytes(source)
+          agent=receipt.get("agent_result")
+          # Nested Agent verdict wins; never infer business PASS from status=success.
+          raw=agent.get("final_status") if isinstance(agent,dict) else receipt.get("final_status")
+          token=raw.strip().upper() if isinstance(raw,str) else ""
+          business={"PASS":"PASS","FAIL":"FAILED","FAILED":"FAILED","BLOCKED":"BLOCKED"}.get(token,"UNKNOWN")
+          status="success" if job_status=="success" and receipt["status"]=="success" and business=="PASS" else "failure"
+          classification=("FAIL" if job_status!="success" or business=="FAILED" else
+                          "PENDING_APPROVAL" if status=="success" else "BLOCKED")
+          # Failed jobs may contain unsafe arbitrary agent text; send only a fixed
+          # summary and the original event identity, never raw result fields.
+          safe={"task_id":task_id,"status":status,"job_status":job_status,
+                "workflow_status":job_status,"business_status":business,"final_status":business,
+                "notification_classification":classification,
+                "summary":"Business PASS reported; review the task artifact." if status=="success" else
+                          "Workflow failed; inspect the task artifact." if job_status!="success" else
+                          "Business status "+business+"; inspect the task artifact."}
+          result=directory/"notification_result.json"
+          result.write_text(json.dumps(safe,ensure_ascii=False),encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8") as output:
+              output.write("code="+str(code)+"\nresult="+str(result)+"\n")
+          print(json.dumps({"base":base,"notification_source_sha256":hashlib.sha256(source).hexdigest(),"status":status}))
+          PY
+
       - name: Restore ServerChan delivery ledger
-        if: success()
+        id: delivery_ledger_restore
+        if: always() && steps.notification_prepare.outcome == 'success'
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/personal_ai_serverchan_delivery_ledger.json
@@ -162,16 +215,28 @@ jobs:
             personal-ai-serverchan-delivery-ledger-v1-
 
       - name: Dedicated ServerChan push (credential only here)
-        if: success()
+        id: notification_push
+        if: always() && steps.notification_prepare.outcome == 'success' && steps.delivery_ledger_restore.outcome == 'success'
         env:
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
           PERSONAL_AI_SERVERCHAN_DELIVERY_LEDGER: ${{ runner.temp }}/personal_ai_serverchan_delivery_ledger.json
           PERSONAL_AI_PUSH_OUTBOX_STATE: ${{ runner.temp }}/personal_ai_push_outbox.json
-          PERSONAL_AI_EXECUTION_RESULT: ${{ runner.temp }}/execution_result.json
-        run: python hello.py notification-push --result "$RUNNER_TEMP/execution_result.json"
+          PERSONAL_AI_CONSUMER_STATE: ${{ runner.temp }}/personal_ai_notification_consumer.json
+          PERSONAL_AI_EXECUTION_RESULT: ${{ steps.notification_prepare.outputs.result }}
+          NOTIFICATION_CODE: ${{ steps.notification_prepare.outputs.code }}
+        run: |
+          python -I -S "$NOTIFICATION_CODE" notification-push --result "$PERSONAL_AI_EXECUTION_RESULT" > "$RUNNER_TEMP/notification_delivery.json"
+          python -I -S - <<'PY'
+          import json,os
+          from pathlib import Path
+          result=json.loads((Path(os.environ["RUNNER_TEMP"])/"notification_delivery.json").read_text(encoding="utf-8"))
+          delivered=result.get("delivery_state")=="delivered" and result.get("dispatched") is True
+          print(json.dumps({key:result.get(key) for key in ("task_id","classification","delivery_state","dispatched","already_delivered","fail_closed","external_blocker")}))
+          raise SystemExit(0 if delivered else 1)
+          PY
 
       - name: Save ServerChan delivery ledger
-        if: success()
+        if: always() && steps.delivery_ledger_restore.outcome == 'success' && steps.notification_push.outcome != 'skipped' && steps.notification_push.outcome != ''
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/personal_ai_serverchan_delivery_ledger.json
