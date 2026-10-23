@@ -224,7 +224,8 @@ def test_worker_sql_is_consumed_at_gated_and_validated_by_node() -> None:
 
     # The consume call site binds an integer epoch second, never an ISO string.
     worker = WORKER_PATH.read_text(encoding="utf-8")
-    assert "Math.floor(Date.now() / 1000)" in worker
+    assert "time_basis='epoch_ms_v1'" in worker
+    assert "julianday('now')-2440587.5)*86400000" in worker
     assert "APPROVAL_LEDGER_CONSUME).bind((new Date()).toISOString()" not in worker
 
 
@@ -452,7 +453,11 @@ def test_0003_migration_is_immutable() -> None:
 
 def test_worker_cannot_mint_an_approval() -> None:
     source = WORKER_PATH.read_text(encoding="utf-8")
-    assert "INSERT INTO personal_ai_approval_ledger" not in source
+    # The immutable schema snapshot contains trigger DDL, but the Worker must
+    # never execute approval registration SQL. Verify the real promotion trace.
+    script = REPO_ROOT / "tests" / "production_gate_scenarios.mjs"
+    out = subprocess.run([NODE, str(script), "no_mint"], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
     assert "registerKnowledgePromotionApproval" not in source
     assert "KNOWLEDGE_PROMOTION_APPROVAL_INSERT" not in source
     # The Worker consumes via the legacy single-use field only.

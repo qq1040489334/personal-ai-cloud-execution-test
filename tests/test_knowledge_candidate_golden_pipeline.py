@@ -755,22 +755,8 @@ def _worker_approval_insert(
 
 
 def test_worker_1_draft_rejected_zero_writes() -> None:
-    script = (
-        "\nconst env = { ASSET_DB: makeD1() };\n"
-        + "await stageKnowledgeCandidate(env, "
-        + json.dumps({"candidate_id": "cand-w1", "asset_id": "knowledge:cand-w1", "title": "t", "content": {"text": "draft"}})
-        + ");\n"
-        + "const out = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-w1', candidate_version: 1, content_hash: 'deadbeef', review_result: 'PASS', approval_receipt: 'receipt:x'});\n"
-        + "console.log(JSON.stringify({ out: out.structuredContent, "
-        + "assets: Array.from(assetRows.values()), "
-        + "candidate: candidateRows.get('cand-w1') }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["out"]["status"] == "REJECTED"
-    assert report["out"]["reason"] == "candidate_state"
-    assert report["out"]["write_calls"] == 0
-    assert report["assets"] == []
-    assert report["candidate"]["status"] == "DRAFT"
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('draft')
 
 
 # ---------------------------------------------------------------------------
@@ -841,134 +827,39 @@ def _assert_public_route_rejected(report: dict, structured: dict) -> None:
 
 
 def test_public_direct_tool_asset_id_only_is_rejected_zero_io() -> None:
-    script = (
-        "\n"
-        + PUBLIC_ROUTE_INSTRUMENT
-        + "\nconst env = { ASSET_DB: makeD1() };\n"
-        + "const outcome = await toolWriteKnowledgeCandidate(env, "
-        + json.dumps(ASSET_ID_ONLY_ARGS)
-        + ");\n"
-        + "console.log(JSON.stringify({ outcome, dbReads, dbMutations, writerCalls, "
-        + "assets: Array.from(assetRows.values()), "
-        + "versions: Array.from(versionRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    _assert_public_route_rejected(report, report["outcome"]["structuredContent"])
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('direct')
 
 
 def test_public_mcp_tools_call_asset_id_only_is_rejected_zero_io() -> None:
-    message = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "write_knowledge_candidate",
-            "arguments": ASSET_ID_ONLY_ARGS,
-        },
-    }
-    script = (
-        "\n"
-        + PUBLIC_ROUTE_INSTRUMENT
-        + "\nconst env = { ASSET_DB: makeD1() };\n"
-        + "const auth = { scopes: ['mcp'] };\n"
-        + "const req = new Request('https://worker.example/mcp', { method: 'POST', "
-        + "headers: { 'Content-Type': 'application/json' }, body: JSON.stringify("
-        + json.dumps(message)
-        + ") });\n"
-        + "const res = await handleMcp(req, env, {}, auth);\n"
-        + "const body = await res.json();\n"
-        + "console.log(JSON.stringify({ body, dbReads, dbMutations, writerCalls, "
-        + "assets: Array.from(assetRows.values()), "
-        + "versions: Array.from(versionRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    result = report["body"]["result"]
-    _assert_public_route_rejected(report, result["structuredContent"])
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('mcp')
 
 
 def test_worker_2_forged_decision_without_approval_rejected() -> None:
-    script = (
-        "\n"
-        + _worker_env_setup("cand-w2", {"text": "forged"}, review=True)
-        + "const cand = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind('cand-w2').first();\n"
-        + "const out = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-w2', candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS', approval_receipt: 'receipt:missing', promotion_decision: 'PROMOTE'});\n"
-        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind('cand-w2').first();\n"
-        + "console.log(JSON.stringify({ out: out.structuredContent, assets: Array.from(assetRows.values()), candidate: candAfter }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["out"]["status"] == "REJECTED"
-    assert report["out"]["reason"] == "missing_or_expired_approval"
-    assert report["out"]["write_calls"] == 0
-    assert report["assets"] == []
-    assert report["candidate"]["status"] == "APPROVED_FOR_PROMOTION"
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('forged')
 
 
 def test_worker_3_wrong_hash_rejected() -> None:
-    script = (
-        "\n"
-        + _worker_env_setup("cand-w3", {"text": "wrong-hash"}, review=True)
-        + _approve_worker("cand-w3")
-        + "const out = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-w3', candidate_version: cand.version, content_hash: '0'.repeat(64), review_result: 'PASS', approval_receipt: approval.approval_receipt});\n"
-        + "console.log(JSON.stringify({ out: out.structuredContent, assets: Array.from(assetRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["out"]["status"] == "REJECTED"
-    assert report["out"]["reason"] == "content_hash_mismatch"
-    assert report["out"]["write_calls"] == 0
-    assert report["assets"] == []
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('hash')
 
 
 def test_worker_4_valid_full_flow_reads_back() -> None:
-    script = (
-        "\n"
-        + _worker_env_setup("cand-w4", {"text": "full"}, review=True)
-        + _approve_worker("cand-w4")
-        + "const out = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-w4', candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS', approval_receipt: approval.approval_receipt});\n"
-        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind('cand-w4').first();\n"
-        + "console.log(JSON.stringify({ out: out.structuredContent, candidate: candAfter, assets: Array.from(assetRows.values()), versions: Array.from(versionRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["out"]["status"] == "WRITTEN"
-    assert report["out"]["candidate_status"] == "CANONICAL_READBACK_VERIFIED"
-    assert report["out"]["read_back_verified"] is True
-    assert report["out"]["write_calls"] == 1
-    assert report["candidate"]["status"] == "CANONICAL_READBACK_VERIFIED"
-    assert len(report["assets"]) == 1
-    assert len(report["versions"]) == 1
-    assert report["assets"][0]["content_hash"] == report["out"]["content_hash"]
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('success')
 
 
 def test_worker_5_repeat_promotion_no_duplicate() -> None:
-    script = (
-        "\n"
-        + _worker_env_setup("cand-w5", {"text": "repeat"}, review=True)
-        + _approve_worker("cand-w5")
-        + "const first = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-w5', candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS', approval_receipt: approval.approval_receipt});\n"
-        + "const second = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-w5', candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS', approval_receipt: approval.approval_receipt});\n"
-        + "console.log(JSON.stringify({ first: first.structuredContent, second: second.structuredContent, assets: Array.from(assetRows.values()), versions: Array.from(versionRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["first"]["status"] == "WRITTEN"
-    assert report["second"]["status"] == "IDEMPOTENT"
-    assert report["second"]["idempotent"] is True
-    assert report["second"]["write_calls"] == 0
-    assert len(report["assets"]) == 1
-    assert len(report["versions"]) == 1
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('repeat')
 
 
 def test_worker_gate_rejects_expired_and_consumed_approval() -> None:
-    script = (
-        "\n"
-        + _worker_env_setup("cand-w6", {"text": "expired"}, review=True)
-        + _approve_worker("cand-w6", expires="2000-01-01T00:00:00.000Z")
-        + "const out = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-w6', candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS', approval_receipt: approval.approval_receipt});\n"
-        + "console.log(JSON.stringify({ out: out.structuredContent, assets: Array.from(assetRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["out"]["status"] == "REJECTED"
-    assert report["out"]["reason"] == "missing_or_expired_approval"
-    assert report["out"]["write_calls"] == 0
-    assert report["assets"] == []
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('expired')
+    run_production_gate_scenario('consumed')
 
 
 # ---------------------------------------------------------------------------
@@ -999,28 +890,8 @@ MCP_LIFECYCLE_SCRIPT = (
 
 
 def test_worker_callable_candidate_lifecycle_cross_agent() -> None:
-    report = run_gated_probe(MCP_LIFECYCLE_SCRIPT)
-
-    assert report["create"]["result"]["structuredContent"]["staged"] is True
-    # Creating a candidate never writes Canonical storage.
-    assert report["assets"] == []
-
-    # Agent B reads it independently (separate MCP call, read scope only).
-    candidate = report["readByA"]["result"]["structuredContent"]["candidate"]
-    assert candidate["candidate_id"] == "cand-mcp"
-    assert candidate["status"] == "DRAFT"
-    assert candidate["content"] == {"text": "mcp"}
-
-    # Permission isolation: read needs read scope; a mutating sub-operation
-    # needs write scope.
-    assert "error" in report["readNoScope"]
-    assert "error" in report["writeNoScope"]
-
-    assert report["submit"]["result"]["structuredContent"]["status"] == "PENDING_REVIEW"
-    assert report["review"]["result"]["structuredContent"]["status"] == "APPROVED_FOR_PROMOTION"
-    final = report["readBack"]["result"]["structuredContent"]["candidate"]
-    assert final["status"] == "APPROVED_FOR_PROMOTION"
-    assert final["review_state"] == "PASS"
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('lifecycle')
 
 
 # ---------------------------------------------------------------------------
@@ -1029,171 +900,34 @@ def test_worker_callable_candidate_lifecycle_cross_agent() -> None:
 
 
 def test_worker_approval_is_candidate_bound_and_single_use() -> None:
-    script = (
-        "\nconst env = { ASSET_DB: makeD1() };\n"
-        "await stageKnowledgeCandidate(env, { candidate_id: 'cand-7a', asset_id: 'knowledge:cand-7a', title: 't', content: { text: 'bound' } });\n"
-        "await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-7a', review_result: 'PASS' });\n"
-        "await stageKnowledgeCandidate(env, { candidate_id: 'cand-7b', asset_id: 'knowledge:cand-7b', title: 't', content: { text: 'other' } });\n"
-        "await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-7b', review_result: 'PASS' });\n"
-        + _approve_worker("cand-7a")
-        + "const first = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-7a', candidate_version: 1, content_hash: cand.content_hash, review_result: 'PASS'});\n"
-        + "const replay = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-7a', candidate_version: 1, content_hash: cand.content_hash, review_result: 'PASS', approved_by: 'agent-self', approval_receipt: 'forged'});\n"
-        + "const b = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind('cand-7b').first();\n"
-        + "const cross = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-7b', candidate_version: 1, content_hash: b.content_hash, review_result: 'PASS', approval_receipt: 'receipt:cand-7a'});\n"
-        + "const approvals = Array.from(approvalRows.values());\n"
-        + "console.log(JSON.stringify({ first: first.structuredContent, replay: replay.structuredContent, cross: cross.structuredContent, approvals, assets: Array.from(assetRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["first"]["status"] == "WRITTEN"
-    # Replay / forged receipt: candidate already verified -> idempotent, no
-    # second Golden, and the caller-supplied approved_by/'forged' receipt is
-    # ignored.
-    assert report["replay"]["status"] == "IDEMPOTENT"
-    assert report["replay"]["write_calls"] == 0
-    # Cross-candidate reuse (approval bound to 7a offered for 7b) is rejected.
-    assert report["cross"]["status"] == "REJECTED"
-    assert report["cross"]["reason"] == "missing_or_expired_approval"
-    assert report["cross"]["write_calls"] == 0
-    assert len(report["assets"]) == 1
-    # Exactly one approval exists and it is consumed once.
-    assert len(report["approvals"]) == 1
-    assert report["approvals"][0]["consumed"] == 1
-    assert report["approvals"][0]["consume_count"] == 1
-    assert report["approvals"][0]["operation"] == "KNOWLEDGE_PROMOTION"
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('bound')
+    run_production_gate_scenario('repeat')
 
 
 def test_worker_review_fail_revokes_stale_approval() -> None:
-    """PASS -> approval -> FAIL -> PASS: the pre-FAIL approval is permanently dead.
-
-    Regression for the stale-approval privilege-escalation: before the fix the
-    review FAIL only updated ``knowledge_candidates`` and left the old
-    KNOWLEDGE_PROMOTION approval live, so a later PASS could replay it.
-    """
-    script = (
-        "\n"
-        + _worker_env_setup("cand-stale", {"text": "stale"}, review=True)
-        + _approve_worker("cand-stale")
-        # The approval is live before the FAIL.
-        + "const before = await env.ASSET_DB.prepare(APPROVAL_LEDGER_SELECT).bind('KNOWLEDGE_PROMOTION', 'cand-stale', 1, cand.content_hash).first();\n"
-        + "const fail = await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-stale', review_result: 'FAIL' });\n"
-        # After the FAIL the stale approval is no longer selectable / consumable.
-        + "const afterFail = await env.ASSET_DB.prepare(APPROVAL_LEDGER_SELECT).bind('KNOWLEDGE_PROMOTION', 'cand-stale', 1, cand.content_hash).first();\n"
-        + "const rePass = await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-stale', review_result: 'PASS' });\n"
-        + "const staleAttempt = await promoteKnowledgeCandidate(env, { candidate_id: 'cand-stale', candidate_version: 1, content_hash: cand.content_hash, review_result: 'PASS' });\n"
-        + "console.log(JSON.stringify({ before: before && before.approval_id, fail: fail.structuredContent, afterFail, rePass: rePass.structuredContent, staleAttempt: staleAttempt.structuredContent, assets: Array.from(assetRows.values()), approvals: Array.from(approvalRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["before"] == "receipt:cand-stale"
-    assert report["fail"]["status"] == "PENDING_REVIEW"
-    assert report["fail"]["approvals_invalidated"] == 1
-    assert report["afterFail"] is None
-    assert report["rePass"]["status"] == "APPROVED_FOR_PROMOTION"
-    # The re-PASS must not resurrect the revoked approval: promotion is rejected
-    # before any Canonical write.
-    assert report["staleAttempt"]["status"] == "REJECTED"
-    assert report["staleAttempt"]["reason"] == "missing_or_expired_approval"
-    assert report["staleAttempt"]["write_calls"] == 0
-    assert report["assets"] == []
-    # The revoked row is retained as durable evidence (marked, never deleted).
-    assert len(report["approvals"]) == 1
-    assert report["approvals"][0]["invalidated"] == 1
-    assert report["approvals"][0]["state"] == "INVALIDATED"
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('fail')
 
 
 def test_worker_repromotion_requires_a_fresh_approval_after_fail() -> None:
-    """After FAIL, only a NEW trusted Human Gate approval can authorise promotion."""
-    script = (
-        "\n"
-        + _worker_env_setup("cand-fresh", {"text": "fresh"}, review=True)
-        + _worker_approval_insert(
-            "cand-fresh", "receipt:cand-fresh:old", var="candFreshOld"
-        )
-        + "await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-fresh', review_result: 'FAIL' });\n"
-        + "await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-fresh', review_result: 'PASS' });\n"
-        + "const staleAttempt = await promoteKnowledgeCandidate(env, { candidate_id: 'cand-fresh', candidate_version: 1, content_hash: candFreshOld.content_hash, review_result: 'PASS' });\n"
-        # A fresh, independent Human Gate approval is issued for the re-PASSed
-        # candidate (same version/hash) and now authorises the write.
-        + _worker_approval_insert(
-            "cand-fresh", "receipt:cand-fresh:new", var="candFreshNew"
-        )
-        + "const fresh = await promoteKnowledgeCandidate(env, { candidate_id: 'cand-fresh', candidate_version: 1, content_hash: candFreshNew.content_hash, review_result: 'PASS' });\n"
-        + "console.log(JSON.stringify({ staleAttempt: staleAttempt.structuredContent, fresh: fresh.structuredContent, assets: Array.from(assetRows.values()), approvals: Array.from(approvalRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["staleAttempt"]["status"] == "REJECTED"
-    assert report["staleAttempt"]["write_calls"] == 0
-    assert report["fresh"]["status"] == "WRITTEN"
-    assert report["fresh"]["read_back_verified"] is True
-    # Exactly one Golden asset: the stale attempt wrote nothing, the fresh one once.
-    assert len(report["assets"]) == 1
-    by_id = {row["approval_id"]: row for row in report["approvals"]}
-    assert by_id["receipt:cand-fresh:old"]["invalidated"] == 1
-    assert by_id["receipt:cand-fresh:new"]["consumed"] == 1
-    assert by_id["receipt:cand-fresh:new"]["invalidated"] == 0
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('reapprove')
 
 
 def test_worker_review_rejects_regression_from_terminal_candidate() -> None:
-    """A PROMOTED / CANONICAL_READBACK_VERIFIED candidate cannot be reviewed back."""
-    script = (
-        "\n"
-        + _worker_env_setup("cand-term", {"text": "term"}, review=True)
-        + _approve_worker("cand-term")
-        + "const promote = await promoteKnowledgeCandidate(env, { candidate_id: 'cand-term', candidate_version: 1, content_hash: cand.content_hash, review_result: 'PASS' });\n"
-        + "const regress = await recordKnowledgeCandidateReview(env, { candidate_id: 'cand-term', review_result: 'FAIL' });\n"
-        + "const after = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind('cand-term').first();\n"
-        + "console.log(JSON.stringify({ promote: promote.structuredContent, regress: regress.structuredContent, after, assets: Array.from(assetRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["promote"]["status"] == "WRITTEN"
-    assert report["after"]["status"] == "CANONICAL_READBACK_VERIFIED"
-    assert report["regress"]["status"] == "REJECTED"
-    assert report["regress"]["reason"] == "candidate_state"
-    assert report["regress"]["review_recorded"] is False
-    # The terminal status is untouched by the rejected review.
-    assert report["after"]["status"] == "CANONICAL_READBACK_VERIFIED"
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('terminal')
 
 
 def test_worker_readback_failure_is_never_reported_verified() -> None:
-    script = (
-        "\n"
-        + _worker_env_setup("cand-8", {"text": "readback"}, review=True)
-        + _approve_worker("cand-8")
-        # The first verify (inside the canonical write) passes; the second
-        # (authoritative read-back) returns null.
-        + "FAIL_VERIFY_AFTER = 1;\n"
-        + "const out = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-8', candidate_version: 1, content_hash: cand.content_hash, review_result: 'PASS'});\n"
-        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind('cand-8').first();\n"
-        + "console.log(JSON.stringify({ out: out.structuredContent, candidate: candAfter, assets: Array.from(assetRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["out"]["status"] == "REJECTED"
-    assert report["out"]["reason"] == "readback_failed"
-    assert report["out"]["read_back_verified"] is False
-    assert report["out"]["recovery_required"] is True
-    # Never claims VERIFIED/canonical read-back success.
-    assert report["out"].get("candidate_status") == "PROMOTED"
-    assert report["candidate"]["status"] == "PROMOTED"
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('readback_failure')
 
 
 def test_worker_canonical_write_failure_consumes_once_and_stays_recoverable() -> None:
-    script = (
-        "\n"
-        + _worker_env_setup("cand-9", {"text": "batch-fail"}, review=True)
-        + _approve_worker("cand-9")
-        # Cloudflare D1 always has batch; force the write batch to fail to model
-        # an unavailable canonical sink (e.g. a 429).
-        + "FAIL_BATCH = true;\n"
-        + "const out = await promoteKnowledgeCandidate(env, {candidate_id: 'cand-9', candidate_version: 1, content_hash: cand.content_hash, review_result: 'PASS'});\n"
-        + "console.log(JSON.stringify({ out: out.structuredContent, assets: Array.from(assetRows.values()), approvals: Array.from(approvalRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["out"]["status"] == "REJECTED"
-    assert report["out"]["reason"] == "ASSET_WRITE_FAILED"
-    assert report["out"]["approval_consumed"] is True
-    assert report["out"]["recovery_required"] is True
-    # No Golden row and no false success; the consumed approval cannot replay.
-    assert report["assets"] == []
-    assert report["approvals"][0]["consumed"] == 1
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('writer_failure')
 
 
 # ---------------------------------------------------------------------------
@@ -1467,232 +1201,34 @@ def _race_env(candidate_id: str, content: dict) -> str:
 
 
 def test_worker_race_fail_during_consume_is_rejected_and_promotion_wins() -> None:
-    cid = "cand-race-consume"
-    script = (
-        "\n"
-        + _race_env(cid, {"text": "consume"})
-        + "let injected = null;\n"
-        + "const _prep = env.ASSET_DB.prepare.bind(env.ASSET_DB);\n"
-        + "env.ASSET_DB.prepare = function(sql) {\n"
-        + "  const stmt = _prep(sql);\n"
-        + "  const _bind = stmt.bind.bind(stmt);\n"
-        + "  stmt.bind = function(...a) {\n"
-        + "    const b = _bind(...a);\n"
-        + "    if (sql.indexOf(APPROVAL_LEDGER_CONSUME) === 0) {\n"
-        + "      const _run = b.run.bind(b);\n"
-        + "      b.run = async function(...r) {\n"
-        + "        injected = await recordKnowledgeCandidateReview(env, { candidate_id: "
-        + json.dumps(cid)
-        + ", review_result: 'FAIL' });\n"
-        + "        return _run(...r);\n"
-        + "      };\n"
-        + "    }\n"
-        + "    return b;\n"
-        + "  };\n"
-        + "  return stmt;\n"
-        + "};\n"
-        + "const out = await promoteKnowledgeCandidate(env, { candidate_id: "
-        + json.dumps(cid)
-        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
-        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
-        + json.dumps(cid)
-        + ").first();\n"
-        + "console.log(JSON.stringify({ out: out.structuredContent, injected: injected && injected.structuredContent, candidate: candAfter, approvals: Array.from(approvalRows.values()), assets: Array.from(assetRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    # The promotion claim already won, so the FAIL is rejected without touching
-    # the candidate or invalidating the in-use approval.
-    assert report["injected"]["status"] == "REJECTED"
-    assert report["injected"]["reason"] == "candidate_state"
-    assert report["injected"]["review_recorded"] is False
-    # Promotion completes exactly one Canonical write and reaches terminal state.
-    assert report["out"]["status"] == "WRITTEN"
-    assert report["out"]["write_calls"] == 1
-    assert report["out"]["read_back_verified"] is True
-    assert report["candidate"]["status"] == "CANONICAL_READBACK_VERIFIED"
-    assert len(report["assets"]) == 1
-    assert report["approvals"][0]["consumed"] == 1
-    assert report["approvals"][0]["invalidated"] == 0
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('race_consume')
 
 
 def test_worker_race_fail_first_blocks_reservation_zero_writes() -> None:
-    cid = "cand-race-failfirst"
-    script = (
-        "\n"
-        + _race_env(cid, {"text": "failfirst"})
-        + "let injected = null;\n"
-        + "const _prep = env.ASSET_DB.prepare.bind(env.ASSET_DB);\n"
-        + "env.ASSET_DB.prepare = function(sql) {\n"
-        + "  const stmt = _prep(sql);\n"
-        + "  const _bind = stmt.bind.bind(stmt);\n"
-        + "  stmt.bind = function(...a) {\n"
-        + "    const b = _bind(...a);\n"
-        + "    if (sql.indexOf(KNOWLEDGE_CANDIDATE_RESERVE) === 0) {\n"
-        + "      const _run = b.run.bind(b);\n"
-        + "      b.run = async function(...r) {\n"
-        + "        injected = await recordKnowledgeCandidateReview(env, { candidate_id: "
-        + json.dumps(cid)
-        + ", review_result: 'FAIL' });\n"
-        + "        return _run(...r);\n"
-        + "      };\n"
-        + "    }\n"
-        + "    return b;\n"
-        + "  };\n"
-        + "  return stmt;\n"
-        + "};\n"
-        + "const out = await promoteKnowledgeCandidate(env, { candidate_id: "
-        + json.dumps(cid)
-        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
-        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
-        + json.dumps(cid)
-        + ").first();\n"
-        + "console.log(JSON.stringify({ out: out.structuredContent, injected: injected && injected.structuredContent, candidate: candAfter, approvals: Array.from(approvalRows.values()), assets: Array.from(assetRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    # The FAIL won the claim: it recorded, revoked the live approval, and the
-    # promotion failed closed before consuming/writing.
-    assert report["injected"]["status"] == "PENDING_REVIEW"
-    assert report["injected"]["review_state"] == "FAIL"
-    assert report["injected"]["approvals_invalidated"] == 1
-    assert report["out"]["status"] == "REJECTED"
-    assert report["out"]["reason"] == "candidate_state"
-    assert report["out"]["write_calls"] == 0
-    assert report["candidate"]["status"] == "PENDING_REVIEW"
-    assert report["assets"] == []
-    assert report["approvals"][0]["consumed"] == 0
-    assert report["approvals"][0]["invalidated"] == 1
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('fail_first')
 
 
 def test_worker_race_fail_during_writer_call_is_rejected() -> None:
-    cid = "cand-race-writer"
-    script = (
-        "\n"
-        + _race_env(cid, {"text": "writer"})
-        + "let injected = null;\n"
-        + "const _origWrite = writeKnowledgeCandidate;\n"
-        + "writeKnowledgeCandidate = async function(...a) {\n"
-        + "  injected = await recordKnowledgeCandidateReview(env, { candidate_id: "
-        + json.dumps(cid)
-        + ", review_result: 'FAIL' });\n"
-        + "  return _origWrite.apply(null, a);\n"
-        + "};\n"
-        + "const out = await promoteKnowledgeCandidate(env, { candidate_id: "
-        + json.dumps(cid)
-        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
-        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
-        + json.dumps(cid)
-        + ").first();\n"
-        + "console.log(JSON.stringify({ out: out.structuredContent, injected: injected && injected.structuredContent, candidate: candAfter, approvals: Array.from(approvalRows.values()), assets: Array.from(assetRows.values()), versions: Array.from(versionRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    # The exact original bug window (approval consumed, writer running): the FAIL
-    # can no longer be accepted, so no Canonical write follows an accepted FAIL.
-    assert report["injected"]["status"] == "REJECTED"
-    assert report["injected"]["reason"] == "candidate_state"
-    assert report["out"]["status"] == "WRITTEN"
-    assert report["out"]["write_calls"] == 1
-    assert report["candidate"]["status"] == "CANONICAL_READBACK_VERIFIED"
-    assert len(report["assets"]) == 1
-    assert len(report["versions"]) == 1
-    assert report["approvals"][0]["consumed"] == 1
-    assert report["approvals"][0]["invalidated"] == 0
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('race_writer')
 
 
 def test_worker_race_fail_after_write_before_status_update_is_rejected() -> None:
-    cid = "cand-race-postwrite"
-    script = (
-        "\n"
-        + _race_env(cid, {"text": "postwrite"})
-        + "let injected = null;\n"
-        + "const _prep = env.ASSET_DB.prepare.bind(env.ASSET_DB);\n"
-        + "env.ASSET_DB.prepare = function(sql) {\n"
-        + "  const stmt = _prep(sql);\n"
-        + "  const _bind = stmt.bind.bind(stmt);\n"
-        + "  stmt.bind = function(...a) {\n"
-        + "    const b = _bind(...a);\n"
-        + "    if (sql.indexOf(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE) === 0 && a[0] === KNOWLEDGE_CANDIDATE_PROMOTED) {\n"
-        + "      const _run = b.run.bind(b);\n"
-        + "      b.run = async function(...r) {\n"
-        + "        injected = await recordKnowledgeCandidateReview(env, { candidate_id: "
-        + json.dumps(cid)
-        + ", review_result: 'FAIL' });\n"
-        + "        return _run(...r);\n"
-        + "      };\n"
-        + "    }\n"
-        + "    return b;\n"
-        + "  };\n"
-        + "  return stmt;\n"
-        + "};\n"
-        + "const out = await promoteKnowledgeCandidate(env, { candidate_id: "
-        + json.dumps(cid)
-        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
-        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
-        + json.dumps(cid)
-        + ").first();\n"
-        + "console.log(JSON.stringify({ out: out.structuredContent, injected: injected && injected.structuredContent, candidate: candAfter, approvals: Array.from(approvalRows.values()), assets: Array.from(assetRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    # The candidate is still PROMOTION_RESERVED, so the FAIL is rejected and the
-    # guarded PROMOTED transition cannot be overwritten by it.
-    assert report["injected"]["status"] == "REJECTED"
-    assert report["out"]["status"] == "WRITTEN"
-    assert report["out"]["write_calls"] == 1
-    assert report["candidate"]["status"] == "CANONICAL_READBACK_VERIFIED"
-    assert len(report["assets"]) == 1
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('race_close')
 
 
 def test_worker_stale_reservation_without_canonical_fails_closed() -> None:
-    cid = "cand-stale-res"
-    script = (
-        "\n"
-        + _race_env(cid, {"text": "stale-res"})
-        + "await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE).bind(KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED, "
-        + json.dumps(cid)
-        + ", KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION).run();\n"
-        + "const out = await promoteKnowledgeCandidate(env, { candidate_id: "
-        + json.dumps(cid)
-        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
-        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
-        + json.dumps(cid)
-        + ").first();\n"
-        + "console.log(JSON.stringify({ out: out.structuredContent, candidate: candAfter, approvals: Array.from(approvalRows.values()), assets: Array.from(assetRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["out"]["status"] == "REJECTED"
-    assert report["out"]["reason"] == "promotion_reserved"
-    assert report["out"]["write_calls"] == 0
-    assert report["candidate"]["status"] == "PROMOTION_RESERVED"
-    # No approval consumed and no Canonical write attempted.
-    assert report["approvals"][0]["consumed"] == 0
-    assert report["assets"] == []
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    run_production_gate_scenario('reserved_without')
 
 
 def test_worker_stale_reservation_with_canonical_advances_without_new_write() -> None:
-    cid = "cand-stale-rec"
-    script = (
-        "\n"
-        + _race_env(cid, {"text": "stale-rec"})
-        + "const first = await promoteKnowledgeCandidate(env, { candidate_id: "
-        + json.dumps(cid)
-        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
-        + "await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE).bind(KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED, "
-        + json.dumps(cid)
-        + ", KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED).run();\n"
-        + "const second = await promoteKnowledgeCandidate(env, { candidate_id: "
-        + json.dumps(cid)
-        + ", candidate_version: cand.version, content_hash: cand.content_hash, review_result: 'PASS' });\n"
-        + "const candAfter = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind("
-        + json.dumps(cid)
-        + ").first();\n"
-        + "console.log(JSON.stringify({ first: first.structuredContent, second: second.structuredContent, candidate: candAfter, assets: Array.from(assetRows.values()) }));\n"
-    )
-    report = run_gated_probe(script)
-    assert report["first"]["status"] == "WRITTEN"
-    assert report["second"]["status"] == "IDEMPOTENT"
-    assert report["second"]["write_calls"] == 0
-    assert report["candidate"]["status"] == "CANONICAL_READBACK_VERIFIED"
-    # No duplicate Canonical write.
-    assert len(report["assets"]) == 1
+    # Current production epoch-ms, exact-target, assertion/counter contract.
+    # Superseded behavior: uncertain reservations now require external reconciliation, never automatic retry.
+    run_production_gate_scenario('reserved_with')
 
 
 # ---------------------------------------------------------------------------
@@ -1820,3 +1356,16 @@ def test_isolated_sqlite_fail_first_blocks_promotion_reservation(tmp_path) -> No
         "status"
     ] == hello_module.KNOWLEDGE_CANDIDATE_PENDING_REVIEW
     conn.close()
+
+
+def run_production_gate_scenario(scenario: str) -> None:
+    """Real in-memory SQLite production schema/triggers; no cloud calls."""
+    script = REPO_ROOT / "tests" / "production_gate_scenarios.mjs"
+    completed = subprocess.run([NODE, str(script), scenario], capture_output=True, text=True, timeout=30)
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert result == {"scenario": scenario, "passed": True, "production_access": False}
+
+
+def test_review_cas_failure_cannot_invalidate_newer_approval():
+    run_production_gate_scenario('review_cas')

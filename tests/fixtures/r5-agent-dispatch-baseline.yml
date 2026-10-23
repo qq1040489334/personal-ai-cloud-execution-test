@@ -1,0 +1,262 @@
+name: cloud-agent-dispatch
+
+on:
+  repository_dispatch:
+    types: [gpt_task]
+
+permissions:
+  contents: write
+
+# Isolate execution concurrency by task so a newly accepted task cannot cancel an
+# older queued task before it starts. Publication to main remains fail-closed:
+# the Push step below fetches/rebases and retries only non-fast-forward races.
+concurrency:
+  group: cloud-agent-dispatch-${{ github.event.client_payload.task.task_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    name: cloud-agent-dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout (no persisted credentials)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install opencode + pytest
+        run: |
+          npm install -g @opencode/cli@2.1.1
+          python -m pip install --quiet pytest
+
+      - name: Record base revision
+        id: base
+        run: echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Write task contract from client_payload
+        env:
+          TASK_JSON: ${{ toJSON(github.event.client_payload.task) }}
+        run: printf '%s' "$TASK_JSON" > "$RUNNER_TEMP/task.json"
+
+      - name: Gate 1 - validate task contract (fail-closed)
+        run: git show "${{ steps.base.outputs.base }}:scripts/task_contract.py" | python - "$RUNNER_TEMP/task.json"
+
+      - name: Run OpenCode agent (execute task contract)
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_GO_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          AGENT_RESULT_PATH: ${{ runner.temp }}/agent_result.json
+        run: |
+          CONTRACT="$(cat "$RUNNER_TEMP/task.json")"
+          opencode run --standalone --auto --model opencode-go/deepseek-v4.1-flash "You are working in a git repository in the current directory. Execute this structured task contract (JSON): ${CONTRACT}. Hard rules: within the repository, modify only paths explicitly listed in task.expected_files; never touch .github/workflows/, secret/token/credential/.env/.pem/.key paths; never delete files. For result publication, you may additionally write ${AGENT_RESULT_PATH} in the runner's temporary directory. Steps: 1) read the files; 2) implement the instructions; 3) add or update pytest tests only when their exact paths are explicitly listed in task.expected_files; otherwise run existing tests and perform task-specific validation without creating or modifying repository files outside the allowlist; 4) run: python -m pytest -q and fix failures; 5) run: git add -A && git commit -m 'cloud agent: gpt task'. Before finishing, write your complete structured execution result as a JSON object to ${AGENT_RESULT_PATH}; preserve all result fields and evidence. Keep business outcome fields such as final_status separate from workflow status. At the very end print a line beginning with AGENT_DONE followed by the pytest summary line and the commit hash."
+
+      - name: Gate 2 - scope guard (fail-closed)
+        run: git show "${{ steps.base.outputs.base }}:scripts/scope_guard.py" | python - "${{ steps.base.outputs.base }}" "$RUNNER_TEMP/task.json"
+
+      - name: Verify tests (independent)
+        id: tests
+        timeout-minutes: 15
+        run: |
+          set +e
+          test_output="$(python -m pytest -q 2>&1)"
+          test_status=$?
+          printf '%s\n' "$test_output"
+          summary="$(printf '%s\n' "$test_output" | tail -n 1)"
+          echo "summary=$summary" >> "$GITHUB_OUTPUT"
+          exit "$test_status"
+
+      - name: Ensure a commit exists
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no uncommitted changes"
+          else
+            git commit -m "cloud agent: gpt task"
+          fi
+
+      - name: Gate 3 - secret leak check (fail-closed)
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: git show "${{ steps.base.outputs.base }}:scripts/secret_guard.py" | python - "${{ steps.base.outputs.base }}"
+
+      - name: Push (credentials added only here)
+        id: push
+        run: |
+          git config user.name "cloud-agent"
+          git config user.email "cloud-agent@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          max_attempts=5
+          attempt=1
+          while [ "$attempt" -le "$max_attempts" ]; do
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              echo "Push rebase conflict; refusing to overwrite main."
+              exit 1
+            fi
+            push_output="$(git push origin HEAD:main 2>&1)" && push_status=0 || push_status=$?
+            printf '%s\n' "$push_output"
+            if [ "$push_status" -eq 0 ]; then exit 0; fi
+            if ! printf '%s' "$push_output" | grep -Eqi 'non-fast-forward|fetch first|stale info|tip of your current branch is behind'; then exit "$push_status"; fi
+            if [ "$attempt" -eq "$max_attempts" ]; then exit "$push_status"; fi
+            attempt=$((attempt + 1))
+            sleep "$attempt"
+          done
+
+      - name: Extract task_id
+        if: always()
+        id: taskid
+        run: |
+          TID=$(python -c "import json,sys;d=json.load(open(sys.argv[1]));d=json.loads(d) if isinstance(d,str) else d;print(d.get('task_id',''))" "$RUNNER_TEMP/task.json")
+          echo "task_id=$TID" >> "$GITHUB_OUTPUT"
+
+      - name: Build execution_result.json
+        if: always()
+        id: receipt
+        env:
+          JOB_STATUS: ${{ job.status }}
+          PUSH_OUTCOME: ${{ steps.push.outcome }}
+        run: |
+          if [ -f "$RUNNER_TEMP/task.json" ]; then
+            BASE="${{ steps.base.outputs.base }}"
+            SUMMARY="${{ steps.tests.outputs.summary }}"
+            if [ -n "$BASE" ] && git cat-file -e "$BASE:scripts/build_execution_result.py" 2>/dev/null; then
+              git show "$BASE:scripts/build_execution_result.py" | python - "$RUNNER_TEMP/task.json" "$BASE" "$SUMMARY" "$RUNNER_TEMP/execution_result.json" "$RUNNER_TEMP/agent_result.json" || true
+            fi
+            if [ "$JOB_STATUS" != "success" ]; then
+              rm -f "$RUNNER_TEMP/execution_result.json"
+            fi
+            if [ ! -s "$RUNNER_TEMP/execution_result.json" ]; then
+              python - "$RUNNER_TEMP/task.json" "$RUNNER_TEMP/execution_result.json" "$JOB_STATUS" "$PUSH_OUTCOME" <<'PY'
+          import json,sys
+          src,out,job_status,push_outcome=sys.argv[1:]
+          d=json.load(open(src))
+          if isinstance(d,str): d=json.loads(d)
+          failure_stage = "push" if push_outcome == "failure" else "workflow"
+          r={"task_id":d.get("task_id",""),"status":"failure","summary":"cloud-agent-dispatch terminated before normal result publication","failure_stage":failure_stage,"job_status":job_status,"push_outcome":push_outcome}
+          json.dump(r,open(out,"w"),ensure_ascii=False,indent=2)
+          PY
+            fi
+          fi
+
+      - name: Prepare trusted terminal notification
+        id: notification_prepare
+        if: always() && steps.receipt.outcome == 'success' && steps.taskid.outputs.task_id != '' && steps.base.outcome == 'success'
+        env:
+          BASE: ${{ steps.base.outputs.base }}
+          TASK_JSON: ${{ toJSON(github.event.client_payload.task) }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          python -I -S - <<'PY'
+          import hashlib,json,os,re,subprocess,tempfile
+          from pathlib import Path
+          base=os.environ["BASE"]
+          if not re.fullmatch(r"[0-9a-fA-F]{40}",base):
+              raise ValueError("trusted notification base is not a commit SHA")
+          task=json.loads(os.environ["TASK_JSON"])
+          if isinstance(task,str): task=json.loads(task)
+          receipt=json.loads((Path(os.environ["RUNNER_TEMP"])/"execution_result.json").read_text(encoding="utf-8"))
+          task_id=task.get("task_id") if isinstance(task,dict) else None
+          if not isinstance(task_id,str) or not task_id or not isinstance(receipt,dict) or receipt.get("task_id")!=task_id:
+              raise ValueError("trusted notification task identity mismatch")
+          job_status=os.environ["JOB_STATUS"]
+          if receipt.get("status") not in {"success","failure"} or job_status not in {"success","failure","cancelled"}:
+              raise ValueError("trusted notification terminal status unavailable")
+          # Ignore agent-created Git replace refs and never execute working-tree code.
+          source=subprocess.run(["git","--no-replace-objects","show",base+":hello.py"],check=True,capture_output=True).stdout
+          directory=Path(tempfile.mkdtemp(prefix="trusted-notification-",dir=os.environ["RUNNER_TEMP"]))
+          code=directory/"hello.py"
+          code.write_bytes(source)
+          agent=receipt.get("agent_result")
+          # Nested Agent verdict wins; never infer business PASS from status=success.
+          raw=agent.get("final_status") if isinstance(agent,dict) else receipt.get("final_status")
+          token=raw.strip().upper() if isinstance(raw,str) else ""
+          business={"PASS":"PASS","FAIL":"FAILED","FAILED":"FAILED","BLOCKED":"BLOCKED"}.get(token,"UNKNOWN")
+          if token.startswith("BLOCKED_"): business="BLOCKED"
+          status="success" if job_status=="success" and receipt["status"]=="success" and business=="PASS" else "failure"
+          classification=("FAIL" if job_status!="success" or business=="FAILED" else
+                          "PENDING_APPROVAL" if status=="success" else "BLOCKED")
+          # Failed jobs may contain unsafe arbitrary agent text; send only a fixed
+          # summary and the original event identity, never raw result fields.
+          safe={"task_id":task_id,"status":status,"job_status":job_status,
+                "workflow_status":job_status,"business_status":business,"final_status":business,
+                "notification_classification":classification,
+                "summary":"Business PASS reported; review the task artifact." if status=="success" else
+                          "Workflow failed; inspect the task artifact." if job_status!="success" else
+                          "Business status "+business+"; inspect the task artifact."}
+          result=directory/"notification_result.json"
+          result.write_text(json.dumps(safe,ensure_ascii=False),encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8") as output:
+              output.write("code="+str(code)+"\nresult="+str(result)+"\n")
+          print(json.dumps({"base":base,"notification_source_sha256":hashlib.sha256(source).hexdigest(),"status":status}))
+          PY
+
+      - name: Restore ServerChan delivery ledger
+        id: delivery_ledger_restore
+        if: always() && steps.notification_prepare.outcome == 'success'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/personal_ai_serverchan_delivery_ledger.json
+          key: personal-ai-serverchan-delivery-ledger-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            personal-ai-serverchan-delivery-ledger-v1-
+
+      - name: Dedicated ServerChan push (credential only here)
+        id: notification_push
+        if: always() && steps.notification_prepare.outcome == 'success' && steps.delivery_ledger_restore.outcome == 'success'
+        env:
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          PERSONAL_AI_SERVERCHAN_DELIVERY_LEDGER: ${{ runner.temp }}/personal_ai_serverchan_delivery_ledger.json
+          PERSONAL_AI_PUSH_OUTBOX_STATE: ${{ runner.temp }}/personal_ai_push_outbox.json
+          PERSONAL_AI_CONSUMER_STATE: ${{ runner.temp }}/personal_ai_notification_consumer.json
+          PERSONAL_AI_EXECUTION_RESULT: ${{ steps.notification_prepare.outputs.result }}
+          NOTIFICATION_CODE: ${{ steps.notification_prepare.outputs.code }}
+        run: |
+          python -I -S "$NOTIFICATION_CODE" notification-push --result "$PERSONAL_AI_EXECUTION_RESULT" > "$RUNNER_TEMP/notification_delivery.json"
+          python -I -S - <<'PY'
+          import json,os
+          from pathlib import Path
+          result=json.loads((Path(os.environ["RUNNER_TEMP"])/"notification_delivery.json").read_text(encoding="utf-8"))
+          delivered=result.get("delivery_state")=="delivered" and result.get("dispatched") is True
+          print(json.dumps({key:result.get(key) for key in ("task_id","classification","delivery_state","dispatched","already_delivered","fail_closed","external_blocker")}))
+          raise SystemExit(0 if delivered else 1)
+          PY
+
+      - name: Save ServerChan delivery ledger
+        if: always() && steps.delivery_ledger_restore.outcome == 'success' && steps.notification_push.outcome != 'skipped' && steps.notification_push.outcome != ''
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/personal_ai_serverchan_delivery_ledger.json
+          key: personal-ai-serverchan-delivery-ledger-v1-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload execution_result artifact
+        if: always() && steps.taskid.outputs.task_id != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: execution_result-${{ steps.taskid.outputs.task_id }}
+          path: ${{ runner.temp }}/execution_result.json
+          if-no-files-found: error
+
+      - name: Step summary
+        if: always()
+        run: |
+          echo "## cloud-agent-dispatch" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$RUNNER_TEMP/execution_result.json" ]; then
+            echo '~~~json' >> "$GITHUB_STEP_SUMMARY"
+            cat "$RUNNER_TEMP/execution_result.json" >> "$GITHUB_STEP_SUMMARY"
+            echo '~~~' >> "$GITHUB_STEP_SUMMARY"
+          fi

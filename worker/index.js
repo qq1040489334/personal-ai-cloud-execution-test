@@ -447,7 +447,8 @@ async function guardedKnowledgePromote(env, input, { writer, verifyVersion }) {
   }
 }
 
-// dispatch/production-knowledge-minimal-package-20261020/worker/entry.mjs
+
+// src/index.js
 var u8 = Uint8Array;
 var u16 = Uint16Array;
 var i32 = Int32Array;
@@ -927,7 +928,18 @@ var EXECUTION_STATUS_PENDING = "PENDING";
 var EXECUTION_STATUS_PASS = "PASS";
 var EXECUTION_STATUS_FAIL = "FAIL";
 var EXECUTION_STATUS_BLOCKED = "BLOCKED";
+var EXECUTION_STATUSES = [
+  EXECUTION_STATUS_PENDING,
+  EXECUTION_STATUS_PASS,
+  EXECUTION_STATUS_FAIL,
+  EXECUTION_STATUS_BLOCKED
+];
 var TERMINAL_EXECUTION_STATUSES = [
+  EXECUTION_STATUS_PASS,
+  EXECUTION_STATUS_FAIL,
+  EXECUTION_STATUS_BLOCKED
+];
+var REVIEW_VERDICTS_CANONICAL = [
   EXECUTION_STATUS_PASS,
   EXECUTION_STATUS_FAIL,
   EXECUTION_STATUS_BLOCKED
@@ -963,6 +975,424 @@ var SELF_REPORTED_SUCCESS_STATUSES = [
   "completed"
 ];
 var PROTOCOL_VERSION = "2025-06-18";
+var EVENTS_PROTOCOL_VERSION = "2026-07-28";
+var EVENTS_KV_PREFIX = "events-subscription::";
+var EVENTS_DELIVERY_PREFIX = "events-delivered::";
+var EVENT_MAX_BYTES = 262144;
+var EVENT_DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+var EVENT_MIN_TTL_MS = 60 * 1000;
+var EVENT_MAX_ATTEMPTS = 4;
+var EVENT_RETRY_BASE_MS = 25;
+var EVENT_CALLBACK_TIMEOUT_MS = 10000;
+var EVENT_SIGNATURE_TOLERANCE_SEC = 300;
+var TASK_COMPLETED_EVENT = "task.completed";
+var EVENTS = [
+  {
+    name: TASK_COMPLETED_EVENT,
+    description: "A Personal AI execution task reached a terminal result. Read the full evidence with the existing get_task_result(task_id) tool; the payload carries identifiers only.",
+    delivery: ["webhook"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string", description: "Only deliver completions for this task id." },
+        project_id: { type: "string", description: "Only deliver completions for this project lineage." }
+      },
+      additionalProperties: false
+    },
+    payloadSchema: {
+      type: "object",
+      properties: {
+        task_id: { type: "string" },
+        status: { type: "string" },
+        project_id: { type: "string" }
+      },
+      required: ["task_id", "status"],
+      additionalProperties: false
+    }
+  }
+];
+function canonicalJson(value) {
+  if (Array.isArray(value)) return "[" + value.map(canonicalJson).join(",") + "]";
+  if (value && typeof value === "object") {
+    return "{" + Object.keys(value).sort().map((k) => JSON.stringify(k) + ":" + canonicalJson(value[k])).join(",") + "}";
+  }
+  return JSON.stringify(value);
+}
+function bytesToB64(bytes) {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+function decodeWhsec(secret) {
+  if (typeof secret !== "string" || !secret.startsWith("whsec_")) return null;
+  const raw = secret.slice(6);
+  if (!raw || !/^[A-Za-z0-9+/=_-]+$/.test(raw)) return null;
+  try {
+    const b64 = raw.replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i2 = 0; i2 < bin.length; i2++) bytes[i2] = bin.charCodeAt(i2);
+    if (bytes.length < 24 || bytes.length > 64) return null;
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+async function standardWebhookSignature(secret, msgId, timestamp, body) {
+  const raw = decodeWhsec(secret);
+  if (!raw) throw mcpError(-32602, "INVALID_PARAMS", "invalid_signing_secret");
+  const key = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${msgId}.${timestamp}.${body}`));
+  return "v1," + bytesToB64(new Uint8Array(sig));
+}
+async function verifyStandardWebhookSignature(secret, msgId, timestamp, body, header, toleranceSec) {
+  if (typeof header !== "string") return false;
+  const ts = Number(timestamp);
+  if (!Number.isFinite(ts)) return false;
+  const tolerance = toleranceSec == null ? EVENT_SIGNATURE_TOLERANCE_SEC : Number(toleranceSec);
+  if (Math.abs(nowSec() - ts) > tolerance) return false;
+  const expected = await standardWebhookSignature(secret, msgId, String(timestamp), body);
+  const expectedSig = expected.slice(expected.indexOf(",") + 1);
+  for (const part of header.split(/\s+/).filter(Boolean)) {
+    const comma = part.indexOf(",");
+    const version = comma === -1 ? "" : part.slice(0, comma);
+    const sig = comma === -1 ? part : part.slice(comma + 1);
+    if (version === "v1" && timingSafeEqual(sig, expectedSig)) return true;
+  }
+  return false;
+}
+function mcpError(code, message, data) {
+  const err = new Error(message);
+  let payload = null;
+  if (typeof data === "string") payload = { reason: data };
+  else if (data && typeof data === "object") payload = data;
+  err.mcpError = { code, message, data: payload };
+  return err;
+}
+function callbackUrlError(reason) {
+  return mcpError(-32015, "CallbackEndpointError", reason);
+}
+function validateCallbackUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl || ""));
+  } catch {
+    throw callbackUrlError("invalid_url");
+  }
+  if (parsed.protocol !== "https:") throw callbackUrlError("insecure_scheme");
+  if (parsed.username || parsed.password) throw callbackUrlError("userinfo_not_allowed");
+  const host = parsed.hostname.toLowerCase();
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) {
+    throw callbackUrlError("non_public_address");
+  }
+  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const parts = ipv4.slice(1).map(Number);
+    if (parts.some((n) => n > 255)) throw callbackUrlError("invalid_url");
+    const [a, b] = parts;
+    if (a === 0 || a === 10 || a === 127 || a >= 224 || a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a === 100 && b >= 64 && b <= 127 || a === 198 && (b === 18 || b === 19)) {
+      throw callbackUrlError("non_public_address");
+    }
+  } else if (host.includes(":")) {
+    const h = host.replace(/^\[|\]$/g, "");
+    if (h === "::" || h === "::1" || h.startsWith("fe80") || h.startsWith("fc") || h.startsWith("fd") || h.startsWith("ff")) {
+      throw callbackUrlError("non_public_address");
+    }
+  }
+  return parsed;
+}
+async function eventFetch(url, options) {
+  validateCallbackUrl(url);
+  if (typeof fetch !== "function") throw callbackUrlError("network_unavailable");
+  return fetch(url, options);
+}
+function utf8ByteLength(text) {
+  return new TextEncoder().encode(text).length;
+}
+function authPrincipal(auth) {
+  if (auth && auth.payload && auth.payload.sub) return String(auth.payload.sub);
+  return "owner";
+}
+function validateEventArgs(args, schema) {
+  const value = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const props = schema.properties || {};
+  for (const key of Object.keys(value)) {
+    if (!props[key]) return { ok: false, reason: `unexpected_argument:${key}` };
+    const type = props[key].type;
+    if (type && typeof value[key] !== type) return { ok: false, reason: `invalid_argument:${key}` };
+  }
+  for (const required of schema.required || []) {
+    if (value[required] === void 0 || value[required] === null || value[required] === "") {
+      return { ok: false, reason: `missing_argument:${required}` };
+    }
+  }
+  return { ok: true, value };
+}
+function resolveTtlMs(requested) {
+  if (requested === null || requested === void 0) return EVENT_DEFAULT_TTL_MS;
+  const value = Number(requested);
+  if (!Number.isFinite(value) || value < 0) return EVENT_DEFAULT_TTL_MS;
+  return Math.max(EVENT_MIN_TTL_MS, Math.min(value, EVENT_DEFAULT_TTL_MS));
+}
+function newEventId() {
+  if (crypto.randomUUID) return "evt_" + crypto.randomUUID().replace(/-/g, "");
+  return "evt_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+function newChallenge() {
+  if (crypto.randomUUID) return crypto.randomUUID().replace(/-/g, "");
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+async function deterministicSubscriptionId(principal, url, name, args) {
+  const fingerprint = `${principal}
+${url}
+${name}
+${canonicalJson(args || {})}`;
+  return "sub_" + (await sha256Hex(fingerprint)).slice(0, 32);
+}
+function listEvents() {
+  return { events: EVENTS, nextCursor: null, truncated: false };
+}
+async function listSubscriptions(env) {
+  if (!env.TASK_REGISTRY || typeof env.TASK_REGISTRY.list !== "function") return [];
+  const listed = await env.TASK_REGISTRY.list({ prefix: EVENTS_KV_PREFIX });
+  const subscriptions = [];
+  for (const key of listed.keys || []) {
+    const sub = await env.TASK_REGISTRY.get(key.name, "json");
+    if (sub) subscriptions.push(sub);
+  }
+  return subscriptions;
+}
+function matchEventFilter(args, data) {
+  const filter = args && typeof args === "object" ? args : {};
+  for (const key of Object.keys(filter)) {
+    if (filter[key] === void 0 || filter[key] === null) continue;
+    if (String(data[key]) !== String(filter[key])) return false;
+  }
+  return true;
+}
+function isSubscriptionExpired(sub, nowMs) {
+  if (!sub || !sub.refreshBefore) return false;
+  const expiry = Date.parse(sub.refreshBefore);
+  return Number.isFinite(expiry) && expiry <= nowMs;
+}
+async function verifyCallbackEndpoint(sub) {
+  const challenge = newChallenge();
+  const msgId = "msg_verification_" + challenge.slice(0, 16);
+  const timestamp = String(nowSec());
+  const body = JSON.stringify({ type: "verification", challenge });
+  let response;
+  try {
+    const signature = await standardWebhookSignature(sub.secret, msgId, timestamp, body);
+    response = await eventFetch(sub.url, {
+      method: "POST",
+      redirect: "error",
+      signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(EVENT_CALLBACK_TIMEOUT_MS) : void 0,
+      headers: {
+        "Content-Type": "application/json",
+        "webhook-id": msgId,
+        "webhook-timestamp": timestamp,
+        "webhook-signature": signature,
+        "X-MCP-Subscription-Id": sub.id
+      },
+      body
+    });
+  } catch (err) {
+    return { ok: false, reason: err && err.mcpError && err.mcpError.data ? err.mcpError.data.reason : "timeout" };
+  }
+  if (!response || response.status < 200 || response.status >= 300) return { ok: false, reason: "challenge_failed" };
+  let echoed = null;
+  try {
+    echoed = await response.json();
+  } catch {
+    echoed = null;
+  }
+  if (!echoed || typeof echoed.challenge !== "string" || !timingSafeEqual(echoed.challenge, challenge)) {
+    return { ok: false, reason: "challenge_failed" };
+  }
+  return { ok: true, reason: null };
+}
+async function handleEventsSubscribe(env, auth, params) {
+  if (!env.TASK_REGISTRY) throw mcpError(-32000, "UNSUPPORTED", "TASK_REGISTRY_UNAVAILABLE");
+  const name = String(params.name || "");
+  const definition = EVENTS.find((event) => event.name === name);
+  if (!definition) throw mcpError(-32602, "INVALID_PARAMS", `unknown event: ${name}`);
+  const validated = validateEventArgs(params.arguments || {}, definition.inputSchema);
+  if (!validated.ok) throw mcpError(-32602, "INVALID_PARAMS", validated.reason);
+  const delivery = params.delivery && typeof params.delivery === "object" ? params.delivery : {};
+  const mode = String(delivery.mode || "webhook");
+  if (mode !== "webhook") throw mcpError(-32602, "INVALID_PARAMS", "unsupported_delivery_mode");
+  const url = validateCallbackUrl(delivery.url).toString();
+  if (decodeWhsec(delivery.secret) === null) throw mcpError(-32602, "INVALID_PARAMS", "invalid_signing_secret");
+  const principal = authPrincipal(auth);
+  const id = await deterministicSubscriptionId(principal, url, name, validated.value);
+  const key = EVENTS_KV_PREFIX + id;
+  let existing = null;
+  try {
+    existing = await env.TASK_REGISTRY.get(key, "json");
+  } catch {
+    existing = null;
+  }
+  const verified = await verifyCallbackEndpoint({ id, url, secret: delivery.secret });
+  if (!verified.ok) throw mcpError(-32015, "CallbackEndpointError", verified.reason || "challenge_failed");
+  const now = /* @__PURE__ */ new Date();
+  const ttlMs = resolveTtlMs(params.ttlMs);
+  const refreshBefore = ttlMs === null ? null : new Date(now.getTime() + ttlMs).toISOString();
+  const secretRotated = Boolean(existing && existing.delivery && existing.delivery.secret && existing.delivery.secret !== delivery.secret);
+  const record = {
+    id,
+    principal,
+    name,
+    arguments: validated.value,
+    delivery: { mode: "webhook", url, secret: delivery.secret },
+    created_at: existing && existing.created_at ? existing.created_at : now.toISOString(),
+    updated_at: now.toISOString(),
+    refreshBefore,
+    ttlMs,
+    verified_at: now.toISOString(),
+    cursor: null,
+    previous_secret: secretRotated ? existing.delivery.secret : null,
+    previous_secret_expires_at: secretRotated ? new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString() : null
+  };
+  await env.TASK_REGISTRY.put(key, JSON.stringify(record), { metadata: { name, principal } });
+  return { id, refreshBefore, cursor: null, truncated: false, secret_rotated: secretRotated };
+}
+async function handleEventsUnsubscribe(env, auth, params) {
+  if (!env.TASK_REGISTRY) throw mcpError(-32000, "UNSUPPORTED", "TASK_REGISTRY_UNAVAILABLE");
+  const name = String(params.name || "");
+  const definition = EVENTS.find((event) => event.name === name);
+  if (!definition) throw mcpError(-32602, "INVALID_PARAMS", `unknown event: ${name}`);
+  const validated = validateEventArgs(params.arguments || {}, definition.inputSchema);
+  if (!validated.ok) throw mcpError(-32602, "INVALID_PARAMS", validated.reason);
+  const delivery = params.delivery && typeof params.delivery === "object" ? params.delivery : {};
+  const url = validateCallbackUrl(delivery.url).toString();
+  const principal = authPrincipal(auth);
+  const id = await deterministicSubscriptionId(principal, url, name, validated.value);
+  const key = EVENTS_KV_PREFIX + id;
+  let existing = null;
+  try {
+    existing = await env.TASK_REGISTRY.get(key, "json");
+  } catch {
+    existing = null;
+  }
+  if (existing && existing.principal === principal && typeof env.TASK_REGISTRY.delete === "function") {
+    try {
+      await env.TASK_REGISTRY.delete(key);
+    } catch {
+    }
+  }
+  return {};
+}
+function retryDelayMs(attempt, options) {
+  const base = options && options.retryBaseMs != null ? options.retryBaseMs : EVENT_RETRY_BASE_MS;
+  return base * Math.pow(2, Math.max(0, attempt - 1));
+}
+async function sleepMs(ms, options) {
+  if (options && typeof options.sleep === "function") return options.sleep(ms);
+  if (!ms || ms <= 0) return;
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+async function sendEventToSubscription(env, sub, event, options) {
+  const opts = options || {};
+  const maxAttempts = Math.max(1, Number(opts.maxAttempts) || EVENT_MAX_ATTEMPTS);
+  const body = JSON.stringify(event);
+  if (utf8ByteLength(body) > EVENT_MAX_BYTES) throw callbackUrlError("payload_too_large");
+  const attempts = [];
+  const secrets = [sub.delivery && sub.delivery.secret ? sub.delivery.secret : sub.secret];
+  const previous = sub.previous_secret || sub.delivery && sub.delivery.previous_secret;
+  if (previous && (!sub.previous_secret_expires_at || Date.parse(sub.previous_secret_expires_at) > Date.now())) secrets.push(previous);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const signedAt = opts.now ? new Date(opts.now) : /* @__PURE__ */ new Date();
+    const timestamp = String(Math.floor(signedAt.getTime() / 1e3));
+    const signatures = [];
+    for (const secret of secrets) signatures.push(await standardWebhookSignature(secret, event.eventId, timestamp, body));
+    let response = null;
+    try {
+      response = await eventFetch(sub.delivery.url, {
+        method: "POST",
+        redirect: "error",
+        signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(EVENT_CALLBACK_TIMEOUT_MS) : void 0,
+        headers: {
+          "Content-Type": "application/json",
+          "webhook-id": event.eventId,
+          "webhook-timestamp": timestamp,
+          "webhook-signature": signatures.join(" "),
+          "X-MCP-Subscription-Id": sub.id
+        },
+        body
+      });
+    } catch (err) {
+      attempts.push({ attempt, status: null, error: "network_error" });
+      if (attempt < maxAttempts) await sleepMs(retryDelayMs(attempt, opts), opts);
+      continue;
+    }
+    const status = response ? response.status : null;
+    attempts.push({ attempt, status });
+    if (status != null && status >= 200 && status < 300) return { accepted: true, status, attempts };
+    if (status === 410 || status === 413) return { accepted: false, status, attempts, retryable: false };
+    if (attempt < maxAttempts) await sleepMs(retryDelayMs(attempt, opts), opts);
+  }
+  const last = attempts[attempts.length - 1] || {};
+  return { accepted: false, status: last.status == null ? null : last.status, attempts, retryable: true };
+}
+async function readDeliveryMarker(env, subscriptionId, eventId) {
+  if (!env.TASK_REGISTRY || typeof env.TASK_REGISTRY.get !== "function") return null;
+  try {
+    return await env.TASK_REGISTRY.get(EVENTS_DELIVERY_PREFIX + subscriptionId + "::" + eventId, "text");
+  } catch {
+    return null;
+  }
+}
+async function writeDeliveryMarker(env, subscriptionId, eventId) {
+  if (!env.TASK_REGISTRY || typeof env.TASK_REGISTRY.put !== "function") return;
+  try {
+    await env.TASK_REGISTRY.put(EVENTS_DELIVERY_PREFIX + subscriptionId + "::" + eventId, "1", { expirationTtl: 86400 });
+  } catch {
+  }
+}
+async function emitTaskCompleted(env, input, options) {
+  const opts = options || {};
+  if (!env || !env.TASK_REGISTRY) return { eventId: null, delivered: [], skipped: [], reason: "TASK_REGISTRY_UNAVAILABLE" };
+  const data = {
+    task_id: String(input && input.task_id ? input.task_id : ""),
+    status: String(input && input.status ? input.status : "")
+  };
+  if (input && input.project_id) data.project_id = String(input.project_id);
+  if (!data.task_id || !data.status) return { eventId: null, delivered: [], skipped: [], reason: "INVALID_EVENT_DATA" };
+  const event = {
+    eventId: input.event_id ? String(input.event_id) : newEventId(),
+    name: TASK_COMPLETED_EVENT,
+    timestamp: new Date(opts.now ? opts.now : Date.now()).toISOString(),
+    data,
+    cursor: null
+  };
+  const nowMs = opts.now ? new Date(opts.now).getTime() : Date.now();
+  const subscriptions = await listSubscriptions(env);
+  const delivered = [];
+  const skipped = [];
+  for (const sub of subscriptions) {
+    if (!sub || sub.name !== event.name) continue;
+    if (isSubscriptionExpired(sub, nowMs)) {
+      skipped.push({ id: sub.id, reason: "expired" });
+      continue;
+    }
+    if (!matchEventFilter(sub.arguments, event.data)) {
+      skipped.push({ id: sub.id, reason: "filter_mismatch" });
+      continue;
+    }
+    if (await readDeliveryMarker(env, sub.id, event.eventId)) {
+      skipped.push({ id: sub.id, reason: "duplicate" });
+      continue;
+    }
+    const result = await sendEventToSubscription(env, sub, event, opts);
+    if (result.accepted) {
+      await writeDeliveryMarker(env, sub.id, event.eventId);
+      delivered.push({ id: sub.id, status: result.status, attempts: result.attempts.length });
+    } else {
+      skipped.push({ id: sub.id, reason: "delivery_failed", status: result.status });
+    }
+  }
+  return { eventId: event.eventId, delivered, skipped };
+}
 var ACCESS_TTL = 3600;
 var REFRESH_TTL = 60 * 60 * 24 * 30;
 var CODE_TTL = 300;
@@ -976,6 +1406,15 @@ var CHATGPT_REDIRECT_PREFIX = "https://chatgpt.com/connector/oauth/";
 var ALLOWLIST = ["hello.py", "test_hello.py"];
 var FORBIDDEN_PREFIXES = [".github/workflows/"];
 var FORBIDDEN_SUBSTRINGS = ["secret", "token", "credential", ".env", ".pem", ".key"];
+var READONLY_MODES = /* @__PURE__ */ new Set(["readonly", "read_only", "read-only"]);
+var WRITE_MODES = /* @__PURE__ */ new Set(["write", "readwrite", "read_write", "read-write"]);
+function resolveMode(raw) {
+  if (raw === void 0 || raw === null || String(raw).trim() === "") return "write";
+  const mode = String(raw).trim().toLowerCase();
+  if (READONLY_MODES.has(mode)) return "readonly";
+  if (WRITE_MODES.has(mode)) return "write";
+  return null;
+}
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
@@ -1287,13 +1726,15 @@ function unauthorized(origin) {
 function newTaskId() {
   return `cf-${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
 }
-function buildContract(goal, instructions, acceptance, expectedFiles, lineage) {
-  const expected_files = expectedFiles === void 0 ? [...ALLOWLIST] : Array.isArray(expectedFiles) ? expectedFiles.map(String) : [];
+function buildContract(goal, instructions, acceptance, expectedFiles, lineage, mode) {
+  const resolvedMode = resolveMode(mode);
+  const expected_files = expectedFiles === void 0 ? resolvedMode === "readonly" ? [] : [...ALLOWLIST] : Array.isArray(expectedFiles) ? expectedFiles.map(String) : [];
   const contract = {
     task_id: newTaskId(),
     goal: String(goal ?? ""),
     instructions: Array.isArray(instructions) ? instructions.map(String) : [],
     risk_level: "LOW",
+    mode: resolvedMode === null ? String(mode) : resolvedMode,
     expected_files,
     acceptance: Array.isArray(acceptance) ? acceptance.map(String) : []
   };
@@ -1308,6 +1749,9 @@ function validateContract(contract) {
   if (!contract.goal.trim()) errors.push("goal must be non-empty");
   if (!contract.instructions.length) errors.push("instructions must be a non-empty list");
   if (!contract.acceptance.length) errors.push("acceptance must be a non-empty list");
+  if (resolveMode(contract.mode) === null) {
+    errors.push(`mode not acceptable: ${contract.mode} (allowed: readonly, write)`);
+  }
   for (const path of contract.expected_files) {
     if (typeof path !== "string" || !path.trim()) {
       errors.push(`expected_file must be a non-empty string: ${path}`);
@@ -1335,7 +1779,11 @@ function ghHeaders(env) {
   };
 }
 function safeGithubResponseBody(raw) {
-  return String(raw || "").slice(0, 512).replace(/gh[pousr]_[A-Za-z0-9_\-]+/gi, "[REDACTED]").replace(/github_pat_[A-Za-z0-9_]+/gi, "[REDACTED]").replace(/("?(?:token|secret|password|authorization)"?\s*:\s*")([^"\\]*)"/gi, '$1[REDACTED]"');
+  return String(raw || "")
+    .slice(0, 512)
+    .replace(/gh[pousr]_[A-Za-z0-9_\-]+/gi, "[REDACTED]")
+    .replace(/github_pat_[A-Za-z0-9_]+/gi, "[REDACTED]")
+    .replace(/("?(?:token|secret|password|authorization)"?\s*:\s*")([^"\\]*)"/gi, "$1[REDACTED]\"");
 }
 async function dispatchTask(env, contract) {
   const res = await fetch(`${API}/repos/${env.GITHUB_REPO}/dispatches`, {
@@ -1432,7 +1880,8 @@ function buildApprovedChildContract(approvedNextTask, parentLineage) {
       project_id: approvedNextTask.project_id || inherited.project_id,
       root_task_id: approvedNextTask.root_task_id || inherited.root_task_id,
       parent_task_id: inherited.parent_task_id
-    }
+    },
+    approvedNextTask.mode
   );
   return { contract, errors: validateContract(contract) };
 }
@@ -1574,10 +2023,10 @@ function reviewDispatchAudit(taskId, verdict, timestamp, dispatch) {
     reason: dispatch.reason ?? null
   };
 }
-async function findArtifact(env, name) {
+async function findArtifact(env, name, readOptions = {}) {
   const res = await fetch(
     `${API}/repos/${env.GITHUB_REPO}/actions/artifacts?name=${encodeURIComponent(name)}`,
-    { headers: ghHeaders(env) }
+    { ...readOptions, headers: ghHeaders(env) }
   );
   if (!res.ok) throw new Error(`GitHub artifact lookup failed HTTP ${res.status}`);
   const payload = await res.json();
@@ -1600,16 +2049,23 @@ async function downloadArtifactJson(env, artifactId) {
   if (!name) throw new Error(`${RESULT_FILENAME} not found in artifact`);
   return JSON.parse(new TextDecoder().decode(files[name]));
 }
-async function getArtifactWorkflowRun(env, artifact) {
+async function getArtifactWorkflowRun(env, artifact, readOptions = {}) {
   const runId = artifact?.workflow_run?.id;
   if (!runId) throw new Error("artifact missing workflow_run.id");
   const res = await fetch(`${API}/repos/${env.GITHUB_REPO}/actions/runs/${runId}`, {
-    headers: ghHeaders(env)
+    ...readOptions, headers: ghHeaders(env)
   });
   if (!res.ok) throw new Error(`GitHub workflow lookup failed HTTP ${res.status}`);
   const run = await res.json();
   return {
     id: run.id,
+    repository_full_name: run.repository?.full_name ?? null,
+    display_title: run.display_title ?? null,
+    event: run.event ?? null,
+    path: run.path ?? null,
+    run_number: run.run_number ?? null,
+    run_attempt: run.run_attempt ?? null,
+    run_started_at: run.run_started_at ?? null,
     status: run.status,
     conclusion: run.conclusion,
     html_url: run.html_url,
@@ -1662,6 +2118,9 @@ var DISPATCH_REASON_RETRY_FAILED = "RETRY_DISPATCH_FAILED";
 function retryDispatchKey(taskId, attempt) {
   return `${RETRY_DISPATCH_PREFIX}${taskId}:${attempt}`;
 }
+var LINEAGE_PROJECT_FIELD = "project_id";
+var LINEAGE_ROOT_FIELD = "root_task_id";
+var LINEAGE_PARENT_FIELD = "parent_task_id";
 var LINEAGE_KIND_PROJECT = "project";
 var LINEAGE_KIND_ROOT = "root";
 var MAX_LINEAGE_WALK = 64;
@@ -1786,6 +2245,179 @@ function lineageInScope(record, scope, index) {
   if (projectId) return resolved.kind === LINEAGE_KIND_PROJECT && resolved.key === String(projectId);
   return resolved.kind === LINEAGE_KIND_ROOT && resolved.key === String(rootTaskId);
 }
+function resolveLineageState(record, index, unresolved) {
+  const taskId = String(record && record.task_id || "");
+  const projectId = record && record.project_id;
+  if (projectId) return { kind: LINEAGE_KIND_PROJECT, key: String(projectId), resolved: true };
+  const root = record && record.root_task_id;
+  if (root) return { kind: LINEAGE_KIND_ROOT, key: String(root), resolved: true };
+  let parent = record && record.parent_task_id;
+  const seen = /* @__PURE__ */ new Set();
+  while (parent && !seen.has(String(parent)) && seen.size < MAX_LINEAGE_WALK) {
+    seen.add(String(parent));
+    if (unresolved && unresolved.has(String(parent))) {
+      return { kind: null, key: null, resolved: false };
+    }
+    const ancestor = index.get(String(parent));
+    if (!ancestor) break;
+    if (ancestor.root_task_id) return { kind: LINEAGE_KIND_ROOT, key: String(ancestor.root_task_id), resolved: true };
+    if (ancestor.project_id) return { kind: LINEAGE_KIND_PROJECT, key: String(ancestor.project_id), resolved: true };
+    parent = ancestor.parent_task_id;
+  }
+  return { kind: LINEAGE_KIND_ROOT, key: taskId, resolved: true };
+}
+var LINEAGE_MEMBERSHIP_MATCH = "match";
+var LINEAGE_MEMBERSHIP_NONMATCH = "nonmatch";
+var LINEAGE_MEMBERSHIP_UNRESOLVED = "unresolved";
+function classifyLineageMembership(record, scope, index, unresolved, taskId) {
+  const id = String(taskId != null ? taskId : record && record.task_id || "");
+  if (unresolved && unresolved.has(id)) return LINEAGE_MEMBERSHIP_UNRESOLVED;
+  const state = resolveLineageState(record, index, unresolved);
+  if (!state.resolved) return LINEAGE_MEMBERSHIP_UNRESOLVED;
+  if (!scope) return LINEAGE_MEMBERSHIP_MATCH;
+  const projectId = scope.project_id;
+  const rootTaskId = scope.root_task_id;
+  if (!projectId && !rootTaskId) return LINEAGE_MEMBERSHIP_MATCH;
+  if (projectId) {
+    return state.kind === LINEAGE_KIND_PROJECT && state.key === String(projectId) ? LINEAGE_MEMBERSHIP_MATCH : LINEAGE_MEMBERSHIP_NONMATCH;
+  }
+  return state.kind === LINEAGE_KIND_ROOT && state.key === String(rootTaskId) ? LINEAGE_MEMBERSHIP_MATCH : LINEAGE_MEMBERSHIP_NONMATCH;
+}
+var TASK_METADATA_MAX_BYTES = 1024;
+var TASK_METADATA_STRING_LIMIT = 256;
+var TASK_METADATA_LINEAGE_FIELDS = ["project_id", "root_task_id", "parent_task_id"];
+var TASK_METADATA_LINEAGE_COMPLETE_FLAG = "lineage_in_metadata_complete";
+var TASK_METADATA_CORE_FIELDS = [
+  "status",
+  "normalized_status",
+  "execution_status",
+  "terminal",
+  "result_available",
+  "reviewed",
+  "review_verdict",
+  "created_at",
+  "updated_at",
+  "dispatch_state",
+  "dispatch_attempt"
+];
+var TASK_METADATA_FIELDS = [
+  // execution state consumed by listing / pending-review reconciliation
+  "status",
+  "normalized_status",
+  "execution_status",
+  "workflow_conclusion",
+  "workflow_verified",
+  "terminal",
+  "result_available",
+  "synced",
+  // review consumer (verdict + timestamps only; never the note payload)
+  "reviewed",
+  "verdict",
+  "review_verdict",
+  "review_state",
+  "reviewed_at",
+  // lineage consumed by the supervisor scope filter
+  "project_id",
+  "root_task_id",
+  "parent_task_id",
+  // liveness / dispatch lease consumed by the retry planner
+  "dispatch_state",
+  "dispatch_attempt",
+  "dispatch_accepted_at",
+  "dispatch_confirm_deadline",
+  // bounded display / audit timestamps
+  "title",
+  "created_at",
+  "updated_at",
+  "completed_at"
+];
+function truncateUtf8Bytes(text, maxBytes) {
+  if (typeof text !== "string") return text;
+  const bytes = new TextEncoder().encode(text);
+  if (maxBytes < 0 || bytes.length <= maxBytes) return text;
+  let end = maxBytes;
+  while (end > 0 && (bytes[end] & 192) === 128) end -= 1;
+  return new TextDecoder().decode(bytes.subarray(0, end));
+}
+function metadataUtf8Bytes(metadata) {
+  return utf8ByteLength(JSON.stringify(metadata));
+}
+function lineageFieldsAltered(original, candidate) {
+  for (const key of TASK_METADATA_LINEAGE_FIELDS) {
+    if (!(key in original)) continue;
+    if (candidate[key] !== original[key]) return true;
+  }
+  return false;
+}
+function boundTaskMetadata(metadata, maxBytes) {
+  if (metadataUtf8Bytes(metadata) <= maxBytes) return metadata;
+  const limits = [128, 64, 32, 16, 8, 0];
+  for (const limit of limits) {
+    const next = {};
+    for (const key of Object.keys(metadata)) {
+      const value = metadata[key];
+      next[key] = typeof value === "string" ? truncateUtf8Bytes(value, limit) : value;
+    }
+    next.metadata_bounded = true;
+    next[TASK_METADATA_LINEAGE_COMPLETE_FLAG] = !lineageFieldsAltered(metadata, next);
+    if (metadataUtf8Bytes(next) <= maxBytes) return next;
+  }
+  for (const limit of [32, 16, 8, 4, 2, 1, 0]) {
+    const minimal = { metadata_bounded: true, [TASK_METADATA_LINEAGE_COMPLETE_FLAG]: false };
+    for (const key of TASK_METADATA_CORE_FIELDS) {
+      if (!(key in metadata)) continue;
+      const value = metadata[key];
+      minimal[key] = typeof value === "string" ? truncateUtf8Bytes(value, limit) : value;
+    }
+    if (metadataUtf8Bytes(minimal) <= maxBytes) return minimal;
+  }
+  return { metadata_bounded: true, [TASK_METADATA_LINEAGE_COMPLETE_FLAG]: false };
+}
+function metadataLineageComplete(record) {
+  if (!record || typeof record !== "object") return true;
+  if (record[TASK_METADATA_LINEAGE_COMPLETE_FLAG] === false) return false;
+  if (record.metadata_bounded === true) return false;
+  return true;
+}
+async function readTaskMetadataForLineage(env, task) {
+  if (!metadataLineageComplete(task)) {
+    try {
+      const full = await readTask(env, task.task_id);
+      if (full && typeof full === "object") return full;
+    } catch {
+    }
+    return null;
+  }
+  return task;
+}
+function buildTaskMetadata(entry) {
+  const source = entry && typeof entry === "object" && !Array.isArray(entry) ? entry : {};
+  const reviewEvent = source.review_event;
+  const eventNote = reviewEvent && typeof reviewEvent === "object" ? reviewEvent.note : void 0;
+  const note = source.review_note;
+  const metadata = {
+    // Bounded, non-leaking presence flags: the full note/event stay in the JSON
+    // value only, so the 1024-byte KV metadata bound can never be breached by a
+    // long or multi-byte note.
+    review_note_present: typeof note === "string" && note.length > 0 || typeof eventNote === "string" && eventNote.length > 0,
+    review_event_present: Boolean(reviewEvent && typeof reviewEvent === "object")
+  };
+  for (const field of TASK_METADATA_FIELDS) {
+    if (!(field in source)) continue;
+    const value = source[field];
+    if (value === null || typeof value === "number" || typeof value === "boolean") {
+      metadata[field] = value;
+    } else if (typeof value === "string") {
+      metadata[field] = TASK_METADATA_LINEAGE_FIELDS.includes(field)
+        ? value
+        : truncateUtf8Bytes(value, TASK_METADATA_STRING_LIMIT);
+    }
+    // Objects/arrays (review_event, review_dispatch, dispatch_contract,
+    // dispatch_events, unknown blobs) are intentionally excluded; the full
+    // record is already persisted in the JSON value and read via readTask.
+  }
+  return boundTaskMetadata(metadata, TASK_METADATA_MAX_BYTES);
+}
 async function recordTask(env, contract, options) {
   if (!env.TASK_REGISTRY) return;
   const opts = options && typeof options === "object" ? options : {};
@@ -1811,7 +2443,7 @@ async function recordTask(env, contract, options) {
   if (contract.root_task_id) meta.root_task_id = String(contract.root_task_id);
   if (contract.parent_task_id) meta.parent_task_id = String(contract.parent_task_id);
   await env.TASK_REGISTRY.put(regKey(contract.task_id), JSON.stringify({ task_id: contract.task_id, ...meta, dispatch_contract: contract }), {
-    metadata: meta
+    metadata: buildTaskMetadata(meta)
   });
 }
 async function listTasks(env) {
@@ -1821,8 +2453,10 @@ async function listTasks(env) {
 }
 async function saveTask(env, entry) {
   if (!env.TASK_REGISTRY) return;
-  const { task_id, dispatch_contract, dispatch_events, ...meta } = entry;
-  await env.TASK_REGISTRY.put(regKey(task_id), JSON.stringify(entry), { metadata: meta });
+  const { task_id, ...rest } = entry;
+  await env.TASK_REGISTRY.put(regKey(task_id), JSON.stringify(entry), {
+    metadata: buildTaskMetadata(rest)
+  });
 }
 async function updateDispatchLease(env, taskId, patch) {
   if (!env.TASK_REGISTRY) return null;
@@ -1863,16 +2497,55 @@ async function listPendingResults(env, scope) {
   const tasks = await listTasks(env);
   const index = /* @__PURE__ */ new Map();
   for (const task of tasks) index.set(String(task.task_id), task);
+  const lineageUnresolved = /* @__PURE__ */ new Set();
+  for (const task of tasks) {
+    if (metadataLineageComplete(task)) continue;
+    const full = await readTaskMetadataForLineage(env, task);
+    if (full) {
+      index.set(String(task.task_id), { ...task, ...full, task_id: task.task_id });
+    } else {
+      lineageUnresolved.add(String(task.task_id));
+    }
+  }
   const now = Date.now();
   const pending = [];
   const pending_review = [];
   const failed = [];
   const blocked = [];
   const unconfirmed = [];
+  const unresolved = [];
   let excluded_by_lineage = 0;
   for (const task of tasks) {
-    if (!lineageInScope(task, scope, index)) {
+    const taskId = String(task.task_id);
+    const record = index.get(taskId) || task;
+    const membership = classifyLineageMembership(record, scope, index, lineageUnresolved, taskId);
+    if (membership === LINEAGE_MEMBERSHIP_NONMATCH) {
       excluded_by_lineage += 1;
+      continue;
+    }
+    if (membership === LINEAGE_MEMBERSHIP_UNRESOLVED) {
+      // The identity (or an ancestor's identity) could not be read back. A
+      // scope match can be neither confirmed nor refuted, and a bounded/compressed
+      // identity must never be treated as the real id. Surface the task in a
+      // dedicated, retryable bucket instead of a confirmed actionable list.
+      unresolved.push({
+        task_id: task.task_id,
+        status: task.normalized_status || task.status || EXECUTION_STATUS_PENDING,
+        normalized_status: task.normalized_status || task.status || EXECUTION_STATUS_PENDING,
+        execution_status: task.execution_status || task.status || EXECUTION_STATUS_PENDING,
+        terminal: task.terminal === true,
+        title: task.title || "",
+        updated_at: task.updated_at || task.created_at || "",
+        result_available: Boolean(task.result_available),
+        reviewed: task.reviewed === true,
+        review_verdict: task.review_verdict ?? null,
+        membership: LINEAGE_MEMBERSHIP_UNRESOLVED,
+        identity_resolved: false,
+        lineage: null,
+        retryable: true,
+        recommended_action: TASK_DISPATCH_ACTION_RETRY,
+        reason: "LINEAGE_IDENTITY_UNRESOLVED"
+      });
       continue;
     }
     let status = task.normalized_status || task.status || EXECUTION_STATUS_PENDING;
@@ -1926,10 +2599,12 @@ async function listPendingResults(env, scope) {
       requires_review: resultAvailable && task.reviewed !== true,
       recommended_action: resultAvailable ? "review" : "wait"
     };
-    if (task.project_id) entry.project_id = String(task.project_id);
-    if (task.root_task_id) entry.root_task_id = String(task.root_task_id);
-    if (task.parent_task_id) entry.parent_task_id = String(task.parent_task_id);
-    entry.lineage = resolveLineage(task, index);
+    entry.membership = LINEAGE_MEMBERSHIP_MATCH;
+    entry.identity_resolved = true;
+    if (record.project_id) entry.project_id = String(record.project_id);
+    if (record.root_task_id) entry.root_task_id = String(record.root_task_id);
+    if (record.parent_task_id) entry.parent_task_id = String(record.parent_task_id);
+    entry.lineage = resolveLineage(record, index);
     if (resultAvailable && task.reviewed !== true) {
       pending.push(entry);
       pending_review.push(entry);
@@ -1977,18 +2652,21 @@ async function listPendingResults(env, scope) {
     failed,
     blocked,
     unconfirmed,
+    unresolved,
     counts: {
       pending: pending.length,
       pending_review: pending_review.length,
       failed: failed.length,
       blocked: blocked.length,
       unconfirmed: unconfirmed.length,
+      unresolved: unresolved.length,
       total: tasks.length
     }
   };
   if (scope) {
     report.scope = scope;
     report.excluded_by_lineage = excluded_by_lineage;
+    report.lineage_unresolved = lineageUnresolved.size;
   }
   return report;
 }
@@ -2038,7 +2716,7 @@ async function toolMarkReviewed(env, args) {
   const executionStatus = String(
     task.normalized_status ?? task.execution_status ?? task.status ?? ""
   ).trim().toUpperCase();
-  const terminal = task.terminal === true || task.result_available === true && TERMINAL_EXECUTION_STATUSES.includes(executionStatus);
+  const terminal = task.terminal === true || (task.result_available === true && TERMINAL_EXECUTION_STATUSES.includes(executionStatus));
   if (!terminal || !TERMINAL_EXECUTION_STATUSES.includes(executionStatus)) {
     return { isError: true, text: `NOT_REVIEWABLE: NON_TERMINAL (${executionStatus || "UNKNOWN"})` };
   }
@@ -2124,7 +2802,7 @@ async function retryDispatchTask(env, args) {
   if (!task) return { isError: true, text: `UNKNOWN_TASK: ${taskId}` };
   const authoritative = task.reviewed === true || task.terminal === true || task.result_available === true;
   if (authoritative) {
-    const result22 = {
+    const result2 = {
       task_id: taskId,
       retried: false,
       dispatched: false,
@@ -2133,12 +2811,12 @@ async function retryDispatchTask(env, args) {
       reason: DISPATCH_REASON_AUTHORITATIVE,
       execution_status: task.normalized_status ?? task.execution_status ?? task.status ?? null
     };
-    return { isError: false, text: JSON.stringify(result22), structuredContent: result22 };
+    return { isError: false, text: JSON.stringify(result2), structuredContent: result2 };
   }
   const evidence = await gatherDispatchEvidence(env, taskId);
   const plan = planTaskDispatchRetry(task, evidence);
   if (!plan.should_retry) {
-    const result22 = {
+    const result2 = {
       task_id: taskId,
       retried: false,
       dispatched: false,
@@ -2148,11 +2826,11 @@ async function retryDispatchTask(env, args) {
       reason: DISPATCH_REASON_NOT_RETRYABLE,
       plan
     };
-    return { isError: false, text: JSON.stringify(result22), structuredContent: result22 };
+    return { isError: false, text: JSON.stringify(result2), structuredContent: result2 };
   }
   const storedContract = task.dispatch_contract;
   if (storedContract == null || typeof storedContract !== "object" || Array.isArray(storedContract)) {
-    const result22 = {
+    const result2 = {
       task_id: taskId,
       retried: false,
       dispatched: false,
@@ -2162,11 +2840,11 @@ async function retryDispatchTask(env, args) {
       reason: DISPATCH_REASON_NO_CONTRACT,
       errors: ["stored dispatch contract unavailable; refusing to redispatch"]
     };
-    return { isError: true, text: JSON.stringify(result22), structuredContent: result22 };
+    return { isError: true, text: JSON.stringify(result2), structuredContent: result2 };
   }
   const contractErrors = validateContract(storedContract);
   if (contractErrors.length) {
-    const result22 = {
+    const result2 = {
       task_id: taskId,
       retried: false,
       dispatched: false,
@@ -2176,7 +2854,7 @@ async function retryDispatchTask(env, args) {
       reason: DISPATCH_REASON_NO_CONTRACT,
       errors: contractErrors
     };
-    return { isError: true, text: JSON.stringify(result22), structuredContent: result22 };
+    return { isError: true, text: JSON.stringify(result2), structuredContent: result2 };
   }
   const contract = { ...storedContract, task_id: taskId };
   const claimKey = plan.idempotency_key || retryDispatchKey(taskId, plan.next_attempt);
@@ -2185,7 +2863,7 @@ async function retryDispatchTask(env, args) {
     markerParent: claimKey
   });
   if (claim.status === "unavailable") {
-    const result22 = {
+    const result2 = {
       task_id: taskId,
       retried: false,
       dispatched: false,
@@ -2195,10 +2873,10 @@ async function retryDispatchTask(env, args) {
       reason: DISPATCH_REASON_RETRY_UNAVAILABLE,
       idempotency_key: plan.idempotency_key
     };
-    return { isError: true, text: JSON.stringify(result22), structuredContent: result22 };
+    return { isError: true, text: JSON.stringify(result2), structuredContent: result2 };
   }
   if (!claim.claimed) {
-    const result22 = {
+    const result2 = {
       task_id: taskId,
       retried: false,
       dispatched: false,
@@ -2209,7 +2887,7 @@ async function retryDispatchTask(env, args) {
       idempotency_key: plan.idempotency_key,
       next_attempt: plan.next_attempt
     };
-    return { isError: false, text: JSON.stringify(result22), structuredContent: result22 };
+    return { isError: false, text: JSON.stringify(result2), structuredContent: result2 };
   }
   let dispatch;
   try {
@@ -2225,7 +2903,7 @@ async function retryDispatchTask(env, args) {
       acceptedAt: (/* @__PURE__ */ new Date()).toISOString(),
       deadline: new Date(Date.now() + TASK_DISPATCH_CONFIRM_GRACE_MS).toISOString()
     });
-    const result22 = {
+    const result2 = {
       task_id: taskId,
       retried: false,
       dispatched: false,
@@ -2237,7 +2915,7 @@ async function retryDispatchTask(env, args) {
       dispatch_status: "network_error",
       error: safeGithubResponseBody(err2?.message || "request failed")
     };
-    return { isError: true, text: JSON.stringify(result22), structuredContent: result22 };
+    return { isError: true, text: JSON.stringify(result2), structuredContent: result2 };
   }
   if (!dispatch.ok) {
     await finalizeDispatchMarker(env, taskId, {
@@ -2252,7 +2930,7 @@ async function retryDispatchTask(env, args) {
       acceptedAt: (/* @__PURE__ */ new Date()).toISOString(),
       deadline: new Date(Date.now() + TASK_DISPATCH_CONFIRM_GRACE_MS).toISOString()
     });
-    const result22 = {
+    const result2 = {
       task_id: taskId,
       retried: false,
       dispatched: false,
@@ -2265,7 +2943,7 @@ async function retryDispatchTask(env, args) {
       github_http_status: dispatch.status,
       github_request_id: dispatch.requestId
     };
-    return { isError: true, text: JSON.stringify(result22), structuredContent: result22 };
+    return { isError: true, text: JSON.stringify(result2), structuredContent: result2 };
   }
   const dispatchedAt = (/* @__PURE__ */ new Date()).toISOString();
   await finalizeDispatchMarker(env, taskId, {
@@ -2302,7 +2980,7 @@ async function toolSubmitTask(env, args) {
     project_id: args.project_id,
     root_task_id: args.root_task_id,
     parent_task_id: args.parent_task_id
-  });
+  }, args.mode);
   const errors = validateContract(contract);
   if (errors.length) return { isError: true, text: `INVALID_TASK: ${errors.join("; ")}` };
   try {
@@ -2476,48 +3154,17 @@ async function finalizeTaskResult(env, taskId, result) {
       synced: true,
       updated_at: (/* @__PURE__ */ new Date()).toISOString()
     });
+    try {
+      await emitTaskCompleted(env, {
+        task_id: taskId,
+        status: result.status,
+        project_id: registry && registry.project_id ? registry.project_id : void 0
+      });
+    } catch {
+    }
   }
   return result;
 }
-async function executionFindArtifact(env, name, readOptions = {}) {
-  const res = await fetch(
-    `${API}/repos/${env.GITHUB_REPO}/actions/artifacts?name=${encodeURIComponent(name)}`,
-    { ...readOptions, headers: ghHeaders(env) }
-  );
-  if (!res.ok) throw new Error(`GitHub artifact lookup failed HTTP ${res.status}`);
-  const payload = await res.json();
-  const artifacts = payload.artifacts || [];
-  if (!artifacts.length) return null;
-  artifacts.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
-  return artifacts[0];
-}
-
-async function executionGetArtifactWorkflowRun(env, artifact, readOptions = {}) {
-  const runId = artifact?.workflow_run?.id;
-  if (!runId) throw new Error("artifact missing workflow_run.id");
-  const res = await fetch(`${API}/repos/${env.GITHUB_REPO}/actions/runs/${runId}`, {
-    ...readOptions, headers: ghHeaders(env)
-  });
-  if (!res.ok) throw new Error(`GitHub workflow lookup failed HTTP ${res.status}`);
-  const run = await res.json();
-  return {
-    id: run.id,
-    repository_full_name: run.repository?.full_name ?? null,
-    display_title: run.display_title ?? null,
-    event: run.event ?? null,
-    path: run.path ?? null,
-    run_number: run.run_number ?? null,
-    run_attempt: run.run_attempt ?? null,
-    run_started_at: run.run_started_at ?? null,
-    status: run.status,
-    conclusion: run.conclusion,
-    html_url: run.html_url,
-    created_at: run.created_at ?? null,
-    updated_at: run.updated_at ?? null,
-    completed_at: run.completed_at ?? null
-  };
-}
-
 // Strict observation path: KV get + GitHub GET only. Never finalize results.
 var EXECUTION_OBSERVATION_TTL_SECONDS = 60;
 function sourceTimestamp(value) {
@@ -2574,7 +3221,7 @@ function hasTaskObservationScope(auth) {
   if (!hasWriteScope(auth)) return false;
   if (auth.kind === "static") return true;
   const payload = auth.payload;
-  // Verify signed audience, expiry and explicit mcp scope independently.
+  // normalizeScopes has legacy defaults: inspect the signed claims directly.
   return auth.kind === "oauth" && payload?.aud === "mcp" &&
     Number.isFinite(payload.exp) && payload.exp > nowSec() &&
     typeof payload.scope === "string" && payload.scope.split(/\s+/).includes(SCOPE);
@@ -2632,7 +3279,7 @@ async function toolGetTaskExecutionStatus(env, args) {
     } else {
       // Compatibility only: old workflows used display_title=gpt_task.
       result.mapping.kind = "execution_result_artifact";
-      artifact = await executionFindArtifact(env, `execution_result-${taskId}`, readOptions);
+      artifact = await findArtifact(env, `execution_result-${taskId}`, readOptions);
       if (!artifact) { result.reason = "task_run_mapping_unavailable"; return finish(); }
       if (artifact.name !== `execution_result-${taskId}` || !positiveSourceInteger(artifact.workflow_run?.id)) {
         result.reason = "invalid_task_run_mapping"; return finish();
@@ -2642,7 +3289,7 @@ async function toolGetTaskExecutionStatus(env, args) {
     const runId = artifact.workflow_run.id;
     result.mapping.run_id = runId;
     result.executor.run_id = runId;
-    const run = await executionGetArtifactWorkflowRun(env, artifact, readOptions);
+    const run = await getArtifactWorkflowRun(env, artifact, readOptions);
     if (run.id !== runId) { result.reason = "run_identity_mismatch"; return finish(); }
     if (typeof run.repository_full_name !== "string" ||
         run.repository_full_name.toLowerCase() !== env.GITHUB_REPO.toLowerCase()) {
@@ -3187,7 +3834,421 @@ async function writeSkillCandidate(env, args) {
   return writeKnowledgeCandidate(env, args, "SKILL");
 }
 async function toolWriteKnowledgeCandidate(env, args) {
+  try {
+    const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+    // The public Knowledge route never writes a non-KNOWLEDGE asset type.
+    const assetType = String(input.asset_type ?? KNOWLEDGE_ASSET_TYPE).trim().toUpperCase();
+    if (assetType !== KNOWLEDGE_ASSET_TYPE) return { isError: true, text: "INVALID_ASSET_TYPE" };
+    // The single public Knowledge MCP tool dispatches the candidate lifecycle
+    // sub-operations so an authorised agent has real, callable entry points
+    // without expanding the frozen `tools/list` surface:
+    //   create  -> persist an independent DRAFT candidate
+    //   read    -> independent read by candidate_id (cross-agent / cross-session)
+    //   submit  -> DRAFT -> PENDING_REVIEW
+    //   review  -> record PASS / FAIL
+    //   promote -> the sole Canonical write gate (default, fail-closed)
+    // Any other/missing sub-operation falls through to the promotion gate.
+    const op = String(input.candidate_operation ?? input.operation ?? "").trim().toLowerCase();
+    if (op === "create" || op === "create_candidate") return await createKnowledgeCandidate(env, input);
+    if (op === "read" || op === "get" || op === "get_candidate") return await readKnowledgeCandidate(env, input);
+    if (op === "submit" || op === "submit_review" || op === "submit_for_review") return await submitKnowledgeCandidateForReview(env, input);
+    if (op === "review" || op === "record_review") return await recordKnowledgeCandidateReview(env, input);
+    // Promotion (fail-closed). A Canonical write is ONLY authorised through the
+    // independent staged-candidate promotion gate (validateCandidateGate via
+    // promoteKnowledgeCandidate). A legacy asset_id-only call carries no
+    // candidate, no review state, and no bound approval, so it is rejected
+    // before any DB read, Canonical writer call, or mutation. A caller-supplied
+    // promotion_decision/approved_by/approval_receipt never authorises the write.
+    return await promoteKnowledgeCandidate(env, args);
+  } catch (err2) {
+    return { isError: true, text: `KNOWLEDGE_WRITE_FAILED: ${err2?.message || "unknown"}` };
+  }
+}
+function knowledgeCandidateReadOperation(args) {
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const op = String(input.candidate_operation ?? input.operation ?? "").trim().toLowerCase();
+  return op === "read" || op === "get" || op === "get_candidate";
+}
+var KNOWLEDGE_CANDIDATE_CONTRACT = "PERSONAL_AI_KNOWLEDGE_CANDIDATE_GOLDEN_PIPELINE_V1";
+var KNOWLEDGE_PROMOTION_OPERATION = "KNOWLEDGE_PROMOTION";
+var KNOWLEDGE_CANDIDATE_DRAFT = "DRAFT";
+var KNOWLEDGE_CANDIDATE_PENDING_REVIEW = "PENDING_REVIEW";
+var KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION = "APPROVED_FOR_PROMOTION";
+// Transient promotion claim. A promotion atomically moves the candidate from
+// APPROVED_FOR_PROMOTION to PROMOTION_RESERVED before it consumes the approval
+// or calls the Canonical writer. This is the linearization point that competes
+// with a review FAIL: once reserved, a FAIL's guarded UPDATE (which only matches
+// pre-promotion states) makes zero changes, so an accepted FAIL can never race
+// ahead of an in-flight promotion, and a promotion can never overwrite a
+// recorded FAIL. Only `recordKnowledgeCandidateReview` (and promotion itself)
+// transitions out of a pre-promotion state, so no extra column is required.
+var KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED = "PROMOTION_RESERVED";
+var KNOWLEDGE_CANDIDATE_PROMOTED = "PROMOTED";
+var KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED = "CANONICAL_READBACK_VERIFIED";
+var KNOWLEDGE_CANDIDATE_STATES = [
+  KNOWLEDGE_CANDIDATE_DRAFT,
+  KNOWLEDGE_CANDIDATE_PENDING_REVIEW,
+  KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION,
+  KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED,
+  KNOWLEDGE_CANDIDATE_PROMOTED,
+  KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED
+];
+var KNOWLEDGE_CANDIDATE_NOT_REVIEWED = "NOT_REVIEWED";
+var KNOWLEDGE_CANDIDATE_REVIEW_PASS = "PASS";
+var KNOWLEDGE_CANDIDATE_REVIEW_FAIL = "FAIL";
+var KNOWLEDGE_PROMOTION_REJECTED = "REJECTED";
+var KNOWLEDGE_PROMOTION_WRITTEN = "WRITTEN";
+var KNOWLEDGE_PROMOTION_IDEMPOTENT = "IDEMPOTENT";
+var KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING = "candidate_missing";
+var KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE = "candidate_state";
+var KNOWLEDGE_PROMOTION_REJECT_STORED_REVIEW = "stored_review_not_pass";
+var KNOWLEDGE_PROMOTION_REJECT_REVIEW = "review_not_pass";
+var KNOWLEDGE_PROMOTION_REJECT_STORED_HASH = "stored_content_hash_mismatch";
+var KNOWLEDGE_PROMOTION_REJECT_HASH = "content_hash_mismatch";
+var KNOWLEDGE_PROMOTION_REJECT_VERSION = "candidate_version_mismatch";
+var KNOWLEDGE_PROMOTION_REJECT_APPROVAL = "missing_or_expired_approval";
+var KNOWLEDGE_PROMOTION_REJECT_RESERVED = "promotion_reserved";
+// Candidate staging lives in its own D1 table, intentionally distinct from the
+// Golden `assets` / `asset_versions` tables. Approvals are NOT a second
+// authority: KNOWLEDGE_PROMOTION reuses the trusted, single-use
+// `personal_ai_approval_ledger` together with the `approval_ledger_operations`
+// registry (both added additively by migration 0003). There is deliberately NO
+// worker code path that registers/mints an approval -- a caller-supplied
+// `approved_by` / `approval_receipt` / `promotion_decision` can never authorise
+// a write. Approvals enter the ledger only through the trusted Human Gate
+// process, which writes to D1 out of band.
+var KNOWLEDGE_CANDIDATE_SELECT = "SELECT * FROM knowledge_candidates WHERE candidate_id = ?";
+var KNOWLEDGE_CANDIDATE_INSERT = "INSERT INTO knowledge_candidates (candidate_id, asset_id, title, status, content, content_hash, version, provenance, created_at, review_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+var KNOWLEDGE_CANDIDATE_REVIEW_UPDATE = "UPDATE knowledge_candidates SET status = ?, review_state = ? WHERE candidate_id = ? AND status='DRAFT'";
+// Recording a review may only act on a pre-promotion candidate. The guarded
+// UPDATE makes the legal lifecycle transition atomic: a PROMOTED /
+// CANONICAL_READBACK_VERIFIED candidate can never be regressed back to
+// APPROVED_FOR_PROMOTION through the review tool (changes === 0 -> rejected).
+var KNOWLEDGE_CANDIDATE_REVIEW_RECORD = "UPDATE knowledge_candidates SET status = ?, review_state = ?, review_result = ?, reviewed_at = ? WHERE candidate_id = ? AND status IN ('DRAFT', 'PENDING_REVIEW', 'APPROVED_FOR_PROMOTION')";
+// The single atomic promotion claim. Only a candidate that is still in the
+// reviewed-PASS pre-promotion state can be claimed; a concurrent review FAIL
+// (which moves the candidate to PENDING_REVIEW) or a competing promotion makes
+// this compare-and-swap return changes === 0, so the loser fails closed BEFORE
+// consuming an approval or calling the Canonical writer.
+var KNOWLEDGE_CANDIDATE_RESERVE = "UPDATE knowledge_candidates SET status = ? WHERE candidate_id = ? AND status = ? AND review_state = ?";
+// Guarded lifecycle transitions. The promotion only ever advances a candidate it
+// still owns (PROMOTION_RESERVED -> PROMOTED -> CANONICAL_READBACK_VERIFIED) and
+// can release a failed claim (PROMOTION_RESERVED -> APPROVED_FOR_PROMOTION).
+// Because each guarded UPDATE pins the expected current status, a promotion can
+// never overwrite a concurrently recorded state (e.g. a FAIL) and a terminal
+// candidate can never be regressed.
+var KNOWLEDGE_CANDIDATE_GUARDED_UPDATE = "UPDATE knowledge_candidates SET status = ? WHERE candidate_id = ? AND status = ?";
+var KNOWLEDGE_CANDIDATE_STATUS_UPDATE = "UPDATE knowledge_candidates SET status = ? WHERE candidate_id = ?";
+// The trusted approval ledger (single authority, reused for
+// decision_write / knowledge_write / KNOWLEDGE_PROMOTION).
+// The select returns only LIVE approvals (unconsumed AND not invalidated), so a
+// FAIL-revoked approval can never be replayed even if a later PASS restores the
+// candidate's APPROVED_FOR_PROMOTION status.
+// The single-use authority is the LEGACY `consumed_at` column (INTEGER epoch),
+// shared with the Site WebAuthn CAS. The Worker-only `consumed`/`state` columns
+// are a mirror updated in the same statement; the gate reads/writes the legacy
+// field so a Site-minted approval and a Worker consume can never diverge.
+var APPROVAL_LEDGER_SELECT = "SELECT approval_id, operation, asset_type, candidate_id, candidate_version, content_hash, review_result, approved_by, expires_at, state, consumed, consume_count, invalidated, consumed_at FROM personal_ai_approval_ledger WHERE operation = ? AND candidate_id = ? AND candidate_version = ? AND content_hash = ? AND consumed_at IS NULL AND invalidated = 0 ORDER BY expires_at DESC";
+var APPROVAL_LEDGER_CONSUME = "UPDATE personal_ai_approval_ledger SET consumed = 1, state = 'CONSUMED', consume_count = consume_count + 1, consumed_at = ? WHERE approval_id = ? AND operation = ? AND consumed_at IS NULL AND invalidated = 0";
+// Atomic stale-approval revocation. Only UNCONSUMED, not-yet-invalidated
+// approvals bound to the operation+candidate are transitioned; a consumed
+// approval (evidence of a completed/pending write) is never rewritten.
+var APPROVAL_LEDGER_INVALIDATE = "UPDATE personal_ai_approval_ledger SET invalidated = 1, state = 'INVALIDATED', invalidated_at = ? WHERE operation = ? AND candidate_id = ? AND consumed_at IS NULL AND invalidated = 0";
+var KNOWLEDGE_PROMOTION_APPROVAL_INVALIDATED = "INVALIDATED";
+function knowledgePromotionOutcome(resultStatus, extra) {
+  const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, status: resultStatus, ...(extra || {}) };
+  return { isError: false, text: JSON.stringify(body), structuredContent: body };
+}
+// Historical contract validator retained for compatibility diagnostics only.
+// Canonical promotion exclusively uses guardedKnowledgePromote and production atomic approval.
+function validateCandidateGate(candidate, supplied, approval, nowMs) {
+  const reject = (reason) => ({ ok: false, reason });
+  if (!candidate || typeof candidate !== "object") return reject(KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING);
+  if (String(candidate.status) !== KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION) return reject(KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE);
+  if (String(candidate.review_state) !== KNOWLEDGE_CANDIDATE_REVIEW_PASS) return reject(KNOWLEDGE_PROMOTION_REJECT_STORED_REVIEW);
+  const src = supplied && typeof supplied === "object" ? supplied : {};
+  if (String(src.recomputed_content_hash) !== String(candidate.content_hash)) return reject(KNOWLEDGE_PROMOTION_REJECT_STORED_HASH);
+  if (String(src.content_hash) !== String(candidate.content_hash)) return reject(KNOWLEDGE_PROMOTION_REJECT_HASH);
+  if (Number(src.candidate_version) !== Number(candidate.version)) return reject(KNOWLEDGE_PROMOTION_REJECT_VERSION);
+  if (String(src.review_result) !== KNOWLEDGE_CANDIDATE_REVIEW_PASS) return reject(KNOWLEDGE_PROMOTION_REJECT_REVIEW);
+  if (!approval || typeof approval !== "object") return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  // The approval must come from the shared trusted ledger, bound to the
+  // KNOWLEDGE_PROMOTION operation. A wrong operation / a receipt that is not in
+  // the ledger can never authorise the write.
+  if (String(approval.operation) !== KNOWLEDGE_PROMOTION_OPERATION) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (String(approval.candidate_id) !== String(candidate.candidate_id)) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (Number(approval.candidate_version) !== Number(candidate.version)) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (String(approval.content_hash) !== String(candidate.content_hash)) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (String(approval.review_result) !== KNOWLEDGE_CANDIDATE_REVIEW_PASS) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (!String(approval.approval_id || "").trim()) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (!String(approval.approved_by || "").trim()) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  // A FAIL-revoked (stale) approval is permanently dead: even if the candidate
+  // is later re-PASSed with the same version/hash it can never authorise a write.
+  if (approval.invalidated === true || Number(approval.invalidated) === 1) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (String(approval.state || "") === KNOWLEDGE_PROMOTION_APPROVAL_INVALIDATED) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  if (approval.consumed === true || Number(approval.consumed) === 1) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  // The legacy `consumed_at` (INTEGER epoch, shared with the Site WebAuthn CAS)
+  // is the single-use authority. A non-null value means another consumer has
+  // already spent this approval, so it is rejected even if the mirror lags.
+  if (approval.consumed_at !== null && approval.consumed_at !== void 0 && String(approval.consumed_at).trim() !== "") return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  const now = Number.isFinite(nowMs) ? Number(nowMs) : Date.now();
+  // `expires_at` is INTEGER epoch seconds in the production/union ledger and an
+  // ISO string in the repo-only schema; accept both, fail closed on neither.
+  const expiresRaw = approval.expires_at;
+  const expiresNumeric = Number(expiresRaw);
+  const expires = String(expiresRaw ?? "").trim() !== "" && Number.isFinite(expiresNumeric)
+    ? expiresNumeric * 1000
+    : Date.parse(String(expiresRaw));
+  if (!Number.isFinite(expires) || expires <= now) return reject(KNOWLEDGE_PROMOTION_REJECT_APPROVAL);
+  return { ok: true, reason: null };
+}
+async function stageKnowledgeCandidate(env, args) {
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
+  const candidateId = String(input.candidate_id ?? "").trim();
+  if (!ASSET_ID_RE.test(candidateId)) return { isError: true, text: "INVALID_ASSET_ID" };
+  const assetId = String(input.asset_id ?? candidateId).trim();
+  if (!ASSET_ID_RE.test(assetId)) return { isError: true, text: "INVALID_ASSET_ID" };
+  if (input.content == null) return { isError: true, text: "INVALID_CONTENT" };
+  const canonicalContent = canonicalKnowledgeContent(input.content);
+  if (!canonicalContent.trim()) return { isError: true, text: "INVALID_CONTENT" };
+  const contentHash = await sha256Hex(canonicalContent);
+  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+  const version = Number.isFinite(Number(input.version)) ? Number(input.version) : 1;
+  const provenance = input.provenance && typeof input.provenance === "object" ? input.provenance : {};
+  try {
+    if (!/^knowledge[:-][a-zA-Z0-9:_-]+$/.test(assetId) || !Number.isSafeInteger(version) || version < 1) return {isError:true,text:'INVALID_CANDIDATE_IDENTITY'};
+    checkedProvenance(provenance);
+    await checkedSchema(env.ASSET_DB, SNAPSHOT);
+    await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_INSERT).bind(
+      candidateId,
+      assetId,
+      String(input.title ?? "").trim(),
+      KNOWLEDGE_CANDIDATE_DRAFT,
+      canonicalContent,
+      contentHash,
+      version,
+      JSON.stringify(provenance),
+      nowIso,
+      KNOWLEDGE_CANDIDATE_NOT_REVIEWED
+    ).run();
+  } catch {
+    return { isError: true, text: "ASSET_WRITE_FAILED" };
+  }
+  const candidate = {
+    candidate_id: candidateId,
+    asset_id: assetId,
+    title: String(input.title ?? "").trim(),
+    status: KNOWLEDGE_CANDIDATE_DRAFT,
+    content: canonicalContent,
+    content_hash: contentHash,
+    version,
+    provenance,
+    created_at: nowIso,
+    review_state: KNOWLEDGE_CANDIDATE_NOT_REVIEWED
+  };
+  return { isError: false, text: JSON.stringify({ contract: KNOWLEDGE_CANDIDATE_CONTRACT, staged: true, candidate }), structuredContent: { contract: KNOWLEDGE_CANDIDATE_CONTRACT, staged: true, candidate } };
+}
+async function recordKnowledgeCandidateReview(env, args) {
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
+  const db = env.ASSET_DB;
+  const candidateId = String(input.candidate_id ?? "").trim();
+  const reviewResult = String(input.review_result ?? "").trim().toUpperCase();
+  if (![KNOWLEDGE_CANDIDATE_REVIEW_PASS, KNOWLEDGE_CANDIDATE_REVIEW_FAIL].includes(reviewResult)) {
+    return { isError: true, text: "INVALID_REVIEW_RESULT" };
+  }
+  // NOTE: approval/approver/receipt fields supplied by the caller are ignored.
+  // Recording a review never mints an approval; it can only REVOKE stale ones.
+  let candidate;
+  try {
+    candidate = await db.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind(candidateId).first();
+  } catch {
+    return { isError: true, text: "ASSET_WRITE_FAILED" };
+  }
+  if (!candidate) return { isError: true, text: "CANDIDATE_NOT_FOUND" };
+  const currentStatus = String(candidate.status);
+  // Only pre-promotion states are reviewable. PROMOTED / CANONICAL_READBACK_VERIFIED
+  // are terminal: review must never regress them back to APPROVED_FOR_PROMOTION.
+  if (![KNOWLEDGE_CANDIDATE_DRAFT, KNOWLEDGE_CANDIDATE_PENDING_REVIEW, KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION].includes(currentStatus)) {
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
+      reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE,
+      candidate_id: candidateId,
+      review_recorded: false
+    });
+  }
+  const nextStatus = reviewResult === KNOWLEDGE_CANDIDATE_REVIEW_PASS
+    ? KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION
+    : KNOWLEDGE_CANDIDATE_PENDING_REVIEW;
+  const nowIso = (new Date()).toISOString();
+  if (typeof input.reviewed_by !== 'string' || !input.reviewed_by.trim() ||
+      typeof input.review_evidence_ref !== 'string' || !input.review_evidence_ref.trim() ||
+      !/^[a-f0-9]{64}$/.test(input.review_evidence_sha256 ?? '')) {
+    return {isError:true,text:'REVIEW_EVIDENCE_REQUIRED'};
+  }
+  let target;
+  try {
+    await checkedSchema(db, SNAPSHOT);
+    target = await db.prepare('SELECT asset_type,current_version FROM assets WHERE asset_id=?').bind(candidate.asset_id).first();
+    if (target && target.asset_type !== 'KNOWLEDGE') return {isError:true,text:'ASSET_TYPE_OWNERSHIP_MISMATCH'};
+  } catch { return {isError:true,text:'PRODUCTION_SCHEMA_OR_TARGET_UNAVAILABLE'}; }
+  const reviewWrite = db.prepare(`UPDATE knowledge_candidates SET status=?,review_state=?,review_result=?,reviewed_at=?,reviewed_by=?,review_evidence_ref=?,review_evidence_sha256=?,expected_asset_version=? WHERE candidate_id=? AND version=? AND content_hash=? AND reviewed_at IS ? AND status IN ('DRAFT','PENDING_REVIEW','APPROVED_FOR_PROMOTION')`)
+    .bind(nextStatus,reviewResult,reviewResult,nowIso,input.reviewed_by,input.review_evidence_ref,input.review_evidence_sha256,target?.current_version??null,candidateId,candidate.version,candidate.content_hash,candidate.reviewed_at??null);
+  // A review FAIL must atomically revoke every still-live KNOWLEDGE_PROMOTION
+  // approval bound to this candidate. A later PASS therefore requires a NEW
+  // trusted Human Gate approval; the revoked one can never be replayed.
+  const invalidateWrite = reviewResult === KNOWLEDGE_CANDIDATE_REVIEW_FAIL
+    ? db.prepare(APPROVAL_LEDGER_INVALIDATE).bind(nowIso, KNOWLEDGE_PROMOTION_OPERATION, candidateId)
+    : null;
+  let reviewChanges = 0;
+  let invalidatedCount = 0;
+  if (typeof db.batch === "function") {
+    try {
+      const results = await db.batch(invalidateWrite ? [reviewWrite, db.prepare("SELECT CASE WHEN changes()=1 THEN 1 ELSE json('REVIEW_CAS_LOST') END AS ok"), invalidateWrite] : [reviewWrite]);
+      reviewChanges = results && results[0] && results[0].meta ? Number(results[0].meta.changes) || 0 : 0;
+      if (invalidateWrite) invalidatedCount = results && results[2] && results[2].meta ? Number(results[2].meta.changes) || 0 : 0;
+    } catch {
+      return { isError: true, text: "ASSET_WRITE_FAILED" };
+    }
+  } else {
+    // No atomic batch available. A FAIL cannot guarantee both the status change
+    // and the stale-approval revocation, so it fails closed rather than leave a
+    // live approval that a later PASS could resurrect.
+    if (invalidateWrite) return { isError: true, text: "ASSET_WRITE_FAILED" };
+    try {
+      const res = await reviewWrite.run();
+      reviewChanges = res && res.meta ? Number(res.meta.changes) || 0 : 1;
+    } catch {
+      return { isError: true, text: "ASSET_WRITE_FAILED" };
+    }
+  }
+  if (reviewChanges < 1) {
+    // The guarded UPDATE found no reviewable candidate (e.g. it was promoted
+    // concurrently). No status regress; report the illegal transition.
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
+      reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE,
+      candidate_id: candidateId,
+      review_recorded: false
+    });
+  }
+  const body = {
+    contract: KNOWLEDGE_CANDIDATE_CONTRACT,
+    candidate_id: candidateId,
+    status: nextStatus,
+    review_state: reviewResult,
+    approvals_invalidated: invalidatedCount
+  };
+  return { isError: false, text: JSON.stringify(body), structuredContent: body };
+}
+async function createKnowledgeCandidate(env, args) {
+  // Callable candidate-intake entry point. Persists an independent DRAFT
+  // candidate record (never a Golden asset). Creating a candidate does NOT
+  // approve or promote anything.
+  const staged = await stageKnowledgeCandidate(env, args);
+  return staged;
+}
+async function readKnowledgeCandidate(env, args) {
+  // Independent read by candidate_id. Any authorised agent/session can read a
+  // candidate another agent persisted; the record is never conflated with a
+  // Canonical asset.
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
+  const candidateId = String(input.candidate_id ?? "").trim();
+  if (!ASSET_ID_RE.test(candidateId)) return { isError: true, text: "INVALID_ASSET_ID" };
+  let row;
+  try {
+    row = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind(candidateId).first();
+  } catch {
+    return { isError: true, text: "ASSET_WRITE_FAILED" };
+  }
+  if (!row) return { isError: true, text: "CANDIDATE_NOT_FOUND" };
+  let parsedContent = row.content;
+  try {
+    parsedContent = JSON.parse(row.content);
+  } catch {
+    parsedContent = row.content;
+  }
+  let provenance = row.provenance;
+  try {
+    provenance = JSON.parse(row.provenance);
+  } catch {
+    provenance = {};
+  }
+  const candidate = {
+    candidate_id: row.candidate_id,
+    asset_id: row.asset_id,
+    title: row.title,
+    status: row.status,
+    content: parsedContent,
+    content_hash: row.content_hash,
+    version: Number(row.version),
+    provenance,
+    created_at: row.created_at,
+    review_state: row.review_state,
+    review_result: row.review_result ?? null
+  };
+  const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, found: true, candidate };
+  return { isError: false, text: JSON.stringify(body), structuredContent: body };
+}
+async function submitKnowledgeCandidateForReview(env, args) {
+  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
+  const candidateId = String(input.candidate_id ?? "").trim();
+  if (!ASSET_ID_RE.test(candidateId)) return { isError: true, text: "INVALID_ASSET_ID" };
+  let row;
+  try {
+    row = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind(candidateId).first();
+  } catch {
+    return { isError: true, text: "ASSET_WRITE_FAILED" };
+  }
+  if (!row) return { isError: true, text: "CANDIDATE_NOT_FOUND" };
+  if (String(row.status) !== KNOWLEDGE_CANDIDATE_DRAFT) {
+    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
+      reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE,
+      candidate_id: candidateId
+    });
+  }
+  try {
+    const changed = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_REVIEW_UPDATE).bind(KNOWLEDGE_CANDIDATE_PENDING_REVIEW, KNOWLEDGE_CANDIDATE_NOT_REVIEWED, candidateId).run();
+    if (changed.meta?.changes !== 1) return {isError:true,text:"CANDIDATE_STATE_CHANGED"};
+  } catch {
+    return { isError: true, text: "ASSET_WRITE_FAILED" };
+  }
+  const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, candidate_id: candidateId, status: KNOWLEDGE_CANDIDATE_PENDING_REVIEW, review_state: KNOWLEDGE_CANDIDATE_NOT_REVIEWED };
+  return { isError: false, text: JSON.stringify(body), structuredContent: body };
+}
+// NOTE: there is deliberately no worker function that registers/mints a
+// promotion approval. The worker can only READ and atomically CONSUME approvals
+// from the trusted `personal_ai_approval_ledger`; it can never mint one. This is
+// what makes a caller-supplied approved_by/approval_receipt/promotion_decision
+// incapable of authorising a write.
+// Gated promotion: candidate -> validateCandidateGate -> atomic promotion
+// reservation -> single-use approval consume -> Golden Writer
+// (writeKnowledgeCandidate) -> guarded status transitions -> authoritative
+// read-back.
+//
+// The reservation is the linearization point against a review FAIL. A promotion
+// that cannot atomically claim a reviewed-PASS candidate fails closed with
+// write_calls === 0 (no approval consume, no Canonical write), and a review FAIL
+// that arrives after the claim is rejected because its guarded UPDATE only
+// matches pre-promotion states.
+async function releaseKnowledgeCandidateReservation(db, candidateId) {
+  try {
+    const result = await db.prepare(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE).bind(KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION, candidateId, KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED).run();
+    return result && result.meta ? Number(result.meta.changes) || 0 : 0;
+  } catch {
+    return 0;
+  }
+}
+async function promoteKnowledgeCandidate(env, args) {
   return guardedKnowledgePromote(env, args, { writer: writeKnowledgeCandidate, verifyVersion: verifyKnowledgeVersion });
+}
+async function toolPromoteKnowledgeCandidate(env, args) {
+  try {
+    return await promoteKnowledgeCandidate(env, args);
+  } catch (err2) {
+    return { isError: true, text: `KNOWLEDGE_PROMOTION_FAILED: ${err2?.message || "unknown"}` };
+  }
 }
 var DECISION_WRITE_CONTRACT = "PERSONAL_AI_DECISION_WRITER_V0.1";
 var DECISION_INGESTION_CONTRACT = "PERSONAL_AI_DECISION_INGESTION_V0.1";
@@ -3199,219 +4260,182 @@ var DECISION_REQUIRED_FIELDS = ["review_verdict", "dispatch_outcome", "promotion
 var DECISION_INSERT_SQL = "INSERT INTO asset_versions (asset_id, version, content, content_hash, provenance, verification, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
 var DECISION_VERIFY_SQL = "SELECT a.asset_id AS asset_id, a.asset_type AS asset_type, a.current_version AS asset_version, a.content_hash AS asset_content_hash, a.status AS asset_status, v.version AS version_version, v.content AS version_content, v.content_hash AS version_content_hash, v.created_by AS version_created_by, v.provenance AS version_provenance, v.verification AS version_verification FROM assets a JOIN asset_versions v ON v.asset_id = a.asset_id AND v.version = a.current_version WHERE a.asset_id = ?";
 function normalizeDecision(input) {
-  const src = input && typeof input === "object" && !Array.isArray(input) ? input : {};
-  const missing = DECISION_REQUIRED_FIELDS.filter((key) => src[key] === null || src[key] === void 0 || typeof src[key] === "string" && !src[key].trim());
-  const invalid = [];
-  const verdict = src.review_verdict == null ? null : String(src.review_verdict).trim().toUpperCase();
-  if (verdict !== null && !REVIEW_VERDICTS.includes(verdict)) invalid.push("review_verdict");
-  const dispatch = src.dispatch_outcome == null ? null : String(src.dispatch_outcome).trim().toUpperCase();
-  if (dispatch !== null && !DECISION_DISPATCH_OUTCOMES.includes(dispatch)) invalid.push("dispatch_outcome");
-  const complete = missing.length === 0 && invalid.length === 0;
-  return { contract: DECISION_INGESTION_CONTRACT, status: complete ? "VERIFIED" : "INCOMPLETE", complete, verified: complete, missing, invalid, record: { review_verdict: verdict, dispatch_outcome: dispatch } };
+const src = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+const missing = DECISION_REQUIRED_FIELDS.filter((key) => src[key] === null || src[key] === void 0 || typeof src[key] === "string" && !src[key].trim());
+const invalid = [];
+const verdict = src.review_verdict == null ? null : String(src.review_verdict).trim().toUpperCase();
+if (verdict !== null && !REVIEW_VERDICTS.includes(verdict)) invalid.push("review_verdict");
+const dispatch = src.dispatch_outcome == null ? null : String(src.dispatch_outcome).trim().toUpperCase();
+if (dispatch !== null && !DECISION_DISPATCH_OUTCOMES.includes(dispatch)) invalid.push("dispatch_outcome");
+const complete = missing.length === 0 && invalid.length === 0;
+return { contract: DECISION_INGESTION_CONTRACT, status: complete ? "VERIFIED" : "INCOMPLETE", complete, verified: complete, missing, invalid, record: { review_verdict: verdict, dispatch_outcome: dispatch } };
 }
 function canonicalDecisionContent(content) {
-  const sorted = (value) => {
-    if (value === null || typeof value !== "object") return JSON.stringify(value);
-    if (Array.isArray(value)) return "[" + value.map(sorted).join(",") + "]";
-    return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + sorted(value[key])).join(",") + "}";
-  };
-  return typeof content === "string" ? content : sorted(content);
+const sorted = (value) => {
+if (value === null || typeof value !== "object") return JSON.stringify(value);
+if (Array.isArray(value)) return "[" + value.map(sorted).join(",") + "]";
+return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + sorted(value[key])).join(",") + "}";
+};
+return typeof content === "string" ? content : sorted(content);
 }
 function buildDecisionProvenance(input) {
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const capturedAt = String(input.captured_at ?? now);
-  const promotedAt = String(input.promoted_at ?? now);
-  const sourceVersion = String(input.source_version ?? "v1");
-  return {
-    source: { identity: String(input.evidence_ref), location: String(input.source_location ?? "cloud://decision-registry") },
-    source_version: sourceVersion,
-    content_version: String(input.content_version ?? sourceVersion),
-    canonical_version: input.canonical_version,
-    content_hash: input.content_hash,
-    verification: {
-      method: "recompute_content_hash",
-      evidence: { checked_by: "decision_ingestion_writer", recomputed: input.content_hash, verified_at: promotedAt },
-      verified_at: promotedAt,
-      expected_content_hash: input.content_hash,
-      content_hash_matches: true
-    },
-    promotion: { decision: String(input.promotion_decision), event_id: String(input.promotion_event), decided_at: String(input.decided_at), actor: String(input.actor ?? "cloud-agent") },
-    captured_at: capturedAt,
-    promoted_at: promotedAt,
-    supersedes: Array.isArray(input.supersedes) ? input.supersedes.slice() : [],
-    superseded_by: null
-  };
+const now = (/* @__PURE__ */ new Date()).toISOString();
+const capturedAt = String(input.captured_at ?? now);
+const promotedAt = String(input.promoted_at ?? now);
+const sourceVersion = String(input.source_version ?? "v1");
+return {
+source: { identity: String(input.evidence_ref), location: String(input.source_location ?? "cloud://decision-registry") },
+source_version: sourceVersion,
+content_version: String(input.content_version ?? sourceVersion),
+canonical_version: input.canonical_version,
+content_hash: input.content_hash,
+verification: {
+method: "recompute_content_hash",
+evidence: { checked_by: "decision_ingestion_writer", recomputed: input.content_hash, verified_at: promotedAt },
+verified_at: promotedAt,
+expected_content_hash: input.content_hash,
+content_hash_matches: true
+},
+promotion: { decision: String(input.promotion_decision), event_id: String(input.promotion_event), decided_at: String(input.decided_at), actor: String(input.actor ?? "cloud-agent") },
+captured_at: capturedAt,
+promoted_at: promotedAt,
+supersedes: Array.isArray(input.supersedes) ? input.supersedes.slice() : [],
+superseded_by: null
+};
 }
 async function verifyDecisionVersion(db, assetId, expectedVersion, expectedHash, expectedContent) {
-  let row;
-  try {
-    row = await db.prepare(DECISION_VERIFY_SQL).bind(assetId).first();
-  } catch {
-    return false;
-  }
-  if (!row) return false;
-  if (String(row.asset_type) !== DECISION_ASSET_TYPE) return false;
-  if (Number(row.asset_version) !== Number(expectedVersion)) return false;
-  if (Number(row.version_version) !== Number(expectedVersion)) return false;
-  if (String(row.asset_content_hash) !== String(expectedHash)) return false;
-  if (String(row.version_content_hash) !== String(expectedHash)) return false;
-  if (expectedContent !== void 0 && String(row.version_content) !== String(expectedContent)) return false;
-  if (String(row.asset_status) !== DECISION_WRITE_STATUS) return false;
-  const createdBy = row.version_created_by == null ? "" : String(row.version_created_by).trim();
-  if (!createdBy) return false;
-  const evaluation = evaluateAssetProvenance(parseAssetJson(row.version_provenance), { content_hash: expectedHash, canonical_version: expectedVersion, verification: parseAssetJson(row.version_verification) });
-  if (evaluation.status !== PROVENANCE_STATUS_VERIFIED || evaluation.verified !== true) return false;
-  return true;
+let row;
+try {
+row = await db.prepare(DECISION_VERIFY_SQL).bind(assetId).first();
+} catch {
+return false;
+}
+if (!row) return false;
+if (String(row.asset_type) !== DECISION_ASSET_TYPE) return false;
+if (Number(row.asset_version) !== Number(expectedVersion)) return false;
+if (Number(row.version_version) !== Number(expectedVersion)) return false;
+if (String(row.asset_content_hash) !== String(expectedHash)) return false;
+if (String(row.version_content_hash) !== String(expectedHash)) return false;
+if (expectedContent !== void 0 && String(row.version_content) !== String(expectedContent)) return false;
+if (String(row.asset_status) !== DECISION_WRITE_STATUS) return false;
+const createdBy = row.version_created_by == null ? "" : String(row.version_created_by).trim();
+if (!createdBy) return false;
+const evaluation = evaluateAssetProvenance(parseAssetJson(row.version_provenance), { content_hash: expectedHash, canonical_version: expectedVersion, verification: parseAssetJson(row.version_verification) });
+if (evaluation.status !== PROVENANCE_STATUS_VERIFIED || evaluation.verified !== true) return false;
+return true;
 }
 async function writeDecisionRecord(env, args) {
-  if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
-  if (args === null || typeof args !== "object" || Array.isArray(args)) return { isError: true, text: "INVALID_INPUT" };
-  const input = args;
-  if (input.asset_type != null && String(input.asset_type).trim().toUpperCase() !== DECISION_ASSET_TYPE) return { isError: true, text: "INVALID_ASSET_TYPE" };
-  const suppliedAssetId = input.asset_id == null ? "" : String(input.asset_id).trim();
-  let decisionId = String(input.decision_id ?? "").trim();
-  if (suppliedAssetId) {
-    if (!suppliedAssetId.startsWith("decision:")) return { isError: true, text: "INVALID_ASSET_ID" };
-    const fromAsset = suppliedAssetId.slice("decision:".length);
-    if (decisionId && decisionId !== fromAsset) return { isError: true, text: "INVALID_ASSET_ID" };
-    if (!decisionId) decisionId = fromAsset;
-  }
-  if (!decisionId) decisionId = String(input.task_id ?? "").trim();
-  const assetId = "decision:" + decisionId;
-  if (!decisionId || !ASSET_ID_RE.test(decisionId) || !ASSET_ID_RE.test(assetId)) return { isError: true, text: "INVALID_ASSET_ID" };
-  const taskId = String(input.task_id ?? "").trim();
-  if (!taskId) return { isError: true, text: "INVALID_TASK_ID" };
-  if (input.review_verdict != null && !REVIEW_VERDICTS.includes(String(input.review_verdict).trim().toUpperCase())) return { isError: true, text: "INVALID_REVIEW_VERDICT" };
-  if (input.dispatch_outcome != null && !DECISION_DISPATCH_OUTCOMES.includes(String(input.dispatch_outcome).trim().toUpperCase())) return { isError: true, text: "INVALID_DISPATCH_OUTCOME" };
-  if (!input.promotion_decision || !input.promotion_event) return { isError: true, text: "INVALID_PROMOTION" };
-  const agentRecommendation = String(input.agent_recommendation ?? "").trim();
-  if (!agentRecommendation) return { isError: true, text: "INVALID_AGENT_RECOMMENDATION" };
-  const userChoice = input.user_choice == null ? "" : String(input.user_choice);
-  if (!userChoice.trim()) return { isError: true, text: "INVALID_USER_CHOICE" };
-  const userOutcome = input.user_outcome == null ? "" : String(input.user_outcome);
-  if (!userOutcome.trim()) return { isError: true, text: "INVALID_USER_OUTCOME" };
-  const derivedOverride = userChoice.trim() !== agentRecommendation;
-  const overrideReason = input.override_reason == null ? "" : String(input.override_reason).trim();
-  if (derivedOverride && !overrideReason) return { isError: true, text: "INVALID_OVERRIDE_REASON" };
-  if (input.user_override !== void 0 && input.user_override !== null && Boolean(input.user_override) !== derivedOverride) return { isError: true, text: "INVALID_OVERRIDE" };
-  const decidedAt = String(input.decided_at ?? "").trim();
-  if (!decidedAt || Number.isNaN(Date.parse(decidedAt))) return { isError: true, text: "INVALID_DECIDED_AT" };
-  const evidenceRef = String(input.evidence_ref ?? "").trim();
-  if (!evidenceRef) return { isError: true, text: "INVALID_EVIDENCE_REF" };
-  const normalized = normalizeDecision(input);
-  if (normalized.status !== "VERIFIED" || normalized.verified !== true) return { isError: true, text: "INCOMPLETE_DECISION" };
-  const content = {
-    decision_id: decisionId,
-    task_id: taskId,
-    review_verdict: normalized.record.review_verdict,
-    dispatch_outcome: normalized.record.dispatch_outcome,
-    promotion_decision: String(input.promotion_decision),
-    promotion_event: String(input.promotion_event),
-    agent_recommendation: agentRecommendation,
-    user_choice: userChoice,
-    user_outcome: userOutcome,
-    user_override: derivedOverride,
-    override_reason: derivedOverride ? overrideReason : null,
-    outcome_feedback: input.outcome_feedback == null ? null : input.outcome_feedback,
-    evidence_ref: evidenceRef,
-    decided_at: decidedAt
-  };
-  const canonicalContent = canonicalDecisionContent(content);
-  const contentHash = await sha256Hex(canonicalContent);
-  if (!DECISION_HASH_RE.test(contentHash)) return { isError: true, text: "ASSET_WRITE_FAILED" };
-  const nowIso = (/* @__PURE__ */ new Date()).toISOString();
-  const db = env.ASSET_DB;
-  let existing;
-  try {
-    existing = await db.prepare("SELECT asset_id, current_version, content_hash, updated_at FROM assets WHERE asset_id = ?").bind(assetId).first();
-  } catch {
-    return { isError: true, text: "ASSET_WRITE_FAILED" };
-  }
-  const schemaVersion = String(input.schema_version ?? "v0.1");
-  const title = String(input.title ?? "").trim() || `Decision ${decisionId}`;
-  if (existing && normalizeProvenanceHash(existing.content_hash) === contentHash) {
-    const currentVersion = Number(existing.current_version) || 1;
-    const present = await verifyDecisionVersion(db, assetId, currentVersion, contentHash, canonicalContent);
-    if (!present) return { isError: true, text: "ASSET_WRITE_FAILED" };
-    const replay = {
-      contract: DECISION_WRITE_CONTRACT,
-      asset_id: assetId,
-      asset_type: DECISION_ASSET_TYPE,
-      schema_version: schemaVersion,
-      title,
-      status: "IDEMPOTENT",
-      created: false,
-      idempotent: true,
-      version: currentVersion,
-      previous_version: currentVersion > 1 ? currentVersion - 1 : null,
-      content_hash: contentHash,
-      provenance_status: PROVENANCE_STATUS_VERIFIED,
-      provenance_verified: true,
-      promotion_event: String(input.promotion_event),
-      supersedes: [],
-      user_override: derivedOverride,
-      user_choice: userChoice,
-      agent_recommendation: agentRecommendation,
-      updated_at: existing.updated_at ?? nowIso
-    };
-    return { isError: false, text: JSON.stringify(replay), structuredContent: replay };
-  }
-  const previousVersion = existing ? Number(existing.current_version) || 0 : 0;
-  const version = previousVersion + 1;
-  const callerSupersedes = Array.isArray(input.supersedes) ? input.supersedes.slice() : [];
-  const supersedes = previousVersion > 0 ? [...callerSupersedes, String(previousVersion)] : callerSupersedes;
-  const createdBy = String(input.created_by ?? input.actor ?? "cloud-agent").trim() || "cloud-agent";
-  const provenance = buildDecisionProvenance({ ...input, actor: createdBy, canonical_version: version, content_hash: contentHash, supersedes });
-  const verification = provenance.verification;
-  const assetWrite = existing ? db.prepare("UPDATE assets SET schema_version = ?, title = ?, status = ?, current_version = ?, content_hash = ?, updated_at = ? WHERE asset_id = ?").bind(schemaVersion, title, DECISION_WRITE_STATUS, version, contentHash, nowIso, assetId) : db.prepare("INSERT INTO assets (asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(assetId, DECISION_ASSET_TYPE, schemaVersion, title, DECISION_WRITE_STATUS, version, contentHash, nowIso, nowIso);
-  const versionWrite = db.prepare(DECISION_INSERT_SQL).bind(assetId, version, canonicalContent, contentHash, JSON.stringify(provenance), JSON.stringify(verification), createdBy, nowIso);
-  if (typeof db.batch !== "function") return { isError: true, text: "ASSET_WRITE_FAILED" };
-  try {
-    await db.batch([assetWrite, versionWrite]);
-  } catch {
-    return { isError: true, text: "ASSET_WRITE_FAILED" };
-  }
-  const persisted = await verifyDecisionVersion(db, assetId, version, contentHash, canonicalContent);
-  if (!persisted) return { isError: true, text: "ASSET_WRITE_FAILED" };
-  const result = {
-    contract: DECISION_WRITE_CONTRACT,
-    asset_id: assetId,
-    asset_type: DECISION_ASSET_TYPE,
-    schema_version: schemaVersion,
-    title,
-    status: "WRITTEN",
-    created: !existing,
-    idempotent: false,
-    version,
-    previous_version: previousVersion > 0 ? previousVersion : null,
-    content_hash: contentHash,
-    provenance_status: PROVENANCE_STATUS_VERIFIED,
-    provenance_verified: true,
-    promotion_event: provenance.promotion.event_id,
-    supersedes: provenance.supersedes,
-    user_override: derivedOverride,
-    user_choice: userChoice,
-    agent_recommendation: agentRecommendation,
-    updated_at: nowIso
-  };
-  return { isError: false, text: JSON.stringify(result), structuredContent: result };
+if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
+if (args === null || typeof args !== "object" || Array.isArray(args)) return { isError: true, text: "INVALID_INPUT" };
+const input = args;
+if (input.asset_type != null && String(input.asset_type).trim().toUpperCase() !== DECISION_ASSET_TYPE) return { isError: true, text: "INVALID_ASSET_TYPE" };
+const suppliedAssetId = input.asset_id == null ? "" : String(input.asset_id).trim();
+let decisionId = String(input.decision_id ?? "").trim();
+if (suppliedAssetId) {
+if (!suppliedAssetId.startsWith("decision:")) return { isError: true, text: "INVALID_ASSET_ID" };
+const fromAsset = suppliedAssetId.slice("decision:".length);
+if (decisionId && decisionId !== fromAsset) return { isError: true, text: "INVALID_ASSET_ID" };
+if (!decisionId) decisionId = fromAsset;
+}
+if (!decisionId) decisionId = String(input.task_id ?? "").trim();
+const assetId = "decision:" + decisionId;
+if (!decisionId || !ASSET_ID_RE.test(decisionId) || !ASSET_ID_RE.test(assetId)) return { isError: true, text: "INVALID_ASSET_ID" };
+const taskId = String(input.task_id ?? "").trim();
+if (!taskId) return { isError: true, text: "INVALID_TASK_ID" };
+if (input.review_verdict != null && !REVIEW_VERDICTS.includes(String(input.review_verdict).trim().toUpperCase())) return { isError: true, text: "INVALID_REVIEW_VERDICT" };
+if (input.dispatch_outcome != null && !DECISION_DISPATCH_OUTCOMES.includes(String(input.dispatch_outcome).trim().toUpperCase())) return { isError: true, text: "INVALID_DISPATCH_OUTCOME" };
+if (!input.promotion_decision || !input.promotion_event) return { isError: true, text: "INVALID_PROMOTION" };
+const agentRecommendation = String(input.agent_recommendation ?? "").trim();
+if (!agentRecommendation) return { isError: true, text: "INVALID_AGENT_RECOMMENDATION" };
+const userChoice = input.user_choice == null ? "" : String(input.user_choice);
+if (!userChoice.trim()) return { isError: true, text: "INVALID_USER_CHOICE" };
+const userOutcome = input.user_outcome == null ? "" : String(input.user_outcome);
+if (!userOutcome.trim()) return { isError: true, text: "INVALID_USER_OUTCOME" };
+const derivedOverride = userChoice.trim() !== agentRecommendation;
+const overrideReason = input.override_reason == null ? "" : String(input.override_reason).trim();
+if (derivedOverride && !overrideReason) return { isError: true, text: "INVALID_OVERRIDE_REASON" };
+if (input.user_override !== void 0 && input.user_override !== null && Boolean(input.user_override) !== derivedOverride) return { isError: true, text: "INVALID_OVERRIDE" };
+const decidedAt = String(input.decided_at ?? "").trim();
+if (!decidedAt || Number.isNaN(Date.parse(decidedAt))) return { isError: true, text: "INVALID_DECIDED_AT" };
+const evidenceRef = String(input.evidence_ref ?? "").trim();
+if (!evidenceRef) return { isError: true, text: "INVALID_EVIDENCE_REF" };
+const normalized = normalizeDecision(input);
+if (normalized.status !== "VERIFIED" || normalized.verified !== true) return { isError: true, text: "INCOMPLETE_DECISION" };
+const content = {
+decision_id: decisionId,
+task_id: taskId,
+review_verdict: normalized.record.review_verdict,
+dispatch_outcome: normalized.record.dispatch_outcome,
+promotion_decision: String(input.promotion_decision),
+promotion_event: String(input.promotion_event),
+agent_recommendation: agentRecommendation,
+user_choice: userChoice,
+user_outcome: userOutcome,
+user_override: derivedOverride,
+override_reason: derivedOverride ? overrideReason : null,
+outcome_feedback: input.outcome_feedback == null ? null : input.outcome_feedback,
+evidence_ref: evidenceRef,
+decided_at: decidedAt
+};
+const canonicalContent = canonicalDecisionContent(content);
+const contentHash = await sha256Hex(canonicalContent);
+if (!DECISION_HASH_RE.test(contentHash)) return { isError: true, text: "ASSET_WRITE_FAILED" };
+const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+const db = env.ASSET_DB;
+let existing;
+try {
+existing = await db.prepare("SELECT asset_id, current_version, content_hash, updated_at FROM assets WHERE asset_id = ?").bind(assetId).first();
+} catch {
+return { isError: true, text: "ASSET_WRITE_FAILED" };
+}
+const schemaVersion = String(input.schema_version ?? "v0.1");
+const title = String(input.title ?? "").trim() || `Decision ${decisionId}`;
+if (existing && normalizeProvenanceHash(existing.content_hash) === contentHash) {
+const currentVersion = Number(existing.current_version) || 1;
+const present = await verifyDecisionVersion(db, assetId, currentVersion, contentHash, canonicalContent);
+if (!present) return { isError: true, text: "ASSET_WRITE_FAILED" };
+const replay = {
+contract: DECISION_WRITE_CONTRACT, asset_id: assetId, asset_type: DECISION_ASSET_TYPE, schema_version: schemaVersion, title,
+status: "IDEMPOTENT", created: false, idempotent: true, version: currentVersion, previous_version: currentVersion > 1 ? currentVersion - 1 : null,
+content_hash: contentHash, provenance_status: PROVENANCE_STATUS_VERIFIED, provenance_verified: true, promotion_event: String(input.promotion_event),
+supersedes: [], user_override: derivedOverride, user_choice: userChoice, agent_recommendation: agentRecommendation, updated_at: existing.updated_at ?? nowIso
+};
+return { isError: false, text: JSON.stringify(replay), structuredContent: replay };
+}
+const previousVersion = existing ? Number(existing.current_version) || 0 : 0;
+const version = previousVersion + 1;
+const callerSupersedes = Array.isArray(input.supersedes) ? input.supersedes.slice() : [];
+const supersedes = previousVersion > 0 ? [...callerSupersedes, String(previousVersion)] : callerSupersedes;
+const createdBy = String(input.created_by ?? input.actor ?? "cloud-agent").trim() || "cloud-agent";
+const provenance = buildDecisionProvenance({ ...input, actor: createdBy, canonical_version: version, content_hash: contentHash, supersedes });
+const verification = provenance.verification;
+const assetWrite = existing ? db.prepare("UPDATE assets SET schema_version = ?, title = ?, status = ?, current_version = ?, content_hash = ?, updated_at = ? WHERE asset_id = ?").bind(schemaVersion, title, DECISION_WRITE_STATUS, version, contentHash, nowIso, assetId) : db.prepare("INSERT INTO assets (asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(assetId, DECISION_ASSET_TYPE, schemaVersion, title, DECISION_WRITE_STATUS, version, contentHash, nowIso, nowIso);
+const versionWrite = db.prepare(DECISION_INSERT_SQL).bind(assetId, version, canonicalContent, contentHash, JSON.stringify(provenance), JSON.stringify(verification), createdBy, nowIso);
+if (typeof db.batch !== "function") return { isError: true, text: "ASSET_WRITE_FAILED" };
+try {
+await db.batch([assetWrite, versionWrite]);
+} catch {
+return { isError: true, text: "ASSET_WRITE_FAILED" };
+}
+const persisted = await verifyDecisionVersion(db, assetId, version, contentHash, canonicalContent);
+if (!persisted) return { isError: true, text: "ASSET_WRITE_FAILED" };
+const result = {
+contract: DECISION_WRITE_CONTRACT, asset_id: assetId, asset_type: DECISION_ASSET_TYPE, schema_version: schemaVersion, title,
+status: "WRITTEN", created: !existing, idempotent: false, version, previous_version: previousVersion > 0 ? previousVersion : null,
+content_hash: contentHash, provenance_status: PROVENANCE_STATUS_VERIFIED, provenance_verified: true, promotion_event: provenance.promotion.event_id,
+supersedes: provenance.supersedes, user_override: derivedOverride, user_choice: userChoice, agent_recommendation: agentRecommendation, updated_at: nowIso
+};
+return { isError: false, text: JSON.stringify(result), structuredContent: result };
 }
 async function toolWriteDecisionRecord(env, args) {
-  try {
-    return await writeDecisionRecord(env, args);
-  } catch {
-    return { isError: true, text: "ASSET_WRITE_FAILED" };
-  }
+try {
+return await writeDecisionRecord(env, args);
+} catch {
+return { isError: true, text: "ASSET_WRITE_FAILED" };
 }
-var TOOLS = [
-  {
-    name: "get_task_execution_status",
-    description: "Strict read-only observation of a registered task's named GitHub workflow run, with historical artifact fallback. No registry writes or events. Preserves run attempt and source times; missing mapping is unknown. One selected task run, never Agent availability, business success or independent acceptance. Observations expire after ttl_seconds.",
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    inputSchema: { type: "object", properties: { task_id: { type: "string" } }, required: ["task_id"], additionalProperties: false },
-    outputSchema: { type: "object", additionalProperties: true }
-  },
+}
 
+var TOOLS = [
   {
     name: "submit_task",
     description: "Submit a structured task to the Cloud Agent via GitHub repository_dispatch.",
@@ -3422,12 +4446,20 @@ var TOOLS = [
         instructions: { type: "array", items: { type: "string" } },
         acceptance: { type: "array", items: { type: "string" } },
         expected_files: { type: "array", items: { type: "string" } },
+        mode: { type: ["string", "null"], description: "Optional execution mode passed through to the Gate mode resolver. Supported values: readonly / write (missing or empty defaults to write; any other value fails closed)." },
         project_id: { type: ["string", "null"], description: "Optional active-project lineage id." },
         root_task_id: { type: ["string", "null"], description: "Optional lineage root task id." },
         parent_task_id: { type: ["string", "null"], description: "Optional immediate parent task id." }
       },
       required: ["goal", "instructions", "acceptance"]
     }
+  },
+  {
+    name: "get_task_execution_status",
+    description: "Strict read-only observation of a registered task's named GitHub workflow run, with historical artifact fallback. No registry writes or events. Preserves run attempt and source times; missing mapping is unknown. One selected task run, never Agent availability, business success or independent acceptance. Observations expire after ttl_seconds.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: { type: "object", properties: { task_id: { type: "string" } }, required: ["task_id"], additionalProperties: false },
+    outputSchema: { type: "object", additionalProperties: true }
   },
   {
     name: "get_task_result",
@@ -3589,45 +4621,49 @@ var TOOLS = [
     }
   },
   {
-    "name": "write_knowledge_candidate",
-    "description": "Promote one independently reviewed exact Knowledge candidate using a trusted same-ledger atomic approval. No raw content or approval mint is accepted.",
-    "inputSchema": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "candidate_operation": {
-          "type": "string",
-          "enum": [
-            "promote"
-          ]
-        },
-        "candidate_id": {
-          "type": "string"
-        },
-        "candidate_version": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "content_hash": {
-          "type": "string",
-          "pattern": "^[a-f0-9]{64}$"
-        },
-        "approval_id": {
-          "type": "string",
-          "pattern": "^knowledge:[A-Za-z0-9_-]{43}$"
-        }
+    name: "write_knowledge_candidate",
+    description: "Controlled KNOWLEDGE candidate lifecycle + canonical writer. `candidate_operation` selects create (persist an independent DRAFT candidate), read (independent read by candidate_id), submit_review (DRAFT -> PENDING_REVIEW), review (record PASS/FAIL), or promote (the sole fail-closed Canonical write gate; default). Promotion requires a real single-use Human Gate approval in the shared personal_ai_approval_ledger bound to candidate_id/version/content_hash/review_result/approved_by/expires_at/KNOWLEDGE_PROMOTION. Write operations require write scope; read requires asset.read scope. Never used for non-KNOWLEDGE assets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        review_evidence_sha256: { type: "string" },
+        review_evidence_ref: { type: "string" },
+        reviewed_by: { type: "string" },
+        approval_id: { type: "string" },
+        candidate_version: { type: "integer" },
+        candidate_operation: { type: "string", enum: ["create", "read", "submit_review", "review", "promote"] },
+        asset_id: { type: "string" },
+        candidate_id: { type: "string" },
+        asset_type: { type: "string", enum: ["KNOWLEDGE"] },
+        title: { type: "string" },
+        content: { type: ["string", "object", "array"] },
+        review_result: { type: "string", enum: ["PASS", "FAIL"] },
+        schema_version: { type: "string" },
+        status: { type: "string" },
+        source_identity: { type: "string" },
+        source_location: { type: "string" },
+        source_version: { type: "string" },
+        content_version: { type: "string" },
+        source_content_hash: { type: "string" },
+        promotion_decision: { type: "string" },
+        promotion_event: { type: "string" },
+        captured_at: { type: "string" },
+        promoted_at: { type: "string" }
       },
-      "required": [
-        "candidate_operation",
-        "candidate_id",
-        "candidate_version",
-        "content_hash",
-        "approval_id"
-      ]
+      required: []
     },
-    "outputSchema": {
-      "type": "object",
-      "additionalProperties": true
+    outputSchema: {
+      type: "object",
+      properties: {
+        asset_id: { type: "string" },
+        asset_type: { type: "string" },
+        version: { type: "number" },
+        content_hash: { type: "string" },
+        idempotent: { type: "boolean" },
+        created: { type: "boolean" },
+        provenance_status: { type: "string" }
+      },
+      additionalProperties: true
     }
   },
   {
@@ -3670,6 +4706,12 @@ var TOOLS = [
     outputSchema: { type: "object", additionalProperties: true }
   }
 ];
+function jsonRpcError(cors, id, err) {
+  const info = err && err.mcpError ? err.mcpError : { code: -32603, message: "Internal error", data: null };
+  const error = { code: info.code, message: info.message };
+  if (info.data) error.data = info.data;
+  return json({ jsonrpc: "2.0", id, error }, 200, cors);
+}
 // task.read: fixed-project, pure-read branch. No registry synchronization.
 const TASK_READ_SCOPE = 'task.read';
 const TASK_READ_PROJECT = 'cloud-assets-activation';
@@ -3705,7 +4747,13 @@ async function taskReadIndex(env) {
       if (index.has(id)) throw Error('REGISTRY_KEY_REPEATED');
       if(!key.metadata||typeof key.metadata!=='object'||Array.isArray(key.metadata)||
         Object.hasOwn(key.metadata,'task_id')&&key.metadata.task_id!==id)throw Error('REGISTRY_METADATA_INVALID');
-      index.set(id,{...(key.metadata??{}),task_id:id});
+      let row = {...(key.metadata ?? {}), task_id: id};
+      if (!metadataLineageComplete(row)) {
+        row = await readTask(env, id);
+        if (!row || row.task_id !== id) throw Error('REGISTRY_IDENTITY_UNAVAILABLE');
+        taskReadIdentity(row);
+      }
+      index.set(id, row);
     }
     if (listed.list_complete) return index;
     if (!listed.cursor || seen.has(listed.cursor)) throw Error('REGISTRY_CURSOR_INVALID');
@@ -3885,7 +4933,7 @@ async function handleMcp(request, env, cors, auth) {
   const { id = null, method, params = {} } = message || {};
   if (method && method.startsWith("notifications/")) return new Response(null, { status: 202, headers: cors });
   const ok = (result) => json({ jsonrpc: "2.0", id, result }, 200, cors);
-  const fail2 = (code, message2) => json({ jsonrpc: "2.0", id, error: { code, message: message2 } }, 200, cors);
+  const fail = (code, message2) => json({ jsonrpc: "2.0", id, error: { code, message: message2 } }, 200, cors);
   switch (method) {
     case "initialize":
       return ok({
@@ -3895,59 +4943,90 @@ async function handleMcp(request, env, cors, auth) {
       });
     case "ping":
       return ok({});
+    case "server/discover":
+      return ok({
+        resultType: "complete",
+        supportedVersions: [EVENTS_PROTOCOL_VERSION],
+        capabilities: { tools: {}, events: {} }
+      });
+    case "events/list":
+      return ok(listEvents());
+    case "events/subscribe": {
+      if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
+      try {
+        return ok(await handleEventsSubscribe(env, auth, params));
+      } catch (err) {
+        return jsonRpcError(cors, id, err);
+      }
+    }
+    case "events/unsubscribe": {
+      if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
+      try {
+        return ok(await handleEventsUnsubscribe(env, auth, params));
+      } catch (err) {
+        return jsonRpcError(cors, id, err);
+      }
+    }
     case "tools/list":
-      return ok({ tools: isTaskRead(auth)?taskReadTools():TOOLS });
+      return ok({ tools: isTaskRead(auth) ? taskReadTools() : TOOLS });
     case "tools/call": {
       const name = params.name;
       const args = params.arguments || {};
       let outcome;
       if (isTaskRead(auth)) {
-        if(name==='get_task_result')outcome=await taskReadGet(env,args);
-        else if(name==='list_pending_results')outcome=await taskReadList(env,args);
-        else return fail2(-32002,'task.read allows only two fixed-project read tools');
+        if (name === 'get_task_result') outcome = await taskReadGet(env, args);
+        else if (name === 'list_pending_results') outcome = await taskReadList(env, args);
+        else return fail(-32002, 'task.read allows only two fixed-project read tools');
       } else if (name === "submit_task") {
-        if (!hasWriteScope(auth)) return fail2(-32002, "mcp scope required");
+        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolSubmitTask(env, args);
       } else if (name === "get_task_execution_status") {
-        if (!hasTaskObservationScope(auth)) return fail2(-32002, "mcp scope required");
+        // Keep existing task authorization without legacy scope defaults.
+        if (!hasTaskObservationScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolGetTaskExecutionStatus(env, args);
       } else if (name === "get_task_result") {
-        if (!hasWriteScope(auth)) return fail2(-32002, "mcp scope required");
+        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolGetTaskResult(env, args);
       } else if (name === "list_pending_results") {
-        if (!hasWriteScope(auth)) return fail2(-32002, "mcp scope required");
+        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolListPendingResults(env, args);
       } else if (name === "mark_reviewed") {
-        if (!hasWriteScope(auth)) return fail2(-32002, "mcp scope required");
+        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolMarkReviewed(env, args);
       } else if (name === "plan_task_redispatch") {
-        if (!hasWriteScope(auth)) return fail2(-32002, "mcp scope required");
+        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolPlanDispatchRetry(env, args);
       } else if (name === "retry_task_dispatch") {
-        if (!hasWriteScope(auth)) return fail2(-32002, "mcp scope required");
+        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await retryDispatchTask(env, args);
       } else if (name === "search_assets") {
-        if (!hasReadScope(auth)) return fail2(-32001, "asset.read scope required");
+        if (!hasReadScope(auth)) return fail(-32001, "asset.read scope required");
         outcome = await toolSearchAssets(env, args);
       } else if (name === "get_asset") {
-        if (!hasReadScope(auth)) return fail2(-32001, "asset.read scope required");
+        if (!hasReadScope(auth)) return fail(-32001, "asset.read scope required");
         outcome = await toolGetAsset(env, args);
       } else if (name === "write_knowledge_candidate") {
-        if (!hasWriteScope(auth)) return fail2(-32002, "mcp scope required");
+        // Candidate reads keep read-scope isolation; every write/mutation
+        // sub-operation (create / submit / review / promote) requires write scope.
+        if (knowledgeCandidateReadOperation(args)) {
+          if (!hasReadScope(auth)) return fail(-32001, "asset.read scope required");
+        } else if (!hasWriteScope(auth)) {
+          return fail(-32002, "mcp scope required");
+        }
         outcome = await toolWriteKnowledgeCandidate(env, args);
       } else if (name === "write_skill_candidate") {
-        if (!hasWriteScope(auth)) return fail2(-32002, "mcp scope required");
+        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await writeSkillCandidate(env, args);
       } else if (name === "write_decision_record") {
-        if (!hasWriteScope(auth)) return fail2(-32002, "mcp scope required");
+        if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolWriteDecisionRecord(env, args);
-      } else return fail2(-32602, `unknown tool: ${name}`);
+      } else return fail(-32602, `unknown tool: ${name}`);
       const toolResult = { content: [{ type: "text", text: outcome.text }], isError: outcome.isError };
       if (outcome.structuredContent !== void 0) toolResult.structuredContent = outcome.structuredContent;
       return ok(toolResult);
     }
     default:
-      return fail2(-32601, `method not found: ${method}`);
+      return fail(-32601, `method not found: ${method}`);
   }
 }
 var index_default = {
@@ -3983,3 +5062,4 @@ var index_default = {
 export {
   index_default as default
 };
+//# sourceMappingURL=index.js.map
