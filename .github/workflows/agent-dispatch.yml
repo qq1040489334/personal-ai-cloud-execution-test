@@ -1,4 +1,6 @@
 name: cloud-agent-dispatch
+# Exact task identity is visible in GitHub metadata before any job/artifact exists.
+run-name: personal-ai-task:${{ github.event.client_payload.task.task_id }}
 
 on:
   repository_dispatch:

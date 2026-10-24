@@ -1,3 +1,452 @@
+// dispatch/production-knowledge-minimal-package-20261020/shared/knowledge-contract.mjs
+var POLICY = "KNOWLEDGE_PROD_V02_COUNTER_V1";
+var RP = "personal-ai-deploy-write-probe.tangyuandousha1010.chatgpt.site";
+var SEED_EVIDENCE = "2e0db873fb4b983fab5dc8fbd7ac9b3ed3dfd8f1d6a4143d30d6aba544782171";
+var hash = async (s) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s))), (b) => b.toString(16).padStart(2, "0")).join("");
+var fail = (code) => {
+  throw Error(code);
+};
+function exactTarget(p) {
+  if (!/^knowledge[:-][a-zA-Z0-9:_-]+$/.test(p?.asset_id ?? "")) fail("KNOWLEDGE_ASSET_NAMESPACE_REQUIRED");
+  if (p?.production_contract !== POLICY || p.operation !== "KNOWLEDGE_PROMOTION" || typeof p.candidate_id !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9:_-]{0,127}$/.test(p.candidate_id) || !Number.isSafeInteger(p.candidate_version) || p.candidate_version < 1 || !/^[a-f0-9]{64}$/.test(p.content_hash) || typeof p.asset_id !== "string" || !p.asset_id || p.review_result !== "PASS" || !p.reviewed_at || !/^[a-f0-9]{64}$/.test(p.review_evidence_sha256) || !(p.expected_asset_version === null || typeof p.expected_asset_version === "string" && p.expected_asset_version.length > 0)) fail("EXACT_REVIEWED_CANDIDATE_REQUIRED");
+  return JSON.stringify({ operation: "KNOWLEDGE_PROMOTION", production_contract: POLICY, candidate_id: p.candidate_id, candidate_version: p.candidate_version, content_hash: p.content_hash, asset_id: p.asset_id, review_result: "PASS", reviewed_at: p.reviewed_at, review_evidence_sha256: p.review_evidence_sha256, expected_asset_version: p.expected_asset_version });
+}
+function candidatePayload(k) {
+  return { operation: "KNOWLEDGE_PROMOTION", production_contract: POLICY, candidate_id: k.candidate_id, candidate_version: k.version, content_hash: k.content_hash, asset_id: k.asset_id, review_result: k.review_result, reviewed_at: k.reviewed_at, review_evidence_sha256: k.review_evidence_sha256, expected_asset_version: k.expected_asset_version };
+}
+function checkedProvenance(raw) {
+  const p = typeof raw === "string" ? JSON.parse(raw) : raw;
+  const required = [p?.source?.identity, p?.source?.location, p?.source_version, p?.content_version, p?.captured_at];
+  if (required.some((x2) => typeof x2 !== "string" || !x2.trim()) || !Number.isFinite(Date.parse(p.captured_at))) fail("REVIEWED_SOURCE_EVIDENCE_REQUIRED");
+  return p;
+}
+function sqlTokens(s) {
+  let out = "", q = null;
+  for (let i2 = 0; i2 < s.length; i2++) {
+    const c = s[i2];
+    if (q) {
+      out += c;
+      if (c === q) {
+        if (s[i2 + 1] === q) out += s[++i2];
+        else q = null;
+      }
+    } else if (c === "'" || c === '"' || c === "`") {
+      q = c;
+      out += c;
+    } else if (!/\s/.test(c)) out += c;
+  }
+  return out;
+}
+async function checkedSchema(db, snapshot) {
+  const q = await db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE tbl_name IN ('assets','asset_versions','asset_audit','approval_ledger_operations','personal_ai_approval_ledger','personal_ai_approval_ledger__project_status_backup','knowledge_candidates','approval_credential_counters_v1','approval_assertion_commits_v1') ORDER BY type,name").all();
+  const rows = q.results;
+  if (!Array.isArray(rows) || rows.length !== snapshot.length || !snapshot.every((e) => rows.some((r) => r.type === e.type && r.name === e.name && r.tbl_name === e.tbl_name && (e.sql === null ? r.sql === null : sqlTokens(e.sql) === sqlTokens(r.sql))))) fail("PRODUCTION_SCHEMA_DRIFT");
+  const registry = (await db.prepare("SELECT * FROM approval_ledger_operations ORDER BY operation").all()).results;
+  if (registry.length !== 6 || !registry.some((r) => r.operation === "KNOWLEDGE_PROMOTION" && r.asset_type === "KNOWLEDGE" && r.canonical_writer === "writeKnowledgeCandidate" && r.single_use === 1 && r.replay_guard === 1)) fail("PRODUCTION_REGISTRY_DRIFT");
+}
+
+// dispatch/production-knowledge-minimal-package-20261020/shared/schema-snapshot.mjs
+var SNAPSHOT = [
+  {
+    "type": "index",
+    "name": "idx_approval_ledger_binding",
+    "tbl_name": "personal_ai_approval_ledger",
+    "sql": "CREATE INDEX idx_approval_ledger_binding ON personal_ai_approval_ledger(operation,candidate_id,candidate_version,content_hash)"
+  },
+  {
+    "type": "index",
+    "name": "idx_approval_ledger_state",
+    "tbl_name": "personal_ai_approval_ledger",
+    "sql": "CREATE INDEX idx_approval_ledger_state ON personal_ai_approval_ledger(operation,consumed,invalidated)"
+  },
+  {
+    "type": "index",
+    "name": "idx_asset_audit_asset_time",
+    "tbl_name": "asset_audit",
+    "sql": "CREATE INDEX idx_asset_audit_asset_time ON asset_audit(asset_id,timestamp)"
+  },
+  {
+    "type": "index",
+    "name": "idx_assets_type_status_title",
+    "tbl_name": "assets",
+    "sql": "CREATE INDEX idx_assets_type_status_title ON assets(asset_type,status,title)"
+  },
+  {
+    "type": "index",
+    "name": "idx_knowledge_candidates_asset",
+    "tbl_name": "knowledge_candidates",
+    "sql": "CREATE INDEX idx_knowledge_candidates_asset ON knowledge_candidates(asset_id)"
+  },
+  {
+    "type": "index",
+    "name": "idx_knowledge_candidates_status",
+    "tbl_name": "knowledge_candidates",
+    "sql": "CREATE INDEX idx_knowledge_candidates_status ON knowledge_candidates(status)"
+  },
+  {
+    "type": "index",
+    "name": "sqlite_autoindex_approval_assertion_commits_v1_1",
+    "tbl_name": "approval_assertion_commits_v1",
+    "sql": null
+  },
+  {
+    "type": "index",
+    "name": "sqlite_autoindex_approval_assertion_commits_v1_2",
+    "tbl_name": "approval_assertion_commits_v1",
+    "sql": null
+  },
+  {
+    "type": "index",
+    "name": "sqlite_autoindex_approval_assertion_commits_v1_3",
+    "tbl_name": "approval_assertion_commits_v1",
+    "sql": null
+  },
+  {
+    "type": "index",
+    "name": "sqlite_autoindex_approval_credential_counters_v1_1",
+    "tbl_name": "approval_credential_counters_v1",
+    "sql": null
+  },
+  {
+    "type": "index",
+    "name": "sqlite_autoindex_approval_ledger_operations_1",
+    "tbl_name": "approval_ledger_operations",
+    "sql": null
+  },
+  {
+    "type": "index",
+    "name": "sqlite_autoindex_asset_audit_1",
+    "tbl_name": "asset_audit",
+    "sql": null
+  },
+  {
+    "type": "index",
+    "name": "sqlite_autoindex_asset_versions_1",
+    "tbl_name": "asset_versions",
+    "sql": null
+  },
+  {
+    "type": "index",
+    "name": "sqlite_autoindex_assets_1",
+    "tbl_name": "assets",
+    "sql": null
+  },
+  {
+    "type": "index",
+    "name": "sqlite_autoindex_knowledge_candidates_1",
+    "tbl_name": "knowledge_candidates",
+    "sql": null
+  },
+  {
+    "type": "index",
+    "name": "sqlite_autoindex_personal_ai_approval_ledger_1",
+    "tbl_name": "personal_ai_approval_ledger",
+    "sql": null
+  },
+  {
+    "type": "index",
+    "name": "sqlite_autoindex_personal_ai_approval_ledger__project_status_backup_1",
+    "tbl_name": "personal_ai_approval_ledger__project_status_backup",
+    "sql": null
+  },
+  {
+    "type": "table",
+    "name": "approval_assertion_commits_v1",
+    "tbl_name": "approval_assertion_commits_v1",
+    "sql": "CREATE TABLE approval_assertion_commits_v1 (\n ceremony_id TEXT PRIMARY KEY NOT NULL CHECK(length(ceremony_id)=43),\n challenge_id TEXT UNIQUE NOT NULL,\n approval_id TEXT UNIQUE NOT NULL,\n owner_hash TEXT NOT NULL,\n rp_id TEXT NOT NULL,\n signer_identity TEXT NOT NULL,\n enrollment_epoch TEXT NOT NULL,\n expected_revision INTEGER NOT NULL,\n expected_mode TEXT NOT NULL CHECK(expected_mode='MONOTONIC'),\n expected_count INTEGER NOT NULL,\n sign_count INTEGER NOT NULL,\n exact_target TEXT NOT NULL CHECK(json_valid(exact_target)),\n payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64),\n issued_at_ms INTEGER NOT NULL,\n expires_at_ms INTEGER NOT NULL,\n accepted_at_ms INTEGER NOT NULL,\n CHECK(expires_at_ms-issued_at_ms=300000),\n CHECK(approval_id='knowledge:'||ceremony_id),\n CHECK(substr(challenge_id,1,48)='PAI:'||ceremony_id||':')\n) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "approval_credential_counters_v1",
+    "tbl_name": "approval_credential_counters_v1",
+    "sql": "CREATE TABLE approval_credential_counters_v1 (\n owner_hash TEXT NOT NULL CHECK(length(owner_hash)=64),\n rp_id TEXT NOT NULL,\n signer_identity TEXT NOT NULL CHECK(length(signer_identity)=73),\n enrollment_epoch TEXT NOT NULL,\n state TEXT NOT NULL CHECK(state IN ('ACTIVE','REVOKED')),\n mode TEXT NOT NULL CHECK(mode='MONOTONIC'),\n last_count INTEGER NOT NULL CHECK(last_count>=2 AND last_count<=4294967295),\n revision INTEGER NOT NULL CHECK(revision>=1),\n enrolled_at_ms INTEGER NOT NULL,\n updated_at_ms INTEGER NOT NULL,\n bootstrap_evidence_sha256 TEXT NOT NULL,\n PRIMARY KEY(owner_hash,rp_id,signer_identity)\n) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "approval_ledger_operations",
+    "tbl_name": "approval_ledger_operations",
+    "sql": "CREATE TABLE approval_ledger_operations(operation TEXT PRIMARY KEY,asset_type TEXT NOT NULL,canonical_writer TEXT NOT NULL,single_use INTEGER NOT NULL DEFAULT 1,replay_guard INTEGER NOT NULL DEFAULT 1)"
+  },
+  {
+    "type": "table",
+    "name": "asset_audit",
+    "tbl_name": "asset_audit",
+    "sql": "CREATE TABLE asset_audit (\n  event_id TEXT PRIMARY KEY,\n  asset_id TEXT NOT NULL,\n  action TEXT NOT NULL,\n  version TEXT NOT NULL,\n  timestamp TEXT NOT NULL,\n  actor TEXT NOT NULL,\n  metadata TEXT NOT NULL,\n  FOREIGN KEY (asset_id,version) REFERENCES asset_versions(asset_id,version) ON DELETE RESTRICT\n)"
+  },
+  {
+    "type": "table",
+    "name": "asset_versions",
+    "tbl_name": "asset_versions",
+    "sql": "CREATE TABLE asset_versions (\n  asset_id TEXT NOT NULL,\n  version TEXT NOT NULL,\n  content TEXT NOT NULL,\n  content_hash TEXT NOT NULL CHECK (length(content_hash)=64),\n  provenance TEXT NOT NULL,\n  verification TEXT NOT NULL,\n  created_at TEXT NOT NULL,\n  created_by TEXT NOT NULL,\n  PRIMARY KEY (asset_id,version),\n  FOREIGN KEY (asset_id) REFERENCES assets(asset_id) ON DELETE RESTRICT\n)"
+  },
+  {
+    "type": "table",
+    "name": "assets",
+    "tbl_name": "assets",
+    "sql": "CREATE TABLE assets (\n  asset_id TEXT PRIMARY KEY,\n  asset_type TEXT NOT NULL CHECK (asset_type IN ('KNOWLEDGE','SKILL','REALITY','DECISION')),\n  schema_version TEXT NOT NULL,\n  title TEXT NOT NULL,\n  status TEXT NOT NULL CHECK (status IN ('staging','accepted','superseded','retired')),\n  current_version TEXT NOT NULL,\n  content_hash TEXT NOT NULL CHECK (length(content_hash)=64),\n  created_at TEXT NOT NULL,\n  updated_at TEXT NOT NULL\n)"
+  },
+  {
+    "type": "table",
+    "name": "knowledge_candidates",
+    "tbl_name": "knowledge_candidates",
+    "sql": "CREATE TABLE knowledge_candidates (\n candidate_id TEXT PRIMARY KEY NOT NULL,\n asset_id TEXT NOT NULL,\n title TEXT NOT NULL,\n status TEXT NOT NULL CHECK(status IN ('DRAFT','PENDING_REVIEW','APPROVED_FOR_PROMOTION','PROMOTION_RESERVED','CANONICAL_READBACK_VERIFIED')),\n content TEXT NOT NULL,\n content_hash TEXT NOT NULL CHECK(length(content_hash)=64),\n version INTEGER NOT NULL CHECK(version>=1),\n provenance TEXT NOT NULL CHECK(json_valid(provenance)),\n created_at TEXT NOT NULL,\n review_state TEXT NOT NULL,\n review_result TEXT,\n reviewed_by TEXT,\n reviewed_at TEXT,\n review_evidence_ref TEXT,\n review_evidence_sha256 TEXT,\n expected_asset_version TEXT,\n CHECK(status NOT IN ('APPROVED_FOR_PROMOTION','PROMOTION_RESERVED','CANONICAL_READBACK_VERIFIED') OR\n coalesce((review_state='PASS' AND review_result='PASS' AND length(reviewed_by)>0 AND length(reviewed_at)>0 AND length(review_evidence_ref)>0 AND length(review_evidence_sha256)=64),0))\n) STRICT"
+  },
+  {
+    "type": "table",
+    "name": "personal_ai_approval_ledger",
+    "tbl_name": "personal_ai_approval_ledger",
+    "sql": `CREATE TABLE "personal_ai_approval_ledger" ( approval_id TEXT PRIMARY KEY NOT NULL, requesting_user_hash TEXT NOT NULL CHECK (length(requesting_user_hash) = 64), operation TEXT NOT NULL CHECK (operation IN ('deploy_worker_version','write_decision_record','decision_write','knowledge_write','KNOWLEDGE_PROMOTION','write_project_status_record')), exact_target TEXT NOT NULL CHECK (length(exact_target) BETWEEN 1 AND 240), payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64), created_at INTEGER NOT NULL CHECK (created_at > 0), expires_at INTEGER NOT NULL CHECK (expires_at > created_at AND expires_at - created_at <= 300000), consumed_at INTEGER CHECK (consumed_at IS NULL OR consumed_at >= created_at) ,
+asset_type TEXT,candidate_id TEXT,candidate_version INTEGER,content_hash TEXT,review_result TEXT,approved_by TEXT,state TEXT NOT NULL DEFAULT 'REGISTERED',consumed INTEGER NOT NULL DEFAULT 0,consume_count INTEGER NOT NULL DEFAULT 0,invalidated INTEGER NOT NULL DEFAULT 0,invalidated_at TEXT,
+exact_target_json TEXT CHECK(exact_target_json IS NULL OR(json_valid(exact_target_json) AND exact_target IS NOT NULL AND payload_sha256 IS NOT NULL AND length(payload_sha256)=64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*' AND operation IS 'KNOWLEDGE_PROMOTION' AND exact_target='knowledge:v1:sha256:'||payload_sha256)),
+time_basis TEXT CHECK(time_basis IS NULL OR(time_basis='epoch_ms_v1' AND operation IS 'KNOWLEDGE_PROMOTION' AND exact_target_json IS NOT NULL AND typeof(created_at)='integer' AND created_at>0 AND created_at<=9007199254740991 AND typeof(expires_at)='integer' AND expires_at>created_at AND expires_at<=9007199254740991 AND expires_at-created_at<=300000 AND(consumed_at IS NULL OR(typeof(consumed_at)='integer' AND consumed_at>=created_at AND consumed_at<=9007199254740991)))),FOREIGN KEY(operation) REFERENCES approval_ledger_operations(operation)) STRICT`
+  },
+  {
+    "type": "table",
+    "name": "personal_ai_approval_ledger__project_status_backup",
+    "tbl_name": "personal_ai_approval_ledger__project_status_backup",
+    "sql": `CREATE TABLE "personal_ai_approval_ledger__project_status_backup" (
+  approval_id TEXT PRIMARY KEY NOT NULL,
+  requesting_user_hash TEXT NOT NULL CHECK (length(requesting_user_hash) = 64),
+  operation TEXT NOT NULL CHECK (operation IN ('deploy_worker_version', 'write_decision_record')),
+  exact_target TEXT NOT NULL CHECK (length(exact_target) BETWEEN 1 AND 240),
+  payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
+  created_at INTEGER NOT NULL CHECK (created_at > 0),
+  expires_at INTEGER NOT NULL CHECK (expires_at > created_at AND expires_at - created_at <= 300000),
+  consumed_at INTEGER CHECK (consumed_at IS NULL OR consumed_at >= created_at)
+) STRICT`
+  },
+  {
+    "type": "trigger",
+    "name": "assertion_v1_atomic",
+    "tbl_name": "approval_assertion_commits_v1",
+    "sql": "CREATE TRIGGER assertion_v1_atomic AFTER INSERT ON approval_assertion_commits_v1 BEGIN\n SELECT CASE WHEN NEW.rp_id!='personal-ai-deploy-write-probe.tangyuandousha1010.chatgpt.site'\n OR NEW.accepted_at_ms<NEW.issued_at_ms OR NEW.sign_count<=NEW.expected_count\n OR NEW.accepted_at_ms>CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)+2000\n OR NEW.accepted_at_ms<CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)-10000\n OR NEW.expires_at_ms<=CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)\n THEN RAISE(ABORT,'ATOMIC_TIME_COUNT_OR_RP_INVALID') END;\n SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM knowledge_candidates k WHERE\n k.candidate_id=json_extract(NEW.exact_target,'$.candidate_id') AND k.version=json_extract(NEW.exact_target,'$.candidate_version')\n AND k.content_hash=json_extract(NEW.exact_target,'$.content_hash') AND k.asset_id=json_extract(NEW.exact_target,'$.asset_id')\n AND k.reviewed_at=json_extract(NEW.exact_target,'$.reviewed_at') AND k.review_evidence_sha256=json_extract(NEW.exact_target,'$.review_evidence_sha256')\n AND k.expected_asset_version IS json_extract(NEW.exact_target,'$.expected_asset_version')\n AND k.status='APPROVED_FOR_PROMOTION' AND k.review_state='PASS' AND k.review_result='PASS'\n AND json_extract(NEW.exact_target,'$.operation')='KNOWLEDGE_PROMOTION'\n AND json_extract(NEW.exact_target,'$.production_contract')='KNOWLEDGE_PROD_V02_COUNTER_V1')\n THEN RAISE(ABORT,'ATOMIC_CANDIDATE_CHANGED') END;\n UPDATE approval_credential_counters_v1 SET last_count=NEW.sign_count,revision=revision+1,updated_at_ms=NEW.accepted_at_ms\n WHERE owner_hash=NEW.owner_hash AND rp_id=NEW.rp_id AND signer_identity=NEW.signer_identity\n AND enrollment_epoch=NEW.enrollment_epoch AND state='ACTIVE' AND mode='MONOTONIC'\n AND revision=NEW.expected_revision AND last_count=NEW.expected_count;\n SELECT CASE WHEN changes()!=1 THEN RAISE(ABORT,'ATOMIC_COUNTER_CAS_REJECTED') END;\n UPDATE personal_ai_approval_ledger SET consumed_at=NEW.accepted_at_ms,state='CHALLENGE_CONSUMED',consumed=1,consume_count=consume_count+1,approved_by=NEW.signer_identity\n WHERE approval_id=NEW.challenge_id AND requesting_user_hash=NEW.owner_hash AND operation='KNOWLEDGE_PROMOTION'\n AND exact_target='knowledge:v1:sha256:'||NEW.payload_sha256 AND exact_target_json=NEW.exact_target AND payload_sha256=NEW.payload_sha256\n AND time_basis='epoch_ms_v1' AND state='CHALLENGE_PENDING' AND consumed_at IS NULL AND consumed=0 AND consume_count=0 AND invalidated=0\n AND candidate_id IS NULL AND candidate_version IS NULL AND asset_type IS NULL AND content_hash IS NULL AND review_result IS NULL\n AND created_at=NEW.issued_at_ms AND expires_at=NEW.expires_at_ms;\n SELECT CASE WHEN changes()!=1 THEN RAISE(ABORT,'ATOMIC_CHALLENGE_CAS_REJECTED') END;\n INSERT INTO personal_ai_approval_ledger\n (approval_id,requesting_user_hash,operation,exact_target,exact_target_json,payload_sha256,time_basis,created_at,expires_at,asset_type,candidate_id,candidate_version,content_hash,review_result,approved_by)\n VALUES(NEW.approval_id,NEW.owner_hash,'KNOWLEDGE_PROMOTION','knowledge:v1:sha256:'||NEW.payload_sha256,NEW.exact_target,NEW.payload_sha256,'epoch_ms_v1',NEW.accepted_at_ms,NEW.expires_at_ms,\n 'KNOWLEDGE',json_extract(NEW.exact_target,'$.candidate_id'),json_extract(NEW.exact_target,'$.candidate_version'),json_extract(NEW.exact_target,'$.content_hash'),'PASS',NEW.signer_identity);\n SELECT CASE WHEN changes()!=1 THEN RAISE(ABORT,'ATOMIC_APPROVAL_INSERT_REJECTED') END;\nEND"
+  },
+  {
+    "type": "trigger",
+    "name": "assertion_v1_delete_guard",
+    "tbl_name": "approval_assertion_commits_v1",
+    "sql": "CREATE TRIGGER assertion_v1_delete_guard BEFORE DELETE ON approval_assertion_commits_v1 BEGIN\n SELECT RAISE(ABORT,'COMMIT_IMMUTABLE');\nEND"
+  },
+  {
+    "type": "trigger",
+    "name": "assertion_v1_update_guard",
+    "tbl_name": "approval_assertion_commits_v1",
+    "sql": "CREATE TRIGGER assertion_v1_update_guard BEFORE UPDATE ON approval_assertion_commits_v1 BEGIN\n SELECT RAISE(ABORT,'COMMIT_IMMUTABLE');\nEND"
+  },
+  {
+    "type": "trigger",
+    "name": "counter_v1_delete_guard",
+    "tbl_name": "approval_credential_counters_v1",
+    "sql": "CREATE TRIGGER counter_v1_delete_guard BEFORE DELETE ON approval_credential_counters_v1 BEGIN\n SELECT RAISE(ABORT,'COUNTER_DELETE_FORBIDDEN');\nEND"
+  },
+  {
+    "type": "trigger",
+    "name": "counter_v1_insert_guard",
+    "tbl_name": "approval_credential_counters_v1",
+    "sql": "CREATE TRIGGER counter_v1_insert_guard BEFORE INSERT ON approval_credential_counters_v1 BEGIN\n SELECT CASE WHEN NEW.state!='ACTIVE' OR NEW.mode!='MONOTONIC' OR NEW.last_count!=2 OR NEW.revision!=1\n OR NEW.rp_id!='personal-ai-deploy-write-probe.tangyuandousha1010.chatgpt.site'\n OR NEW.bootstrap_evidence_sha256!='2e0db873fb4b983fab5dc8fbd7ac9b3ed3dfd8f1d6a4143d30d6aba544782171'\n OR length(NEW.enrollment_epoch)<16 OR NEW.enrolled_at_ms<=0 OR NEW.updated_at_ms<NEW.enrolled_at_ms\n OR EXISTS(SELECT 1 FROM approval_assertion_commits_v1 WHERE owner_hash=NEW.owner_hash)\n OR EXISTS(SELECT 1 FROM personal_ai_approval_ledger WHERE requesting_user_hash=NEW.owner_hash AND operation='KNOWLEDGE_PROMOTION')\n THEN RAISE(ABORT,'COUNTER_IMPORT_ABSENT_HISTORY_REQUIRED') END;\nEND"
+  },
+  {
+    "type": "trigger",
+    "name": "counter_v1_update_guard",
+    "tbl_name": "approval_credential_counters_v1",
+    "sql": "CREATE TRIGGER counter_v1_update_guard BEFORE UPDATE ON approval_credential_counters_v1 BEGIN\n SELECT CASE WHEN NEW.owner_hash!=OLD.owner_hash OR NEW.rp_id!=OLD.rp_id OR NEW.signer_identity!=OLD.signer_identity\n OR NEW.enrollment_epoch!=OLD.enrollment_epoch OR NEW.enrolled_at_ms!=OLD.enrolled_at_ms\n OR NEW.bootstrap_evidence_sha256!=OLD.bootstrap_evidence_sha256 OR OLD.state!='ACTIVE'\n OR NOT ((NEW.state='REVOKED' AND NEW.mode=OLD.mode AND NEW.last_count=OLD.last_count AND NEW.revision=OLD.revision AND NEW.updated_at_ms=OLD.updated_at_ms)\n OR (NEW.state='ACTIVE' AND NEW.mode='MONOTONIC' AND NEW.last_count>OLD.last_count AND NEW.revision=OLD.revision+1 AND NEW.updated_at_ms>=OLD.updated_at_ms))\n THEN RAISE(ABORT,'COUNTER_TRANSITION_INVALID') END;\nEND"
+  }
+];
+var SCHEMA_GUARD = `(SELECT count(*) FROM sqlite_master WHERE tbl_name IN ('assets','asset_versions','asset_audit','personal_ai_approval_ledger','personal_ai_approval_ledger__project_status_backup','approval_ledger_operations','knowledge_candidates','approval_credential_counters_v1','approval_assertion_commits_v1'))=32 AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_approval_ledger_binding' AND tbl_name='personal_ai_approval_ledger' AND sql IS 'CREATE INDEX idx_approval_ledger_binding ON personal_ai_approval_ledger(operation,candidate_id,candidate_version,content_hash)') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_approval_ledger_state' AND tbl_name='personal_ai_approval_ledger' AND sql IS 'CREATE INDEX idx_approval_ledger_state ON personal_ai_approval_ledger(operation,consumed,invalidated)') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_asset_audit_asset_time' AND tbl_name='asset_audit' AND sql IS 'CREATE INDEX idx_asset_audit_asset_time ON asset_audit(asset_id,timestamp)') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_assets_type_status_title' AND tbl_name='assets' AND sql IS 'CREATE INDEX idx_assets_type_status_title ON assets(asset_type,status,title)') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_knowledge_candidates_asset' AND tbl_name='knowledge_candidates' AND sql IS 'CREATE INDEX idx_knowledge_candidates_asset ON knowledge_candidates(asset_id)') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_knowledge_candidates_status' AND tbl_name='knowledge_candidates' AND sql IS 'CREATE INDEX idx_knowledge_candidates_status ON knowledge_candidates(status)') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_approval_assertion_commits_v1_1' AND tbl_name='approval_assertion_commits_v1' AND sql IS NULL) AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_approval_assertion_commits_v1_2' AND tbl_name='approval_assertion_commits_v1' AND sql IS NULL) AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_approval_assertion_commits_v1_3' AND tbl_name='approval_assertion_commits_v1' AND sql IS NULL) AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_approval_credential_counters_v1_1' AND tbl_name='approval_credential_counters_v1' AND sql IS NULL) AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_approval_ledger_operations_1' AND tbl_name='approval_ledger_operations' AND sql IS NULL) AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_asset_audit_1' AND tbl_name='asset_audit' AND sql IS NULL) AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_asset_versions_1' AND tbl_name='asset_versions' AND sql IS NULL) AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_assets_1' AND tbl_name='assets' AND sql IS NULL) AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_knowledge_candidates_1' AND tbl_name='knowledge_candidates' AND sql IS NULL) AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_personal_ai_approval_ledger_1' AND tbl_name='personal_ai_approval_ledger' AND sql IS NULL) AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_personal_ai_approval_ledger__project_status_backup_1' AND tbl_name='personal_ai_approval_ledger__project_status_backup' AND sql IS NULL) AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='approval_assertion_commits_v1' AND tbl_name='approval_assertion_commits_v1' AND sql IS 'CREATE TABLE approval_assertion_commits_v1 (
+ ceremony_id TEXT PRIMARY KEY NOT NULL CHECK(length(ceremony_id)=43),
+ challenge_id TEXT UNIQUE NOT NULL,
+ approval_id TEXT UNIQUE NOT NULL,
+ owner_hash TEXT NOT NULL,
+ rp_id TEXT NOT NULL,
+ signer_identity TEXT NOT NULL,
+ enrollment_epoch TEXT NOT NULL,
+ expected_revision INTEGER NOT NULL,
+ expected_mode TEXT NOT NULL CHECK(expected_mode=''MONOTONIC''),
+ expected_count INTEGER NOT NULL,
+ sign_count INTEGER NOT NULL,
+ exact_target TEXT NOT NULL CHECK(json_valid(exact_target)),
+ payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64),
+ issued_at_ms INTEGER NOT NULL,
+ expires_at_ms INTEGER NOT NULL,
+ accepted_at_ms INTEGER NOT NULL,
+ CHECK(expires_at_ms-issued_at_ms=300000),
+ CHECK(approval_id=''knowledge:''||ceremony_id),
+ CHECK(substr(challenge_id,1,48)=''PAI:''||ceremony_id||'':'')
+) STRICT') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='approval_credential_counters_v1' AND tbl_name='approval_credential_counters_v1' AND sql IS 'CREATE TABLE approval_credential_counters_v1 (
+ owner_hash TEXT NOT NULL CHECK(length(owner_hash)=64),
+ rp_id TEXT NOT NULL,
+ signer_identity TEXT NOT NULL CHECK(length(signer_identity)=73),
+ enrollment_epoch TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN (''ACTIVE'',''REVOKED'')),
+ mode TEXT NOT NULL CHECK(mode=''MONOTONIC''),
+ last_count INTEGER NOT NULL CHECK(last_count>=2 AND last_count<=4294967295),
+ revision INTEGER NOT NULL CHECK(revision>=1),
+ enrolled_at_ms INTEGER NOT NULL,
+ updated_at_ms INTEGER NOT NULL,
+ bootstrap_evidence_sha256 TEXT NOT NULL,
+ PRIMARY KEY(owner_hash,rp_id,signer_identity)
+) STRICT') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='approval_ledger_operations' AND tbl_name='approval_ledger_operations' AND sql IS 'CREATE TABLE approval_ledger_operations(operation TEXT PRIMARY KEY,asset_type TEXT NOT NULL,canonical_writer TEXT NOT NULL,single_use INTEGER NOT NULL DEFAULT 1,replay_guard INTEGER NOT NULL DEFAULT 1)') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='asset_audit' AND tbl_name='asset_audit' AND sql IS 'CREATE TABLE asset_audit (
+  event_id TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  version TEXT NOT NULL,
+  timestamp TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  metadata TEXT NOT NULL,
+  FOREIGN KEY (asset_id,version) REFERENCES asset_versions(asset_id,version) ON DELETE RESTRICT
+)') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='asset_versions' AND tbl_name='asset_versions' AND sql IS 'CREATE TABLE asset_versions (
+  asset_id TEXT NOT NULL,
+  version TEXT NOT NULL,
+  content TEXT NOT NULL,
+  content_hash TEXT NOT NULL CHECK (length(content_hash)=64),
+  provenance TEXT NOT NULL,
+  verification TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  PRIMARY KEY (asset_id,version),
+  FOREIGN KEY (asset_id) REFERENCES assets(asset_id) ON DELETE RESTRICT
+)') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='assets' AND tbl_name='assets' AND sql IS 'CREATE TABLE assets (
+  asset_id TEXT PRIMARY KEY,
+  asset_type TEXT NOT NULL CHECK (asset_type IN (''KNOWLEDGE'',''SKILL'',''REALITY'',''DECISION'')),
+  schema_version TEXT NOT NULL,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN (''staging'',''accepted'',''superseded'',''retired'')),
+  current_version TEXT NOT NULL,
+  content_hash TEXT NOT NULL CHECK (length(content_hash)=64),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge_candidates' AND tbl_name='knowledge_candidates' AND sql IS 'CREATE TABLE knowledge_candidates (
+ candidate_id TEXT PRIMARY KEY NOT NULL,
+ asset_id TEXT NOT NULL,
+ title TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN (''DRAFT'',''PENDING_REVIEW'',''APPROVED_FOR_PROMOTION'',''PROMOTION_RESERVED'',''CANONICAL_READBACK_VERIFIED'')),
+ content TEXT NOT NULL,
+ content_hash TEXT NOT NULL CHECK(length(content_hash)=64),
+ version INTEGER NOT NULL CHECK(version>=1),
+ provenance TEXT NOT NULL CHECK(json_valid(provenance)),
+ created_at TEXT NOT NULL,
+ review_state TEXT NOT NULL,
+ review_result TEXT,
+ reviewed_by TEXT,
+ reviewed_at TEXT,
+ review_evidence_ref TEXT,
+ review_evidence_sha256 TEXT,
+ expected_asset_version TEXT,
+ CHECK(status NOT IN (''APPROVED_FOR_PROMOTION'',''PROMOTION_RESERVED'',''CANONICAL_READBACK_VERIFIED'') OR
+ coalesce((review_state=''PASS'' AND review_result=''PASS'' AND length(reviewed_by)>0 AND length(reviewed_at)>0 AND length(review_evidence_ref)>0 AND length(review_evidence_sha256)=64),0))
+) STRICT') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='personal_ai_approval_ledger' AND tbl_name='personal_ai_approval_ledger' AND sql IS 'CREATE TABLE "personal_ai_approval_ledger" ( approval_id TEXT PRIMARY KEY NOT NULL, requesting_user_hash TEXT NOT NULL CHECK (length(requesting_user_hash) = 64), operation TEXT NOT NULL CHECK (operation IN (''deploy_worker_version'',''write_decision_record'',''decision_write'',''knowledge_write'',''KNOWLEDGE_PROMOTION'',''write_project_status_record'')), exact_target TEXT NOT NULL CHECK (length(exact_target) BETWEEN 1 AND 240), payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64), created_at INTEGER NOT NULL CHECK (created_at > 0), expires_at INTEGER NOT NULL CHECK (expires_at > created_at AND expires_at - created_at <= 300000), consumed_at INTEGER CHECK (consumed_at IS NULL OR consumed_at >= created_at) ,
+asset_type TEXT,candidate_id TEXT,candidate_version INTEGER,content_hash TEXT,review_result TEXT,approved_by TEXT,state TEXT NOT NULL DEFAULT ''REGISTERED'',consumed INTEGER NOT NULL DEFAULT 0,consume_count INTEGER NOT NULL DEFAULT 0,invalidated INTEGER NOT NULL DEFAULT 0,invalidated_at TEXT,
+exact_target_json TEXT CHECK(exact_target_json IS NULL OR(json_valid(exact_target_json) AND exact_target IS NOT NULL AND payload_sha256 IS NOT NULL AND length(payload_sha256)=64 AND payload_sha256 NOT GLOB ''*[^0-9a-f]*'' AND operation IS ''KNOWLEDGE_PROMOTION'' AND exact_target=''knowledge:v1:sha256:''||payload_sha256)),
+time_basis TEXT CHECK(time_basis IS NULL OR(time_basis=''epoch_ms_v1'' AND operation IS ''KNOWLEDGE_PROMOTION'' AND exact_target_json IS NOT NULL AND typeof(created_at)=''integer'' AND created_at>0 AND created_at<=9007199254740991 AND typeof(expires_at)=''integer'' AND expires_at>created_at AND expires_at<=9007199254740991 AND expires_at-created_at<=300000 AND(consumed_at IS NULL OR(typeof(consumed_at)=''integer'' AND consumed_at>=created_at AND consumed_at<=9007199254740991)))),FOREIGN KEY(operation) REFERENCES approval_ledger_operations(operation)) STRICT') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='personal_ai_approval_ledger__project_status_backup' AND tbl_name='personal_ai_approval_ledger__project_status_backup' AND sql IS 'CREATE TABLE "personal_ai_approval_ledger__project_status_backup" (
+  approval_id TEXT PRIMARY KEY NOT NULL,
+  requesting_user_hash TEXT NOT NULL CHECK (length(requesting_user_hash) = 64),
+  operation TEXT NOT NULL CHECK (operation IN (''deploy_worker_version'', ''write_decision_record'')),
+  exact_target TEXT NOT NULL CHECK (length(exact_target) BETWEEN 1 AND 240),
+  payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
+  created_at INTEGER NOT NULL CHECK (created_at > 0),
+  expires_at INTEGER NOT NULL CHECK (expires_at > created_at AND expires_at - created_at <= 300000),
+  consumed_at INTEGER CHECK (consumed_at IS NULL OR consumed_at >= created_at)
+) STRICT') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='assertion_v1_atomic' AND tbl_name='approval_assertion_commits_v1' AND sql IS 'CREATE TRIGGER assertion_v1_atomic AFTER INSERT ON approval_assertion_commits_v1 BEGIN
+ SELECT CASE WHEN NEW.rp_id!=''personal-ai-deploy-write-probe.tangyuandousha1010.chatgpt.site''
+ OR NEW.accepted_at_ms<NEW.issued_at_ms OR NEW.sign_count<=NEW.expected_count
+ OR NEW.accepted_at_ms>CAST((julianday(''now'')-2440587.5)*86400000 AS INTEGER)+2000
+ OR NEW.accepted_at_ms<CAST((julianday(''now'')-2440587.5)*86400000 AS INTEGER)-10000
+ OR NEW.expires_at_ms<=CAST((julianday(''now'')-2440587.5)*86400000 AS INTEGER)
+ THEN RAISE(ABORT,''ATOMIC_TIME_COUNT_OR_RP_INVALID'') END;
+ SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM knowledge_candidates k WHERE
+ k.candidate_id=json_extract(NEW.exact_target,''$.candidate_id'') AND k.version=json_extract(NEW.exact_target,''$.candidate_version'')
+ AND k.content_hash=json_extract(NEW.exact_target,''$.content_hash'') AND k.asset_id=json_extract(NEW.exact_target,''$.asset_id'')
+ AND k.reviewed_at=json_extract(NEW.exact_target,''$.reviewed_at'') AND k.review_evidence_sha256=json_extract(NEW.exact_target,''$.review_evidence_sha256'')
+ AND k.expected_asset_version IS json_extract(NEW.exact_target,''$.expected_asset_version'')
+ AND k.status=''APPROVED_FOR_PROMOTION'' AND k.review_state=''PASS'' AND k.review_result=''PASS''
+ AND json_extract(NEW.exact_target,''$.operation'')=''KNOWLEDGE_PROMOTION''
+ AND json_extract(NEW.exact_target,''$.production_contract'')=''KNOWLEDGE_PROD_V02_COUNTER_V1'')
+ THEN RAISE(ABORT,''ATOMIC_CANDIDATE_CHANGED'') END;
+ UPDATE approval_credential_counters_v1 SET last_count=NEW.sign_count,revision=revision+1,updated_at_ms=NEW.accepted_at_ms
+ WHERE owner_hash=NEW.owner_hash AND rp_id=NEW.rp_id AND signer_identity=NEW.signer_identity
+ AND enrollment_epoch=NEW.enrollment_epoch AND state=''ACTIVE'' AND mode=''MONOTONIC''
+ AND revision=NEW.expected_revision AND last_count=NEW.expected_count;
+ SELECT CASE WHEN changes()!=1 THEN RAISE(ABORT,''ATOMIC_COUNTER_CAS_REJECTED'') END;
+ UPDATE personal_ai_approval_ledger SET consumed_at=NEW.accepted_at_ms,state=''CHALLENGE_CONSUMED'',consumed=1,consume_count=consume_count+1,approved_by=NEW.signer_identity
+ WHERE approval_id=NEW.challenge_id AND requesting_user_hash=NEW.owner_hash AND operation=''KNOWLEDGE_PROMOTION''
+ AND exact_target=''knowledge:v1:sha256:''||NEW.payload_sha256 AND exact_target_json=NEW.exact_target AND payload_sha256=NEW.payload_sha256
+ AND time_basis=''epoch_ms_v1'' AND state=''CHALLENGE_PENDING'' AND consumed_at IS NULL AND consumed=0 AND consume_count=0 AND invalidated=0
+ AND candidate_id IS NULL AND candidate_version IS NULL AND asset_type IS NULL AND content_hash IS NULL AND review_result IS NULL
+ AND created_at=NEW.issued_at_ms AND expires_at=NEW.expires_at_ms;
+ SELECT CASE WHEN changes()!=1 THEN RAISE(ABORT,''ATOMIC_CHALLENGE_CAS_REJECTED'') END;
+ INSERT INTO personal_ai_approval_ledger
+ (approval_id,requesting_user_hash,operation,exact_target,exact_target_json,payload_sha256,time_basis,created_at,expires_at,asset_type,candidate_id,candidate_version,content_hash,review_result,approved_by)
+ VALUES(NEW.approval_id,NEW.owner_hash,''KNOWLEDGE_PROMOTION'',''knowledge:v1:sha256:''||NEW.payload_sha256,NEW.exact_target,NEW.payload_sha256,''epoch_ms_v1'',NEW.accepted_at_ms,NEW.expires_at_ms,
+ ''KNOWLEDGE'',json_extract(NEW.exact_target,''$.candidate_id''),json_extract(NEW.exact_target,''$.candidate_version''),json_extract(NEW.exact_target,''$.content_hash''),''PASS'',NEW.signer_identity);
+ SELECT CASE WHEN changes()!=1 THEN RAISE(ABORT,''ATOMIC_APPROVAL_INSERT_REJECTED'') END;
+END') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='assertion_v1_delete_guard' AND tbl_name='approval_assertion_commits_v1' AND sql IS 'CREATE TRIGGER assertion_v1_delete_guard BEFORE DELETE ON approval_assertion_commits_v1 BEGIN
+ SELECT RAISE(ABORT,''COMMIT_IMMUTABLE'');
+END') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='assertion_v1_update_guard' AND tbl_name='approval_assertion_commits_v1' AND sql IS 'CREATE TRIGGER assertion_v1_update_guard BEFORE UPDATE ON approval_assertion_commits_v1 BEGIN
+ SELECT RAISE(ABORT,''COMMIT_IMMUTABLE'');
+END') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='counter_v1_delete_guard' AND tbl_name='approval_credential_counters_v1' AND sql IS 'CREATE TRIGGER counter_v1_delete_guard BEFORE DELETE ON approval_credential_counters_v1 BEGIN
+ SELECT RAISE(ABORT,''COUNTER_DELETE_FORBIDDEN'');
+END') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='counter_v1_insert_guard' AND tbl_name='approval_credential_counters_v1' AND sql IS 'CREATE TRIGGER counter_v1_insert_guard BEFORE INSERT ON approval_credential_counters_v1 BEGIN
+ SELECT CASE WHEN NEW.state!=''ACTIVE'' OR NEW.mode!=''MONOTONIC'' OR NEW.last_count!=2 OR NEW.revision!=1
+ OR NEW.rp_id!=''personal-ai-deploy-write-probe.tangyuandousha1010.chatgpt.site''
+ OR NEW.bootstrap_evidence_sha256!=''2e0db873fb4b983fab5dc8fbd7ac9b3ed3dfd8f1d6a4143d30d6aba544782171''
+ OR length(NEW.enrollment_epoch)<16 OR NEW.enrolled_at_ms<=0 OR NEW.updated_at_ms<NEW.enrolled_at_ms
+ OR EXISTS(SELECT 1 FROM approval_assertion_commits_v1 WHERE owner_hash=NEW.owner_hash)
+ OR EXISTS(SELECT 1 FROM personal_ai_approval_ledger WHERE requesting_user_hash=NEW.owner_hash AND operation=''KNOWLEDGE_PROMOTION'')
+ THEN RAISE(ABORT,''COUNTER_IMPORT_ABSENT_HISTORY_REQUIRED'') END;
+END') AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='counter_v1_update_guard' AND tbl_name='approval_credential_counters_v1' AND sql IS 'CREATE TRIGGER counter_v1_update_guard BEFORE UPDATE ON approval_credential_counters_v1 BEGIN
+ SELECT CASE WHEN NEW.owner_hash!=OLD.owner_hash OR NEW.rp_id!=OLD.rp_id OR NEW.signer_identity!=OLD.signer_identity
+ OR NEW.enrollment_epoch!=OLD.enrollment_epoch OR NEW.enrolled_at_ms!=OLD.enrolled_at_ms
+ OR NEW.bootstrap_evidence_sha256!=OLD.bootstrap_evidence_sha256 OR OLD.state!=''ACTIVE''
+ OR NOT ((NEW.state=''REVOKED'' AND NEW.mode=OLD.mode AND NEW.last_count=OLD.last_count AND NEW.revision=OLD.revision AND NEW.updated_at_ms=OLD.updated_at_ms)
+ OR (NEW.state=''ACTIVE'' AND NEW.mode=''MONOTONIC'' AND NEW.last_count>OLD.last_count AND NEW.revision=OLD.revision+1 AND NEW.updated_at_ms>=OLD.updated_at_ms))
+ THEN RAISE(ABORT,''COUNTER_TRANSITION_INVALID'') END;
+END') AND (SELECT json_group_array(json_array(operation,asset_type,canonical_writer,single_use,replay_guard)) FROM (SELECT * FROM approval_ledger_operations ORDER BY operation))='[["KNOWLEDGE_PROMOTION","KNOWLEDGE","writeKnowledgeCandidate",1,1],["decision_write","DECISION","writeDecisionRecord",1,1],["deploy_worker_version","DEPLOY","deployWorkerVersion",1,1],["knowledge_write","KNOWLEDGE","writeKnowledgeCandidate",1,1],["write_decision_record","DECISION","writeDecisionRecord",1,1],["write_project_status_record","REALITY","writeProjectStatusRecord",1,1]]'`;
+
+// dispatch/production-knowledge-minimal-package-20261020/worker/knowledge-production.mjs
+var reject = (code, outcome = "NOT_ATTEMPTED") => ({ isError: true, text: code, structuredContent: { status: "BLOCKED", reason: code, outcome, retry_allowed: false, canonical_write_performed: outcome === "NOT_ATTEMPTED" ? false : null } });
+async function guardedKnowledgePromote(env, input, { writer, verifyVersion }) {
+  let stage = "preflight", attempted = false;
+  try {
+    if (!input || Object.keys(input).some((k2) => !["candidate_operation", "candidate_id", "candidate_version", "content_hash", "approval_id"].includes(k2)) || input.candidate_operation !== "promote" || typeof input.candidate_id !== "string" || !Number.isSafeInteger(input.candidate_version) || !/^[a-f0-9]{64}$/.test(input.content_hash) || !/^knowledge:[A-Za-z0-9_-]{43}$/.test(input.approval_id)) return reject("EXACT_REGISTERED_KNOWLEDGE_APPROVAL_REQUIRED");
+    const db = env?.ASSET_DB;
+    if (!db) return reject("ASSET_WRITE_UNAVAILABLE");
+    await checkedSchema(db, SNAPSHOT);
+    const k = await db.prepare("SELECT * FROM knowledge_candidates WHERE candidate_id=?").bind(input.candidate_id).first();
+    if (!k || k.version !== input.candidate_version || k.content_hash !== input.content_hash || k.status !== "APPROVED_FOR_PROMOTION" || k.review_state !== "PASS" || k.review_result !== "PASS") return reject("CANDIDATE_NOT_REVIEWED_PASS");
+    const exact = exactTarget(candidatePayload(k)), digest = await hash(exact);
+    if (await hash(k.content) !== k.content_hash) return reject("CANDIDATE_HASH_CHANGED");
+    const p = checkedProvenance(k.provenance);
+    const target = await db.prepare("SELECT asset_type,current_version,content_hash FROM assets WHERE asset_id=?").bind(k.asset_id).first();
+    if (target && target.asset_type !== "KNOWLEDGE" || (target?.current_version ?? null) !== k.expected_asset_version) return reject("TARGET_VERSION_CHANGED");
+    if (target?.content_hash === k.content_hash) return reject("DUPLICATE_CANONICAL_NO_WRITE");
+    const a = await db.prepare("SELECT * FROM personal_ai_approval_ledger WHERE approval_id=?").bind(input.approval_id).first();
+    const c = await db.prepare("SELECT * FROM approval_assertion_commits_v1 WHERE approval_id=?").bind(input.approval_id).first();
+    if (!a || !c) return reject("TRUSTED_ATOMIC_APPROVAL_REQUIRED");
+    const counter = await db.prepare("SELECT * FROM approval_credential_counters_v1 WHERE owner_hash=? AND rp_id=? AND signer_identity=?").bind(c.owner_hash, RP, c.signer_identity).first();
+    const now = Date.now();
+    if (a.operation !== "KNOWLEDGE_PROMOTION" || a.asset_type !== "KNOWLEDGE" || a.exact_target !== "knowledge:v1:sha256:" + digest || a.exact_target_json !== exact || a.payload_sha256 !== digest || a.time_basis !== "epoch_ms_v1" || a.candidate_id !== k.candidate_id || a.candidate_version !== k.version || a.content_hash !== k.content_hash || a.review_result !== "PASS" || a.state !== "REGISTERED" || a.consumed !== 0 || a.consume_count !== 0 || a.consumed_at !== null || a.invalidated !== 0 || !Number.isSafeInteger(a.expires_at) || a.expires_at <= now || a.created_at > now || a.expires_at - a.created_at > 3e5 || a.requesting_user_hash !== c.owner_hash || a.approved_by !== c.signer_identity || c.exact_target !== exact || c.payload_sha256 !== digest || c.rp_id !== RP || !counter || counter.state !== "ACTIVE" || counter.enrollment_epoch !== c.enrollment_epoch || counter.revision < c.expected_revision + 1 || counter.last_count < c.sign_count || counter.bootstrap_evidence_sha256 !== SEED_EVIDENCE) return reject("APPROVAL_BINDING_OR_TTL_INVALID");
+    const claim = db.prepare(`UPDATE knowledge_candidates SET status='PROMOTION_RESERVED' WHERE candidate_id=? AND version=? AND content_hash=? AND asset_id=? AND reviewed_at=? AND review_evidence_sha256=? AND content=? AND status='APPROVED_FOR_PROMOTION' AND review_state='PASS' AND review_result='PASS' AND expected_asset_version IS ? AND ((? IS NULL AND NOT EXISTS(SELECT 1 FROM assets WHERE asset_id=?)) OR EXISTS(SELECT 1 FROM assets WHERE asset_id=? AND asset_type='KNOWLEDGE' AND current_version=?)) AND (${SCHEMA_GUARD})`).bind(k.candidate_id, k.version, k.content_hash, k.asset_id, k.reviewed_at, k.review_evidence_sha256, k.content, k.expected_asset_version, k.expected_asset_version, k.asset_id, k.asset_id, k.expected_asset_version);
+    const consume = db.prepare(`UPDATE personal_ai_approval_ledger SET consumed=1,state='CONSUMED',consume_count=consume_count+1,consumed_at=CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) WHERE approval_id=? AND requesting_user_hash=? AND approved_by=? AND operation='KNOWLEDGE_PROMOTION' AND candidate_id=? AND candidate_version=? AND content_hash=? AND exact_target=? AND exact_target_json=? AND payload_sha256=? AND time_basis='epoch_ms_v1' AND state='REGISTERED' AND consumed=0 AND consume_count=0 AND consumed_at IS NULL AND invalidated=0 AND created_at<=CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) AND expires_at>CAST((julianday('now')-2440587.5)*86400000 AS INTEGER) AND EXISTS(SELECT 1 FROM knowledge_candidates WHERE candidate_id=? AND status='PROMOTION_RESERVED' AND version=? AND content_hash=? AND reviewed_at=?) AND (${SCHEMA_GUARD})`).bind(a.approval_id, c.owner_hash, c.signer_identity, k.candidate_id, k.version, k.content_hash, "knowledge:v1:sha256:" + digest, exact, digest, k.candidate_id, k.version, k.content_hash, k.reviewed_at);
+    const guard = db.prepare("SELECT CASE WHEN changes()=1 THEN 1 ELSE json('KNOWLEDGE_APPROVAL_CAS_LOST') END AS ok");
+    stage = "claim_consume";
+    attempted = true;
+    const receipt = await db.batch([claim, guard, consume, guard]);
+    if (receipt[0]?.meta?.changes !== 1 || receipt[2]?.meta?.changes !== 1) return reject("CLAIM_CONSUME_OUTCOME_UNKNOWN", "UNKNOWN_RECONCILE_REQUIRED");
+    stage = "canonical_writer";
+    const result = await writer(env, { __knowledge_gate: "KNOWLEDGE_PROD_V02_COUNTER_V1", expected_current_version: k.expected_asset_version, asset_id: k.asset_id, title: k.title, content: k.content, source_identity: p.source.identity, source_location: p.source.location, source_version: p.source_version, content_version: p.content_version, source_content_hash: p.source_content_hash ?? null, captured_at: p.captured_at, supersedes: [...p.supersedes ?? [], ...k.expected_asset_version === null ? [] : [k.asset_id + "@" + k.expected_asset_version]], promotion_decision: "PROMOTE", promotion_event: "knowledge-approval:" + a.approval_id, actor: a.approved_by, created_by: a.approved_by });
+    if (result?.isError || !result?.structuredContent) return reject("CANONICAL_WRITE_OUTCOME_UNKNOWN", "UNKNOWN_RECONCILE_REQUIRED");
+    const written = result.structuredContent;
+    if (written.asset_id !== k.asset_id || written.content_hash !== k.content_hash || Number(written.version) !== Number(k.expected_asset_version ?? 0) + 1 || !await verifyVersion(db, k.asset_id, written.version, k.content_hash, k.content)) return reject("CANONICAL_READBACK_UNKNOWN", "UNKNOWN_RECONCILE_REQUIRED");
+    stage = "status_readback";
+    const q = await db.prepare("UPDATE knowledge_candidates SET status='CANONICAL_READBACK_VERIFIED' WHERE candidate_id=? AND status='PROMOTION_RESERVED' AND version=? AND content_hash=? AND reviewed_at=?").bind(k.candidate_id, k.version, k.content_hash, k.reviewed_at).run();
+    if (q.meta?.changes !== 1) return reject("CANDIDATE_CLOSEOUT_UNKNOWN", "UNKNOWN_RECONCILE_REQUIRED");
+    const final = { ...written, candidate_id: k.candidate_id, candidate_status: "CANONICAL_READBACK_VERIFIED", approval_id: a.approval_id, retry_allowed: false, read_back_verified: true, canonical_write_performed: true };
+    return { ...result, text: JSON.stringify(final), structuredContent: final };
+  } catch {
+    return reject("KNOWLEDGE_" + stage.toUpperCase() + "_STOPPED", attempted ? "UNKNOWN_RECONCILE_REQUIRED" : "NOT_ATTEMPTED");
+  }
+}
+
 
 // src/index.js
 var u8 = Uint8Array;
@@ -1049,12 +1498,23 @@ function nowSec() {
   return Math.floor(Date.now() / 1e3);
 }
 function normalizeScopes(value) {
-  const requested = String(value || "").split(/\s+/).filter(Boolean);
-  const scopes = [...new Set(requested.filter((scope) => scope === SCOPE || scope === ASSET_READ_SCOPE))];
-  return scopes.length ? scopes : [SCOPE];
+  if (typeof value !== 'string' || !value || value.length>128 || !/^[a-z.]+(?: [a-z.]+)*$/.test(value)) return [];
+  const scopes=[...new Set(value.split(' '))];
+  if(scopes.some(scope=>![SCOPE,ASSET_READ_SCOPE,TASK_READ_SCOPE].includes(scope)))return [];
+  if(scopes.includes(TASK_READ_SCOPE)&&scopes.length!==1)return [];
+  return scopes;
 }
 function scopeString(value) {
-  return normalizeScopes(value).join(" ");
+  const scopes=normalizeScopes(value);
+  if(!scopes.length)throw Error('INVALID_SCOPE');
+  return scopes.join(' ');
+}
+function validGrantScope(payload,form) {
+  const original=normalizeScopes(payload?.scope);
+  if(!original.length||original.includes(TASK_READ_SCOPE)&&payload.task_project!==TASK_READ_PROJECT)return null;
+  const requested=form.has('scope')?normalizeScopes(form.get('scope')):original;
+  if(!requested.length||requested.some(s=>!original.includes(s)))return null;
+  return requested.join(' ');
 }
 function hasReadScope(auth) {
   return Boolean(auth && auth.scopes && (auth.scopes.includes(ASSET_READ_SCOPE) || auth.scopes.includes(SCOPE)));
@@ -1066,7 +1526,7 @@ function protectedResourceMetadata(origin) {
   return {
     resource: origin,
     authorization_servers: [origin],
-    scopes_supported: [SCOPE, ASSET_READ_SCOPE],
+    scopes_supported: [SCOPE, ASSET_READ_SCOPE, TASK_READ_SCOPE],
     bearer_methods_supported: ["header"],
     resource_documentation: `${origin}/`
   };
@@ -1081,7 +1541,7 @@ function authorizationServerMetadata(origin) {
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: [SCOPE, ASSET_READ_SCOPE],
+    scopes_supported: [SCOPE, ASSET_READ_SCOPE, TASK_READ_SCOPE],
     authorization_response_iss_parameter_supported: false
   };
 }
@@ -1135,7 +1595,7 @@ function consentPage(params, error) {
   return `<!doctype html><html><head><meta charset="utf-8"><title>Authorize Personal AI Execution</title></head>
 <body style="font-family:system-ui;max-width:520px;margin:48px auto">
 <h2>Authorize <em>Personal AI Execution</em></h2>
-<p>This grants the requesting MCP client access to <code>submit_task</code> and <code>get_task_result</code>.</p>
+${normalizeScopes(params.scope).includes(TASK_READ_SCOPE)?'<p>Scope: <code>task.read</code>. Fixed project: <code>cloud-assets-activation</code>.</p><p>Only <code>list_pending_results</code> and <code>get_task_result</code> are allowed. No registry synchronization writes; no dispatch, retry, asset or Canonical writes.</p>':'<p>This grants the requesting MCP client access to <code>submit_task</code> and <code>get_task_result</code>.</p>'}
 ${message}
 <form method="post" action="/authorize">
 ${hidden}
@@ -1147,6 +1607,7 @@ ${hidden}
 async function authorizeGet(request, env) {
   const url = new URL(request.url);
   const p = Object.fromEntries(url.searchParams);
+  if (!normalizeScopes(p.scope).length) return json({error:"invalid_scope"},400);
   if (p.response_type !== "code") return json({ error: "unsupported_response_type" }, 400);
   if (p.code_challenge_method && p.code_challenge_method !== "S256") {
     return json({ error: "invalid_request", error_description: "PKCE S256 required" }, 400);
@@ -1161,6 +1622,7 @@ async function authorizeGet(request, env) {
 async function authorizePost(request, env) {
   const form = await request.formData();
   const p = Object.fromEntries(form.entries());
+  if (!normalizeScopes(p.scope).length) return json({error:"invalid_scope"},400);
   const registered = await resolveRedirectUris(p.client_id, env);
   if (!redirectAllowed(registered, p.redirect_uri)) {
     return json({ error: "invalid_request", error_description: "redirect_uri not allowed" }, 400);
@@ -1177,7 +1639,8 @@ async function authorizePost(request, env) {
       client_id: p.client_id,
       redirect_uri: p.redirect_uri,
       code_challenge: p.code_challenge,
-      scope: scopeString(p.scope || SCOPE),
+      scope: scopeString(p.scope),
+      ...(normalizeScopes(p.scope).includes(TASK_READ_SCOPE)?{task_project:TASK_READ_PROJECT}:{}),
       exp: nowSec() + CODE_TTL
     },
     env.OAUTH_SIGNING_KEY
@@ -1207,23 +1670,27 @@ async function tokenEndpoint(request, env) {
     if (challenge !== payload.code_challenge) {
       return json({ error: "invalid_grant", error_description: "PKCE verification failed" }, 400);
     }
-    return json(await issueTokens(env, payload.scope || SCOPE));
+    const scope=validGrantScope(payload,form);
+    if(!scope)return json({error:"invalid_scope"},400);
+    return json(await issueTokens(env, scope));
   }
   if (grantType === "refresh_token") {
     const payload = await verifyPayload(String(form.get("refresh_token") || ""), env.OAUTH_SIGNING_KEY);
     if (!payload || payload.kind !== "refresh") return json({ error: "invalid_grant" }, 400);
-    return json(await issueTokens(env, payload.scope || SCOPE));
+    const scope=validGrantScope(payload,form);
+    if(!scope)return json({error:"invalid_scope"},400);
+    return json(await issueTokens(env, scope));
   }
   return json({ error: "unsupported_grant_type" }, 400);
 }
 async function issueTokens(env, scope) {
   scope = scopeString(scope);
   const access = await signPayload(
-    { kind: "access", sub: "owner", scope, aud: "mcp", exp: nowSec() + ACCESS_TTL },
+    { kind: "access", sub: "owner", scope, ...(scope===TASK_READ_SCOPE?{task_project:TASK_READ_PROJECT}:{}), aud: "mcp", exp: nowSec() + ACCESS_TTL },
     env.OAUTH_SIGNING_KEY
   );
   const refresh = await signPayload(
-    { kind: "refresh", sub: "owner", scope, exp: nowSec() + REFRESH_TTL },
+    { kind: "refresh", sub: "owner", scope, ...(scope===TASK_READ_SCOPE?{task_project:TASK_READ_PROJECT}:{}), exp: nowSec() + REFRESH_TTL },
     env.OAUTH_SIGNING_KEY
   );
   return {
@@ -1242,7 +1709,10 @@ async function mcpAuthorized(request, env) {
     return { scopes: [SCOPE, ASSET_READ_SCOPE], kind: "static" };
   }
   const payload = await verifyPayload(presented, env.OAUTH_SIGNING_KEY);
-  return payload && payload.kind === "access" ? { scopes: normalizeScopes(payload.scope), kind: "oauth", payload } : false;
+  if(!payload||payload.kind!=="access")return false;
+  const scopes=normalizeScopes(payload.scope);
+  if(!scopes.length||scopes.includes(TASK_READ_SCOPE)&&payload.task_project!==TASK_READ_PROJECT)return false;
+  return {scopes,kind:"oauth",payload};
 }
 function unauthorized(origin) {
   return json(
@@ -1553,10 +2023,10 @@ function reviewDispatchAudit(taskId, verdict, timestamp, dispatch) {
     reason: dispatch.reason ?? null
   };
 }
-async function findArtifact(env, name) {
+async function findArtifact(env, name, readOptions = {}) {
   const res = await fetch(
     `${API}/repos/${env.GITHUB_REPO}/actions/artifacts?name=${encodeURIComponent(name)}`,
-    { headers: ghHeaders(env) }
+    { ...readOptions, headers: ghHeaders(env) }
   );
   if (!res.ok) throw new Error(`GitHub artifact lookup failed HTTP ${res.status}`);
   const payload = await res.json();
@@ -1579,16 +2049,23 @@ async function downloadArtifactJson(env, artifactId) {
   if (!name) throw new Error(`${RESULT_FILENAME} not found in artifact`);
   return JSON.parse(new TextDecoder().decode(files[name]));
 }
-async function getArtifactWorkflowRun(env, artifact) {
+async function getArtifactWorkflowRun(env, artifact, readOptions = {}) {
   const runId = artifact?.workflow_run?.id;
   if (!runId) throw new Error("artifact missing workflow_run.id");
   const res = await fetch(`${API}/repos/${env.GITHUB_REPO}/actions/runs/${runId}`, {
-    headers: ghHeaders(env)
+    ...readOptions, headers: ghHeaders(env)
   });
   if (!res.ok) throw new Error(`GitHub workflow lookup failed HTTP ${res.status}`);
   const run = await res.json();
   return {
     id: run.id,
+    repository_full_name: run.repository?.full_name ?? null,
+    display_title: run.display_title ?? null,
+    event: run.event ?? null,
+    path: run.path ?? null,
+    run_number: run.run_number ?? null,
+    run_attempt: run.run_attempt ?? null,
+    run_started_at: run.run_started_at ?? null,
     status: run.status,
     conclusion: run.conclusion,
     html_url: run.html_url,
@@ -2688,6 +3165,172 @@ async function finalizeTaskResult(env, taskId, result) {
   }
   return result;
 }
+// Strict observation path: KV get + GitHub GET only. Never finalize results.
+var EXECUTION_OBSERVATION_TTL_SECONDS = 60;
+function sourceTimestamp(value) {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value)) ? value : null;
+}
+function positiveSourceInteger(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+// Reuse GitHub's existing workflow-run registry; no callback or mapping writes.
+var TASK_RUN_TITLE_PREFIX = "personal-ai-task:";
+var TASK_WORKFLOW_PATH = ".github/workflows/agent-dispatch.yml";
+async function findEarlyTaskRun(env, task, readOptions) {
+  const createdAt = sourceTimestamp(task.created_at);
+  if (!createdAt) return { run: null, reason: null, coverage: "registration_time_missing" };
+  // Approved-child registration happens AFTER dispatch. Reuse the existing
+  // 15-minute dispatch grace as a bounded lookback, not an identity assertion.
+  // Exact task/repo/workflow matching remains mandatory; older unseen runs stay unknown.
+  const boundary = new Date(Math.floor((Date.parse(createdAt) - TASK_DISPATCH_CONFIRM_GRACE_MS) / 1000) * 1000).toISOString();
+  const query = new URLSearchParams({ event: "repository_dispatch", per_page: "100", created: `>=${boundary}` });
+  const response = await fetch(`${API}/repos/${env.GITHUB_REPO}/actions/workflows/agent-dispatch.yml/runs?${query}`, {
+    ...readOptions, headers: ghHeaders(env)
+  });
+  if (!response.ok) throw new Error("workflow run lookup failed");
+  const payload = await response.json();
+  // A bounded incomplete page is not evidence that a newer dispatch is absent.
+  if (!Array.isArray(payload.workflow_runs) || !Number.isSafeInteger(payload.total_count) ||
+      payload.total_count < 0 || payload.total_count !== payload.workflow_runs.length ||
+      response.headers.get("link")?.includes('rel="next"')) {
+    return { run: null, reason: "run_lookup_incomplete" };
+  }
+  const title = `${TASK_RUN_TITLE_PREFIX}${task.task_id}`;
+  const matches = payload.workflow_runs.filter((run) => run?.display_title === title);
+  if (!matches.length) return { run: null, reason: null, coverage: "no_named_run_visible" };
+  for (const run of matches) {
+    if (!positiveSourceInteger(run.id) || !positiveSourceInteger(run.run_number) ||
+        !positiveSourceInteger(run.run_attempt) || run.event !== "repository_dispatch" ||
+        run.path !== TASK_WORKFLOW_PATH ||
+        typeof run.repository?.full_name !== "string" ||
+        run.repository.full_name.toLowerCase() !== env.GITHUB_REPO.toLowerCase() ||
+        !sourceTimestamp(run.created_at) || Date.parse(run.created_at) < Date.parse(boundary)) {
+      return { run: null, reason: "invalid_early_run_identity" };
+    }
+  }
+  // run_number orders dispatches within this one workflow; run_attempt orders reruns.
+  // A late rerun of an older dispatch must not replace a newer dispatch.
+  matches.sort((a, b) => b.run_number - a.run_number || b.run_attempt - a.run_attempt);
+  const selected = matches[0];
+  if (matches.some((run) => run.run_number === selected.run_number && run.id !== selected.id)) {
+    return { run: null, reason: "ambiguous_early_run_identity" };
+  }
+  return { run: selected, reason: null, coverage: "named_workflow_run" };
+}
+function hasTaskObservationScope(auth) {
+  if (!hasWriteScope(auth)) return false;
+  if (auth.kind === "static") return true;
+  const payload = auth.payload;
+  // normalizeScopes has legacy defaults: inspect the signed claims directly.
+  return auth.kind === "oauth" && payload?.aud === "mcp" &&
+    Number.isFinite(payload.exp) && payload.exp > nowSec() &&
+    typeof payload.scope === "string" && payload.scope.split(/\s+/).includes(SCOPE);
+}
+async function toolGetTaskExecutionStatus(env, args) {
+  const taskId = args.task_id;
+  if (typeof taskId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(taskId)) {
+    return { isError: true, text: "INVALID_INPUT: task_id required (1-128 letters, digits, _ or -)" };
+  }
+  const result = {
+    contract: "task_execution_observation.v1", task_id: taskId,
+    source: "github_actions", scope: "single_task_mapped_run",
+    full_task_coverage: false, agent_state: "unknown",
+    mapping: { kind: "unknown", artifact_id: null, run_id: null, run_number: null, coverage: null },
+    executor: { state: "unknown", run_id: null, run_attempt: null, status: null, conclusion: null,
+      created_at: null, updated_at: null, run_started_at: null, completed_at: null },
+    // Registry execution_status historically combines workflow and business status.
+    // Neither that value nor a review verdict establishes independent acceptance.
+    business: { state: "unknown", reason: "business_result_not_read" },
+    acceptance: { state: "unknown", reason: "independent_acceptance_not_read" },
+    registry: { available: false, dispatch_attempt: null },
+    observed_at: null, ttl_seconds: EXECUTION_OBSERVATION_TTL_SECONDS,
+    expires_at: null, reason: null
+  };
+  const finish = () => {
+    result.observed_at = new Date().toISOString();
+    result.expires_at = new Date(Date.parse(result.observed_at) + result.ttl_seconds * 1000).toISOString();
+    return { isError: false, text: JSON.stringify(result), structuredContent: result };
+  };
+  let task;
+  try { task = await readTask(env, taskId); }
+  catch { result.reason = "registry_read_failed"; return finish(); }
+  if (!task || task.task_id !== taskId) {
+    result.reason = "task_registration_unavailable";
+    return finish();
+  }
+  result.registry = { available: true, dispatch_attempt: positiveSourceInteger(task.dispatch_attempt) };
+  if (typeof env.GITHUB_REPO !== "string" || !/^[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/.test(env.GITHUB_REPO) || !env.GITHUB_TOKEN) {
+    result.reason = "github_configuration_unavailable";
+    return finish();
+  }
+  // Bound all GETs together; reject redirects so authorization stays on GitHub.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  const readOptions = { method: "GET", redirect: "error", signal: controller.signal };
+  try {
+    const early = await findEarlyTaskRun(env, task, readOptions);
+    result.mapping.coverage = early.coverage ?? null;
+    if (early.reason) { result.reason = early.reason; return finish(); }
+    let artifact;
+    if (early.run) {
+      result.mapping.kind = "workflow_run_name";
+      result.mapping.run_number = early.run.run_number;
+      artifact = { workflow_run: { id: early.run.id } };
+    } else {
+      // Compatibility only: old workflows used display_title=gpt_task.
+      result.mapping.kind = "execution_result_artifact";
+      artifact = await findArtifact(env, `execution_result-${taskId}`, readOptions);
+      if (!artifact) { result.reason = "task_run_mapping_unavailable"; return finish(); }
+      if (artifact.name !== `execution_result-${taskId}` || !positiveSourceInteger(artifact.workflow_run?.id)) {
+        result.reason = "invalid_task_run_mapping"; return finish();
+      }
+      result.mapping.artifact_id = positiveSourceInteger(artifact.id);
+    }
+    const runId = artifact.workflow_run.id;
+    result.mapping.run_id = runId;
+    result.executor.run_id = runId;
+    const run = await getArtifactWorkflowRun(env, artifact, readOptions);
+    if (run.id !== runId) { result.reason = "run_identity_mismatch"; return finish(); }
+    if (typeof run.repository_full_name !== "string" ||
+        run.repository_full_name.toLowerCase() !== env.GITHUB_REPO.toLowerCase()) {
+      result.reason = "run_repository_mismatch"; return finish();
+    }
+    if (early.run && (run.display_title !== `${TASK_RUN_TITLE_PREFIX}${taskId}` ||
+        run.event !== "repository_dispatch" || run.path !== TASK_WORKFLOW_PATH ||
+        run.run_number !== early.run.run_number || !positiveSourceInteger(run.run_attempt) ||
+        run.run_attempt < early.run.run_attempt)) {
+      result.reason = "early_run_changed_or_regressed"; return finish();
+    }
+    if (result.registry.dispatch_attempt > 1) {
+      const accepted = sourceTimestamp(task.dispatch_accepted_at);
+      const sourceCreated = sourceTimestamp(run.created_at);
+      if (!accepted || !sourceCreated || Date.parse(sourceCreated) < Math.floor(Date.parse(accepted) / 1000) * 1000) {
+        result.reason = "latest_dispatch_not_visible"; return finish();
+      }
+    }
+    const ex = result.executor;
+    ex.run_attempt = positiveSourceInteger(run.run_attempt);
+    const statuses = ["queued", "in_progress", "completed", "requested", "waiting", "pending"];
+    const conclusions = ["success", "failure", "neutral", "cancelled", "skipped", "timed_out", "action_required", "stale", "startup_failure"];
+    ex.status = typeof run.status === "string" ? run.status : null;
+    ex.conclusion = typeof run.conclusion === "string" ? run.conclusion : null;
+    for (const field of ["created_at", "updated_at", "run_started_at", "completed_at"]) {
+      ex[field] = sourceTimestamp(run[field]);
+    }
+    if (!statuses.includes(ex.status) || !ex.run_attempt || (ex.status === "completed" && !conclusions.includes(ex.conclusion))) {
+      result.reason = "incomplete_source_fields";
+    } else if (ex.status !== "completed" && run.conclusion != null) {
+      result.reason = "inconsistent_source_fields";
+    } else {
+      ex.state = ex.status === "in_progress" ? "running" : ex.status === "completed" ? "completed" : "queued";
+    }
+  } catch {
+    // Never return exception bodies, headers, credentials or raw GitHub payloads.
+    result.reason = controller.signal.aborted ? "github_read_timeout" : "github_read_failed";
+  } finally { clearTimeout(timer); }
+  return finish();
+}
+
 async function toolGetTaskResult(env, args) {
   const taskId = String(args.task_id ?? "");
   if (!taskId) return { isError: true, text: "INVALID_INPUT: task_id required" };
@@ -3088,7 +3731,6 @@ async function writeKnowledgeCandidate(env, args, allowed = KNOWLEDGE_ASSET_TYPE
   const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
   if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
   const assetType = String(input.asset_type ?? allowed).trim().toUpperCase();
-  // The default KNOWLEDGE entry point stays knowledge-only: assetType !== KNOWLEDGE_ASSET_TYPE
   if (assetType !== allowed) return { isError: true, text: "INVALID_ASSET_TYPE" };
   const contract = assetType === KNOWLEDGE_ASSET_TYPE ? KNOWLEDGE_WRITE_CONTRACT : "PERSONAL_AI_SKILL_CANDIDATE_WRITER_V0.1";
   const assetId = String(input.asset_id ?? input.candidate_id ?? "").trim();
@@ -3105,11 +3747,14 @@ async function writeKnowledgeCandidate(env, args, allowed = KNOWLEDGE_ASSET_TYPE
   let existing;
   try {
     existing = await db.prepare(
-      "SELECT asset_id, current_version, content_hash, updated_at FROM assets WHERE asset_id = ?"
+      "SELECT asset_id, asset_type, current_version, content_hash, updated_at FROM assets WHERE asset_id = ?"
     ).bind(assetId).first();
   } catch {
     return { isError: true, text: "ASSET_WRITE_FAILED" };
   }
+  if (existing && existing.asset_type !== assetType) return { isError: true, text: "ASSET_TYPE_OWNERSHIP_MISMATCH" };
+  const approvalBound = assetType === "KNOWLEDGE" && input.__knowledge_gate === "KNOWLEDGE_PROD_V02_COUNTER_V1";
+  if (approvalBound && (existing?.current_version ?? null) !== input.expected_current_version) return { isError: true, text: "TARGET_VERSION_CHANGED" };
   if (existing && normalizeProvenanceHash(existing.content_hash) === contentHash) {
     const currentVersion = Number(existing.current_version) || 1;
     const present = await verifyKnowledgeVersion(db, assetId, currentVersion, contentHash, canonicalContent);
@@ -3136,7 +3781,7 @@ async function writeKnowledgeCandidate(env, args, allowed = KNOWLEDGE_ASSET_TYPE
     asset_id: assetId,
     canonical_version: version,
     content_hash: contentHash,
-    supersedes: previousVersion > 0 ? [...(Array.isArray(input.supersedes) ? input.supersedes : []), String(previousVersion)] : input.supersedes
+    supersedes: previousVersion > 0 ? [...Array.isArray(input.supersedes) ? input.supersedes : [], String(previousVersion)] : input.supersedes
   });
   const verification = provenance.verification;
   const schemaVersion = String(input.schema_version ?? "v0.1");
@@ -3146,6 +3791,7 @@ async function writeKnowledgeCandidate(env, args, allowed = KNOWLEDGE_ASSET_TYPE
   ).bind(schemaVersion, title, KNOWLEDGE_WRITE_STATUS, version, contentHash, nowIso, assetId) : db.prepare(
     "INSERT INTO assets (asset_id, asset_type, schema_version, title, status, current_version, content_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
   ).bind(assetId, assetType, schemaVersion, title, KNOWLEDGE_WRITE_STATUS, version, contentHash, nowIso, nowIso);
+  const boundAssetWrite = approvalBound && existing ? db.prepare("UPDATE assets SET schema_version=?,title=?,status=?,current_version=?,content_hash=?,updated_at=? WHERE asset_id=? AND asset_type='KNOWLEDGE' AND current_version=?").bind(schemaVersion, title, KNOWLEDGE_WRITE_STATUS, version, contentHash, nowIso, assetId, input.expected_current_version) : assetWrite;
   const versionWrite = db.prepare(KNOWLEDGE_VERSION_INSERT).bind(
     assetId,
     version,
@@ -3158,7 +3804,7 @@ async function writeKnowledgeCandidate(env, args, allowed = KNOWLEDGE_ASSET_TYPE
   );
   if (typeof db.batch !== "function") return { isError: true, text: "ASSET_WRITE_FAILED" };
   try {
-    await db.batch([assetWrite, versionWrite]);
+    await db.batch(approvalBound ? [boundAssetWrite, db.prepare("SELECT CASE WHEN changes()=1 THEN 1 ELSE json('TARGET_VERSION_CAS_LOST') END AS ok"), versionWrite] : [assetWrite, versionWrite]);
   } catch {
     return { isError: true, text: "ASSET_WRITE_FAILED" };
   }
@@ -3213,13 +3859,6 @@ async function toolWriteKnowledgeCandidate(env, args) {
     // candidate, no review state, and no bound approval, so it is rejected
     // before any DB read, Canonical writer call, or mutation. A caller-supplied
     // promotion_decision/approved_by/approval_receipt never authorises the write.
-    const candidateId = input.candidate_id == null ? "" : String(input.candidate_id).trim();
-    if (!candidateId) {
-      return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
-        reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING,
-        write_calls: 0
-      });
-    }
     return await promoteKnowledgeCandidate(env, args);
   } catch (err2) {
     return { isError: true, text: `KNOWLEDGE_WRITE_FAILED: ${err2?.message || "unknown"}` };
@@ -3278,9 +3917,9 @@ var KNOWLEDGE_PROMOTION_REJECT_RESERVED = "promotion_reserved";
 // `approved_by` / `approval_receipt` / `promotion_decision` can never authorise
 // a write. Approvals enter the ledger only through the trusted Human Gate
 // process, which writes to D1 out of band.
-var KNOWLEDGE_CANDIDATE_SELECT = "SELECT candidate_id, asset_id, title, status, content, content_hash, version, provenance, created_at, review_state, review_result FROM knowledge_candidates WHERE candidate_id = ?";
+var KNOWLEDGE_CANDIDATE_SELECT = "SELECT * FROM knowledge_candidates WHERE candidate_id = ?";
 var KNOWLEDGE_CANDIDATE_INSERT = "INSERT INTO knowledge_candidates (candidate_id, asset_id, title, status, content, content_hash, version, provenance, created_at, review_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-var KNOWLEDGE_CANDIDATE_REVIEW_UPDATE = "UPDATE knowledge_candidates SET status = ?, review_state = ? WHERE candidate_id = ?";
+var KNOWLEDGE_CANDIDATE_REVIEW_UPDATE = "UPDATE knowledge_candidates SET status = ?, review_state = ? WHERE candidate_id = ? AND status='DRAFT'";
 // Recording a review may only act on a pre-promotion candidate. The guarded
 // UPDATE makes the legal lifecycle transition atomic: a PROMOTED /
 // CANONICAL_READBACK_VERIFIED candidate can never be regressed back to
@@ -3320,8 +3959,8 @@ function knowledgePromotionOutcome(resultStatus, extra) {
   const body = { contract: KNOWLEDGE_CANDIDATE_CONTRACT, status: resultStatus, ...(extra || {}) };
   return { isError: false, text: JSON.stringify(body), structuredContent: body };
 }
-// validateCandidateGate is the SOLE authorisation for a Knowledge Canonical
-// write. A caller-supplied promotion_decision is never an input here.
+// Historical contract validator retained for compatibility diagnostics only.
+// Canonical promotion exclusively uses guardedKnowledgePromote and production atomic approval.
 function validateCandidateGate(candidate, supplied, approval, nowMs) {
   const reject = (reason) => ({ ok: false, reason });
   if (!candidate || typeof candidate !== "object") return reject(KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING);
@@ -3378,6 +4017,9 @@ async function stageKnowledgeCandidate(env, args) {
   const version = Number.isFinite(Number(input.version)) ? Number(input.version) : 1;
   const provenance = input.provenance && typeof input.provenance === "object" ? input.provenance : {};
   try {
+    if (!/^knowledge[:-][a-zA-Z0-9:_-]+$/.test(assetId) || !Number.isSafeInteger(version) || version < 1) return {isError:true,text:'INVALID_CANDIDATE_IDENTITY'};
+    checkedProvenance(provenance);
+    await checkedSchema(env.ASSET_DB, SNAPSHOT);
     await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_INSERT).bind(
       candidateId,
       assetId,
@@ -3439,7 +4081,19 @@ async function recordKnowledgeCandidateReview(env, args) {
     ? KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION
     : KNOWLEDGE_CANDIDATE_PENDING_REVIEW;
   const nowIso = (new Date()).toISOString();
-  const reviewWrite = db.prepare(KNOWLEDGE_CANDIDATE_REVIEW_RECORD).bind(nextStatus, reviewResult, reviewResult, nowIso, candidateId);
+  if (typeof input.reviewed_by !== 'string' || !input.reviewed_by.trim() ||
+      typeof input.review_evidence_ref !== 'string' || !input.review_evidence_ref.trim() ||
+      !/^[a-f0-9]{64}$/.test(input.review_evidence_sha256 ?? '')) {
+    return {isError:true,text:'REVIEW_EVIDENCE_REQUIRED'};
+  }
+  let target;
+  try {
+    await checkedSchema(db, SNAPSHOT);
+    target = await db.prepare('SELECT asset_type,current_version FROM assets WHERE asset_id=?').bind(candidate.asset_id).first();
+    if (target && target.asset_type !== 'KNOWLEDGE') return {isError:true,text:'ASSET_TYPE_OWNERSHIP_MISMATCH'};
+  } catch { return {isError:true,text:'PRODUCTION_SCHEMA_OR_TARGET_UNAVAILABLE'}; }
+  const reviewWrite = db.prepare(`UPDATE knowledge_candidates SET status=?,review_state=?,review_result=?,reviewed_at=?,reviewed_by=?,review_evidence_ref=?,review_evidence_sha256=?,expected_asset_version=? WHERE candidate_id=? AND version=? AND content_hash=? AND reviewed_at IS ? AND status IN ('DRAFT','PENDING_REVIEW','APPROVED_FOR_PROMOTION')`)
+    .bind(nextStatus,reviewResult,reviewResult,nowIso,input.reviewed_by,input.review_evidence_ref,input.review_evidence_sha256,target?.current_version??null,candidateId,candidate.version,candidate.content_hash,candidate.reviewed_at??null);
   // A review FAIL must atomically revoke every still-live KNOWLEDGE_PROMOTION
   // approval bound to this candidate. A later PASS therefore requires a NEW
   // trusted Human Gate approval; the revoked one can never be replayed.
@@ -3450,9 +4104,9 @@ async function recordKnowledgeCandidateReview(env, args) {
   let invalidatedCount = 0;
   if (typeof db.batch === "function") {
     try {
-      const results = await db.batch(invalidateWrite ? [reviewWrite, invalidateWrite] : [reviewWrite]);
+      const results = await db.batch(invalidateWrite ? [reviewWrite, db.prepare("SELECT CASE WHEN changes()=1 THEN 1 ELSE json('REVIEW_CAS_LOST') END AS ok"), invalidateWrite] : [reviewWrite]);
       reviewChanges = results && results[0] && results[0].meta ? Number(results[0].meta.changes) || 0 : 0;
-      if (invalidateWrite) invalidatedCount = results && results[1] && results[1].meta ? Number(results[1].meta.changes) || 0 : 0;
+      if (invalidateWrite) invalidatedCount = results && results[2] && results[2].meta ? Number(results[2].meta.changes) || 0 : 0;
     } catch {
       return { isError: true, text: "ASSET_WRITE_FAILED" };
     }
@@ -3555,7 +4209,8 @@ async function submitKnowledgeCandidateForReview(env, args) {
     });
   }
   try {
-    await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_REVIEW_UPDATE).bind(KNOWLEDGE_CANDIDATE_PENDING_REVIEW, KNOWLEDGE_CANDIDATE_NOT_REVIEWED, candidateId).run();
+    const changed = await env.ASSET_DB.prepare(KNOWLEDGE_CANDIDATE_REVIEW_UPDATE).bind(KNOWLEDGE_CANDIDATE_PENDING_REVIEW, KNOWLEDGE_CANDIDATE_NOT_REVIEWED, candidateId).run();
+    if (changed.meta?.changes !== 1) return {isError:true,text:"CANDIDATE_STATE_CHANGED"};
   } catch {
     return { isError: true, text: "ASSET_WRITE_FAILED" };
   }
@@ -3586,200 +4241,7 @@ async function releaseKnowledgeCandidateReservation(db, candidateId) {
   }
 }
 async function promoteKnowledgeCandidate(env, args) {
-  const input = args && typeof args === "object" && !Array.isArray(args) ? args : {};
-  if (!env || !env.ASSET_DB) return { isError: true, text: "ASSET_WRITE_UNAVAILABLE" };
-  const db = env.ASSET_DB;
-  const candidateId = String(input.candidate_id ?? "").trim();
-  if (!ASSET_ID_RE.test(candidateId)) return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING, write_calls: 0 });
-  let candidate;
-  try {
-    candidate = await db.prepare(KNOWLEDGE_CANDIDATE_SELECT).bind(candidateId).first();
-  } catch {
-    return { isError: true, text: "ASSET_WRITE_FAILED" };
-  }
-  if (!candidate) return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_MISSING, write_calls: 0 });
-  const assetId = String(candidate.asset_id || candidateId).trim();
-  const canonicalContent = canonicalKnowledgeContent(candidate.content);
-  const recomputed = await sha256Hex(canonicalContent);
-  const supplied = {
-    candidate_version: input.candidate_version,
-    content_hash: input.content_hash,
-    review_result: String(input.review_result ?? "").trim().toUpperCase(),
-    recomputed_content_hash: recomputed
-  };
-  if (String(candidate.status) === KNOWLEDGE_CANDIDATE_PROMOTED || String(candidate.status) === KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED) {
-    const present = await verifyKnowledgeVersion(db, assetId, Number(candidate.version), recomputed, canonicalContent);
-    if (present) {
-      return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_IDEMPOTENT, {
-        candidate_id: candidateId,
-        candidate_status: KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED,
-        asset_id: assetId,
-        version: Number(candidate.version),
-        content_hash: recomputed,
-        idempotent: true,
-        created: false,
-        write_calls: 0,
-        read_back_verified: true
-      });
-    }
-    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE, write_calls: 0 });
-  }
-  if (String(candidate.status) === KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED) {
-    // A prior promotion claimed this candidate. If the Canonical write already
-    // landed (write succeeded but the process died before the guarded status
-    // transition), advance it without a new write. Otherwise fail closed: no
-    // approval consume and no second Canonical write. Recovery is re-driven by
-    // a fresh Human Gate approval once the stale claim is released.
-    const present = await verifyKnowledgeVersion(db, assetId, Number(candidate.version), recomputed, canonicalContent);
-    if (present) {
-      try {
-        await db.prepare(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE).bind(KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED, candidateId, KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED).run();
-      } catch {
-        return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: "ASSET_WRITE_FAILED", write_calls: 0, candidate_id: candidateId });
-      }
-      return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_IDEMPOTENT, {
-        candidate_id: candidateId,
-        candidate_status: KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED,
-        asset_id: assetId,
-        version: Number(candidate.version),
-        content_hash: recomputed,
-        idempotent: true,
-        created: false,
-        write_calls: 0,
-        read_back_verified: true
-      });
-    }
-    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
-      reason: KNOWLEDGE_PROMOTION_REJECT_RESERVED,
-      write_calls: 0,
-      candidate_id: candidateId,
-      candidate_status: KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED,
-      recovery_required: true,
-      recovery_hint: "a prior promotion claim is unresolved; obtain a fresh Human Gate approval after the claim is cleared"
-    });
-  }
-  let approval = null;
-  try {
-    approval = await db.prepare(APPROVAL_LEDGER_SELECT).bind(KNOWLEDGE_PROMOTION_OPERATION, candidateId, Number(candidate.version), String(candidate.content_hash)).first();
-  } catch {
-    approval = null;
-  }
-  const gate = validateCandidateGate(candidate, supplied, approval, Date.parse(String(input.now ?? "")) || Date.now());
-  if (!gate.ok) {
-    // Fail closed BEFORE any Golden/Canonical write attempt.
-    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: gate.reason, write_calls: 0, candidate_id: candidateId });
-  }
-  // Atomic promotion claim: compete with a concurrent review FAIL on the same
-  // candidate status. Only a reviewed-PASS candidate still in
-  // APPROVED_FOR_PROMOTION is claimed; a FAIL that already moved the candidate
-  // to PENDING_REVIEW (or a competing promotion) makes changes === 0. This is
-  // the atomic boundary: the approval is never consumed and the writer is never
-  // called unless the claim succeeds, so an accepted FAIL can never be followed
-  // by a Canonical write and a FAIL can never be recorded after the claim.
-  let reserved = 0;
-  try {
-    const reserveResult = await db.prepare(KNOWLEDGE_CANDIDATE_RESERVE).bind(KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED, candidateId, KNOWLEDGE_CANDIDATE_APPROVED_FOR_PROMOTION, KNOWLEDGE_CANDIDATE_REVIEW_PASS).run();
-    reserved = reserveResult && reserveResult.meta ? Number(reserveResult.meta.changes) || 0 : 0;
-  } catch {
-    reserved = 0;
-  }
-  if (reserved < 1) {
-    // A concurrent review FAIL (or competing promotion) won the claim. Fail
-    // closed before any approval consume / Canonical write.
-    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_CANDIDATE_STATE, write_calls: 0, candidate_id: candidateId });
-  }
-  // Atomic single-use consume against the shared trusted ledger. The conditional
-  // UPDATE (consumed_at IS NULL, legacy integer epoch) is a compare-and-swap:
-  // under concurrent promotion of the same candidate, at most one consumer
-  // receives meta.changes === 1.
-  let consumed = 0;
-  try {
-    const consumedResult = await db.prepare(APPROVAL_LEDGER_CONSUME).bind(Math.floor(Date.now() / 1000), String(approval.approval_id), KNOWLEDGE_PROMOTION_OPERATION).run();
-    consumed = consumedResult && consumedResult.meta ? Number(consumedResult.meta.changes) || 0 : 0;
-  } catch {
-    consumed = 0;
-  }
-  if (consumed < 1) {
-    // Release the claim so the lifecycle is recoverable; no write occurred and
-    // the (dead) approval can never authorise a later write.
-    await releaseKnowledgeCandidateReservation(db, candidateId);
-    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: KNOWLEDGE_PROMOTION_REJECT_APPROVAL, write_calls: 0, candidate_id: candidateId });
-  }
-  // The Canonical writer's actor comes ONLY from the trusted ledger approval,
-  // never from a caller-supplied approved_by.
-  const writeOutcome = await writeKnowledgeCandidate(env, {
-    asset_id: assetId,
-    title: String(candidate.title ?? "").trim() || "candidate",
-    content: candidate.content,
-    source_identity: `knowledge-candidate:${candidateId}`,
-    created_by: String(approval.approved_by || "human-gate")
-  });
-  if (writeOutcome.isError) {
-    // Approval consumed but no Golden row exists: fail closed and expose a
-    // recovery token. Release the claim so the candidate is not dead-ended; a
-    // later promotion still requires a fresh, unconsumed, Human-Gate-bound
-    // approval (the consumed one can never be replayed).
-    await releaseKnowledgeCandidateReservation(db, candidateId);
-    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
-      reason: "ASSET_WRITE_FAILED",
-      write_calls: 1,
-      candidate_id: candidateId,
-      approval_consumed: true,
-      recovery_required: true,
-      recovery_hint: "obtain a new Human Gate approval bound to this candidate/version/hash"
-    });
-  }
-  const write = writeOutcome.structuredContent || {};
-  // Guarded transition PROMOTION_RESERVED -> PROMOTED. It pins the expected
-  // current status, so a promotion can never overwrite a concurrently recorded
-  // review state.
-  let promoted = 0;
-  try {
-    const promotedResult = await db.prepare(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE).bind(KNOWLEDGE_CANDIDATE_PROMOTED, candidateId, KNOWLEDGE_CANDIDATE_PROMOTION_RESERVED).run();
-    promoted = promotedResult && promotedResult.meta ? Number(promotedResult.meta.changes) || 0 : 0;
-  } catch {
-    promoted = 0;
-  }
-  if (promoted < 1) {
-    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: "ASSET_WRITE_FAILED", write_calls: 1, candidate_id: candidateId });
-  }
-  const readBack = await verifyKnowledgeVersion(db, assetId, Number(write.version), recomputed, canonicalContent);
-  if (!readBack) {
-    // Canonical write appeared to succeed but the authoritative read-back
-    // failed. Never claim VERIFIED. The candidate stays PROMOTED; the Golden row
-    // (if present) makes a later attempt idempotent, so recovery is safe.
-    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, {
-      reason: "readback_failed",
-      write_calls: 1,
-      candidate_id: candidateId,
-      candidate_status: KNOWLEDGE_CANDIDATE_PROMOTED,
-      read_back_verified: false,
-      recovery_required: true,
-      recovery_hint: "re-read the Canonical asset; re-promotion is idempotent and creates no duplicate"
-    });
-  }
-  let verified = 0;
-  try {
-    const verifiedResult = await db.prepare(KNOWLEDGE_CANDIDATE_GUARDED_UPDATE).bind(KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED, candidateId, KNOWLEDGE_CANDIDATE_PROMOTED).run();
-    verified = verifiedResult && verifiedResult.meta ? Number(verifiedResult.meta.changes) || 0 : 0;
-  } catch {
-    verified = 0;
-  }
-  if (verified < 1) {
-    return knowledgePromotionOutcome(KNOWLEDGE_PROMOTION_REJECTED, { reason: "ASSET_WRITE_FAILED", write_calls: 1, candidate_id: candidateId });
-  }
-  return knowledgePromotionOutcome(write.idempotent ? KNOWLEDGE_PROMOTION_IDEMPOTENT : KNOWLEDGE_PROMOTION_WRITTEN, {
-    candidate_id: candidateId,
-    candidate_status: KNOWLEDGE_CANDIDATE_CANONICAL_READBACK_VERIFIED,
-    asset_id: assetId,
-    version: Number(write.version),
-    content_hash: recomputed,
-    idempotent: Boolean(write.idempotent),
-    created: Boolean(write.created),
-    write_calls: 1,
-    read_back_verified: true,
-    operation: KNOWLEDGE_PROMOTION_OPERATION
-  });
+  return guardedKnowledgePromote(env, args, { writer: writeKnowledgeCandidate, verifyVersion: verifyKnowledgeVersion });
 }
 async function toolPromoteKnowledgeCandidate(env, args) {
   try {
@@ -3993,6 +4455,13 @@ var TOOLS = [
     }
   },
   {
+    name: "get_task_execution_status",
+    description: "Strict read-only observation of a registered task's named GitHub workflow run, with historical artifact fallback. No registry writes or events. Preserves run attempt and source times; missing mapping is unknown. One selected task run, never Agent availability, business success or independent acceptance. Observations expire after ttl_seconds.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    inputSchema: { type: "object", properties: { task_id: { type: "string" } }, required: ["task_id"], additionalProperties: false },
+    outputSchema: { type: "object", additionalProperties: true }
+  },
+  {
     name: "get_task_result",
     description: "Read the execution_result.json produced by the Cloud Agent for a task_id.",
     inputSchema: {
@@ -4157,6 +4626,11 @@ var TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
+        review_evidence_sha256: { type: "string" },
+        review_evidence_ref: { type: "string" },
+        reviewed_by: { type: "string" },
+        approval_id: { type: "string" },
+        candidate_version: { type: "integer" },
         candidate_operation: { type: "string", enum: ["create", "read", "submit_review", "review", "promote"] },
         asset_id: { type: "string" },
         candidate_id: { type: "string" },
@@ -4238,6 +4712,217 @@ function jsonRpcError(cors, id, err) {
   if (info.data) error.data = info.data;
   return json({ jsonrpc: "2.0", id, error }, 200, cors);
 }
+// task.read: fixed-project, pure-read branch. No registry synchronization.
+const TASK_READ_SCOPE = 'task.read';
+const TASK_READ_PROJECT = 'cloud-assets-activation';
+function isTaskRead(auth) {
+  return auth?.scopes?.length === 1 && auth.scopes[0] === TASK_READ_SCOPE &&
+    auth.payload?.task_project === TASK_READ_PROJECT;
+}
+function taskReadError(code) { return {isError:true,text:code}; }
+function taskReadTools() {
+  return [{name:'get_task_result',description:'Pure read of one registry-verified task in cloud-assets-activation; no registry sync.',
+    inputSchema:{type:'object',additionalProperties:false,properties:{task_id:{type:'string',pattern:'^cf-[a-f0-9]{12}$'}},required:['task_id']}},
+    {name:'list_pending_results',description:'Pure read of pending-review/failed/blocked/unconfirmed buckets in fixed project cloud-assets-activation; not all running tasks.',
+    inputSchema:{type:'object',additionalProperties:false,properties:{project_id:{type:'string',enum:[TASK_READ_PROJECT]}},required:[]}}]
+    .map(t=>({...t,annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true}}));
+}
+function taskReadArgs(args, detail=false) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return false;
+  const allowed = detail ? ['task_id'] : ['project_id'];
+  if (Object.keys(args).some(k=>!allowed.includes(k))) return false;
+  return detail ? typeof args.task_id === 'string' && /^cf-[a-f0-9]{12}$/.test(args.task_id) :
+    !Object.hasOwn(args,'project_id') || args.project_id === TASK_READ_PROJECT;
+}
+async function taskReadIndex(env) {
+  if (!env.TASK_REGISTRY) throw Error('REGISTRY_UNAVAILABLE');
+  const index = new Map(), seen = new Set();
+  let cursor;
+  for (let page=0; page<100; page++) {
+    const listed = await env.TASK_REGISTRY.list({prefix:REG_PREFIX,...(cursor?{cursor}:{})});
+    if (!listed || !Array.isArray(listed.keys) || typeof listed.list_complete !== 'boolean') throw Error('REGISTRY_PAGE_INVALID');
+    for (const key of listed.keys) {
+      if (typeof key.name !== 'string' || !key.name.startsWith(REG_PREFIX)) throw Error('REGISTRY_KEY_INVALID');
+      const id=key.name.slice(REG_PREFIX.length);
+      if (index.has(id)) throw Error('REGISTRY_KEY_REPEATED');
+      if(!key.metadata||typeof key.metadata!=='object'||Array.isArray(key.metadata)||
+        Object.hasOwn(key.metadata,'task_id')&&key.metadata.task_id!==id)throw Error('REGISTRY_METADATA_INVALID');
+      let row = {...(key.metadata ?? {}), task_id: id};
+      if (!metadataLineageComplete(row)) {
+        row = await readTask(env, id);
+        if (!row || row.task_id !== id) throw Error('REGISTRY_IDENTITY_UNAVAILABLE');
+        taskReadIdentity(row);
+      }
+      index.set(id, row);
+    }
+    if (listed.list_complete) return index;
+    if (!listed.cursor || seen.has(listed.cursor)) throw Error('REGISTRY_CURSOR_INVALID');
+    cursor=listed.cursor;seen.add(cursor);
+  }
+  throw Error('REGISTRY_INCOMPLETE');
+}
+// All declared parent/root references must resolve consistently. Unknown fails closed.
+function taskReadProject(row,index,seen=new Set()) {
+  if (!row || typeof row.task_id !== 'string' || seen.has(row.task_id) || seen.size>=MAX_LINEAGE_WALK) return null;
+  const trail=new Set(seen);trail.add(row.task_id);
+  let own=null;
+  if (Object.hasOwn(row,'project_id')) {
+    if (typeof row.project_id!=='string'||!row.project_id) return null;
+    own=row.project_id;
+  }
+  const links=[];
+  for (const field of ['root_task_id','parent_task_id']) {
+    if (!Object.hasOwn(row,field)||row[field]===null||row[field]==='') continue;
+    if (typeof row[field]!=='string') return null;
+    if (field==='root_task_id'&&row[field]===row.task_id) continue;
+    links.push(row[field]);
+  }
+  for (const id of new Set(links)) {
+    const project=taskReadProject(index.get(id),index,trail);
+    if (!project || own && project!==own) return null;
+    own=project;
+  }
+  return own;
+}
+async function taskReadResult(env,taskId,registry) {
+  const artifact=await findArtifact(env,`execution_result-${taskId}`);
+  let data=null,run=null;
+  if (artifact) {
+    data=await downloadArtifactJson(env,artifact.id);
+    if (!data || typeof data!=='object'||Array.isArray(data)||data.task_id!==taskId) throw Error('RESULT_TASK_ID_MISMATCH');
+    for(const field of ['project_id','root_task_id','parent_task_id']){
+      if(Object.hasOwn(data,field)&&data[field]!== (field==='project_id'?TASK_READ_PROJECT:registry[field]??null))throw Error('RESULT_LINEAGE_CONFLICT');
+    }
+    if(Object.hasOwn(data,'lineage')&&(!data.lineage||data.lineage.kind!=='project'||data.lineage.key!==TASK_READ_PROJECT))throw Error('RESULT_LINEAGE_CONFLICT');
+    run=await getArtifactWorkflowRun(env,artifact);
+  }
+  const safeRun=taskReadRun(run,artifact,env.GITHUB_REPO);
+  const status=data?verifiedResultStatus(data.status,safeRun):EXECUTION_STATUS_PENDING;
+  // Deliberate task.read allowlist: no raw result, free text, tests, commit,
+  // arbitrary artifact metadata or user-supplied nested evidence is forwarded.
+  return {task_id:taskId,project_id:TASK_READ_PROJECT,status,normalized_status:status,execution_status:status,
+    terminal:TERMINAL_EXECUTION_STATUSES.includes(status),workflow_conclusion:safeRun?.conclusion??null,
+    review_verdict:['PASS','FAIL','BLOCKED'].includes(registry.review_verdict??registry.verdict)?registry.review_verdict??registry.verdict:null,
+    review_state:['reviewed','unreviewed','pending_review'].includes(registry.review_state)?registry.review_state:registry.reviewed===true?'reviewed':null,
+    artifacts:Array.isArray(data?.artifacts)&&data.artifacts.length===0?[]:null,
+    artifact_metadata_policy:'UNTRUSTED_DELIVERABLE_METADATA_NOT_PROJECTED',
+    evidence:{artifact:{name:`execution_result-${taskId}`,id:artifact?.id??null,file:RESULT_FILENAME},
+      validation:{artifact_found:!!artifact,result_loaded:!!data,task_id_matches:!!data&&data.task_id===taskId},workflow_run:safeRun},
+    completed_at:safeRun?.completed_at??null,source_updated_at:safeRun?.updated_at??null,
+    registry_updated_at:taskReadTime(registry.updated_at),observed_at:new Date().toISOString(),
+    read_only:true,registry_sync_performed:false};
+}
+function taskReadTime(value){
+  return typeof value==='string'&&value.length<=40&&/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/.test(value)&&Number.isFinite(Date.parse(value))?value:null;
+}
+function taskReadRun(run,artifact,repo){
+  if(!run)return null;
+  if(!Number.isSafeInteger(run.id)||run.id<=0||run.id!==artifact?.workflow_run?.id||
+    !Number.isSafeInteger(artifact.id)||artifact.id<=0||
+    typeof repo!=='string'||!/^[-\w.]+\/[-\w.]+$/.test(repo)||
+    run.html_url!==`https://github.com/${repo}/actions/runs/${run.id}`)throw Error('WORKFLOW_IDENTITY_CONFLICT');
+  const statuses=['queued','in_progress','completed','requested','waiting','pending'];
+  const conclusions=['success','failure','cancelled','timed_out','neutral','skipped','action_required','stale','startup_failure'];
+  if(!statuses.includes(run.status)||run.conclusion!==null&&run.conclusion!==undefined&&!conclusions.includes(run.conclusion))throw Error('WORKFLOW_STATUS_INVALID');
+  return {id:run.id,status:run.status,conclusion:run.conclusion??null,html_url:run.html_url,
+    created_at:taskReadTime(run.created_at),updated_at:taskReadTime(run.updated_at),completed_at:taskReadTime(run.completed_at)};
+}
+function taskReadIdentity(row){
+  if(!row||typeof row!=='object'||Array.isArray(row)||typeof row.task_id!=='string'||!/^cf-[a-f0-9]{12}$/.test(row.task_id))throw Error('REGISTRY_IDENTITY_INVALID');
+  const identity={task_id:row.task_id};
+  for(const field of ['project_id','root_task_id','parent_task_id']){
+    const v=row[field]??null;
+    if(v!==null&&(typeof v!=='string'||!v||field!=='project_id'&&!/^cf-[a-f0-9]{12}$/.test(v)))throw Error('REGISTRY_IDENTITY_INVALID');
+    identity[field]=v;
+  }
+  return identity;
+}
+function taskReadContext(env,index){
+  const bodies=new Map();
+  async function node(id){
+    if(!index.has(id))throw Error('REGISTRY_NODE_MISSING');
+    if(!bodies.has(id))bodies.set(id,(async()=>{
+      const metadata=taskReadIdentity(index.get(id)),body=await readTask(env,id),actual=taskReadIdentity(body);
+      if(actual.task_id!==id||JSON.stringify(metadata)!==JSON.stringify(actual))throw Error('REGISTRY_METADATA_BODY_CONFLICT');
+      if(body.dispatch_contract!==undefined){
+        const contract=body.dispatch_contract;
+        if(!contract||typeof contract!=='object'||Array.isArray(contract))throw Error('REGISTRY_CONTRACT_INVALID');
+        for(const key of ['task_id','project_id','root_task_id','parent_task_id'])
+          if(Object.hasOwn(contract,key)&&(contract[key]??null)!==actual[key])throw Error('REGISTRY_CONTRACT_CONFLICT');
+      }
+      return body;
+    })());
+    return bodies.get(id);
+  }
+  async function project(id,seen=new Set()){
+    if(seen.has(id)||seen.size>=MAX_LINEAGE_WALK)throw Error('REGISTRY_LINEAGE_UNKNOWN');
+    const trail=new Set(seen);trail.add(id);
+    const row=await node(id);let own=row.project_id??null;
+    const links=new Set([row.parent_task_id,row.root_task_id===id?null:row.root_task_id].filter(Boolean));
+    for(const parent of links){
+      const inherited=await project(parent,trail);
+      if(!inherited||own&&own!==inherited)throw Error('REGISTRY_LINEAGE_CONFLICT');
+      own=inherited;
+    }
+    if(!own)throw Error('REGISTRY_PROJECT_UNKNOWN');
+    return own;
+  }
+  return {node,project};
+}
+async function taskReadGet(env,args) {
+  if (!taskReadArgs(args,true)) return taskReadError('TASK_READ_ARGUMENTS_REJECTED');
+  try {
+    const index=await taskReadIndex(env);
+    if (!index.has(args.task_id)) return taskReadError('TASK_PROJECT_NOT_VERIFIED');
+    const context=taskReadContext(env,index);
+    if (await context.project(args.task_id)!==TASK_READ_PROJECT) return taskReadError('TASK_PROJECT_NOT_VERIFIED');
+    const row=await context.node(args.task_id);
+    const result=await taskReadResult(env,args.task_id,row);
+    return {isError:false,text:JSON.stringify(result),structuredContent:result};
+  } catch { return taskReadError('TASK_READ_SOURCE_FAILED'); }
+}
+async function taskReadList(env,args) {
+  if (!taskReadArgs(args)) return taskReadError('TASK_READ_ARGUMENTS_REJECTED');
+  try {
+    const index=await taskReadIndex(env),pending_review=[],failed=[],blocked=[],unconfirmed=[];
+    const now=Date.now(),context=taskReadContext(env,index),verified=[];
+    for (const metadata of index.values()) {
+      const claimed=taskReadProject(metadata,index);
+      if(claimed===null)throw Error('REGISTRY_PROJECT_UNKNOWN');
+      if(claimed!==TASK_READ_PROJECT)continue;
+      if(await context.project(metadata.task_id)!==TASK_READ_PROJECT)throw Error('REGISTRY_PROJECT_CONFLICT');
+      verified.push(await context.node(metadata.task_id));
+    }
+    // All selected task and ancestor bodies verified before any GitHub fetch.
+    for (const row of verified) {
+      const r=await taskReadResult(env,row.task_id,row);
+      const available=r.terminal&&r.evidence?.validation?.result_loaded===true;
+      const item={task_id:row.task_id,project_id:TASK_READ_PROJECT,
+        execution_status:r.execution_status,status:r.status,terminal:r.terminal,
+        workflow_conclusion:r.workflow_conclusion,review_verdict:r.review_verdict,review_state:r.review_state,
+        result_available:available,reviewed:row.reviewed===true,
+        completed_at:r.completed_at,source_updated_at:r.source_updated_at,registry_updated_at:r.registry_updated_at};
+      if (available&&row.reviewed!==true) {
+        pending_review.push(item);if(r.execution_status===EXECUTION_STATUS_FAIL)failed.push(item);
+      } else if (!available) {
+        const liveness=classifyTaskDispatchLiveness(row,{now,hasArtifact:!!r.evidence?.validation?.artifact_found,
+          runStatus:r.evidence?.workflow_run?.status,runConclusion:r.workflow_conclusion});
+        item.dispatch_state=liveness.dispatch_state;
+        item.recommended_action=liveness.recommended_action;
+        // This is a report only. No retry/lease/dispatch function is invoked.
+        if(liveness.recommended_action===TASK_DISPATCH_ACTION_RETRY)unconfirmed.push(item);
+        else { const created=Date.parse(row.created_at);if(Number.isFinite(created)&&now-created>BLOCKED_AFTER_MS)blocked.push(item); }
+      }
+    }
+    const report={pending:pending_review,pending_review,failed,blocked,unconfirmed,
+      counts:{pending:pending_review.length,pending_review:pending_review.length,failed:failed.length,
+        blocked:blocked.length,unconfirmed:unconfirmed.length,total:verified.length},
+      scope:{project_id:TASK_READ_PROJECT},read_only:true,registry_sync_performed:false,
+      coverage:'PENDING_REVIEW_FAILED_BLOCKED_UNCONFIRMED_NOT_ALL_RUNNING_TASKS',observed_at:new Date().toISOString()};
+    return {isError:false,text:JSON.stringify(report),structuredContent:report};
+  } catch { return taskReadError('TASK_READ_SOURCE_FAILED'); }
+}
+
 async function handleMcp(request, env, cors, auth) {
   let message;
   try {
@@ -4283,14 +4968,22 @@ async function handleMcp(request, env, cors, auth) {
       }
     }
     case "tools/list":
-      return ok({ tools: TOOLS });
+      return ok({ tools: isTaskRead(auth) ? taskReadTools() : TOOLS });
     case "tools/call": {
       const name = params.name;
       const args = params.arguments || {};
       let outcome;
-      if (name === "submit_task") {
+      if (isTaskRead(auth)) {
+        if (name === 'get_task_result') outcome = await taskReadGet(env, args);
+        else if (name === 'list_pending_results') outcome = await taskReadList(env, args);
+        else return fail(-32002, 'task.read allows only two fixed-project read tools');
+      } else if (name === "submit_task") {
         if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolSubmitTask(env, args);
+      } else if (name === "get_task_execution_status") {
+        // Keep existing task authorization without legacy scope defaults.
+        if (!hasTaskObservationScope(auth)) return fail(-32002, "mcp scope required");
+        outcome = await toolGetTaskExecutionStatus(env, args);
       } else if (name === "get_task_result") {
         if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolGetTaskResult(env, args);

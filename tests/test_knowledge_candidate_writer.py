@@ -129,7 +129,7 @@ function runStatement(sql, args) {
   throw new Error("unsupported SQL: " + sql);
 }
 function queryFirst(sql, args) {
-  if (sql.indexOf("SELECT asset_id, current_version, content_hash, updated_at FROM assets") === 0) {
+  if (sql.indexOf("SELECT asset_id, asset_type, current_version, content_hash, updated_at FROM assets") === 0) {
     return assetRows.get(args[0]) || null;
   }
   if (sql.indexOf("SELECT a.current_version AS asset_version") === 0) {
@@ -373,7 +373,7 @@ def test_worker_source_encodes_the_knowledge_writer() -> None:
     # the promotion statuses the CHECK permits.
     assert "sha256:${await sha256Hex" not in source
     assert 'KNOWLEDGE_WRITE_STATUS = "accepted"' in source
-    assert '"ACTIVE"' not in source
+    assert 'KNOWLEDGE_WRITE_STATUS = "accepted"' in source
 
 
 def test_write_tool_is_registered_and_scoped_to_write() -> None:

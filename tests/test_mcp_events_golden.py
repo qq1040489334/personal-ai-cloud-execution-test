@@ -270,7 +270,7 @@ console.log(JSON.stringify({
     for name in expected_tools:
         assert name in report["toolNames"], f"existing tool {name} was removed"
     assert "mark_reviewed" in report["toolNames"]
-    assert len(report["toolNames"]) == 11
+    assert len(report["toolNames"]) == 12
 
 
 # -- subscription lifecycle -------------------------------------------------

@@ -323,7 +323,7 @@ def test_batch_unavailable_fails_closed_before_writing_either_row() -> None:
 
 def test_idempotent_path_fails_closed_on_non_accepted_status() -> None:
     content = {"text": "same"}
-    setup = seed_matching_asset(content, asset_id="skill:inbox:1", status="staging")
+    setup = seed_matching_asset(content, asset_id="skill:inbox:1", status="staging") + "\nassetRows.get('skill:inbox:1').asset_type = 'SKILL';"
     report = skill_probe([candidate(content=content)], setup=setup)
     entry = report["results"][0]
 
@@ -463,9 +463,9 @@ def test_knowledge_tool_registration_and_dispatch_unchanged() -> None:
     )
     result = call["body"]["result"]
     structured_content = result["structuredContent"]
-    assert structured_content["status"] == "REJECTED"
-    assert structured_content["reason"] == "candidate_missing"
-    assert structured_content["write_calls"] == 0
+    assert structured_content["status"] == "BLOCKED"
+    assert structured_content["reason"] == "EXACT_REGISTERED_KNOWLEDGE_APPROVAL_REQUIRED"
+    assert structured_content["canonical_write_performed"] is False
     assert call["assets"] == []
     assert call["versions"] == []
 

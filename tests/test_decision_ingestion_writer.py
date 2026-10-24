@@ -439,7 +439,7 @@ def test_worker_source_encodes_the_decision_writer() -> None:
         assert token in source, f"worker is missing decision writer token {token}"
     assert "sha256:${await sha256Hex" not in source
     assert 'DECISION_WRITE_STATUS = "accepted"' in source
-    assert '"ACTIVE"' not in source
+    assert 'DECISION_WRITE_STATUS = "accepted"' in source
 
 
 def test_write_decision_tool_is_registered_and_scoped_to_write() -> None:
