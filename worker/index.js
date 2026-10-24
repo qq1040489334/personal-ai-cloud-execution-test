@@ -2028,6 +2028,7 @@ async function findArtifact(env, name, readOptions = {}) {
     `${API}/repos/${env.GITHUB_REPO}/actions/artifacts?name=${encodeURIComponent(name)}`,
     { ...readOptions, headers: ghHeaders(env) }
   );
+  if (readOptions.redirect === "manual") rejectObservationRedirect(res, "artifacts");
   if (!res.ok) throw new Error(`GitHub artifact lookup failed HTTP ${res.status}`);
   const payload = await res.json();
   const artifacts = payload.artifacts || [];
@@ -2055,6 +2056,7 @@ async function getArtifactWorkflowRun(env, artifact, readOptions = {}) {
   const res = await fetch(`${API}/repos/${env.GITHUB_REPO}/actions/runs/${runId}`, {
     ...readOptions, headers: ghHeaders(env)
   });
+  if (readOptions.redirect === "manual") rejectObservationRedirect(res, "run_detail");
   if (!res.ok) throw new Error(`GitHub workflow lookup failed HTTP ${res.status}`);
   const run = await res.json();
   return {
@@ -3183,6 +3185,13 @@ class TaskObservationReadError extends Error {
     this.diagnostics = diagnostics;
   }
 }
+function rejectObservationRedirect(response, stage) {
+  // Never read Location, consume the redirect body, or forward credentials.
+  if (response.status >= 300 && response.status < 400) {
+    throw new TaskObservationReadError({ stage, failure_class: "redirect_rejected",
+      http_status: response.status, github_request_id: null, rate_limit_remaining: null });
+  }
+}
 async function observationWorkflowJson(url, options) {
   const d = { stage: "workflow_runs", failure_class: null,
     http_status: null, github_request_id: null, rate_limit_remaining: null };
@@ -3192,6 +3201,7 @@ async function observationWorkflowJson(url, options) {
     d.failure_class = options.signal?.aborted ? "timeout" : "network_or_redirect";
     throw new TaskObservationReadError(d);
   }
+  rejectObservationRedirect(response, "workflow_runs");
   d.http_status = Number.isInteger(response.status) ? response.status : null;
   const requestId = response.headers.get("x-github-request-id");
   d.github_request_id = typeof requestId === "string" && /^[A-Fa-f0-9:]{1,128}$/.test(requestId) ? requestId : null;
@@ -3301,7 +3311,7 @@ async function toolGetTaskExecutionStatus(env, args) {
   // Bound all GETs together; reject redirects so authorization stays on GitHub.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
-  const readOptions = { method: "GET", redirect: "error", signal: controller.signal };
+  const readOptions = { method: "GET", redirect: "manual", signal: controller.signal };
   try {
     const early = await findEarlyTaskRun(env, task, readOptions);
     result.mapping.coverage = early.coverage ?? null;

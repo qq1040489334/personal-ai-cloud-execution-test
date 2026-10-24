@@ -42,7 +42,7 @@ async function probe(options = {}) {
   const previous = global.fetch;
   global.fetch = async (url, init) => {
     calls.push(url); fetchAttempts.push({url, method:init.method, redirect:init.redirect}); call++;
-    assert.equal(init.method, 'GET'); assert.equal(init.redirect, 'error');
+    assert.equal(init.method, 'GET'); assert.equal(init.redirect, 'manual');
     assert.ok(init.signal instanceof AbortSignal);
     assert.equal(url, call === 1
       ? `https://api.github.com/repos/fixture/repo/actions/artifacts?name=execution_result-${taskId}`
@@ -71,7 +71,7 @@ async function probe(options = {}) {
     // Verify after the Worker returns: its catch blocks must not hide a forbidden call.
     assert.ok(fetchAttempts.length <= 2);
     for (const [i, attempt] of fetchAttempts.entries()) {
-      assert.equal(attempt.method, 'GET'); assert.equal(attempt.redirect, 'error');
+      assert.equal(attempt.method, 'GET'); assert.equal(attempt.redirect, 'manual');
       assert.equal(attempt.url, i === 0
         ? `https://api.github.com/repos/fixture/repo/actions/artifacts?name=execution_result-${taskId}`
         : 'https://api.github.com/repos/fixture/repo/actions/runs/123');

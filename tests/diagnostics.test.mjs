@@ -22,7 +22,7 @@ async function invoke(reply,implementation=api){
  try{
  const result=await implementation.toolGetTaskExecutionStatus({GITHUB_REPO:'fixture/repo',GITHUB_TOKEN:secret,TASK_REGISTRY:{get:async()=>task,put:deny,delete:deny,list:deny},get ASSET_DB(){return deny()}},{task_id:task.task_id});
  assert.equal(writes,0);assert.ok(!JSON.stringify(result).includes(secret));
- assert.ok(calls.every(x=>x.method==='GET'&&x.redirect==='error'));
+ assert.ok(calls.every(x=>x.method==='GET'&&x.redirect===(implementation===api?'manual':'error')));
  return {r:result.structuredContent,calls};
  }finally{Object.assign(globalThis,saved)}
 }
@@ -45,7 +45,7 @@ for(const [value,expected] of [['0',0],['5000',5000],['01',1],['-1',null],['1.5'
 const strip=r=>{const {observed_at,expires_at,...rest}=r;return rest};
 for(const status of ['queued','in_progress','completed'])test('success unchanged '+status,async()=>{
  const row={...run,status,conclusion:status==='completed'?'success':null};const response=n=>new Response(JSON.stringify(n===1?{total_count:1,workflow_runs:[row]}:row));
- const a=await invoke(response),b=await invoke(response,old);assert.deepEqual(strip(a.r),strip(b.r));assert.deepEqual(a.calls,b.calls);assert.equal(a.calls.length,2);assert.equal(a.r.github_diagnostics,undefined);
+ const a=await invoke(response),b=await invoke(response,old);assert.deepEqual(strip(a.r),strip(b.r));assert.deepEqual(a.calls,b.calls.map(call=>({...call,redirect:'manual'})));assert.equal(a.calls.length,2);assert.equal(a.r.github_diagnostics,undefined);
 });
 test('incomplete shape keeps existing reason',async()=>{const reply=()=>new Response('{}');const a=await invoke(reply),b=await invoke(reply,old);assert.deepEqual(strip(a.r),strip(b.r));assert.equal(a.r.reason,'run_lookup_incomplete');assert.equal(a.calls.length,1)});
 
