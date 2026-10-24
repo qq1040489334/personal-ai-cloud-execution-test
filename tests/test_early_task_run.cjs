@@ -41,7 +41,7 @@ async function read(options={}) {
     assert.deepEqual(writes,[]);
     assert.ok(calls.length<=3);
     for(const call of calls){
-      assert.equal(call.method,'GET');assert.equal(call.redirect,'error');
+      assert.equal(call.method,'GET');assert.equal(call.redirect,'manual');
       const url=new URL(call.url);
       assert.equal(url.origin,'https://api.github.com');
       assert.ok(['/repos/fixture/repo/actions/workflows/agent-dispatch.yml/runs',

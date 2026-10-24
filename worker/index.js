@@ -2028,6 +2028,7 @@ async function findArtifact(env, name, readOptions = {}) {
     `${API}/repos/${env.GITHUB_REPO}/actions/artifacts?name=${encodeURIComponent(name)}`,
     { ...readOptions, headers: ghHeaders(env) }
   );
+  if (readOptions.redirect === "manual") rejectObservationRedirect(res, "artifacts");
   if (!res.ok) throw new Error(`GitHub artifact lookup failed HTTP ${res.status}`);
   const payload = await res.json();
   const artifacts = payload.artifacts || [];
@@ -2055,6 +2056,7 @@ async function getArtifactWorkflowRun(env, artifact, readOptions = {}) {
   const res = await fetch(`${API}/repos/${env.GITHUB_REPO}/actions/runs/${runId}`, {
     ...readOptions, headers: ghHeaders(env)
   });
+  if (readOptions.redirect === "manual") rejectObservationRedirect(res, "run_detail");
   if (!res.ok) throw new Error(`GitHub workflow lookup failed HTTP ${res.status}`);
   const run = await res.json();
   return {
@@ -3176,6 +3178,51 @@ function positiveSourceInteger(value) {
 // Reuse GitHub's existing workflow-run registry; no callback or mapping writes.
 var TASK_RUN_TITLE_PREFIX = "personal-ai-task:";
 var TASK_WORKFLOW_PATH = ".github/workflows/agent-dispatch.yml";
+// Diagnostic draft: structured allowlist only; never exception messages or bodies.
+class TaskObservationReadError extends Error {
+  constructor(diagnostics) {
+    super("task observation read failed");
+    this.diagnostics = diagnostics;
+  }
+}
+function rejectObservationRedirect(response, stage) {
+  // Never read Location, consume the redirect body, or forward credentials.
+  if (response.status >= 300 && response.status < 400) {
+    throw new TaskObservationReadError({ stage, failure_class: "redirect_rejected",
+      http_status: response.status, github_request_id: null, rate_limit_remaining: null });
+  }
+}
+async function observationWorkflowJson(url, options) {
+  const d = { stage: "workflow_runs", failure_class: null,
+    http_status: null, github_request_id: null, rate_limit_remaining: null };
+  let response;
+  try { response = await fetch(url, options); }
+  catch {
+    d.failure_class = options.signal?.aborted ? "timeout" : "network_or_redirect";
+    throw new TaskObservationReadError(d);
+  }
+  rejectObservationRedirect(response, "workflow_runs");
+  d.http_status = Number.isInteger(response.status) ? response.status : null;
+  const requestId = response.headers.get("x-github-request-id");
+  d.github_request_id = typeof requestId === "string" && /^[A-Fa-f0-9:]{1,128}$/.test(requestId) ? requestId : null;
+  const remaining = response.headers.get("x-ratelimit-remaining");
+  d.rate_limit_remaining = typeof remaining === "string" && /^\d{1,10}$/.test(remaining) && Number.isSafeInteger(Number(remaining)) ? Number(remaining) : null;
+  if (!response.ok) {
+    d.failure_class = "http";
+    throw new TaskObservationReadError(d);
+  }
+  let payload;
+  try { payload = await response.json(); }
+  catch {
+    d.failure_class = options.signal?.aborted ? "timeout" : "response_json";
+    throw new TaskObservationReadError(d);
+  }
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    d.failure_class = "response_shape";
+    throw new TaskObservationReadError(d);
+  }
+  return { response, payload };
+}
 async function findEarlyTaskRun(env, task, readOptions) {
   const createdAt = sourceTimestamp(task.created_at);
   if (!createdAt) return { run: null, reason: null, coverage: "registration_time_missing" };
@@ -3184,11 +3231,9 @@ async function findEarlyTaskRun(env, task, readOptions) {
   // Exact task/repo/workflow matching remains mandatory; older unseen runs stay unknown.
   const boundary = new Date(Math.floor((Date.parse(createdAt) - TASK_DISPATCH_CONFIRM_GRACE_MS) / 1000) * 1000).toISOString();
   const query = new URLSearchParams({ event: "repository_dispatch", per_page: "100", created: `>=${boundary}` });
-  const response = await fetch(`${API}/repos/${env.GITHUB_REPO}/actions/workflows/agent-dispatch.yml/runs?${query}`, {
+  const { response, payload } = await observationWorkflowJson(`${API}/repos/${env.GITHUB_REPO}/actions/workflows/agent-dispatch.yml/runs?${query}`, {
     ...readOptions, headers: ghHeaders(env)
   });
-  if (!response.ok) throw new Error("workflow run lookup failed");
-  const payload = await response.json();
   // A bounded incomplete page is not evidence that a newer dispatch is absent.
   if (!Array.isArray(payload.workflow_runs) || !Number.isSafeInteger(payload.total_count) ||
       payload.total_count < 0 || payload.total_count !== payload.workflow_runs.length ||
@@ -3266,7 +3311,7 @@ async function toolGetTaskExecutionStatus(env, args) {
   // Bound all GETs together; reject redirects so authorization stays on GitHub.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
-  const readOptions = { method: "GET", redirect: "error", signal: controller.signal };
+  const readOptions = { method: "GET", redirect: "manual", signal: controller.signal };
   try {
     const early = await findEarlyTaskRun(env, task, readOptions);
     result.mapping.coverage = early.coverage ?? null;
@@ -3324,8 +3369,9 @@ async function toolGetTaskExecutionStatus(env, args) {
     } else {
       ex.state = ex.status === "in_progress" ? "running" : ex.status === "completed" ? "completed" : "queued";
     }
-  } catch {
-    // Never return exception bodies, headers, credentials or raw GitHub payloads.
+  } catch (error) {
+    // Only our locally constructed diagnostic type can supply allowlisted fields.
+    if (error instanceof TaskObservationReadError) result.github_diagnostics = error.diagnostics;
     result.reason = controller.signal.aborted ? "github_read_timeout" : "github_read_failed";
   } finally { clearTimeout(timer); }
   return finish();
