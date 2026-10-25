@@ -27,6 +27,7 @@ async function invoke(reply,implementation=api){
  }finally{Object.assign(globalThis,saved)}
 }
 function check(r,kind,status=null){
+ checkIdentity(r);
  assert.equal(r.executor.state,'unknown');assert.equal(r.mapping.kind,'unknown');assert.equal(r.agent_state,'unknown');assert.equal(r.business.state,'unknown');assert.equal(r.acceptance.state,'unknown');
  assert.equal(r.reason,kind==='timeout'?'github_read_timeout':'github_read_failed');assert.equal(r.ttl_seconds,60);assert.equal(Date.parse(r.expires_at)-Date.parse(r.observed_at),60000);
  assert.deepEqual(Object.keys(r.github_diagnostics).sort(),['stage','failure_class','http_status','github_request_id','rate_limit_remaining'].sort());
@@ -43,10 +44,28 @@ for(const payload of [null,[],true,42,'bad'])test('invalid JSON top-level '+JSON
 for(const value of [secret,'https://private.invalid',':'.repeat(129),'','ABC xyz'])test('request-id rejects '+value.slice(0,20),async()=>{const {r}=await invoke(()=>new Response(secret,{status:403,headers:{'x-github-request-id':value}}));assert.equal(r.github_diagnostics.github_request_id,null)});
 for(const [value,expected] of [['0',0],['5000',5000],['01',1],['-1',null],['1.5',null],['1e3',null],['99999999999',null],['',null],[secret,null]])test('remaining validates '+value,async()=>{const {r}=await invoke(()=>new Response(secret,{status:429,headers:{'x-ratelimit-remaining':value}}));assert.equal(r.github_diagnostics.rate_limit_remaining,expected)});
 const strip=r=>{const {observed_at,expires_at,...rest}=r;return rest};
+function checkIdentity(r,observed=null){
+ assert.deepEqual(r.execution_identity,{
+  state:'unknown',employee_id:null,agent_id:null,configured:null,observed,
+  receipt_identity_verified:false,reason:'trusted_agent_identity_unavailable'
+ });
+}
+function checkLegacyFields(current,previous,observed=null){
+ checkIdentity(current,observed);
+ assert.equal(Object.hasOwn(previous,'execution_identity'),false);
+ const {execution_identity,...originalFields}=strip(current);
+ assert.deepEqual(originalFields,strip(previous));
+}
 for(const status of ['queued','in_progress','completed'])test('success unchanged '+status,async()=>{
  const row={...run,status,conclusion:status==='completed'?'success':null};const response=n=>new Response(JSON.stringify(n===1?{total_count:1,workflow_runs:[row]}:row));
- const a=await invoke(response),b=await invoke(response,old);assert.deepEqual(strip(a.r),strip(b.r));assert.deepEqual(a.calls,b.calls.map(call=>({...call,redirect:'manual'})));assert.equal(a.calls.length,2);assert.equal(a.r.github_diagnostics,undefined);
+ const a=await invoke(response),b=await invoke(response,old);
+ checkLegacyFields(a.r,b.r,{
+  source:'github_actions_run_api',executor_kind:'github_actions_workflow_run',
+  repository:'fixture/repo',run_id:123,run_attempt:1,
+  workflow_path:'.github/workflows/agent-dispatch.yml',run_head_sha:null
+ });
+ assert.deepEqual(a.calls,b.calls.map(call=>({...call,redirect:'manual'})));assert.equal(a.calls.length,2);assert.equal(a.r.github_diagnostics,undefined);
 });
-test('incomplete shape keeps existing reason',async()=>{const reply=()=>new Response('{}');const a=await invoke(reply),b=await invoke(reply,old);assert.deepEqual(strip(a.r),strip(b.r));assert.equal(a.r.reason,'run_lookup_incomplete');assert.equal(a.calls.length,1)});
+test('incomplete shape keeps existing reason',async()=>{const reply=()=>new Response('{}');const a=await invoke(reply),b=await invoke(reply,old);checkLegacyFields(a.r,b.r);assert.equal(a.r.reason,'run_lookup_incomplete');assert.equal(a.calls.length,1)});
 
 test('timeout during body decode remains timeout',async()=>{const {r,calls}=await invoke((n,abort)=>({ok:true,status:200,headers:new Headers(),async json(){abort();throw Error(secret)}}));check(r,'timeout',200);assert.equal(calls.length,1)});
