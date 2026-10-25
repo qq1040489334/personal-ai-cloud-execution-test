@@ -250,7 +250,8 @@ const initialized = await callMcp(kv, "initialize", {});
 const tools = await callMcp(kv, "tools/list", {});
 console.log(JSON.stringify({
   protocolVersion: initialized.result.protocolVersion,
-  toolNames: tools.result.tools.map((tool) => tool.name)
+  toolNames: tools.result.tools.map((tool) => tool.name),
+  catalogTool: tools.result.tools.find((tool) => tool.name === "list_registered_tasks")
 }));
 """
     )
@@ -266,11 +267,30 @@ console.log(JSON.stringify({
         "write_knowledge_candidate",
         "write_skill_candidate",
         "write_decision_record",
+        "mark_reviewed",
+        "get_task_execution_status",
+        "list_registered_tasks",
     ]
-    for name in expected_tools:
-        assert name in report["toolNames"], f"existing tool {name} was removed"
-    assert "mark_reviewed" in report["toolNames"]
-    assert len(report["toolNames"]) == 12
+    assert len(report["toolNames"]) == len(expected_tools) == 13
+    assert set(report["toolNames"]) == set(expected_tools)
+    catalog = report["catalogTool"]
+    assert catalog["inputSchema"] == {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "project_id": {"type": "string", "enum": ["cloud-assets-activation"]},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+            "cursor": {
+                "type": "string", "minLength": 1, "maxLength": 8192,
+                "pattern": r"^tc1\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]+$",
+            },
+        },
+        "required": [],
+    }
+    assert catalog["annotations"] == {
+        "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True,
+    }
+    assert catalog["outputSchema"] == {"type": "object", "additionalProperties": True}
 
 
 # -- subscription lifecycle -------------------------------------------------

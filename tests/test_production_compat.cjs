@@ -16,8 +16,8 @@ async function call(method,name,args,scope='task.read') {
     method:'POST',headers:{Authorization:'Bearer '+token},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params:{name,arguments:args}})}),env)).json();}
   finally{global.fetch=old;}
 }
-test('production task.read discovery stays exactly two fixed-project tools',async()=>{
-  const r=await call('tools/list');assert.deepEqual(r.result.tools.map(t=>t.name),['get_task_result','list_pending_results']);
+test('task.read discovery adds only the fixed-project registered catalog',async()=>{
+  const r=await call('tools/list');assert.deepEqual(r.result.tools.map(t=>t.name),['get_task_result','list_pending_results','list_registered_tasks']);
 });
 test('production task.read cannot enter new observation or write branches',async()=>{
   for(const name of ['get_task_execution_status','submit_task','write_knowledge_candidate']) {

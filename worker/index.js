@@ -1595,7 +1595,7 @@ function consentPage(params, error) {
   return `<!doctype html><html><head><meta charset="utf-8"><title>Authorize Personal AI Execution</title></head>
 <body style="font-family:system-ui;max-width:520px;margin:48px auto">
 <h2>Authorize <em>Personal AI Execution</em></h2>
-${normalizeScopes(params.scope).includes(TASK_READ_SCOPE)?'<p>Scope: <code>task.read</code>. Fixed project: <code>cloud-assets-activation</code>.</p><p>Only <code>list_pending_results</code> and <code>get_task_result</code> are allowed. No registry synchronization writes; no dispatch, retry, asset or Canonical writes.</p>':'<p>This grants the requesting MCP client access to <code>submit_task</code> and <code>get_task_result</code>.</p>'}
+${normalizeScopes(params.scope).includes(TASK_READ_SCOPE)?'<p>Scope: <code>task.read</code>. Fixed project: <code>cloud-assets-activation</code>.</p><p>Only <code>list_registered_tasks</code>, <code>list_pending_results</code> and <code>get_task_result</code> are allowed. No registry synchronization writes; no dispatch, retry, asset or Canonical writes.</p>':'<p>This grants the requesting MCP client access to <code>submit_task</code> and <code>get_task_result</code>.</p>'}
 ${message}
 <form method="post" action="/authorize">
 ${hidden}
@@ -2067,6 +2067,8 @@ async function getArtifactWorkflowRun(env, artifact, readOptions = {}) {
     path: run.path ?? null,
     run_number: run.run_number ?? null,
     run_attempt: run.run_attempt ?? null,
+    head_sha: typeof run.head_sha === "string" && /^[a-f0-9]{40}$/i.test(run.head_sha)
+      ? run.head_sha.toLowerCase() : null,
     run_started_at: run.run_started_at ?? null,
     status: run.status,
     conclusion: run.conclusion,
@@ -3169,6 +3171,11 @@ async function finalizeTaskResult(env, taskId, result) {
 }
 // Strict observation path: KV get + GitHub GET only. Never finalize results.
 var EXECUTION_OBSERVATION_TTL_SECONDS = 60;
+function unknownExecutionIdentity() {
+  return { state: "unknown", employee_id: null, agent_id: null,
+    configured: null, observed: null, receipt_identity_verified: false,
+    reason: "trusted_agent_identity_unavailable" };
+}
 function sourceTimestamp(value) {
   return typeof value === "string" && /^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value)) ? value : null;
 }
@@ -3280,6 +3287,7 @@ async function toolGetTaskExecutionStatus(env, args) {
     contract: "task_execution_observation.v1", task_id: taskId,
     source: "github_actions", scope: "single_task_mapped_run",
     full_task_coverage: false, agent_state: "unknown",
+    execution_identity: unknownExecutionIdentity(),
     mapping: { kind: "unknown", artifact_id: null, run_id: null, run_number: null, coverage: null },
     executor: { state: "unknown", run_id: null, run_attempt: null, status: null, conclusion: null,
       created_at: null, updated_at: null, run_started_at: null, completed_at: null },
@@ -3368,6 +3376,16 @@ async function toolGetTaskExecutionStatus(env, args) {
       result.reason = "inconsistent_source_fields";
     } else {
       ex.state = ex.status === "in_progress" ? "running" : ex.status === "completed" ? "completed" : "queued";
+      // Only GitHub's already-validated run metadata is observed here. Neither
+      // actor/model names nor agent-controlled receipt/registry fields identify
+      // an employee. head_sha is a run revision, not a verified workflow ref.
+      result.execution_identity.observed = {
+        source: "github_actions_run_api", executor_kind: "github_actions_workflow_run",
+        repository: env.GITHUB_REPO, run_id: runId, run_attempt: ex.run_attempt,
+        workflow_path: run.path === TASK_WORKFLOW_PATH ? TASK_WORKFLOW_PATH : null,
+        run_head_sha: typeof run.head_sha === "string" && /^[a-f0-9]{40}$/i.test(run.head_sha)
+          ? run.head_sha.toLowerCase() : null
+      };
     }
   } catch (error) {
     // Only our locally constructed diagnostic type can supply allowlisted fields.
@@ -4766,11 +4784,59 @@ function isTaskRead(auth) {
     auth.payload?.task_project === TASK_READ_PROJECT;
 }
 function taskReadError(code) { return {isError:true,text:code}; }
+const TASK_CATALOG_DEFAULT_LIMIT = 50;
+const TASK_CATALOG_MAX_LIMIT = 100;
+const TASK_CATALOG_MAX_READS = 200;
+const TASK_CATALOG_CURSOR_TTL_SECONDS = 900;
+const TASK_CATALOG_MAX_TOKEN_LENGTH = 8192;
+const TASK_CATALOG_CURSOR_CONTEXT = 'registered-task-catalog:v1:task::cloud-assets-activation';
+async function taskCatalogCursorKey(env) {
+  const secret=typeof env.OAUTH_SIGNING_KEY==='string' && env.OAUTH_SIGNING_KEY
+    ? env.OAUTH_SIGNING_KEY : env.MCP_AUTH_TOKEN;
+  if(typeof secret!=='string' || !secret)throw Error('CURSOR_KEY_UNAVAILABLE');
+  const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(`${TASK_CATALOG_CURSOR_CONTEXT}\0${secret}`));
+  return crypto.subtle.importKey('raw',digest,{name:'AES-GCM'},false,['encrypt','decrypt']);
+}
+async function sealTaskCatalogCursor(env,cursor) {
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const payload=JSON.stringify({v:1,project:TASK_READ_PROJECT,cursor,exp:nowSec()+TASK_CATALOG_CURSOR_TTL_SECONDS});
+  const encrypted=await crypto.subtle.encrypt({name:'AES-GCM',iv,
+    additionalData:new TextEncoder().encode(TASK_CATALOG_CURSOR_CONTEXT)},await taskCatalogCursorKey(env),new TextEncoder().encode(payload));
+  const token=`tc1.${bytesToB64url(iv)}.${bytesToB64url(new Uint8Array(encrypted))}`;
+  if(token.length>TASK_CATALOG_MAX_TOKEN_LENGTH)throw Error('CURSOR_TOO_LARGE');
+  return token;
+}
+async function openTaskCatalogCursor(env,token) {
+  if(typeof token!=='string' || token.length>TASK_CATALOG_MAX_TOKEN_LENGTH || !/^tc1\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]+$/.test(token))throw Error('CURSOR_INVALID');
+  const [,nonce,data]=token.split('.');
+  const decode=value=>Uint8Array.from(atob(value.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));
+  const plaintext=await crypto.subtle.decrypt({name:'AES-GCM',iv:decode(nonce),
+    additionalData:new TextEncoder().encode(TASK_CATALOG_CURSOR_CONTEXT)},await taskCatalogCursorKey(env),decode(data));
+  const payload=JSON.parse(new TextDecoder().decode(plaintext));
+  if(payload?.v!==1 || payload.project!==TASK_READ_PROJECT || !Number.isInteger(payload.exp) || payload.exp<=nowSec() ||
+      typeof payload.cursor!=='string' || !/^[\x21-\x7e]{1,2048}$/.test(payload.cursor))throw Error('CURSOR_INVALID');
+  return payload.cursor;
+}
+function hasTaskCatalogScope(auth) {
+  return hasTaskObservationScope(auth) || isTaskRead(auth) && auth.kind==='oauth' &&
+    auth.payload?.aud==='mcp' && Number.isFinite(auth.payload.exp) && auth.payload.exp>nowSec();
+}
+function taskCatalogTool() {
+  return {name:'list_registered_tasks',
+    description:'Read one bounded KV page of registered tasks in cloud-assets-activation. Includes reviewed/new registrations; never establishes run or employee state. Empty filtered pages may have a continuation cursor.',
+    inputSchema:{type:'object',additionalProperties:false,properties:{
+      project_id:{type:'string',enum:[TASK_READ_PROJECT]},
+      limit:{type:'integer',minimum:1,maximum:TASK_CATALOG_MAX_LIMIT,default:TASK_CATALOG_DEFAULT_LIMIT},
+      cursor:{type:'string',minLength:1,maxLength:TASK_CATALOG_MAX_TOKEN_LENGTH,pattern:'^tc1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]+$'}},required:[]},
+    annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true},
+    outputSchema:{type:'object',additionalProperties:true}};
+}
 function taskReadTools() {
   return [{name:'get_task_result',description:'Pure read of one registry-verified task in cloud-assets-activation; no registry sync.',
     inputSchema:{type:'object',additionalProperties:false,properties:{task_id:{type:'string',pattern:'^cf-[a-f0-9]{12}$'}},required:['task_id']}},
     {name:'list_pending_results',description:'Pure read of pending-review/failed/blocked/unconfirmed buckets in fixed project cloud-assets-activation; not all running tasks.',
-    inputSchema:{type:'object',additionalProperties:false,properties:{project_id:{type:'string',enum:[TASK_READ_PROJECT]}},required:[]}}]
+    inputSchema:{type:'object',additionalProperties:false,properties:{project_id:{type:'string',enum:[TASK_READ_PROJECT]}},required:[]}},
+    taskCatalogTool()]
     .map(t=>({...t,annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true}}));
 }
 function taskReadArgs(args, detail=false) {
@@ -4927,6 +4993,87 @@ async function taskReadGet(env,args) {
     return {isError:false,text:JSON.stringify(result),structuredContent:result};
   } catch { return taskReadError('TASK_READ_SOURCE_FAILED'); }
 }
+// A single source page, plus bounded KV gets for project/ancestor verification.
+// No GitHub fetch, registry synchronization, artifact download or second store.
+async function taskReadCatalog(env,args) {
+  if (!args || typeof args!=='object' || Array.isArray(args) ||
+      Object.keys(args).some(k=>!['project_id','limit','cursor'].includes(k)) ||
+      Object.hasOwn(args,'project_id') && args.project_id!==TASK_READ_PROJECT ||
+      Object.hasOwn(args,'limit') && (!Number.isInteger(args.limit) || args.limit<1 || args.limit>TASK_CATALOG_MAX_LIMIT) ||
+      Object.hasOwn(args,'cursor') && (typeof args.cursor!=='string' || args.cursor.length>TASK_CATALOG_MAX_TOKEN_LENGTH)) {
+    return taskReadError('TASK_CATALOG_ARGUMENTS_REJECTED');
+  }
+  const limit=args.limit??TASK_CATALOG_DEFAULT_LIMIT;
+  let cursor;
+  try { if(Object.hasOwn(args,'cursor'))cursor=await openTaskCatalogCursor(env,args.cursor); }
+  catch { return taskReadError('TASK_CATALOG_ARGUMENTS_REJECTED'); }
+  try {
+    if(!env.TASK_REGISTRY)throw Error('REGISTRY_UNAVAILABLE');
+    const listed=await env.TASK_REGISTRY.list({prefix:REG_PREFIX,limit,...(cursor?{cursor}:{})});
+    if(!listed || !Array.isArray(listed.keys) || listed.keys.length>limit || typeof listed.list_complete!=='boolean')throw Error('REGISTRY_PAGE_INVALID');
+    if(!listed.list_complete && (typeof listed.cursor!=='string' ||
+        !/^[\x21-\x7e]{1,2048}$/.test(listed.cursor) || listed.cursor===cursor))throw Error('REGISTRY_CURSOR_INVALID');
+    const cache=new Map(),projects=new Map(),seenKeys=new Set();
+    let reads=0;
+    async function node(id) {
+      if(cache.has(id))return cache.get(id);
+      if(++reads>TASK_CATALOG_MAX_READS)throw Error('REGISTRY_READ_LIMIT');
+      const row=await readTask(env,id),identity=taskReadIdentity(row);
+      if(identity.task_id!==id)throw Error('REGISTRY_IDENTITY_CONFLICT');
+      if(row.dispatch_contract!==undefined) {
+        const contract=row.dispatch_contract;
+        if(!contract || typeof contract!=='object' || Array.isArray(contract))throw Error('REGISTRY_CONTRACT_INVALID');
+        for(const key of ['task_id','project_id','root_task_id','parent_task_id'])
+          if(Object.hasOwn(contract,key) && (contract[key]??null)!==identity[key])throw Error('REGISTRY_CONTRACT_CONFLICT');
+      }
+      cache.set(id,row);return row;
+    }
+    async function project(id,trail=new Set()) {
+      if(trail.has(id) || trail.size>=MAX_LINEAGE_WALK)throw Error('REGISTRY_LINEAGE_UNKNOWN');
+      if(projects.has(id))return projects.get(id);
+      const row=await node(id),next=new Set(trail);next.add(id);
+      let own=row.project_id??null;
+      const links=new Set([row.parent_task_id,row.root_task_id===id?null:row.root_task_id].filter(Boolean));
+      for(const parent of links) {
+        const inherited=await project(parent,next);
+        if(!inherited || own && own!==inherited)throw Error('REGISTRY_LINEAGE_CONFLICT');
+        own=inherited;
+      }
+      if(!own)throw Error('REGISTRY_PROJECT_UNKNOWN');
+      projects.set(id,own);return own;
+    }
+    const tasks=[];
+    for(const key of listed.keys) {
+      if(typeof key.name!=='string' || !key.name.startsWith(REG_PREFIX) || seenKeys.has(key.name))throw Error('REGISTRY_KEY_INVALID');
+      seenKeys.add(key.name);
+      const id=key.name.slice(REG_PREFIX.length);
+      // Validate the key before using it in a get; full bodies, not metadata
+      // assertions alone, determine membership even across source pages.
+      taskReadIdentity({task_id:id});
+      const row=await node(id);
+      if(key.metadata!==undefined && key.metadata!==null) {
+        if(typeof key.metadata!=='object' || Array.isArray(key.metadata) ||
+            Object.hasOwn(key.metadata,'task_id') && key.metadata.task_id!==id)throw Error('REGISTRY_METADATA_INVALID');
+        if(metadataLineageComplete(key.metadata) &&
+            JSON.stringify(taskReadIdentity({...key.metadata,task_id:id}))!==JSON.stringify(taskReadIdentity(row)))throw Error('REGISTRY_METADATA_BODY_CONFLICT');
+      }
+      if(await project(id)!==TASK_READ_PROJECT)continue;
+      const identity=taskReadIdentity(row);
+      tasks.push({...identity,project_id:TASK_READ_PROJECT,registration_state:'registered',
+        created_at:taskReadTime(row.created_at),registry_updated_at:taskReadTime(row.updated_at),
+        runtime_state:'unknown',agent_state:'unknown',
+        execution_identity:unknownExecutionIdentity()});
+    }
+    const report={contract:'registered_task_catalog.v1',source:'task_registry',
+      scope:{project_id:TASK_READ_PROJECT},tasks,
+      pagination:{limit,limit_applies_to:'registry_keys',has_more:!listed.list_complete,
+        next_cursor:listed.list_complete?null:await sealTaskCatalogCursor(env,listed.cursor)},
+      coverage:'REGISTERED_TASKS_FIXED_PROJECT_PAGE',full_task_coverage:false,
+      consistency:'eventual',observed_at:new Date().toISOString(),
+      read_only:true,registry_sync_performed:false};
+    return {isError:false,text:JSON.stringify(report),structuredContent:report};
+  } catch { return taskReadError('TASK_CATALOG_SOURCE_FAILED'); }
+}
 async function taskReadList(env,args) {
   if (!taskReadArgs(args)) return taskReadError('TASK_READ_ARGUMENTS_REJECTED');
   try {
@@ -5014,15 +5161,18 @@ async function handleMcp(request, env, cors, auth) {
       }
     }
     case "tools/list":
-      return ok({ tools: isTaskRead(auth) ? taskReadTools() : TOOLS });
+      return ok({ tools: isTaskRead(auth) ? taskReadTools() : hasTaskObservationScope(auth) ? [...TOOLS,taskCatalogTool()] : TOOLS });
     case "tools/call": {
       const name = params.name;
       const args = params.arguments || {};
       let outcome;
-      if (isTaskRead(auth)) {
+      if (name === 'list_registered_tasks') {
+        if (!hasTaskCatalogScope(auth)) return fail(-32002, 'task scope required');
+        outcome = await taskReadCatalog(env, Object.hasOwn(params,'arguments') ? params.arguments : {});
+      } else if (isTaskRead(auth)) {
         if (name === 'get_task_result') outcome = await taskReadGet(env, args);
         else if (name === 'list_pending_results') outcome = await taskReadList(env, args);
-        else return fail(-32002, 'task.read allows only two fixed-project read tools');
+        else return fail(-32002, 'task.read allows only fixed-project read tools');
       } else if (name === "submit_task") {
         if (!hasWriteScope(auth)) return fail(-32002, "mcp scope required");
         outcome = await toolSubmitTask(env, args);
